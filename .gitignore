@@ -1,0 +1,43 @@
+# Rust
+/target/
+**/target/
+Cargo.lock
+*.rs.bk
+*.pdb
+
+# OS Image
+*.img
+*.iso
+*.bin
+!bootloader/boot.bin
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.elf
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# MacOS
+.DS_Store
+
+# Backup files
+*.bak
+*~
+
+# Test outputs
+test_results/
+benchmark_results/
+
+# Temporary files
+tmp/
+temp/

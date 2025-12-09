@@ -1,0 +1,23 @@
+[package]
+name = "aetherion-kernel"
+version = "0.0.1"
+edition = "2021"
+authors = ["Cabrel Foka <cabrel@aetherion.dev>"]
+license = "MIT"
+description = "Aetherion OS Kernel - A next-generation OS written in Rust"
+
+[dependencies]
+# Aucune dépendance externe pour Phase 0 (ultra minimal)
+# Les crates seront ajoutées progressivement dans les phases suivantes
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true         # Link Time Optimization
+opt-level = 2      # Optimize for size and speed
+codegen-units = 1  # Better optimization, slower compile
+
+[profile.test]
+panic = "unwind"   # Allow panics in tests
