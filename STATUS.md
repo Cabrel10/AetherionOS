@@ -1,9 +1,9 @@
 # Aetherion OS - État d'Avancement Détaillé
 
 **Date de Dernière MAJ** : 2025-12-11  
-**Version Actuelle** : v0.1.0-alpha  
+**Version Actuelle** : v0.1.5-alpha  
 **Phase en Cours** : Phase 1 - Memory Management  
-**Progression Globale** : 🟢 6% (Phase 0 complete + Phase 1.1 complete)
+**Progression Globale** : 🟢 9% (Phase 0 ✅ + Phase 1.1 ✅ + Phase 1.2 ✅)
 
 ---
 
@@ -11,7 +11,7 @@
 
 ```
 Phase 0: Fondations           ████████████████████████ 100% ✅ COMPLETE
-Phase 1: Memory Management    ████████░░░░░░░░░░░░░░░░  33% [Phase 1.1 ✅]
+Phase 1: Memory Management    ████████████████░░░░░░░░  67% [1.1 ✅, 1.2 ✅]
 Phase 2: Syscalls & Userland  ░░░░░░░░░░░░░░░░░░░░░░░░   0%
 Phase 3: VFS & Drivers        ░░░░░░░░░░░░░░░░░░░░░░░░   0%
 Phase 4: Sécurité Avancée     ░░░░░░░░░░░░░░░░░░░░░░░░   0%
@@ -20,7 +20,7 @@ Phase 6: Réseau               ░░░░░░░░░░░░░░░░�
 Phase 7: Tests & QA           ░░░░░░░░░░░░░░░░░░░░░░░░   0%
 Phase 8: Optimisations        ░░░░░░░░░░░░░░░░░░░░░░░░   0%
 
-Overall Progress: ███░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  6%
+Overall Progress: ████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  9%
 ```
 
 ---
@@ -81,10 +81,10 @@ Overall Progress: ███░░░░░░░░░░░░░░░░░�
 
 ---
 
-## 🚀 Phase 1 : Memory Management (EN COURS - 33%)
+## 🚀 Phase 1 : Memory Management (EN COURS - 67%)
 
 **Objectif** : Implémentation complète de la gestion mémoire  
-**Status** : 🟡 EN COURS (Phase 1.1 ✅, Phase 1.2 ⏳)  
+**Status** : 🟢 EN COURS (Phase 1.1 ✅, Phase 1.2 ✅, Phase 1.3 ⏳)  
 **Started**: 2025-12-11
 
 ### ✅ Phase 1.1: Physical Memory Manager (COMPLETE)
@@ -122,17 +122,50 @@ Accomplishments:
 
 See [PHASE1_RESULTS.md](PHASE1_RESULTS.md) for full details.
 
-### 🚧 Phase 1.2: Virtual Memory (Paging) - NEXT
+### ✅ Phase 1.2: Virtual Memory (Paging) - COMPLETE
 
-**Target**: 3 days
+**Completed**: 2025-12-11 (3 hours)
 
-Tasks:
-- [ ] Paging 4-level (PML4 → PDPT → PD → PT)
-- [ ] Page table structures
-- [ ] Mapper/unmapper pages
-- [ ] TLB invalidation
-- [ ] Identity mapping kernel
-- [ ] Tests de mapping
+Accomplishments:
+- [x] Paging 4-level (PML4 → PDPT → PD → PT)
+  - [x] Complete page table hierarchy
+  - [x] Automatic page table creation
+  - [x] Lazy allocation strategy
+- [x] Page table structures
+  - [x] PageTableEntry with 10 flags
+  - [x] PageTable (4KB aligned, 512 entries)
+  - [x] Hardware-compatible layout
+- [x] Page mapper operations
+  - [x] map_page() - Map virtual → physical
+  - [x] unmap_page() - Unmap and return frame
+  - [x] translate() - Address translation
+  - [x] identity_map_range() - Identity mapping
+- [x] TLB management
+  - [x] flush_tlb() - Single page invalidation
+  - [x] flush_tlb_all() - Full TLB flush
+- [x] Error handling (4 error types)
+  - [x] OutOfMemory, PageAlreadyMapped
+  - [x] InvalidAddress, TableCreationFailed
+- [x] Tests unitaires (10 tests, 100% passing)
+  - [x] Page table entry tests (8)
+  - [x] Page mapper tests (2)
+- [x] Comprehensive documentation
+  - [x] PHASE1.2_PAGING.md (10.4 KB)
+  - [x] Architecture diagrams
+  - [x] Usage examples
+
+**Files**: 3 modified/new modules (27.7 KB code)
+- `kernel/src/memory/page_table.rs` (9.0 KB) - NEW
+- `kernel/src/memory/paging.rs` (10.1 KB) - NEW
+- `kernel/src/memory/mod.rs` (updated with paging)
+
+**Metrics**:
+- Build time: <1 second
+- Tests: 10/10 passing (100%)
+- GitHub pushes: 4 atomic commits
+- Documentation: Complete with examples
+
+See [docs/PHASE1.2_PAGING.md](docs/PHASE1.2_PAGING.md) for full details.
 
 ### 📋 Phase 1.3: Heap Allocator (Planned)
 
@@ -147,7 +180,7 @@ Tasks:
 ### 🎯 Critères de Succès Phase 1
 
 - ✅ Allocation physique fonctionnelle (DONE)
-- ⏳ Paging 4-level opérationnel
+- ✅ Paging 4-level opérationnel (DONE)
 - ⏳ Heap alloué et utilisable
 - ✅ Tests unitaires passent (13/13)
 - ✅ Documentation API complète (DONE)

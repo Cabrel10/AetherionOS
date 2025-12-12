@@ -1,8 +1,14 @@
 // Aetherion OS - Memory Management Module
-// Phase 1: Physical memory management with frame allocator
+// Phase 1: Complete memory management (Physical + Virtual)
 
 pub mod bitmap;
 pub mod frame_allocator;
+pub mod page_table;
+pub mod paging;
+
+// Re-exports for convenience
+pub use page_table::{PageTable, PageTableEntry, PageTableFlags};
+pub use paging::{PageMapper, MapperError};
 
 /// Page and frame size (4 KB standard)
 pub const PAGE_SIZE: usize = 4096;
@@ -93,6 +99,26 @@ impl VirtualAddress {
     pub fn align_up(&self, align: usize) -> Self {
         VirtualAddress((self.0 + align - 1) & !(align - 1))
     }
+    
+    /// Check if address is aligned to boundary
+    pub fn is_aligned(&self, align: usize) -> bool {
+        self.0 % align == 0
+    }
+    
+    /// Add offset to address
+    pub fn offset(&self, offset: usize) -> Self {
+        VirtualAddress(self.0 + offset)
+    }
+}
+
+/// Initialize a new PML4 table at the given physical address
+/// 
+/// # Safety
+/// The physical address must point to valid, writable memory
+pub unsafe fn init_pml4_table(pml4_addr: PhysicalAddress) -> &'static mut PageTable {
+    let table = &mut *(pml4_addr.as_usize() as *mut PageTable);
+    table.zero();
+    table
 }
 
 #[cfg(test)]
