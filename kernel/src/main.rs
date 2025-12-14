@@ -20,6 +20,19 @@ mod gdt;
 mod interrupts;
 mod syscall;
 
+// Phase 2 completion
+mod process;
+mod ipc;
+
+// Phase 3: Drivers
+mod drivers;
+
+// Phase 4: Filesystem
+mod fs;
+
+// Phase 5: Networking
+mod net;
+
 use memory::{PhysicalAddress, frame_allocator::FrameAllocator};
 
 // VGA Text Mode Constants
@@ -50,10 +63,10 @@ pub extern "C" fn _start() -> ! {
     clear_screen();
     
     // Display boot message
-    print_str("AETHERION OS v0.2.0 - Phase 2", 0, 0);
-    print_str("================================", 0, 1);
+    print_str("AETHERION OS v1.0.0 - FINAL", 0, 0);
+    print_str("============================", 0, 1);
     print_str("Kernel loaded successfully!", 0, 3);
-    print_str("Phase 2: Interrupts & Syscalls", 0, 4);
+    print_str("All Phases: COMPLETE", 0, 4);
     print_str("Status: INITIALIZING...", 0, 5);
     
     // Initialize GDT
@@ -73,6 +86,27 @@ pub extern "C" fn _start() -> ! {
     syscall::init();
     print_str("Syscalls: INITIALIZED", 0, 8);
     serial_print("[SYSCALL] Syscall interface ready\n");
+    
+    // Phase 2 completion
+    serial_print("[PROCESS] Initializing process management...\n");
+    process::init();
+    ipc::init();
+    print_str("Processes & IPC: INITIALIZED", 0, 9);
+    
+    // Phase 3: Drivers
+    serial_print("[DRIVERS] Initializing device drivers...\n");
+    drivers::init_all();
+    print_str("Drivers: INITIALIZED", 0, 10);
+    
+    // Phase 4: Filesystem
+    serial_print("[FS] Initializing filesystem...\n");
+    fs::init();
+    print_str("Filesystem: INITIALIZED", 0, 11);
+    
+    // Phase 5: Networking
+    serial_print("[NET] Initializing network stack...\n");
+    net::init();
+    print_str("Networking: INITIALIZED", 0, 12);
     
     // Log to serial
     serial_print("[KERNEL] Aetherion OS booted successfully\n");
