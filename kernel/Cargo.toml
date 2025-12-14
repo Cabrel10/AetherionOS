@@ -7,8 +7,8 @@ license = "MIT"
 description = "Aetherion OS Kernel - A next-generation OS written in Rust"
 
 [dependencies]
-# Aucune dépendance externe pour Phase 0 (ultra minimal)
-# Les crates seront ajoutées progressivement dans les phases suivantes
+# Phase 1.3: Heap allocator dependencies
+spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
 
 [profile.dev]
 panic = "abort"
