@@ -1,0 +1,55 @@
+digraph Aetherion_HAL {
+    rankdir=TB;
+    node [shape=box, style=filled, fillcolor="#f0f0f0", fontname="Helvetica"];
+    edge [fontname="Helvetica", fontsize=10];
+
+    // Title
+    label="Aetherion OS - Couche 1 HAL Architecture v0.1.0";
+    labelloc="t";
+    fontsize=16;
+    fontname="Helvetica-Bold";
+
+    // HAL Layer (Top)
+    subgraph cluster_hal {
+        label="Couche 1 - HAL";
+        style=rounded;
+        fillcolor="#e8f4f8";
+        color="#0066cc";
+        penwidth=2;
+
+        bootloader [label="Bootloader 0.11.7\nBIOS/UEFI", fillcolor="#4CAF50", fontcolor=white];
+        memory [label="Memory Management\nFrame Allocator\nHeap (1MB)", fillcolor="#2196F3", fontcolor=white];
+        security [label="Security\nTPM 2.0 Detection\nPCR Measurements", fillcolor="#FF9800", fontcolor=white];
+        cpu [label="CPU\nGDT/IDT\nSyscalls", fillcolor="#9C27B0", fontcolor=white];
+        interrupts [label="Interrupts\nTimer/IRQ\nHandlers", fillcolor="#F44336", fontcolor=white];
+        output [label="Output\nVGA Text\nSerial COM1", fillcolor="#607D8B", fontcolor=white];
+    }
+
+    // Hardware Layer (Bottom)
+    subgraph cluster_hw {
+        label="Hardware (x86_64)";
+        style=rounded;
+        fillcolor="#fff3e0";
+        color="#E65100";
+        penwidth=2;
+
+        cpu_hw [label="CPU\nx86_64 Long Mode", fillcolor="#795548", fontcolor=white];
+        mem_hw [label="Memory\n32MB RAM", fillcolor="#795548", fontcolor=white];
+        tpm_hw [label="TPM 2.0\nSecurity Chip", fillcolor="#795548", fontcolor=white];
+        vga_hw [label="VGA\nSerial Port", fillcolor="#795548", fontcolor=white];
+    }
+
+    // Connections HAL -> Hardware
+    bootloader -> cpu_hw [label="boot", color="#4CAF50", penwidth=2];
+    memory -> mem_hw [label="manage", color="#2196F3", penwidth=2];
+    security -> tpm_hw [label="detect", color="#FF9800", penwidth=2];
+    cpu -> cpu_hw [label="configure", color="#9C27B0", penwidth=2];
+    interrupts -> cpu_hw [label="handle", color="#F44336", penwidth=2];
+    output -> vga_hw [label="output", color="#607D8B", penwidth=2];
+
+    // Internal HAL connections
+    bootloader -> memory [label="init", style=dashed, color="#666666"];
+    bootloader -> cpu [label="setup", style=dashed, color="#666666"];
+    cpu -> interrupts [label="register", style=dashed, color="#666666"];
+    memory -> security [label="protect", style=dashed, color="#666666"];
+}

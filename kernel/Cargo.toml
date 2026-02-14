@@ -1,14 +1,27 @@
 [package]
 name = "aetherion-kernel"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 authors = ["Cabrel Foka <cabrel@aetherion.dev>"]
 license = "MIT"
 description = "Aetherion OS Kernel - A next-generation OS written in Rust"
 
 [dependencies]
+# Phase 1.1: Bootloader 0.11 with BIOS and UEFI support
+bootloader = { version = "0.11.7", features = ["bios", "uefi"] }
+
 # Phase 1.3: Heap allocator dependencies
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
+
+# Phase 1.3: ACPI and AML for TPM detection
+acpi = "5.0"
+aml = "0.16"
+
+# SHA-256 for PCR measurements
+sha2 = { version = "0.10", default-features = false }
+
+[build-dependencies]
+bootloader-locator = "0.0.4"
 
 [profile.dev]
 panic = "abort"

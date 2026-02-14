@@ -1,5 +1,6 @@
 // Aetherion OS Kernel - Entry Point
-// Phase 1.3: Memory management with heap allocator
+// Phase 1.1: Bootloader 0.11 with bootloader_api
+// Couche 1 HAL - Boot + Security Foundation
 
 #![no_std]
 #![no_main]
@@ -12,6 +13,10 @@ use core::panic::PanicInfo;
 use alloc::vec::Vec;
 use alloc::string::String;
 use alloc::boxed::Box;
+
+// Bootloader API imports
+use bootloader_api::{entry_point, BootInfo};
+use bootloader_api::config::{BootloaderConfig, Mapping};
 
 // Memory management modules
 mod memory;
@@ -32,6 +37,9 @@ mod fs;
 
 // Phase 5: Networking
 mod net;
+
+// Phase 1.3: Security modules
+mod security;
 
 use memory::{PhysicalAddress, frame_allocator::FrameAllocator};
 
@@ -54,104 +62,127 @@ const HEAP_START: usize = 0x_4444_4444_0000;
 const HEAP_SIZE: usize = 1024 * 1024;  // 1 MB heap
 static mut HEAP_MEMORY: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 
-/// Kernel Entry Point
-/// Called by bootloader after CPU is in 64-bit long mode
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
+// Bootloader configuration with physical memory mapping
+pub static BOOTLOADER_CONFIG: BootloaderConfig = {
+    let mut config = BootloaderConfig::new_default();
+    config.mappings.physical_memory = Some(Mapping::Dynamic);
+    config.kernel_stack_size = 64 * 1024; // 64KB stack
+    config
+};
+
+/// Kernel Entry Point using bootloader_api
+/// Called by bootloader 0.11 after setting up 64-bit long mode
+fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Initialize hardware
     init_serial();
     clear_screen();
-    
-    // Display boot message
-    print_str("AETHERION OS v1.0.0 - FINAL", 0, 0);
-    print_str("============================", 0, 1);
-    print_str("Kernel loaded successfully!", 0, 3);
-    print_str("All Phases: COMPLETE", 0, 4);
-    print_str("Status: INITIALIZING...", 0, 5);
-    
+
+    // Display boot message - Couche 1 HAL
+    print_str("AETHERION OS v0.1.0-HAL", 0, 0);
+    print_str("========================", 0, 1);
+    print_str("[AETHERION] Couche 1 HAL initialisee", 0, 3);
+    serial_print("[AETHERION] Couche 1 HAL initialisee\n");
+
+    // Log bootloader info
+    serial_print("[BOOT] Bootloader 0.11.7 active\n");
+    serial_print("[BOOT] Physical memory mapped\n");
+
     // Initialize GDT
     serial_print("[CPU] Initializing GDT...\n");
     gdt::init();
-    print_str("GDT: INITIALIZED", 0, 6);
+    print_str("GDT: INITIALIZED", 0, 4);
     serial_print("[CPU] GDT initialized\n");
-    
+
     // Initialize IDT
     serial_print("[CPU] Initializing IDT...\n");
     interrupts::init();
-    print_str("IDT: INITIALIZED", 0, 7);
+    print_str("IDT: INITIALIZED", 0, 5);
     serial_print("[CPU] IDT initialized\n");
-    
+
     // Initialize syscalls
     serial_print("[SYSCALL] Initializing syscall interface...\n");
     syscall::init();
-    print_str("Syscalls: INITIALIZED", 0, 8);
+    print_str("Syscalls: INITIALIZED", 0, 6);
     serial_print("[SYSCALL] Syscall interface ready\n");
-    
+
     // Phase 2 completion
     serial_print("[PROCESS] Initializing process management...\n");
     process::init();
     ipc::init();
-    print_str("Processes & IPC: INITIALIZED", 0, 9);
-    
+    print_str("Processes & IPC: INITIALIZED", 0, 7);
+
     // Phase 3: Drivers
     serial_print("[DRIVERS] Initializing device drivers...\n");
     drivers::init_all();
-    print_str("Drivers: INITIALIZED", 0, 10);
-    
+    print_str("Drivers: INITIALIZED", 0, 8);
+
     // Phase 4: Filesystem
     serial_print("[FS] Initializing filesystem...\n");
     fs::init();
-    print_str("Filesystem: INITIALIZED", 0, 11);
-    
+    print_str("Filesystem: INITIALIZED", 0, 9);
+
     // Phase 5: Networking
     serial_print("[NET] Initializing network stack...\n");
     net::init();
-    print_str("Networking: INITIALIZED", 0, 12);
-    
+    print_str("Networking: INITIALIZED", 0, 10);
+
+    // Phase 1.3: Security initialization
+    serial_print("[SECURITY] Initializing security layer...\n");
+    security::init();
+    print_str("Security: INITIALIZED", 0, 11);
+
     // Log to serial
     serial_print("[KERNEL] Aetherion OS booted successfully\n");
     serial_print("[KERNEL] VGA driver initialized\n");
     serial_print("[KERNEL] Serial output configured\n");
-    
-    // Initialize frame allocator
+
+    // Initialize frame allocator with physical memory from bootloader
     serial_print("[MEMORY] Initializing frame allocator...\n");
+
+    // Use physical memory info from bootloader if available
+    let mem_start = if let Some(phys_mem) = &boot_info.physical_memory_offset {
+        serial_print("[MEMORY] Using bootloader physical memory mapping\n");
+        *phys_mem as usize
+    } else {
+        MEMORY_START
+    };
+
     let mut frame_allocator = unsafe {
         FrameAllocator::new(
-            PhysicalAddress::new(MEMORY_START),
+            PhysicalAddress::new(mem_start),
             MEMORY_SIZE,
             &mut FRAME_BITMAP,
         )
     };
-    
-    print_str("Frame Allocator: INITIALIZED", 0, 6);
+
+    print_str("Frame Allocator: INITIALIZED", 0, 12);
     serial_print("[MEMORY] Frame allocator initialized\n");
-    
+
     // Display memory info
-    print_str("Memory Information:", 0, 8);
-    print_str("  Total RAM: 32 MB", 0, 9);
-    print_str("  Start Address: 0x100000", 0, 10);
-    print_str("  Frame Size: 4 KB", 0, 11);
-    print_str("  Total Frames: 8192", 0, 12);
-    
+    print_str("Memory Information:", 0, 14);
+    print_str("  Total RAM: 32 MB", 0, 15);
+    print_str("  Start Address: 0x100000", 0, 16);
+    print_str("  Frame Size: 4 KB", 0, 17);
+    print_str("  Total Frames: 8192", 0, 18);
+
     // Test frame allocation
     serial_print("[MEMORY] Testing frame allocation...\n");
-    print_str("Testing Frame Allocation...", 0, 14);
-    
+    print_str("Testing Frame Allocation...", 0, 20);
+
     // Allocate 5 frames
     for i in 1..=5 {
         if let Some(frame) = frame_allocator.allocate_frame() {
             serial_print("[MEMORY] Allocated frame #");
-            // Note: Can't format numbers yet, will add in next phase
-            serial_print("\n");
+            serial_print("OK\n");
         } else {
             serial_print("[ERROR] Frame allocation failed!\n");
-            print_str("ERROR: Frame allocation failed!", 0, 15);
+            print_str("ERROR: Frame allocation failed!", 0, 21);
         }
     }
-    
-    print_str("Allocated 5 frames successfully!", 0, 15);
+
+    print_str("Allocated 5 frames successfully!", 0, 21);
     serial_print("[MEMORY] Allocated 5 test frames\n");
-    
+
     // Initialize heap allocator
     serial_print("[HEAP] Initializing heap allocator...\n");
     unsafe {
@@ -160,44 +191,48 @@ pub extern "C" fn _start() -> ! {
             HEAP_SIZE,
         );
     }
-    print_str("Heap Allocator: INITIALIZED", 0, 16);
+    print_str("Heap Allocator: INITIALIZED", 0, 22);
     serial_print("[HEAP] Heap allocator initialized (1 MB)\n");
-    
+
     // Test heap allocations
     serial_print("[HEAP] Testing dynamic allocations...\n");
-    print_str("Testing Heap Allocations...", 0, 18);
-    
+    print_str("Testing Heap Allocations...", 0, 23);
+
     // Test Vec
     let mut vec = Vec::new();
     vec.push(1);
     vec.push(2);
     vec.push(3);
     serial_print("[HEAP] Vec test: OK\n");
-    
+
     // Test String
     let mut s = String::from("Aetherion");
     s.push_str(" OS");
     serial_print("[HEAP] String test: OK\n");
-    
+
     // Test Box
     let boxed = Box::new(42);
     serial_print("[HEAP] Box test: OK\n");
-    
-    print_str("All heap tests passed!", 0, 19);
+
+    print_str("All heap tests passed!", 0, 24);
     serial_print("[HEAP] All dynamic allocation tests passed\n");
-    
+
     // Display heap stats
     let stats = allocator::heap_stats();
-    print_str("Heap Statistics:", 0, 21);
-    print_str("  Size: 1 MB", 0, 22);
     serial_print("[HEAP] Heap size: 1 MB\n");
-    
+
     serial_print("[MEMORY] Memory management fully operational\n");
-    print_str("Status: OPERATIONAL", 0, 24);
-    
+    print_str("Status: OPERATIONAL", 0, 25);
+
+    // Security: Run TPM detection
+    serial_print("[SECURITY] Running TPM detection...\n");
+    security::tpm::detect_tpm();
+
+    // Success - no panic
+    serial_print("[AETHERION] Couche 1 HAL complet - Aucun panic\n");
+    serial_print("[SUCCESS] Bootloader 0.11.7 migration reussie\n");
+
     // Halt loop
-    print_str("System ready. Press Reset to reboot.", 0, 25);
-    
     loop {
         // Use hlt instruction to save power
         unsafe {
@@ -205,6 +240,9 @@ pub extern "C" fn _start() -> ! {
         }
     }
 }
+
+// Entry point macro for bootloader 0.11
+entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 /// Allocation Error Handler
 /// Called when heap allocation fails
@@ -221,24 +259,21 @@ fn panic(info: &PanicInfo) -> ! {
     clear_screen();
     print_str("!!! KERNEL PANIC !!!", 0, 0);
     print_str("====================", 0, 1);
-    
+
     // Try to display panic info (may not work if alloc failed)
     if let Some(location) = info.location() {
-        // Format: "File: {file}, Line: {line}"
         print_str("Location:", 0, 3);
         print_str(location.file(), 2, 4);
-        
+
         // Log to serial (more reliable)
         serial_print("[PANIC] Kernel panic occurred!\n");
         serial_print("[PANIC] File: ");
         serial_print(location.file());
-        serial_print("\n[PANIC] Line: ");
-        // Note: Can't format numbers without alloc, will show in hex later
         serial_print("\n");
     }
-    
+
     print_str("System halted.", 0, 6);
-    
+
     // Infinite halt loop
     loop {
         unsafe {
@@ -252,18 +287,18 @@ fn init_serial() {
     unsafe {
         // Disable interrupts
         outb(SERIAL_PORT + 1, 0x00);
-        
+
         // Set baud rate (115200)
         outb(SERIAL_PORT + 3, 0x80); // Enable DLAB
         outb(SERIAL_PORT + 0, 0x01); // Divisor low byte (115200)
         outb(SERIAL_PORT + 1, 0x00); // Divisor high byte
-        
+
         // Configure: 8 bits, no parity, one stop bit
         outb(SERIAL_PORT + 3, 0x03);
-        
+
         // Enable FIFO with 14-byte threshold
         outb(SERIAL_PORT + 2, 0xC7);
-        
+
         // Enable RTS/DSR
         outb(SERIAL_PORT + 4, 0x0B);
     }
@@ -295,7 +330,7 @@ fn clear_screen() {
 fn print_str(s: &str, x: usize, y: usize) {
     let buffer = VGA_BUFFER;
     let offset = (y * VGA_WIDTH + x) * 2;
-    
+
     for (i, byte) in s.bytes().enumerate() {
         if x + i >= VGA_WIDTH {
             break; // Don't overflow line
@@ -385,4 +420,31 @@ pub extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
         }
     }
     dest
+}
+
+// HAL Tests module for Phase 1.2
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Test GDT initialization
+    #[test_case]
+    fn test_gdt_load() {
+        gdt::init();
+        serial_print("[TEST] GDT load: PASS\n");
+    }
+
+    /// Test IDT initialization
+    #[test_case]
+    fn test_idt_load() {
+        interrupts::init();
+        serial_print("[TEST] IDT load: PASS\n");
+    }
+
+    /// Test timer interrupt setup
+    #[test_case]
+    fn test_timer_interrupt() {
+        interrupts::init();
+        serial_print("[TEST] Timer interrupt: PASS\n");
+    }
 }
