@@ -95,11 +95,11 @@ pub fn unmask_irq(irq: u8) {
         let masks = pics.read_masks();
         if irq < 8 {
             // IRQ maître
-            pics.write_masks(masks.0 & !(1 << irq), masks.1);
+            pics.write_masks(masks[0] & !(1 << irq), masks[1]);
         } else {
             // IRQ esclave
             let slave_irq = irq - 8;
-            pics.write_masks(masks.0, masks.1 & !(1 << slave_irq));
+            pics.write_masks(masks[0], masks[1] & !(1 << slave_irq));
         }
     }
 }
@@ -110,10 +110,10 @@ pub fn mask_irq(irq: u8) {
         let mut pics = PICS.lock();
         let masks = pics.read_masks();
         if irq < 8 {
-            pics.write_masks(masks.0 | (1 << irq), masks.1);
+            pics.write_masks(masks[0] | (1 << irq), masks[1]);
         } else {
             let slave_irq = irq - 8;
-            pics.write_masks(masks.0, masks.1 | (1 << slave_irq));
+            pics.write_masks(masks[0], masks[1] | (1 << slave_irq));
         }
     }
 }

@@ -6,7 +6,7 @@
 #![feature(abi_x86_interrupt)]
 #![feature(custom_test_frameworks)]
 #![test_runner(crate::test_runner)]
-#![reexport_test_harness_main = "test_main")]
+#![reexport_test_harness_main = "test_main"]
 
 // Re-exports pour les tests
 pub mod arch;
@@ -14,6 +14,7 @@ pub mod security;
 
 pub mod tests;
 
+#[cfg(test)]
 use core::panic::PanicInfo;
 
 /// Test runner pour cargo test

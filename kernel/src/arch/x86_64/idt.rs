@@ -2,7 +2,6 @@
 // Interrupt Descriptor Table avec handlers exceptions
 
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
-use x86_64::set_general_handler;
 use lazy_static::lazy_static;
 
 // Import du GDT pour IST index
@@ -111,13 +110,13 @@ lazy_static! {
         // IRQ Handlers (PIC 8259)
         // Timer (IRQ 0 -> vector 32)
         unsafe {
-            idt[(super::interrupts::PIC1_OFFSET as usize)]
+            idt[super::interrupts::PIC1_OFFSET as usize]
                 .set_handler_fn(timer_interrupt_handler);
         }
 
         // Keyboard (IRQ 1 -> vector 33)
         unsafe {
-            idt[(super::interrupts::PIC1_OFFSET as usize + 1)]
+            idt[super::interrupts::PIC1_OFFSET as usize + 1]
                 .set_handler_fn(keyboard_interrupt_handler);
         }
 

@@ -157,18 +157,18 @@ fn panic(info: &PanicInfo) -> ! {
     let mut vga = VGA.lock();
     vga.color = 0x4F; // White on red
     vga.write_str("\n[KERNEL PANIC] ");
-    if let Some(msg) = info.message() {
+    {
         use core::fmt::Write;
         let mut s = arrayvec::ArrayString::<256>::new();
-        let _ = write!(s, "{}", msg);
+        let _ = write!(s, "{}", info.message());
         vga.write_str(&s);
     }
 
     serial_write("\n[PANIC] Kernel panic: ");
-    if let Some(msg) = info.message() {
+    {
         use core::fmt::Write;
         let mut s = arrayvec::ArrayString::<256>::new();
-        let _ = write!(s, "{}", msg);
+        let _ = write!(s, "{}", info.message());
         serial_write(&s);
     }
     serial_write("\nSystem halted.\n");

@@ -24,10 +24,6 @@ pub fn init() {
 /// Ajoute les handlers IRQ à l'IDT après initialisation PIC
 /// Doit être appelé après idt::init() mais avant interrupts::enable()
 fn init_idt_handlers() {
-    use interrupts::InterruptIndex;
-    use x86_64::structures::idt::InterruptDescriptorTable;
-    use lazy_static::lazy_static;
-
     // Les handlers sont déjà définis dans idt.rs avec set_handler_fn
     // mais pour les IRQs dynamiques, on les configure via la fonction externe
     // Note: En pratique, on pourrait utiliser une IDT mutable ou lazy init

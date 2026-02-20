@@ -25,8 +25,8 @@ x86_64 = "0.14.13"
 # PIC 8259 Programmable Interrupt Controller
 pic8259 = "0.10.4"
 
-# SHA256 for TPM PCR measurements (no_std)
-sha2 = { version = "0.10", default-features = false }
+# SHA256 for TPM PCR measurements (no_std, force-soft for compatibility)
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
 
 # ArrayString for macros (no_std)
 arrayvec = { version = "0.7", default-features = false }
