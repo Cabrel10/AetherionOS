@@ -86,12 +86,14 @@ pub struct ResourceRegistry;
 
 impl ResourceRegistry {
     /// Log une allocation (stub pour futur développement)
+    #[allow(dead_code)]
     pub fn log_allocation(_tag: &ResourceTag, _addr: u64) {
         // TODO: Implémenter un buffer circulaire de logs ACHA
         // Pour l'instant, les logs sont via serial_println! dans le code appelant
     }
-    
+
     /// Log une désallocation
+    #[allow(dead_code)]
     pub fn log_deallocation(_addr: u64, _pid: u64) {
         // TODO: Buffer circulaire
     }

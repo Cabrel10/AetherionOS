@@ -70,7 +70,7 @@ impl OffsetPageTableManager {
         page: Page<Size4KiB>,
         frame: PhysFrame,
         flags: PageTableFlags,
-        frame_allocator: &mut FrameAllocator,
+        _frame_allocator: &mut FrameAllocator,
     ) -> Result<(), MemoryError> {
         use x86_64::structures::paging::mapper::Mapper;
         
@@ -106,10 +106,10 @@ impl OffsetPageTableManager {
         &mut self,
         frame: PhysFrame,
         flags: PageTableFlags,
-        frame_allocator: &mut FrameAllocator,
+        _frame_allocator: &mut FrameAllocator,
     ) -> Result<Page<Size4KiB>, MemoryError> {
         let page = Page::containing_address(VirtAddr::new(frame.start_address().as_u64()));
-        self.map_page(page, frame, flags, frame_allocator)?;
+        self.map_page(page, frame, flags, _frame_allocator)?;
         Ok(page)
     }
     
@@ -147,7 +147,7 @@ impl OffsetPageTableManager {
         start: PhysAddr,
         end: PhysAddr,
         flags: PageTableFlags,
-        frame_allocator: &mut FrameAllocator,
+        _frame_allocator: &mut FrameAllocator,
     ) -> Result<(), MemoryError> {
         let start_frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(start);
         let end_addr = end.as_u64().saturating_sub(1);
@@ -159,7 +159,7 @@ impl OffsetPageTableManager {
         
         while current_addr <= end_addr {
             let frame = PhysFrame::containing_address(PhysAddr::new(current_addr));
-            self.identity_map(frame, flags, frame_allocator)?;
+            self.identity_map(frame, flags, _frame_allocator)?;
             current_addr += 4096;
         }
         

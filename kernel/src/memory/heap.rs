@@ -49,8 +49,8 @@ pub fn init_heap(
     }
     
     let heap_start = VirtAddr::new(HEAP_START as u64);
-    let heap_end = heap_start + HEAP_SIZE as u64;
-    
+    let _heap_end = heap_start + HEAP_SIZE as u64;
+
     crate::serial_println!("[HEAP] Mapping {} pages for heap...", HEAP_PAGES);
     
     // Mapper chaque page du heap
