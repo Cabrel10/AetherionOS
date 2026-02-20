@@ -1,21 +1,24 @@
-// Aetherion OS - Kernel HAL Couche 1 (Finalisé)
+// Aetherion OS - Kernel Couche 2 (Memory Management)
 // Architecture: x86_64, Bootloader: 0.9.23
-// Modules: GDT, IDT, PIC, TPM/Security
+// Modules: GDT, IDT, PIC, TPM/Security, Memory (NEW)
 
 #![no_std]
 #![no_main]
 #![feature(abi_x86_interrupt)]
+#![feature(alloc_error_handler)]
 
 use core::panic::PanicInfo;
 use lazy_static::lazy_static;
 use spin::Mutex;
+use bootloader::BootInfo;
 
-// ===== Modules HAL =====
+// ===== Modules =====
 mod arch;
 mod security;
+mod memory;
 
 // ===== Configuration =====
-const KERNEL_VERSION: &str = "0.1.0-hal";
+const KERNEL_VERSION: &str = "0.2.0-memory";
 const KERNEL_NAME: &str = "AetherionOS";
 
 // VGA text buffer
@@ -35,7 +38,7 @@ struct VgaBuffer {
 
 impl VgaBuffer {
     const fn new() -> Self {
-        VgaBuffer { row: 0, col: 0, color: 0x0F } // White on black
+        VgaBuffer { row: 0, col: 0, color: 0x0F }
     }
 
     fn clear(&mut self) {
@@ -155,7 +158,7 @@ unsafe fn inb(port: u16) -> u8 {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     let mut vga = VGA.lock();
-    vga.color = 0x4F; // White on red
+    vga.color = 0x4F;
     vga.write_str("\n[KERNEL PANIC] ");
     {
         use core::fmt::Write;
@@ -178,14 +181,15 @@ fn panic(info: &PanicInfo) -> ! {
     }
 }
 
-// ===== Entry Point =====
-#[no_mangle]
-pub extern "C" fn _start() -> ! {
+// ===== Entry Point avec BootInfo =====
+bootloader::entry_point!(kernel_main);
+
+fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // Initialiser VGA
     {
         let mut vga = VGA.lock();
         vga.clear();
-        vga.write_str("[AETHERION] Couche 1 HAL - Initialisation\n");
+        vga.write_str("[AETHERION] Couche 2 Memory - Initialisation\n");
     }
 
     // Header serial
@@ -196,35 +200,88 @@ pub extern "C" fn _start() -> ! {
     serial_write("========================================\n");
 
     // ===== ÉTAPE 1: GDT =====
-    serial_write("[1/4] Loading GDT...\n");
+    serial_write("[1/5] Loading GDT...\n");
     arch::x86_64::gdt::init();
     serial_write("      [OK] GDT with TSS loaded\n");
 
     // ===== ÉTAPE 2: IDT =====
-    serial_write("[2/4] Loading IDT...\n");
+    serial_write("[2/5] Loading IDT...\n");
     arch::x86_64::idt::init();
     serial_write("      [OK] IDT with 20 handlers loaded\n");
 
     // ===== ÉTAPE 3: Interrupts =====
-    serial_write("[3/4] Initializing PIC...\n");
+    serial_write("[3/5] Initializing PIC...\n");
     arch::x86_64::interrupts::init();
     serial_write("      [OK] PIC 8259 remapped (32-47), IRQs enabled\n");
 
     // ===== ÉTAPE 4: Security =====
-    serial_write("[4/4] Initializing Security...\n");
+    serial_write("[4/5] Initializing Security...\n");
     security::init();
     serial_write("      [OK] TPM checked, PCR0 measured\n");
 
+    // ===== ÉTAPE 5: Memory (Couche 2) =====
+    serial_write("[5/5] Initializing Memory (Couche 2)...\n");
+    let mut memory_manager = match memory::init(boot_info) {
+        Ok(mm) => {
+            serial_write("      [OK] Memory manager initialized\n");
+            mm
+        }
+        Err(e) => {
+            serial_write("      [FAILED] Memory init error: ");
+            {
+                use core::fmt::Write;
+                let mut s = arrayvec::ArrayString::<64>::new();
+                let _ = write!(s, "{}", e);
+                serial_write(&s);
+            }
+            serial_write("\n");
+            panic!("Memory initialization failed");
+        }
+    };
+    
+    // Initialiser le heap
+    match memory_manager.init_heap() {
+        Ok(()) => {
+            serial_write("      [OK] Heap allocator initialized\n");
+        }
+        Err(e) => {
+            serial_write("      [WARNING] Heap init failed: ");
+            {
+                use core::fmt::Write;
+                let mut s = arrayvec::ArrayString::<64>::new();
+                let _ = write!(s, "{}", e);
+                serial_write(&s);
+            }
+            serial_write("\n");
+        }
+    }
+
     // ===== Boot Complete =====
-    serial_write("\n[BOOT] AetherionOS HAL initialized successfully!\n");
-    serial_write("       Timer: 100Hz, Keyboard: enabled\n");
+    serial_write("\n[BOOT] AetherionOS Couche 2 initialized!\n");
+    serial_write("       Memory: ");
+    {
+        use core::fmt::Write;
+        let mut s = arrayvec::ArrayString::<32>::new();
+        let _ = write!(s, "{} KB usable", 
+            memory_manager.frame_allocator.total_frames() * 4);
+        serial_write(&s);
+    }
+    serial_write("\n");
+    serial_write("       Heap: ");
+    {
+        use core::fmt::Write;
+        let mut s = arrayvec::ArrayString::<32>::new();
+        let _ = write!(s, "{} KB", memory::heap::HEAP_SIZE / 1024);
+        serial_write(&s);
+    }
+    serial_write("\n");
     serial_write("       Interrupts: enabled\n");
     serial_write("       Security: TPM stub active\n");
 
     // Update VGA
     {
         let mut vga = VGA.lock();
-        vga.write_str("\n[OK] HAL initialized - System ready\n");
+        vga.write_str("\n[OK] Couche 2 ready - Memory management active\n");
     }
 
     // Idle loop

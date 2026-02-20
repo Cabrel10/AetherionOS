@@ -5,12 +5,16 @@
 #![cfg_attr(test, no_main)]
 #![feature(abi_x86_interrupt)]
 #![feature(custom_test_frameworks)]
+#![feature(alloc_error_handler)]
 #![test_runner(crate::test_runner)]
 #![reexport_test_harness_main = "test_main"]
+
+extern crate alloc;
 
 // Re-exports pour les tests
 pub mod arch;
 pub mod security;
+pub mod memory;
 
 pub mod tests;
 

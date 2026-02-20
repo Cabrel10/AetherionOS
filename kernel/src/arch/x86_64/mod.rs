@@ -3,6 +3,7 @@
 pub mod gdt;
 pub mod idt;
 pub mod interrupts;
+pub mod timer;
 
 /// Initialise tous les modules HAL x86_64
 /// Ordre critique: GDT -> IDT -> Interrupts
