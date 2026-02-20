@@ -19,6 +19,18 @@ spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
 # Lazy static pour initialisation
 lazy_static = { version = "1.4", features = ["spin_no_std"] }
 
+# x86_64 architecture support - GDT, IDT, TSS
+x86_64 = "0.14.13"
+
+# PIC 8259 Programmable Interrupt Controller
+pic8259 = "0.10.4"
+
+# SHA256 for TPM PCR measurements (no_std)
+sha2 = { version = "0.10", default-features = false }
+
+# ArrayString for macros (no_std)
+arrayvec = { version = "0.7", default-features = false }
+
 [profile.dev]
 panic = "abort"
 
