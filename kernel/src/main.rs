@@ -181,6 +181,57 @@ fn panic(info: &PanicInfo) -> ! {
     }
 }
 
+// ===== Heap Tests =====
+// Tests minimaux pour valider l'allocateur heap (Box, Vec, String)
+
+extern crate alloc;
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use alloc::string::String;
+
+fn run_heap_tests() {
+    // Test 1: Box allocation
+    serial_write("  [TEST 1/3] Box::new(42)... ");
+    let boxed_value = Box::new(42u64);
+    assert_eq!(*boxed_value, 42);
+    {
+        use core::fmt::Write;
+        let mut s = arrayvec::ArrayString::<64>::new();
+        let _ = write!(s, "ptr={:p}, val={} OK\n", boxed_value.as_ref(), *boxed_value);
+        serial_write(&s);
+    }
+    // Note: Box is dropped here, testing deallocation
+
+    // Test 2: Vec allocation and push
+    serial_write("  [TEST 2/3] Vec push 0..9... ");
+    let mut vec = Vec::new();
+    for i in 0..10 {
+        vec.push(i * 10);
+    }
+    assert_eq!(vec.len(), 10);
+    assert_eq!(vec[5], 50);
+    {
+        use core::fmt::Write;
+        let mut s = arrayvec::ArrayString::<64>::new();
+        let _ = write!(s, "len={}, vec[5]={} OK\n", vec.len(), vec[5]);
+        serial_write(&s);
+    }
+    // Note: Vec is dropped here, testing deallocation
+
+    // Test 3: String allocation
+    serial_write("  [TEST 3/3] String::from(\"AetherionOS\")... ");
+    let test_string = String::from("AetherionOS Heap OK");
+    assert_eq!(test_string.len(), 19);
+    assert!(test_string.contains("Heap"));
+    {
+        use core::fmt::Write;
+        let mut s = arrayvec::ArrayString::<64>::new();
+        let _ = write!(s, "len={}, \"{}\" OK\n", test_string.len(), &test_string[..10]);
+        serial_write(&s);
+    }
+    // Note: String is dropped here, testing deallocation
+}
+
 // ===== Entry Point avec BootInfo =====
 bootloader::entry_point!(kernel_main);
 
@@ -255,6 +306,11 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             serial_write("\n");
         }
     }
+
+    // ===== Heap Tests (Validation Couche 2) =====
+    serial_write("\n[TEST] Running heap validation tests...\n");
+    run_heap_tests();
+    serial_write("[TEST] All heap tests passed!\n");
 
     // ===== Boot Complete =====
     serial_write("\n[BOOT] AetherionOS Couche 2 initialized!\n");

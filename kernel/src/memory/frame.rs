@@ -267,6 +267,19 @@ impl Default for FrameAllocator {
     }
 }
 
+// =============================================================================
+// Implémentation du trait x86_64 FrameAllocator
+// Nécessaire pour OffsetPageTable::map_to() et autres fonctions du mapper
+// =============================================================================
+
+use x86_64::structures::paging::Size4KiB;
+
+unsafe impl x86_64::structures::paging::FrameAllocator<Size4KiB> for FrameAllocator {
+    fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
+        self.alloc_frame_kernel()
+    }
+}
+
 /// Tests unitaires (adaptés pour sandbox)
 #[cfg(test)]
 mod tests {
