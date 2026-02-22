@@ -2,7 +2,6 @@
 // Simplifié: pas de recursive mapping, utilise l'offset physique direct
 
 use super::MemoryError;
-use super::frame::FrameAllocator;
 use x86_64::structures::paging::{
     PageTable, PageTableFlags, OffsetPageTable,
     Page, PhysFrame, Size4KiB, Translate,
@@ -62,15 +61,19 @@ impl OffsetPageTableManager {
     /// * `page` - La page virtuelle à mapper
     /// * `frame` - La frame physique cible
     /// * `flags` - Les flags (PRESENT, WRITABLE, etc.)
+    /// * `frame_allocator` - Frame allocator pour créer les tables intermédiaires si nécessaire
     /// 
     /// # Errors
-    /// Retourne une erreur si la page est déjà mappée
+    /// Retourne une erreur si la page est déjà mappée ou si l'allocation de table échoue
+    /// 
+    /// # Safety
+    /// Cette fonction est unsafe car elle modifie les tables de pages actives.
     pub fn map_page(
         &mut self,
         page: Page<Size4KiB>,
         frame: PhysFrame,
         flags: PageTableFlags,
-        _frame_allocator: &mut FrameAllocator,
+        frame_allocator: &mut impl x86_64::structures::paging::FrameAllocator<Size4KiB>,
     ) -> Result<(), MemoryError> {
         use x86_64::structures::paging::mapper::Mapper;
         
@@ -82,13 +85,10 @@ impl OffsetPageTableManager {
         }
         
         // Mapper avec frame allocator pour tables intermédiaires
-        // Note: Simplifié - on passe frame_allocator mais en pratique
-        // il faudrait implémenter le trait FrameAllocator<x86_64::structures::paging::Size4KiB>
+        // Le frame allocator est utilisé si des tables de pages (P3, P2, P1) 
+        // doivent être créées pour cette adresse virtuelle
         let result = unsafe {
-            // Pour l'instant on ne passe pas d'allocateur car les tables existent déjà
-            // Dans une vraie implémentation avec extension heap, il faudrait:
-            // self.mapper.map_to(page, frame, flags, frame_allocator)
-            self.mapper.map_to(page, frame, flags, &mut NullAllocator)
+            self.mapper.map_to(page, frame, flags, frame_allocator)
         };
         
         match result {
@@ -106,10 +106,10 @@ impl OffsetPageTableManager {
         &mut self,
         frame: PhysFrame,
         flags: PageTableFlags,
-        _frame_allocator: &mut FrameAllocator,
+        frame_allocator: &mut impl x86_64::structures::paging::FrameAllocator<Size4KiB>,
     ) -> Result<Page<Size4KiB>, MemoryError> {
         let page = Page::containing_address(VirtAddr::new(frame.start_address().as_u64()));
-        self.map_page(page, frame, flags, _frame_allocator)?;
+        self.map_page(page, frame, flags, frame_allocator)?;
         Ok(page)
     }
     
@@ -147,7 +147,7 @@ impl OffsetPageTableManager {
         start: PhysAddr,
         end: PhysAddr,
         flags: PageTableFlags,
-        _frame_allocator: &mut FrameAllocator,
+        frame_allocator: &mut impl x86_64::structures::paging::FrameAllocator<Size4KiB>,
     ) -> Result<(), MemoryError> {
         let start_frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(start);
         let end_addr = end.as_u64().saturating_sub(1);
@@ -159,7 +159,7 @@ impl OffsetPageTableManager {
         
         while current_addr <= end_addr {
             let frame = PhysFrame::containing_address(PhysAddr::new(current_addr));
-            self.identity_map(frame, flags, _frame_allocator)?;
+            self.identity_map(frame, flags, frame_allocator)?;
             current_addr += 4096;
         }
         
@@ -194,15 +194,9 @@ impl OffsetPageTableManager {
     }
 }
 
-/// Placeholder allocator (les tables existent déjà via bootloader)
-struct NullAllocator;
-
-unsafe impl x86_64::structures::paging::FrameAllocator<Size4KiB> for NullAllocator {
-    fn allocate_frame(&mut self) -> Option<PhysFrame> {
-        // Les tables de pages existent déjà, pas besoin d'allouer
-        None
-    }
-}
+// Note: NullAllocator supprimé car il empêchait la création de tables intermédiaires
+// Le vrai FrameAllocator de frame.rs implémente maintenant x86_64::structures::paging::FrameAllocator
+// Ce qui permet à OffsetPageTable::map_to() d'allouer des frames pour les tables P3/P2/P1 si nécessaire
 
 /// Flags de page couramment utilisés
 pub mod flags {

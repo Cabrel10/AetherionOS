@@ -52,9 +52,10 @@ impl core::fmt::Display for MemoryError {
 /// Résultat des opérations mémoire
 pub type MemoryResult<T> = Result<T, MemoryError>;
 
-/// Offset mémoire physique pour le mapping (bootloader 0.9.x standard)
-/// Par défaut: 0xFFFF_8000_0000_0000 (haut de l'espace d'adressage)
-pub const PHYSICAL_MEMORY_OFFSET: u64 = 0xFFFF_8000_0000_0000;
+// Note: PHYSICAL_MEMORY_OFFSET n'est plus une constante hardcodée.
+// L'offset est maintenant récupéré dynamiquement depuis boot_info.physical_memory_offset
+// (nécessite la feature "map_physical_memory" activée sur le crate bootloader)
+// Voir: https://docs.rs/bootloader/0.9.x/bootloader/bootinfo/struct.BootInfo.html
 
 /// État global du système mémoire
 pub struct MemoryManager {
@@ -65,12 +66,29 @@ pub struct MemoryManager {
 
 impl MemoryManager {
     /// Crée un nouveau MemoryManager à partir des infos de boot
+    /// 
+    /// # Safety
+    /// Cette fonction est unsafe car elle dépend du bootloader ayant mappé
+    /// la mémoire physique à l'offset spécifié dans BootInfo.
+    /// Assurez-vous d'avoir activé `map-physical-memory` dans Cargo.toml:
+    /// ```toml
+    /// [package.metadata.bootloader]
+    /// map-physical-memory = true
+    /// ```
     pub fn new(boot_info: &BootInfo) -> MemoryResult<Self> {
-        // 1. Utiliser l'offset standard pour bootloader 0.9.x
-        let physical_memory_offset = PHYSICAL_MEMORY_OFFSET;
+        // 1. Récupérer l'offset depuis BootInfo (nécessite map-physical-memory feature)
+        let physical_memory_offset = boot_info.physical_memory_offset;
+        
+        // Vérifier que l'offset est valide (non-zéro)
+        if physical_memory_offset == 0 {
+            serial_println!("[MEMORY] ERROR: physical_memory_offset is 0");
+            serial_println!("[MEMORY] Did you enable 'map-physical-memory' in Cargo.toml?");
+            return Err(MemoryError::OutOfMemory);
+        }
+        
         let phys_offset = VirtAddr::new(physical_memory_offset);
         
-        serial_println!("[MEMORY] Physical memory offset: {:#x}", physical_memory_offset);
+        serial_println!("[MEMORY] Physical memory offset from BootInfo: {:#x}", physical_memory_offset);
         
         // 2. Calculer les régions de mémoire utilisable depuis memory_map
         let mut total_usable = 0u64;
