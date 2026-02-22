@@ -12,113 +12,73 @@ lazy_static! {
         let mut idt = InterruptDescriptorTable::new();
 
         // Exception: Divide by zero (#DE)
-        unsafe {
-            idt.divide_error.set_handler_fn(divide_error_handler);
-        }
+        idt.divide_error.set_handler_fn(divide_error_handler);
 
         // Exception: Debug (#DB)
-        unsafe {
-            idt.debug.set_handler_fn(debug_handler);
-        }
+        idt.debug.set_handler_fn(debug_handler);
 
-        // Exception: Breakpoint (#BP) - permet breakpoints logiciels
-        unsafe {
-            idt.breakpoint.set_handler_fn(breakpoint_handler);
-        }
+        // Exception: Breakpoint (#BP)
+        idt.breakpoint.set_handler_fn(breakpoint_handler);
 
         // Exception: Overflow (#OF)
-        unsafe {
-            idt.overflow.set_handler_fn(overflow_handler);
-        }
+        idt.overflow.set_handler_fn(overflow_handler);
 
         // Exception: Bound range exceeded (#BR)
-        unsafe {
-            idt.bound_range_exceeded.set_handler_fn(bound_range_exceeded_handler);
-        }
+        idt.bound_range_exceeded.set_handler_fn(bound_range_exceeded_handler);
 
         // Exception: Invalid opcode (#UD)
-        unsafe {
-            idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
-        }
+        idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
 
         // Exception: Device not available (#NM)
-        unsafe {
-            idt.device_not_available.set_handler_fn(device_not_available_handler);
-        }
+        idt.device_not_available.set_handler_fn(device_not_available_handler);
 
-        // Exception: Double fault (#DF) - utilise IST (stack séparé)
+        // Exception: Double fault (#DF) - utilise IST (stack separé)
         unsafe {
             idt.double_fault.set_handler_fn(double_fault_handler)
                 .set_stack_index(gdt::double_fault_ist_index());
         }
 
         // Exception: Invalid TSS (#TS)
-        unsafe {
-            idt.invalid_tss.set_handler_fn(invalid_tss_handler);
-        }
+        idt.invalid_tss.set_handler_fn(invalid_tss_handler);
 
         // Exception: Segment not present (#NP)
-        unsafe {
-            idt.segment_not_present.set_handler_fn(segment_not_present_handler);
-        }
+        idt.segment_not_present.set_handler_fn(segment_not_present_handler);
 
         // Exception: Stack segment fault (#SS)
-        unsafe {
-            idt.stack_segment_fault.set_handler_fn(stack_segment_fault_handler);
-        }
+        idt.stack_segment_fault.set_handler_fn(stack_segment_fault_handler);
 
         // Exception: General protection fault (#GP)
-        unsafe {
-            idt.general_protection_fault.set_handler_fn(general_protection_fault_handler);
-        }
+        idt.general_protection_fault.set_handler_fn(general_protection_fault_handler);
 
         // Exception: Page fault (#PF)
-        unsafe {
-            idt.page_fault.set_handler_fn(page_fault_handler);
-        }
+        idt.page_fault.set_handler_fn(page_fault_handler);
 
         // Exception: x87 FPU error (#MF)
-        unsafe {
-            idt.x87_floating_point.set_handler_fn(x87_floating_point_handler);
-        }
+        idt.x87_floating_point.set_handler_fn(x87_floating_point_handler);
 
         // Exception: Alignment check (#AC)
-        unsafe {
-            idt.alignment_check.set_handler_fn(alignment_check_handler);
-        }
+        idt.alignment_check.set_handler_fn(alignment_check_handler);
 
         // Exception: Machine check (#MC)
-        unsafe {
-            idt.machine_check.set_handler_fn(machine_check_handler);
-        }
+        idt.machine_check.set_handler_fn(machine_check_handler);
 
         // Exception: SIMD floating point (#XF)
-        unsafe {
-            idt.simd_floating_point.set_handler_fn(simd_floating_point_handler);
-        }
+        idt.simd_floating_point.set_handler_fn(simd_floating_point_handler);
 
         // Exception: Virtualization (#VE)
-        unsafe {
-            idt.virtualization.set_handler_fn(virtualization_handler);
-        }
+        idt.virtualization.set_handler_fn(virtualization_handler);
 
         // Exception: Security (#SX)
-        unsafe {
-            idt.security_exception.set_handler_fn(security_exception_handler);
-        }
+        idt.security_exception.set_handler_fn(security_exception_handler);
 
         // IRQ Handlers (PIC 8259)
         // Timer (IRQ 0 -> vector 32)
-        unsafe {
-            idt[super::interrupts::PIC1_OFFSET as usize]
-                .set_handler_fn(timer_interrupt_handler);
-        }
+        idt[super::interrupts::PIC1_OFFSET as usize]
+            .set_handler_fn(timer_interrupt_handler);
 
         // Keyboard (IRQ 1 -> vector 33)
-        unsafe {
-            idt[super::interrupts::PIC1_OFFSET as usize + 1]
-                .set_handler_fn(keyboard_interrupt_handler);
-        }
+        idt[super::interrupts::PIC1_OFFSET as usize + 1]
+            .set_handler_fn(keyboard_interrupt_handler);
 
         idt
     };
@@ -130,7 +90,7 @@ pub fn init() {
     crate::serial_println!("[IDT] Loaded with 20 exception handlers");
 }
 
-/// Retourne une référence statique à l'IDT (pour tests)
+/// Retourne une reference statique a l'IDT (pour tests)
 pub fn idt_ref() -> &'static InterruptDescriptorTable {
     &IDT
 }
@@ -233,10 +193,7 @@ extern "x86-interrupt" fn security_exception_handler(stack_frame: InterruptStack
 // ===== IRQ Handlers =====
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    // Tick du timer PIT (Programmable Interval Timer)
-    // Fréquence typique: 100Hz (toutes les 10ms)
-
-    // Envoyer EOI (End of Interrupt) au PIC
+    // Tick du timer PIT
     unsafe {
         super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET);
     }
@@ -249,8 +206,6 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     let mut port = Port::new(0x60);
     let scancode: u8 = unsafe { port.read() };
 
-    // Ignorer les scancode 0xE0 (extended) et 0xE1 (pause key)
-    // Pour l'instant, juste log
     if scancode != 0 {
         crate::serial_println!("[KEYBOARD] Scancode: 0x{:02x}", scancode);
     }
@@ -268,14 +223,10 @@ mod tests {
     #[test_case]
     fn test_idt_init() {
         init();
-        // Si pas de panic, IDT chargée correctement
     }
 
     #[test_case]
     fn test_idt_handlers_present() {
-        let idt = idt_ref();
-        // Vérifier que les handlers critiques sont présents
-        // Note: On ne peut pas directement tester les pointeurs de fonction,
-        // mais le fait que IDT.load() n'a pas paniqué est déjà un bon test
+        let _idt = idt_ref();
     }
 }

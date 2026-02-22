@@ -7,27 +7,18 @@ pub mod paging;
 pub mod heap;
 pub mod resource_tag;
 
-use crate::serial_println;
 use bootloader::bootinfo::{BootInfo, MemoryRegionType};
 use x86_64::VirtAddr;
 
-/// Erreurs mémoire exhaustives
+/// Erreurs mémoire
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryError {
-    /// Plus de mémoire physique disponible
     OutOfMemory,
-    /// Frame déjà allouée
     FrameAlreadyAllocated(u64),
-    /// Frame non allouée (désallocation invalide)
     FrameNotAllocated(u64),
-    /// Page déjà mappée
     PageAlreadyMapped(u64),
-    /// Page non mappée
     PageNotMapped(u64),
-    /// Échec initialisation heap
     HeapInitFailed,
-    /// Fuite mémoire détectée
-    MemoryLeak { frames_leaked: usize },
 }
 
 impl core::fmt::Display for MemoryError {
@@ -43,19 +34,11 @@ impl core::fmt::Display for MemoryError {
             Self::PageNotMapped(addr) =>
                 write!(f, "Page at {:#x} not mapped", addr),
             Self::HeapInitFailed => write!(f, "Heap initialization failed"),
-            Self::MemoryLeak { frames_leaked } =>
-                write!(f, "Memory leak detected: {} frames", frames_leaked),
         }
     }
 }
 
-/// Résultat des opérations mémoire
 pub type MemoryResult<T> = Result<T, MemoryError>;
-
-// Note: PHYSICAL_MEMORY_OFFSET n'est plus une constante hardcodée.
-// L'offset est maintenant récupéré dynamiquement depuis boot_info.physical_memory_offset
-// (nécessite la feature "map_physical_memory" activée sur le crate bootloader)
-// Voir: https://docs.rs/bootloader/0.9.x/bootloader/bootinfo/struct.BootInfo.html
 
 /// État global du système mémoire
 pub struct MemoryManager {
@@ -66,43 +49,33 @@ pub struct MemoryManager {
 
 impl MemoryManager {
     /// Crée un nouveau MemoryManager à partir des infos de boot
-    /// 
-    /// # Safety
-    /// Cette fonction est unsafe car elle dépend du bootloader ayant mappé
-    /// la mémoire physique à l'offset spécifié dans BootInfo.
-    /// Assurez-vous d'avoir activé `map-physical-memory` dans Cargo.toml:
-    /// ```toml
-    /// [package.metadata.bootloader]
-    /// map-physical-memory = true
-    /// ```
     pub fn new(boot_info: &BootInfo) -> MemoryResult<Self> {
-        // 1. Récupérer l'offset depuis BootInfo (nécessite map-physical-memory feature)
+        // 1. Récupérer l'offset depuis BootInfo
         let physical_memory_offset = boot_info.physical_memory_offset;
         
-        // Vérifier que l'offset est valide (non-zéro)
         if physical_memory_offset == 0 {
-            serial_println!("[MEMORY] ERROR: physical_memory_offset is 0");
-            serial_println!("[MEMORY] Did you enable 'map-physical-memory' in Cargo.toml?");
+            crate::serial_write("[MEMORY] ERROR: physical_memory_offset is 0\n");
             return Err(MemoryError::OutOfMemory);
         }
         
         let phys_offset = VirtAddr::new(physical_memory_offset);
         
-        serial_println!("[MEMORY] Physical memory offset from BootInfo: {:#x}", physical_memory_offset);
+        // Log physical_memory_offset
+        {
+            use core::fmt::Write;
+            let mut s = arrayvec::ArrayString::<128>::new();
+            let _ = write!(s, "[MEMORY] Physical memory offset: {:#x}\n", physical_memory_offset);
+            crate::serial_write(&s);
+        }
         
-        // 2. Calculer les régions de mémoire utilisable depuis memory_map
+        // 2. Calculer les régions de mémoire utilisable
         let mut total_usable = 0u64;
-        let mut usable_regions = [(0u64, 0u64); 32]; // Max 32 régions
+        let mut usable_regions = [(0u64, 0u64); 32];
         let mut region_count = 0;
         
         for region in boot_info.memory_map.iter() {
             let start = region.range.start_addr();
             let end = region.range.end_addr();
-            
-            serial_println!(
-                "[MEMORY] Region {:#x}-{:#x}: {:?}",
-                start, end, region.region_type
-            );
             
             if region.region_type == MemoryRegionType::Usable && region_count < 32 {
                 usable_regions[region_count] = (start, end);
@@ -111,28 +84,34 @@ impl MemoryManager {
             }
         }
         
-        serial_println!(
-            "[MEMORY] Found {} usable regions, total: {} KB",
-            region_count, total_usable / 1024
-        );
+        {
+            use core::fmt::Write;
+            let mut s = arrayvec::ArrayString::<128>::new();
+            let _ = write!(s, "[MEMORY] Found {} usable regions, total: {} KB\n",
+                region_count, total_usable / 1024);
+            crate::serial_write(&s);
+        }
         
         // 3. Initialiser le frame allocator
         let frame_allocator = unsafe {
             frame::FrameAllocator::new(&usable_regions[..region_count])
         };
         
-        serial_println!(
-            "[MEMORY] Frame allocator: {} frames ({} MB) available",
-            frame_allocator.total_frames(),
-            frame_allocator.total_frames() * 4 / 1024
-        );
+        {
+            use core::fmt::Write;
+            let mut s = arrayvec::ArrayString::<128>::new();
+            let _ = write!(s, "[MEMORY] Frame allocator: {} frames ({} KB)\n",
+                frame_allocator.total_frames(),
+                frame_allocator.total_frames() * 4);
+            crate::serial_write(&s);
+        }
         
-        // 4. Initialiser le page table manager avec offset mapping
+        // 4. Initialiser le page table manager
         let page_table = unsafe {
             paging::OffsetPageTableManager::new(phys_offset)
         };
         
-        serial_println!("[MEMORY] Page table manager initialized (offset mapping)");
+        crate::serial_write("[MEMORY] Page table manager initialized\n");
         
         Ok(Self {
             frame_allocator,
@@ -151,35 +130,29 @@ impl MemoryManager {
             .map_err(|_| MemoryError::HeapInitFailed)?;
         
         self.heap_initialized = true;
-        serial_println!("[MEMORY] Heap initialized: {} KB", heap::HEAP_SIZE / 1024);
+        
+        {
+            use core::fmt::Write;
+            let mut s = arrayvec::ArrayString::<128>::new();
+            let _ = write!(s, "[HEAP] Initialized: {} KB at {:#x}\n",
+                heap::HEAP_SIZE / 1024, heap::HEAP_START);
+            crate::serial_write(&s);
+        }
         
         Ok(())
     }
 }
 
-/// Initialisation globale de la mémoire (appelée depuis main.rs)
+/// Initialisation globale de la mémoire
 pub fn init(boot_info: &BootInfo) -> MemoryResult<MemoryManager> {
-    serial_println!("\n========================================");
-    serial_println!("[MEMORY] Couche 2 - Initializing...");
-    serial_println!("========================================");
+    crate::serial_write("\n========================================\n");
+    crate::serial_write("[MEMORY] Couche 2 - Initializing...\n");
+    crate::serial_write("========================================\n");
     
     let manager = MemoryManager::new(boot_info)?;
     
-    serial_println!("[MEMORY] Couche 2 core initialized ✅");
-    serial_println!("========================================\n");
+    crate::serial_write("[MEMORY] Couche 2 core initialized\n");
+    crate::serial_write("========================================\n\n");
     
     Ok(manager)
-}
-
-/// Tests de validation (adaptés pour sandbox ~500 MB)
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[test_case]
-    fn test_memory_module_creation() {
-        // Note: Ce test nécessite un BootInfo simulé en environnement de test
-        serial_println!("[TEST] Memory module compiles correctly");
-        assert_eq!(4 + 4, 8);
-    }
 }

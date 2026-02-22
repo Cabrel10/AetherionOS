@@ -6,6 +6,7 @@
 #![feature(abi_x86_interrupt)]
 #![feature(custom_test_frameworks)]
 #![feature(alloc_error_handler)]
+#![feature(panic_info_message)]
 #![test_runner(crate::test_runner)]
 #![reexport_test_harness_main = "test_main"]
 
@@ -124,8 +125,7 @@ pub mod util {
 }
 
 /// Fonction stub pour serial_write (sera définie dans main.rs)
-#[no_mangle]
-pub extern "C" fn serial_write(_s: &str) {
+pub fn serial_write(_s: &str) {
     // Stub - sera remplacé par main.rs
 }
 
