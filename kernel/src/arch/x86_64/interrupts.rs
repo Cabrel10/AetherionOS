@@ -64,10 +64,11 @@ pub fn init() {
 }
 
 /// End of Interrupt - notifie le PIC qu'on a fini de traiter l'IRQ
-pub fn end_of_interrupt(interrupt_id: u8) {
-    unsafe {
-        PICS.lock().notify_end_of_interrupt(interrupt_id);
-    }
+/// 
+/// # Safety
+/// Must only be called from interrupt handlers to acknowledge the PIC
+pub unsafe fn end_of_interrupt(interrupt_id: u8) {
+    PICS.lock().notify_end_of_interrupt(interrupt_id);
 }
 
 /// Désactive toutes les interruptions (CLI)

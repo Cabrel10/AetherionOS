@@ -77,16 +77,8 @@ impl OffsetPageTableManager {
     ) -> Result<(), MemoryError> {
         use x86_64::structures::paging::mapper::Mapper;
         
-        // Vérifier si déjà mappée
-        if self.is_page_mapped(page) {
-            return Err(MemoryError::PageAlreadyMapped(
-                page.start_address().as_u64()
-            ));
-        }
-        
-        // Mapper avec frame allocator pour tables intermédiaires
-        // Le frame allocator est utilisé si des tables de pages (P3, P2, P1) 
-        // doivent être créées pour cette adresse virtuelle
+        // Map the page using the x86_64 crate's mapper
+        // frame_allocator is used to allocate intermediate page tables (P3, P2, P1)
         let result = unsafe {
             self.mapper.map_to(page, frame, flags, frame_allocator)
         };
