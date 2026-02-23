@@ -16,6 +16,7 @@ extern crate alloc;
 pub mod arch;
 pub mod security;
 pub mod memory;
+pub mod ipc;
 
 pub mod tests;
 
