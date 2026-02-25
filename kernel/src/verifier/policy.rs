@@ -229,7 +229,16 @@ pub fn init() -> Result<(), VerifierError> {
     let mut rules = POLICY_RULES.lock();
     rules.clear();
 
-    // Rule 1: Allow reads from /dev/ (device access)
+    // Rule 1: DENY writes larger than 64 KB (DoS protection)
+    // MUST be evaluated FIRST - before any path-based allow rules
+    rules.push(PolicyRule::new(
+        "deny-large-writes",
+        RuleCondition::MaxWriteSize(65536),
+        PolicyAction::Deny,
+        OperationType::VfsWrite,
+    ));
+
+    // Rule 2: Allow reads from /dev/ (device access)
     rules.push(PolicyRule::new(
         "allow-dev-read",
         RuleCondition::PathPrefix(String::from("/dev/")),
@@ -237,7 +246,7 @@ pub fn init() -> Result<(), VerifierError> {
         OperationType::VfsRead,
     ));
 
-    // Rule 2: Allow writes to /dev/ (device access)
+    // Rule 3: Allow writes to /dev/ (device access)
     rules.push(PolicyRule::new(
         "allow-dev-write",
         RuleCondition::PathPrefix(String::from("/dev/")),
@@ -245,7 +254,7 @@ pub fn init() -> Result<(), VerifierError> {
         OperationType::VfsWrite,
     ));
 
-    // Rule 3: Allow reads from /tmp/ (temporary files)
+    // Rule 4: Allow reads from /tmp/ (temporary files)
     rules.push(PolicyRule::new(
         "allow-tmp-read",
         RuleCondition::PathPrefix(String::from("/tmp/")),
@@ -253,19 +262,11 @@ pub fn init() -> Result<(), VerifierError> {
         OperationType::VfsRead,
     ));
 
-    // Rule 4: Audit writes to /tmp/ (temporary files)
+    // Rule 5: Audit writes to /tmp/ (temporary files)
     rules.push(PolicyRule::new(
         "audit-tmp-write",
         RuleCondition::PathPrefix(String::from("/tmp/")),
         PolicyAction::Audit,
-        OperationType::VfsWrite,
-    ));
-
-    // Rule 5: Deny writes larger than 64 KB (DoS protection)
-    rules.push(PolicyRule::new(
-        "deny-large-writes",
-        RuleCondition::MaxWriteSize(65536),
-        PolicyAction::Deny,
         OperationType::VfsWrite,
     ));
 
