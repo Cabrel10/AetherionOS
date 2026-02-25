@@ -4,20 +4,21 @@
 use x86_64::VirtAddr;
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
 use x86_64::structures::tss::TaskStateSegment;
-use x86_64::registers::segmentation::{CS, DS};
 use lazy_static::lazy_static;
 
 // Index IST pour double-fault (stack séparé)
 const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
-/// Task State Segment - contient les pointeurs de stack pour exceptions
+// Task State Segment - contient les pointeurs de stack pour exceptions
 lazy_static! {
     static ref TSS: TaskStateSegment = {
         let mut tss = TaskStateSegment::new();
         tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
             const STACK_SIZE: usize = 4096 * 5;  // 20KB stack pour double-fault
             static mut STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
-            // Safety: STACK est static mut, accessible uniquement ici une fois
+            // SAFETY: STACK is a static mut [u8; STACK_SIZE], only accessed here
+            // during lazy_static initialization (runs exactly once). Taking a pointer
+            // to it is safe because no other code reads/writes this array.
             let stack_start = VirtAddr::from_ptr(unsafe { &STACK });
             stack_start + STACK_SIZE as u64  // Stack grows downwards
         };
@@ -53,7 +54,10 @@ pub fn init() {
     // Charger la GDT
     GDT.0.load();
 
-    // Safety: Les selecteurs sont valides car GDT vient d'être chargée
+    // SAFETY: The GDT was just loaded above, so the selectors are valid.
+    // CS::set_reg reloads the code segment register to point at kernel code.
+    // DS::set_reg sets the data segment. load_tss activates the TSS for IST.
+    // This sequence must happen exactly once during boot, in this order.
     unsafe {
         CS::set_reg(GDT.1.code_selector);
         DS::set_reg(GDT.1.data_selector);

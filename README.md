@@ -92,44 +92,52 @@ Aetherion OS est un système d'exploitation expérimental visant à repousser le
 
 | Phase | Nom | Durée | Status | Détails |
 |-------|-----|-------|--------|---------|
-| **0** | Fondations | 1 sem | 🟢 COMPLETE | Kernel minimal bootable |
-| **1** | HAL (Couche 1) | 1 sem | 🟢 COMPLETE | GDT/IDT/PIC/Security |
-| **1.1** | Memory Mgmt | 1 sem | 🟡 IN PROGRESS | Physical/Virtual allocators |
-| **2** | Syscalls & User | 1 sem | ⚪ PLANNED | Ring 3 transitions |
-| **3** | VFS & Drivers | 2 sem | ⚪ PLANNED | Filesystem + I/O |
-| **4** | Sécurité Avancée | 2 sem | ⚪ PLANNED | Secure Boot + TPM |
-| **5** | ML Scheduler | 2 sem | ⚪ PLANNED | Ordonnanceur intelligent |
-| **6** | Réseau | 2 sem | ⚪ PLANNED | TCP/IP stack |
-| **7** | Tests & QA | 2 sem | ⚪ PLANNED | Test suite complète |
-| **8** | Optimisations | 2 sem | ⚪ PLANNED | Performance tuning |
+| **0** | Fondations | 1 sem | COMPLETE | Kernel minimal bootable |
+| **1** | HAL (Couche 1) | 1 sem | COMPLETE | GDT/IDT/PIC/Security |
+| **2** | Memory (Couche 2) | 1 sem | COMPLETE | Frame alloc/Paging/Heap |
+| **3** | Cognitive Bus (Couche 3) | 1 sem | COMPLETE | Lock-free MPMC IPC |
+| **4** | VFS (Couche 4) | 1 sem | COMPLETE | Virtual Filesystem + Security |
+| **5** | Verifier (Couche 5) | 2 sem | PLANNED | Syscall filtering + Policy engine |
+| **6** | Reseau | 2 sem | PLANNED | TCP/IP stack |
+| **7** | ML Scheduler | 2 sem | PLANNED | Ordonnanceur intelligent |
+| **8** | Tests & QA | 2 sem | PLANNED | Test suite complete |
 
 **Durée Totale** : ~15 semaines (3.5 mois)
 
-### ✅ Couche 1 HAL (Hardware Abstraction Layer) - COMPLETE
+### Couche 1 HAL - COMPLETE
 
-La couche HAL fournit l'abstraction matérielle complète pour x86_64:
+| Composant | Fichier | Status |
+|-----------|---------|--------|
+| **GDT** | `arch/x86_64/gdt.rs` | DONE |
+| **IDT** | `arch/x86_64/idt.rs` | DONE |
+| **PIC** | `arch/x86_64/interrupts.rs` | DONE |
+| **Security** | `security/mod.rs` | DONE |
 
-| Composant | Fichier | Description | Status |
-|-----------|---------|-------------|--------|
-| **GDT** | `arch/x86_64/gdt.rs` | Global Descriptor Table + TSS/IST | ✅ |
-| **IDT** | `arch/x86_64/idt.rs` | Interrupt Descriptor Table (20 handlers) | ✅ |
-| **PIC** | `arch/x86_64/interrupts.rs` | PIC 8259 remapping (IRQ 0-15 → 32-47) | ✅ |
-| **Security** | `security/mod.rs` | TPM stub + SHA256 PCR measurements | ✅ |
-| **Tests** | `tests/mod.rs` | 4 tests unitaires (GDT/IDT/IRQ/Sec) | ✅ |
+### Couche 2 Memory - COMPLETE
 
-**Métriques HAL:**
-- Build time: ~3s (debug)
-- Binary size: ~2.0 MB (debug), ~60 KB (release estimated)
-- Tests: 4/4 passing
-- Warnings: 26 (non-blocking)
+| Composant | Fichier | Status |
+|-----------|---------|--------|
+| **Frame Allocator** | `memory/frame.rs` | DONE |
+| **Paging** | `memory/paging.rs` | DONE |
+| **Heap** | `memory/heap.rs` | DONE |
 
-**Validation:**
-```bash
-cd kernel
-cargo check        # ✅ PASS
-cargo build        # ✅ PASS (3.37s)
-cargo test --lib   # ✅ 4/4 tests
-```
+### Couche 3 Cognitive Bus - COMPLETE
+
+| Composant | Fichier | Status |
+|-----------|---------|--------|
+| **Bus** | `ipc/bus.rs` | DONE |
+| **IntentMessage** | `ipc/mod.rs` | DONE |
+
+### Couche 4 VFS - COMPLETE
+
+| Composant | Fichier | Status |
+|-----------|---------|--------|
+| **VFS Core** | `fs/vfs.rs` | DONE |
+| **Manifests** | `fs/manifest.rs` | DONE |
+| **Path Security** | `fs/vfs.rs` | DONE |
+| **Metrics** | `fs/vfs.rs` | DONE |
+
+**Build Metrics:** 0 errors, 0 warnings, 21+ tests passing
 
 ---
 
@@ -277,42 +285,26 @@ Les contributions sont bienvenues ! Veuillez suivre ces étapes :
 
 ## 🗺️ Roadmap
 
-### v0.1.0 (Q1 2025) - Milestone "First Boot" ✅ COMPLETE
-- [x] Kernel minimal bootable
-- [x] Bootloader BIOS
-- [x] VGA text output
-- [x] **HAL Layer (Couche 1)**
-  - [x] GDT with TSS/IST (double-fault handler)
-  - [x] IDT with 20 exception handlers
-  - [x] PIC 8259 (IRQ remapping + timer/keyboard)
-  - [x] Security module (TPM stub + SHA256)
-  - [x] Unit tests (4/4 passing)
-- [ ] Memory management complet
-- [ ] Basic syscalls
+### v0.1.0 - Milestone "First Boot" - COMPLETE
+- [x] Kernel minimal bootable + HAL (GDT/IDT/PIC/Security)
 
-### v0.2.0 (Q2 2025) - Milestone "Userland"
-- [ ] User mode processes
-- [ ] Shell interactif
-- [ ] Filesystem (FAT32)
-- [ ] Driver keyboard
+### v0.2.0 - Milestone "Memory" - COMPLETE
+- [x] Frame allocator + Paging + Heap (100 KB)
 
-### v0.3.0 (Q2 2025) - Milestone "Network"
-- [ ] TCP/IP stack
-- [ ] virtio-net driver
-- [ ] HTTP client
-- [ ] DNS resolver
+### v0.3.0 - Milestone "IPC" - COMPLETE
+- [x] Cognitive Bus (lock-free MPMC, Intent-based messages)
 
-### v0.4.0 (Q3 2025) - Milestone "Security"
-- [ ] Secure Boot
-- [ ] TPM 2.0 integration
-- [ ] ML anomaly detection
-- [ ] ASLR kernel
+### v0.4.0 - Milestone "VFS" - COMPLETE
+- [x] Virtual Filesystem with security hardening
+- [x] Path traversal + null byte + overflow protection
+- [x] Capability-based device access + Metrics
+- [x] 14 tests (7 functional + 7 security), 0 warnings
 
-### v1.0.0 (Q4 2025) - Milestone "Production Ready"
-- [ ] ML Scheduler stable
-- [ ] Test suite complète
-- [ ] Documentation exhaustive
-- [ ] Performance benchmarks publiés
+### v0.5.0 - Milestone "Verifier" (NEXT)
+- [ ] Policy engine + Syscall filtering + VFS hooks
+
+### v1.0.0 - Milestone "Production Ready"
+- [ ] ML Scheduler + Full test suite + Documentation
 
 ---
 

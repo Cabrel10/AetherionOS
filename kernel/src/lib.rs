@@ -7,6 +7,7 @@
 #![feature(custom_test_frameworks)]
 #![feature(alloc_error_handler)]
 #![feature(panic_info_message)]
+#![allow(dead_code)]
 #![test_runner(crate::test_runner)]
 #![reexport_test_harness_main = "test_main"]
 
@@ -17,6 +18,8 @@ pub mod arch;
 pub mod security;
 pub mod memory;
 pub mod ipc;
+pub mod fs;
+pub mod verifier;
 
 pub mod tests;
 

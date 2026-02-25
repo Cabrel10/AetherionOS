@@ -20,6 +20,7 @@ use core::fmt;
 /// Chaque module du kernel est identifie par un ComponentId unique
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[allow(clippy::upper_case_acronyms)]
 pub enum ComponentId {
     /// Orchestrateur central (destination par defaut)
     Orchestrator = 0,

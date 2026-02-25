@@ -64,7 +64,7 @@ impl MemoryManager {
         {
             use core::fmt::Write;
             let mut s = arrayvec::ArrayString::<128>::new();
-            let _ = write!(s, "[MEMORY] Physical memory offset: {:#x}\n", physical_memory_offset);
+            let _ = writeln!(s, "[MEMORY] Physical memory offset: {:#x}", physical_memory_offset);
             crate::serial_write(&s);
         }
         
@@ -87,7 +87,7 @@ impl MemoryManager {
         {
             use core::fmt::Write;
             let mut s = arrayvec::ArrayString::<128>::new();
-            let _ = write!(s, "[MEMORY] Found {} usable regions, total: {} KB\n",
+            let _ = writeln!(s, "[MEMORY] Found {} usable regions, total: {} KB",
                 region_count, total_usable / 1024);
             crate::serial_write(&s);
         }
@@ -100,7 +100,7 @@ impl MemoryManager {
         {
             use core::fmt::Write;
             let mut s = arrayvec::ArrayString::<128>::new();
-            let _ = write!(s, "[MEMORY] Frame allocator: {} frames ({} KB)\n",
+            let _ = writeln!(s, "[MEMORY] Frame allocator: {} frames ({} KB)",
                 frame_allocator.total_frames(),
                 frame_allocator.total_frames() * 4);
             crate::serial_write(&s);
@@ -134,7 +134,7 @@ impl MemoryManager {
         {
             use core::fmt::Write;
             let mut s = arrayvec::ArrayString::<128>::new();
-            let _ = write!(s, "[HEAP] Initialized: {} KB at {:#x}\n",
+            let _ = writeln!(s, "[HEAP] Initialized: {} KB at {:#x}",
                 heap::HEAP_SIZE / 1024, heap::HEAP_START);
             crate::serial_write(&s);
         }

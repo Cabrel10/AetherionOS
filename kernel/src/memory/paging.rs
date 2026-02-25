@@ -34,7 +34,10 @@ impl OffsetPageTableManager {
         let phys = level_4_table_frame.start_address();
         let virt = physical_memory_offset + phys.as_u64();
         
-        // Pointer vers la table P4
+        // SAFETY: The physical memory offset from bootloader maps all physical
+        // memory starting at this virtual address. CR3 contains the physical address
+        // of the active P4 table. Adding the offset gives its virtual address.
+        // The resulting pointer is valid for the lifetime of the kernel.
         let page_table = &mut *(virt.as_mut_ptr::<PageTable>());
         
         // Créer l'OffsetPageTable
@@ -77,8 +80,10 @@ impl OffsetPageTableManager {
     ) -> Result<(), MemoryError> {
         use x86_64::structures::paging::mapper::Mapper;
         
-        // Map the page using the x86_64 crate's mapper
-        // frame_allocator is used to allocate intermediate page tables (P3, P2, P1)
+        // SAFETY: page, frame, and flags are validated by caller. The frame comes
+        // from FrameAllocator (unique, non-overlapping). frame_allocator may be used
+        // to allocate intermediate page table frames (P3/P2/P1). The resulting
+        // mapping is flushed from TLB immediately after creation.
         let result = unsafe {
             self.mapper.map_to(page, frame, flags, frame_allocator)
         };
@@ -129,7 +134,7 @@ impl OffsetPageTableManager {
     /// Traduit une page entière
     pub fn translate_page(&self, page: Page<Size4KiB>) -> Option<PhysFrame<Size4KiB>> {
         self.mapper.translate_addr(page.start_address())
-            .map(|phys_addr| PhysFrame::containing_address(phys_addr))
+            .map(PhysFrame::containing_address)
     }
     
     /// Mappe une région mémoire avec identity mapping
@@ -166,6 +171,9 @@ impl OffsetPageTableManager {
     ) -> Result<(), MemoryError> {
         use x86_64::structures::paging::mapper::Mapper;
         
+        // SAFETY: The page must be currently mapped (checked by the mapper).
+        // Updating flags does not change the physical frame backing, only the
+        // permission bits. The TLB is flushed after the update.
         match unsafe { self.mapper.update_flags(page, flags) } {
             Ok(flusher) => {
                 flusher.flush();
