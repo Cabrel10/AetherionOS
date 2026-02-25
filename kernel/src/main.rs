@@ -1,13 +1,16 @@
-// Aetherion OS - Kernel Couche 4 (VFS - Virtual Filesystem)
+// Aetherion OS - Kernel Consolidation (Couches 1-5 Hardened)
 // Architecture: x86_64, Bootloader: 0.9.23
-// Modules: GDT, IDT, PIC, TPM/Security, Memory, IPC (Cognitive Bus), VFS
+// Modules: GDT, IDT, PIC, TPM/Security, Memory, IPC (Cognitive Bus), VFS, Verifier
 //
-// Security hardening:
-//   - Path traversal protection
+// Security hardening (Audit Phase - Option A Consolidation):
+//   - FIFO determinism in Cognitive Bus (Ord-based sift with timestamp tiebreak)
+//   - Path traversal protection (component-level + charset whitelist)
 //   - Null byte injection prevention
-//   - Buffer overflow checks
-//   - Capability-based device access
-//   - Metrics collection and reporting
+//   - Buffer overflow / capacity checks
+//   - Capability-based device access (ACHA manifests)
+//   - VFS stress tests (1000 cycles, binary patterns, boundary overflow)
+//   - Metrics collection and reporting (atomic counters)
+//   - Verifier policy engine (Couche 5) with default-deny whitelist
 //   - Proper error handling (no silent .ok())
 
 #![no_std]
@@ -33,7 +36,7 @@ mod fs;
 mod verifier;
 
 // ===== Configuration =====
-const KERNEL_VERSION: &str = "0.5.0-verifier";
+const KERNEL_VERSION: &str = "0.5.1-hardened";
 
 // VGA text buffer
 const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
@@ -501,6 +504,322 @@ fn run_vfs_tests() {
 }
 
 // ===================================================================
+// VFS STRESS & HARDENING TEST SUITE (Audit Phase 3)
+// ===================================================================
+
+fn run_vfs_stress_tests() {
+    serial_write("\n========================================\n");
+    serial_write("[VFS STRESS] Starting hardening test suite\n");
+    serial_write("========================================\n\n");
+
+    let mut tests_passed = 0u32;
+    let mut tests_failed = 0u32;
+
+    // --- STRESS TEST 1: 1000 write/read cycles ---
+    serial_write("  [STRESS 1/7] 1000 write/read cycles on /dev/ram0...\n");
+    {
+        let mut ok = true;
+        for i in 0u32..1000 {
+            let data = alloc::format!("Cycle-{:04}", i);
+            match fs::vfs::file_write("/dev/ram0", data.as_bytes()) {
+                Ok(n) if n == data.len() => {}
+                _ => { ok = false; break; }
+            }
+            match fs::vfs::file_read("/dev/ram0") {
+                Ok(ref read_data) if read_data.as_slice() == data.as_bytes() => {}
+                _ => { ok = false; break; }
+            }
+            if i % 250 == 0 {
+                let mut s = arrayvec::ArrayString::<64>::new();
+                let _ = writeln!(s, "    Cycle {}/1000 OK", i);
+                serial_write(&s);
+            }
+        }
+        if ok {
+            serial_write("  [OK] 1000 VFS write/read cycles PASSED\n");
+            tests_passed += 1;
+        } else {
+            serial_write("  [FAIL] VFS stress test failed!\n");
+            tests_failed += 1;
+        }
+    }
+
+    // --- STRESS TEST 2: Path traversal attack variants ---
+    serial_write("\n  [STRESS 2/7] Path traversal attack vectors...\n");
+    {
+        let attacks: [&str; 6] = [
+            "/../etc/passwd",
+            "/dev/../../root",
+            "/dev/../../../shadow",
+            "/./dev/ram0",
+            "/dev//ram0",
+            "/dev/..hidden",
+        ];
+        let mut all_blocked = true;
+        for attack_path in &attacks {
+            match fs::vfs::file_read(attack_path) {
+                Err(_) => {
+                    let mut s = arrayvec::ArrayString::<128>::new();
+                    let _ = writeln!(s, "    [OK] Blocked: {}", attack_path);
+                    serial_write(&s);
+                }
+                Ok(_) => {
+                    let mut s = arrayvec::ArrayString::<128>::new();
+                    let _ = writeln!(s, "    [FAIL] NOT BLOCKED: {}", attack_path);
+                    serial_write(&s);
+                    all_blocked = false;
+                }
+            }
+        }
+        if all_blocked {
+            serial_write("  [OK] All 6 path traversal attacks blocked\n");
+            tests_passed += 1;
+        } else {
+            serial_write("  [FAIL] Some path traversal attacks got through!\n");
+            tests_failed += 1;
+        }
+    }
+
+    // --- STRESS TEST 3: device_can() enforcement ---
+    serial_write("\n  [STRESS 3/7] device_can() ACHA enforcement...\n");
+    {
+        // Mount a read-only virtual device to test capabilities
+        let manifest = fs::manifest::DeviceManifest::virtual_readonly("test-sensor");
+        match fs::vfs::mount_device("/dev/sensor0", manifest) {
+            Ok(_) => serial_write("    Mounted /dev/sensor0 (read-only virtual)\n"),
+            Err(e) => {
+                let mut s = arrayvec::ArrayString::<128>::new();
+                let _ = writeln!(s, "    Mount failed: {:?}", e);
+                serial_write(&s);
+            }
+        }
+
+        // Test: write to read-only device MUST fail
+        let mut cap_ok = true;
+        match fs::vfs::file_write("/dev/sensor0", b"attack") {
+            Err(fs::vfs::VfsError::ReadOnlyDevice) => {
+                serial_write("    [OK] Write to read-only device denied\n");
+            }
+            _ => {
+                serial_write("    [FAIL] Write to read-only device NOT denied!\n");
+                cap_ok = false;
+            }
+        }
+
+        // Test: read from read-only device should work (even if empty)
+        match fs::vfs::file_read("/dev/sensor0") {
+            Ok(_) => {
+                serial_write("    [OK] Read from read-only device allowed\n");
+            }
+            Err(e) => {
+                let mut s = arrayvec::ArrayString::<128>::new();
+                let _ = writeln!(s, "    [FAIL] Read denied: {:?}", e);
+                serial_write(&s);
+                cap_ok = false;
+            }
+        }
+
+        if cap_ok {
+            serial_write("  [OK] ACHA capability enforcement PASSED\n");
+            tests_passed += 1;
+        } else {
+            serial_write("  [FAIL] ACHA capability enforcement FAILED\n");
+            tests_failed += 1;
+        }
+    }
+
+    // --- STRESS TEST 4: list_path() directory listing ---
+    serial_write("\n  [STRESS 4/7] list_path() directory listing...\n");
+    {
+        let mut list_ok = true;
+
+        // List root
+        match fs::vfs::list_path("/") {
+            Ok(entries) => {
+                let mut s = arrayvec::ArrayString::<128>::new();
+                let _ = writeln!(s, "    [OK] Root has {} entries", entries.len());
+                serial_write(&s);
+                if entries.is_empty() {
+                    serial_write("    [FAIL] Root should not be empty\n");
+                    list_ok = false;
+                }
+            }
+            Err(e) => {
+                let mut s = arrayvec::ArrayString::<128>::new();
+                let _ = writeln!(s, "    [FAIL] list_path('/') error: {:?}", e);
+                serial_write(&s);
+                list_ok = false;
+            }
+        }
+
+        // List /dev
+        match fs::vfs::list_path("/dev") {
+            Ok(entries) => {
+                let mut s = arrayvec::ArrayString::<128>::new();
+                let _ = writeln!(s, "    [OK] /dev has {} entries", entries.len());
+                serial_write(&s);
+                // /dev should contain at least ram0 (mounted in run_vfs_tests)
+                if entries.is_empty() {
+                    serial_write("    [FAIL] /dev should not be empty\n");
+                    list_ok = false;
+                }
+            }
+            Err(e) => {
+                let mut s = arrayvec::ArrayString::<128>::new();
+                let _ = writeln!(s, "    [FAIL] list_path('/dev') error: {:?}", e);
+                serial_write(&s);
+                list_ok = false;
+            }
+        }
+
+        if list_ok {
+            serial_write("  [OK] Directory listing PASSED\n");
+            tests_passed += 1;
+        } else {
+            serial_write("  [FAIL] Directory listing FAILED\n");
+            tests_failed += 1;
+        }
+    }
+
+    // --- STRESS TEST 5: Data integrity with binary patterns ---
+    serial_write("\n  [STRESS 5/7] Binary data integrity (256-byte pattern)...\n");
+    {
+        let pattern: Vec<u8> = (0..=255u8).collect();
+        let mut integrity_ok = true;
+
+        match fs::vfs::file_write("/dev/ram0", &pattern) {
+            Ok(n) if n == 256 => {
+                match fs::vfs::file_read("/dev/ram0") {
+                    Ok(data) if data == pattern => {
+                        serial_write("  [OK] 256-byte binary pattern verified\n");
+                    }
+                    Ok(_) => {
+                        serial_write("  [FAIL] Binary data corruption!\n");
+                        integrity_ok = false;
+                    }
+                    Err(e) => {
+                        let mut s = arrayvec::ArrayString::<128>::new();
+                        let _ = writeln!(s, "  [FAIL] Read error: {:?}", e);
+                        serial_write(&s);
+                        integrity_ok = false;
+                    }
+                }
+            }
+            _ => {
+                serial_write("  [FAIL] Write error for binary pattern\n");
+                integrity_ok = false;
+            }
+        }
+
+        if integrity_ok { tests_passed += 1; } else { tests_failed += 1; }
+    }
+
+    // --- STRESS TEST 6: Capacity overflow protection ---
+    serial_write("\n  [STRESS 6/7] Capacity overflow with exact boundary...\n");
+    {
+        // Write exactly 1024 bytes (ram0 capacity) - should succeed
+        let exact_data = [0xBBu8; 1024];
+        let mut boundary_ok = true;
+
+        match fs::vfs::file_write("/dev/ram0", &exact_data) {
+            Ok(1024) => {
+                serial_write("    [OK] Exact capacity write (1024B) accepted\n");
+            }
+            _ => {
+                serial_write("    [FAIL] Exact capacity write rejected!\n");
+                boundary_ok = false;
+            }
+        }
+
+        // Write 1025 bytes - should fail
+        let overflow_data = [0xCCu8; 1025];
+        match fs::vfs::file_write("/dev/ram0", &overflow_data) {
+            Err(fs::vfs::VfsError::CapacityExceeded) => {
+                serial_write("    [OK] Overflow (1025B) correctly blocked\n");
+            }
+            _ => {
+                serial_write("    [FAIL] Overflow (1025B) NOT blocked!\n");
+                boundary_ok = false;
+            }
+        }
+
+        if boundary_ok {
+            serial_write("  [OK] Capacity boundary enforcement PASSED\n");
+            tests_passed += 1;
+        } else {
+            serial_write("  [FAIL] Capacity boundary enforcement FAILED\n");
+            tests_failed += 1;
+        }
+    }
+
+    // --- STRESS TEST 7: VFS Metrics accuracy ---
+    serial_write("\n  [STRESS 7/7] VFS metrics accuracy check...\n");
+    {
+        let metrics = fs::vfs::get_metrics();
+        let mut metrics_ok = true;
+
+        if metrics.operations_count == 0 {
+            serial_write("    [FAIL] operations_count should be > 0\n");
+            metrics_ok = false;
+        } else {
+            let mut s = arrayvec::ArrayString::<128>::new();
+            let _ = writeln!(s, "    [OK] Operations: {}", metrics.operations_count);
+            serial_write(&s);
+        }
+
+        if metrics.total_bytes_written == 0 {
+            serial_write("    [FAIL] total_bytes_written should be > 0\n");
+            metrics_ok = false;
+        } else {
+            let mut s = arrayvec::ArrayString::<128>::new();
+            let _ = writeln!(s, "    [OK] Bytes written: {}", metrics.total_bytes_written);
+            serial_write(&s);
+        }
+
+        if metrics.total_bytes_read == 0 {
+            serial_write("    [FAIL] total_bytes_read should be > 0\n");
+            metrics_ok = false;
+        } else {
+            let mut s = arrayvec::ArrayString::<128>::new();
+            let _ = writeln!(s, "    [OK] Bytes read: {}", metrics.total_bytes_read);
+            serial_write(&s);
+        }
+
+        // Security violations should be > 0 (from path traversal tests)
+        if metrics.security_violations == 0 {
+            serial_write("    [WARN] security_violations = 0 (expected > 0 from traversal tests)\n");
+        } else {
+            let mut s = arrayvec::ArrayString::<128>::new();
+            let _ = writeln!(s, "    [OK] Security violations tracked: {}", metrics.security_violations);
+            serial_write(&s);
+        }
+
+        if metrics_ok {
+            serial_write("  [OK] VFS metrics accuracy PASSED\n");
+            tests_passed += 1;
+        } else {
+            serial_write("  [FAIL] VFS metrics accuracy FAILED\n");
+            tests_failed += 1;
+        }
+    }
+
+    // ===== STRESS TEST SUMMARY =====
+    serial_write("\n========================================\n");
+    {
+        let mut s = arrayvec::ArrayString::<128>::new();
+        let _ = writeln!(s, "[VFS STRESS] Results: {}/{} passed, {} failed",
+            tests_passed, tests_passed + tests_failed, tests_failed);
+        serial_write(&s);
+    }
+    if tests_failed == 0 {
+        serial_write("[VFS STRESS] ALL STRESS TESTS PASSED!\n");
+    } else {
+        serial_write("[VFS STRESS] SOME STRESS TESTS FAILED!\n");
+    }
+    serial_write("========================================\n");
+}
+
+// ===================================================================
 // VERIFIER TEST SUITE
 // ===================================================================
 
@@ -872,6 +1191,108 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         serial_write("  [OK] Queue drained successfully\n");
     }
 
+    // --- IPC TEST 4: FIFO Determinism within same Priority ---
+    serial_write("\n[IPC TEST 4] FIFO determinism (same priority):\n");
+    {
+        use ipc::{IntentMessage, ComponentId, Priority};
+
+        // Drain any leftover messages
+        while ipc::bus::consume().is_ok() {}
+
+        // Publish 5 Normal-priority messages with known ascending timestamps.
+        // We manually set timestamps to guarantee ordering.
+        let base_ts = arch::x86_64::timer::read_tsc();
+        for i in 0u32..5 {
+            let mut msg = IntentMessage::new(
+                ComponentId::HAL,
+                ComponentId::Orchestrator,
+                i,           // intent_id = 0,1,2,3,4
+                Priority::Normal,
+                i as u64,
+            );
+            // Force ascending timestamps (base + i*1000)
+            msg.timestamp = base_ts + (i as u64) * 1000;
+            ipc::bus::publish(msg).unwrap();
+        }
+
+        // Consume: expect FIFO order (0, 1, 2, 3, 4)
+        let mut fifo_ok = true;
+        for expected in 0u32..5 {
+            match ipc::bus::consume() {
+                Ok(msg) if msg.intent_id == expected => {}
+                Ok(msg) => {
+                    let mut s = arrayvec::ArrayString::<128>::new();
+                    let _ = writeln!(s, "  [FAIL] Expected intent_id={}, got {}", expected, msg.intent_id);
+                    serial_write(&s);
+                    fifo_ok = false;
+                }
+                Err(e) => {
+                    let mut s = arrayvec::ArrayString::<128>::new();
+                    let _ = writeln!(s, "  [FAIL] Consume error: {:?}", e);
+                    serial_write(&s);
+                    fifo_ok = false;
+                }
+            }
+        }
+        if fifo_ok {
+            serial_write("  [OK] FIFO order preserved for 5 same-priority messages\n");
+        } else {
+            panic!("FIFO DETERMINISM VIOLATED: same-priority messages consumed out of order!");
+        }
+    }
+
+    // --- IPC TEST 5: Priority + FIFO combined ---
+    serial_write("\n[IPC TEST 5] Priority ordering + FIFO within level:\n");
+    {
+        use ipc::{IntentMessage, ComponentId, Priority};
+
+        while ipc::bus::consume().is_ok() {}
+
+        let base_ts = arch::x86_64::timer::read_tsc();
+
+        // Publish interleaved priorities: Low, Critical, Normal, Normal, High
+        let specs: [(Priority, u32, u64); 5] = [
+            (Priority::Low,      0xA0, base_ts + 100),
+            (Priority::Critical, 0xB0, base_ts + 200),
+            (Priority::Normal,   0xC0, base_ts + 300),  // Normal #1
+            (Priority::Normal,   0xC1, base_ts + 400),  // Normal #2
+            (Priority::High,     0xD0, base_ts + 500),
+        ];
+        for (prio, id, ts) in &specs {
+            let mut msg = IntentMessage::new(
+                ComponentId::HAL, ComponentId::Orchestrator,
+                *id, *prio, 0,
+            );
+            msg.timestamp = *ts;
+            ipc::bus::publish(msg).unwrap();
+        }
+
+        // Expected consumption order: Critical(0xB0), High(0xD0), Normal(0xC0), Normal(0xC1), Low(0xA0)
+        let expected_order: [u32; 5] = [0xB0, 0xD0, 0xC0, 0xC1, 0xA0];
+        let mut order_ok = true;
+        for (i, expected_id) in expected_order.iter().enumerate() {
+            match ipc::bus::consume() {
+                Ok(msg) if msg.intent_id == *expected_id => {
+                    let mut s = arrayvec::ArrayString::<128>::new();
+                    let _ = writeln!(s, "  #{}: intent=0x{:02X} prio={} OK", i+1, msg.intent_id, msg.priority);
+                    serial_write(&s);
+                }
+                Ok(msg) => {
+                    let mut s = arrayvec::ArrayString::<128>::new();
+                    let _ = writeln!(s, "  #{}: FAIL expected 0x{:02X}, got 0x{:02X}", i+1, expected_id, msg.intent_id);
+                    serial_write(&s);
+                    order_ok = false;
+                }
+                Err(_) => { order_ok = false; }
+            }
+        }
+        if order_ok {
+            serial_write("  [OK] Priority + FIFO ordering verified\n");
+        } else {
+            panic!("PRIORITY+FIFO ORDERING VIOLATED!");
+        }
+    }
+
     serial_write("\n[COGNITIVE BUS] All tests PASSED!\n");
     serial_write("========================================\n");
 
@@ -885,6 +1306,11 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     }
 
     run_vfs_tests();
+
+    // ===================================================================
+    // VFS STRESS & HARDENING TESTS (AUDIT PHASE 3)
+    // ===================================================================
+    run_vfs_stress_tests();
 
     // ===================================================================
     // COUCHE 5: VERIFIER (Policy Engine) INIT + TESTS

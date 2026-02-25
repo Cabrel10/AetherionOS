@@ -45,9 +45,9 @@ opt-level = 1      # Faster dev builds
 
 [profile.release]
 panic = "abort"
-lto = true         # Link Time Optimization
+lto = false        # Disabled LTO to avoid OOM on low-memory sandbox
 opt-level = 2      # Optimize for size and speed
-codegen-units = 1  # Better optimization, slower compile
+codegen-units = 4  # More codegen units = less memory per unit
 
 # =============================================================================
 # Bootloader Configuration (bootloader 0.9.x)

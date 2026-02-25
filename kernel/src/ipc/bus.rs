@@ -105,10 +105,16 @@ impl CognitiveBus {
 
     // ---- Binary heap helpers ----
 
+    /// Sift up: restore max-heap invariant after insertion.
+    ///
+    /// FIFO-FIX: Uses `Ord::cmp` (not just `>`) so that equal-priority
+    /// messages are ordered by timestamp (older = higher in heap).
+    /// This guarantees deterministic FIFO within the same priority level.
     fn sift_up(&mut self, mut idx: usize) {
         while idx > 0 {
             let parent = (idx - 1) / 2;
-            if self.heap[idx] > self.heap[parent] {
+            // Swap if child is strictly greater (per Ord which encodes FIFO)
+            if self.heap[idx].cmp(&self.heap[parent]) == core::cmp::Ordering::Greater {
                 self.heap.swap(idx, parent);
                 idx = parent;
             } else {
@@ -117,6 +123,11 @@ impl CognitiveBus {
         }
     }
 
+    /// Sift down: restore max-heap invariant after removal.
+    ///
+    /// FIFO-FIX: Uses `Ord::cmp` so that among equal-priority messages,
+    /// the one with the earlier timestamp is considered "larger" and
+    /// stays closer to the root, ensuring FIFO consumption order.
     fn sift_down(&mut self, mut idx: usize) {
         let len = self.heap.len();
         loop {
@@ -124,10 +135,10 @@ impl CognitiveBus {
             let right = 2 * idx + 2;
             let mut largest = idx;
 
-            if left < len && self.heap[left] > self.heap[largest] {
+            if left < len && self.heap[left].cmp(&self.heap[largest]) == core::cmp::Ordering::Greater {
                 largest = left;
             }
-            if right < len && self.heap[right] > self.heap[largest] {
+            if right < len && self.heap[right].cmp(&self.heap[largest]) == core::cmp::Ordering::Greater {
                 largest = right;
             }
             if largest != idx {
