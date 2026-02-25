@@ -118,7 +118,7 @@ Please read [CONTRIBUTING.md](CONTRIBUTING.md) for details on our code of conduc
 
 ## Authors
 
-- **Cabrel Foka** - *Initial work* - [@Cabrel10](https://github.com/Cabrel10)
+- **MORNINGSTAR** - *Initial work* - [@MORNINGSTAR-OS](https://github.com/Cabrel10)
 
 See also the list of [contributors](https://github.com/Cabrel10/AetherionOS/contributors) who participated in this project.
 
@@ -133,5 +133,5 @@ See also the list of [contributors](https://github.com/Cabrel10/AetherionOS/cont
 ---
 
 **Last Updated**: 2025-12-09  
-**Maintainer**: Cabrel Foka  
+**Maintainer**: MORNINGSTAR  
 **Repository**: https://github.com/Cabrel10/AetherionOS

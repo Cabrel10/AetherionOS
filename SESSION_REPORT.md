@@ -450,7 +450,7 @@ Overall: ███░░░░░░░░░░░░░░░░░░░░�
 ---
 
 **Generated**: 2025-12-11  
-**Author**: Cabrel Foka  
+**Author**: MORNINGSTAR  
 **Project**: Aetherion OS  
 **License**: MIT
 

@@ -605,7 +605,7 @@ All three memory management components fully operational:
 ---
 
 **Dernière Mise à Jour** : 2025-12-09 18:45 UTC  
-**Maintainer** : Cabrel Foka (@Cabrel10)  
+**Maintainer** : MORNINGSTAR (@MORNINGSTAR-OS)  
 **Status Global** : 🟢 ON TRACK
 
 ---

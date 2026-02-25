@@ -271,6 +271,6 @@ lto = true           # Link-time optimization
 
 ---
 
-**Author:** Cabrel Foka <cabrel@aetherion.dev>
+**Author:** MORNINGSTAR <morningstar@aetherion.dev>
 **License:** MIT
 **Version:** v0.1.0-HAL

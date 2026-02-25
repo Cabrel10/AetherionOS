@@ -333,11 +333,11 @@ Future optimizations:
 
 ---
 
-**Author**: Cabrel Foka  
+**Author**: MORNINGSTAR  
 **Project**: Aetherion OS  
 **Repository**: https://github.com/Cabrel10/AetherionOS  
 **License**: MIT  
-**Contact**: cabrel@aetherion.dev
+**Contact**: morningstar@aetherion.dev
 
 ---
 

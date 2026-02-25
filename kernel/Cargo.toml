@@ -1,10 +1,10 @@
 [package]
 name = "aetherion-kernel"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-authors = ["Cabrel Foka <cabrel@aetherion.dev>"]
+authors = ["MORNINGSTAR <morningstar@aetherion.dev>"]
 license = "MIT"
-description = "Aetherion OS Kernel - Couche 2 Memory Management"
+description = "Aetherion OS Kernel - Couche 3 Cognitive Bus (IPC)"
 
 [dependencies]
 # Bootloader 0.9.23 - compatible with nightly-2023-08-01
@@ -35,6 +35,9 @@ arrayvec = { version = "0.7", default-features = false }
 
 # Heap allocator pour alloc (Box, Vec)
 linked_list_allocator = "0.10.5"
+
+# Cognitive Bus - Lock-free MPMC queue (no_std compatible)
+crossbeam-queue = { version = "0.3", default-features = false, features = ["alloc"] }
 
 [profile.dev]
 panic = "abort"

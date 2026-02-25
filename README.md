@@ -338,10 +338,10 @@ Ce projet est sous licence **MIT**. Voir le fichier [LICENSE](LICENSE) pour plus
 
 ## 👨‍💻 Auteur
 
-**Cabrel Foka**  
-- GitHub: [@Cabrel10](https://github.com/Cabrel10)
-- Email: cabrel@aetherion.dev
-- LinkedIn: [Cabrel Foka](https://linkedin.com/in/cabrel-foka)
+**MORNINGSTAR**  
+- GitHub: [@MORNINGSTAR-OS](https://github.com/Cabrel10)
+- Email: morningstar@aetherion.dev
+- Project: [AetherionOS](https://github.com/Cabrel10/AetherionOS)
 
 ---
 

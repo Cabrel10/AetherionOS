@@ -2,7 +2,7 @@
 
 **Document Version** : 1.0  
 **Date** : 2025-12-09  
-**Auteur** : Cabrel Foka  
+**Auteur** : MORNINGSTAR  
 **Status** : Living Document (mis à jour régulièrement)
 
 ---
@@ -647,8 +647,8 @@ CLOSED → LISTEN → SYN_RECEIVED → ESTABLISHED
 
 ---
 
-**Auteur** : Cabrel Foka  
-**Contact** : cabrel@aetherion.dev  
+**Auteur** : MORNINGSTAR  
+**Contact** : morningstar@aetherion.dev  
 **Status** : Living Document (updated with project evolution)
 
 ---
