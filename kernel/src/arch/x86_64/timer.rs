@@ -9,6 +9,9 @@ pub fn read_tsc() -> u64 {
     let low: u32;
     let high: u32;
     
+    // SAFETY: RDTSC is always available on x86_64 CPUs in ring 0 (kernel mode).
+    // It reads the Time Stamp Counter which is a monotonically increasing 64-bit
+    // register. The instruction has no side effects (nomem, nostack).
     unsafe {
         core::arch::asm!(
             "rdtsc",

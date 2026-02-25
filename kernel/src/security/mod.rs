@@ -75,7 +75,7 @@ pub fn extend_pcr(pcr_index: u8, data: &[u8]) -> [u8; 32] {
 
     // Lire ancienne valeur (stub - en vrai: lire depuis TPM)
     let old_value = [0u8; 32]; // Placeholder
-    hasher.update(&old_value);
+    hasher.update(old_value);
     hasher.update(data);
 
     let new_value: [u8; 32] = hasher.finalize().into();

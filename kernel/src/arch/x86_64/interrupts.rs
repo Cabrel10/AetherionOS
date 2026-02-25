@@ -12,6 +12,9 @@ pub const PIC1_OFFSET: u8 = 32;
 pub const PIC2_OFFSET: u8 = PIC1_OFFSET + 8;
 
 /// PIC 8259 chaîné (maître + esclave)
+/// SAFETY: ChainedPics::new requires correct I/O port offsets.
+/// PIC1_OFFSET=32 and PIC2_OFFSET=40 remap IRQs 0-15 to vectors 32-47,
+/// which avoids conflict with CPU exception vectors 0-31.
 pub static PICS: Mutex<ChainedPics> =
     Mutex::new(unsafe { ChainedPics::new(PIC1_OFFSET, PIC2_OFFSET) });
 
@@ -46,6 +49,10 @@ impl InterruptIndex {
 /// Initialise le PIC et active les interruptions
 /// Remap IRQs 0-15 vers vecteurs 32-47 pour éviter conflits avec CPU exceptions
 pub fn init() {
+    // SAFETY: PIC initialization remaps IRQ vectors and writes masks.
+    // The PICs are hardware I/O devices at ports 0x20-0x21 / 0xA0-0xA1.
+    // initialize() sends the ICW1-ICW4 initialization sequence.
+    // write_masks(0xFC, 0xFF) enables only IRQ0 (timer) and IRQ1 (keyboard).
     unsafe {
         // Remap et initialise les PICs
         PICS.lock().initialize();
@@ -91,6 +98,9 @@ where
 
 /// Active une IRQ spécifique
 pub fn unmask_irq(irq: u8) {
+    // SAFETY: Reads/writes PIC mask registers. The irq index is bounds-checked
+    // (< 8 for master, >= 8 for slave). Bit manipulation only affects the
+    // target IRQ without disturbing other mask bits.
     unsafe {
         let mut pics = PICS.lock();
         let masks = pics.read_masks();
@@ -107,6 +117,8 @@ pub fn unmask_irq(irq: u8) {
 
 /// Désactive une IRQ spécifique
 pub fn mask_irq(irq: u8) {
+    // SAFETY: Same justification as unmask_irq - reads/writes PIC mask
+    // registers with bounds-checked irq index.
     unsafe {
         let mut pics = PICS.lock();
         let masks = pics.read_masks();
@@ -125,6 +137,8 @@ pub extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptSta
     // Tick du timer - pour l'instant juste EOI
     // Plus tard: scheduler, timeouts, etc.
 
+    // SAFETY: Sends EOI to PIC for the timer IRQ. Called from within the
+    // timer interrupt handler at the correct point (after processing).
     unsafe {
         PICS.lock().notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
     }
@@ -135,11 +149,15 @@ pub extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: Interrupt
 
     // Lire le scancode du port 0x60
     let mut port = Port::new(0x60);
+    // SAFETY: Port 0x60 is the PS/2 keyboard data port. Reading inside
+    // the keyboard IRQ handler retrieves the pending scancode byte.
     let scancode: u8 = unsafe { port.read() };
 
     crate::serial_println!("[KEYBOARD] Scancode: 0x{:02x}", scancode);
 
     // Notifier fin d'interruption
+    // SAFETY: Sends EOI to PIC for keyboard IRQ. Required to re-enable
+    // further keyboard interrupts from the PIC.
     unsafe {
         PICS.lock().notify_end_of_interrupt(InterruptIndex::Keyboard.as_u8());
     }

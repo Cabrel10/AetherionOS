@@ -33,6 +33,9 @@ lazy_static! {
         idt.device_not_available.set_handler_fn(device_not_available_handler);
 
         // Exception: Double fault (#DF) - utilise IST (stack separé)
+        // SAFETY: The IST index is valid (0) and corresponds to a 20 KB stack
+        // allocated in gdt.rs. The double-fault handler needs its own stack to
+        // handle stack overflows that would otherwise cause a triple-fault.
         unsafe {
             idt.double_fault.set_handler_fn(double_fault_handler)
                 .set_stack_index(gdt::double_fault_ist_index());
@@ -194,6 +197,8 @@ extern "x86-interrupt" fn security_exception_handler(stack_frame: InterruptStack
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
     // Tick du timer PIT
+    // SAFETY: Sends EOI for timer IRQ (vector 32) to acknowledge the PIC.
+    // Required so the PIC will deliver subsequent timer interrupts.
     unsafe {
         super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET);
     }
@@ -204,6 +209,9 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
 
     // Lire le scancode du port clavier 0x60
     let mut port = Port::new(0x60);
+    // SAFETY: Port 0x60 is the PS/2 keyboard data port. Reading it inside
+    // the keyboard IRQ handler retrieves the pending scancode. No side effects
+    // beyond consuming the byte from the hardware buffer.
     let scancode: u8 = unsafe { port.read() };
 
     if scancode != 0 {
@@ -211,6 +219,8 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     }
 
     // Envoyer EOI au PIC
+    // SAFETY: Sends EOI for keyboard IRQ (vector 33). Must be called to
+    // acknowledge the interrupt and re-enable subsequent keyboard IRQs.
     unsafe {
         super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET + 1);
     }
