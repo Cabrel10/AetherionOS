@@ -18,6 +18,7 @@ use lazy_static::lazy_static;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 pub use task::{AgentRole, Process, ProcessState};
+pub use crate::arch::x86_64::context::TaskContext;
 
 // ===== Error Type =====
 
@@ -246,6 +247,20 @@ pub fn get_ppid(pid: u64) -> Option<u64> {
 pub fn get_role(pid: u64) -> Option<AgentRole> {
     let table = PROCESS_TABLE.lock();
     table.get(&pid).map(|p| p.role)
+}
+
+/// Get wait_ticks for a process (used by scheduler aging)
+pub fn get_wait_ticks(pid: u64) -> Option<u64> {
+    let table = PROCESS_TABLE.lock();
+    table.get(&pid).map(|p| p.wait_ticks)
+}
+
+/// Set wait_ticks for a process (used by scheduler aging)
+pub fn set_wait_ticks(pid: u64, ticks: u64) {
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(p) = table.get_mut(&pid) {
+        p.wait_ticks = ticks;
+    }
 }
 
 /// Initialize the process manager (creates kernel_idle as PID 1)

@@ -7,6 +7,7 @@
 #![feature(custom_test_frameworks)]
 #![feature(alloc_error_handler)]
 #![feature(panic_info_message)]
+#![feature(naked_functions)]
 #![allow(dead_code)]
 #![test_runner(crate::test_runner)]
 #![reexport_test_harness_main = "test_main"]

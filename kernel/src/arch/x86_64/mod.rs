@@ -5,6 +5,8 @@ pub mod idt;
 pub mod interrupts;
 pub mod timer;
 pub mod pci;
+pub mod context;
+pub mod syscall;
 
 /// Initialize all x86_64 HAL modules
 /// Critical order: GDT -> IDT -> Interrupts

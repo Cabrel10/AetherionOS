@@ -10,6 +10,8 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::fmt;
 
+use crate::arch::x86_64::context::TaskContext;
+
 // ===== Global PID Counter =====
 
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
@@ -95,6 +97,10 @@ pub struct Process {
     pub priority: u8,
     /// List of child PIDs
     pub children: Vec<u64>,
+    /// CPU register context for context switching
+    pub context: TaskContext,
+    /// Number of scheduler ticks this process has been waiting (for aging)
+    pub wait_ticks: u64,
 }
 
 impl Process {
@@ -116,6 +122,8 @@ impl Process {
             gid,
             priority,
             children: Vec::new(),
+            context: TaskContext::zero(),
+            wait_ticks: 0,
         }
     }
 

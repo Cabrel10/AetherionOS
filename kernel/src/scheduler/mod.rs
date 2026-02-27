@@ -1,8 +1,10 @@
-// scheduler/mod.rs - Couche 7: Priority Scheduler
+// scheduler/mod.rs - Couche 7+9: Priority Scheduler with Anti-Starvation Aging
 //
 // PriorityScheduler with 5 queues: Critical, High, Normal, Low, Idle
 // Matriarch = High, SubMatriarch = Normal, Worker = Low
 // Connected to PIT timer via scheduler::tick()
+//
+// Anti-starvation: apply_aging() boosts processes that have waited > 100 ticks.
 
 use alloc::collections::VecDeque;
 use spin::Mutex;
@@ -44,17 +46,24 @@ pub fn role_to_priority(role: AgentRole) -> SchedPriority {
     }
 }
 
+/// The number of wait ticks before a process gets an aging boost
+const AGING_THRESHOLD: u64 = 100;
+
 // ===== Scheduler State =====
 
 struct PriorityScheduler {
     /// Queues indexed by SchedPriority ordinal [Idle=0, Low=1, Normal=2, High=3, Critical=4]
     queues: [VecDeque<u64>; 5],
+    /// Per-PID wait tick counters (indexed by position in the queue)
+    /// We track wait_ticks per PID in the process table itself.
     /// PID of the currently running process (0 = none)
     current_pid: u64,
     /// Total ticks since scheduler start
     total_ticks: u64,
     /// Count of context switches
     context_switches: u64,
+    /// Number of aging boosts performed
+    aging_boosts: u64,
 }
 
 impl PriorityScheduler {
@@ -70,6 +79,7 @@ impl PriorityScheduler {
             current_pid: 0,
             total_ticks: 0,
             context_switches: 0,
+            aging_boosts: 0,
         }
     }
 
@@ -99,9 +109,64 @@ impl PriorityScheduler {
         None
     }
 
-    /// Perform a scheduler tick: preempt current, pick next
+    /// Anti-starvation aging: increment wait_ticks for all queued (Ready)
+    /// processes and boost those that exceed AGING_THRESHOLD.
+    ///
+    /// A boosted process is moved one priority level up (Low→Normal,
+    /// Normal→High). Critical and High processes are not boosted further.
+    /// After boosting, the process's wait_ticks are reset to 0.
+    fn apply_aging(&mut self) {
+        // We need to collect PIDs to boost, then move them.
+        // Iterate from Idle(0) to Normal(2) — only these can be boosted.
+        for queue_idx in 0..=2usize {
+            let target_idx = queue_idx + 1; // one level up
+            if target_idx > 4 { continue; }
+
+            let mut i = 0;
+            while i < self.queues[queue_idx].len() {
+                let pid = self.queues[queue_idx][i];
+                // Read wait_ticks from process table
+                let wt = process::get_wait_ticks(pid).unwrap_or(0);
+                let new_wt = wt + 1;
+                process::set_wait_ticks(pid, new_wt);
+
+                if new_wt > AGING_THRESHOLD {
+                    // Boost: remove from current queue, add to higher queue
+                    self.queues[queue_idx].remove(i);
+                    self.queues[target_idx].push_back(pid);
+                    process::set_wait_ticks(pid, 0); // reset after boost
+
+                    let from_name = match queue_idx {
+                        0 => "IDLE",
+                        1 => "LOW",
+                        2 => "NORMAL",
+                        _ => "?",
+                    };
+                    let to_name = match target_idx {
+                        1 => "LOW",
+                        2 => "NORMAL",
+                        3 => "HIGH",
+                        _ => "?",
+                    };
+                    crate::serial_println!(
+                        "[SCHEDULER] AGING: Boosting PID {} from {} to {} (waited {} ticks)",
+                        pid, from_name, to_name, new_wt
+                    );
+                    self.aging_boosts += 1;
+                    // don't increment i — removal shifted elements
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    /// Perform a scheduler tick: apply aging, preempt current, pick next
     fn tick(&mut self) -> TickResult {
         self.total_ticks += 1;
+
+        // Apply anti-starvation aging
+        self.apply_aging();
 
         // Re-enqueue the current process if still alive
         let old_pid = self.current_pid;
@@ -119,6 +184,8 @@ impl PriorityScheduler {
                 self.context_switches += 1;
             }
             self.current_pid = next_pid;
+            // Reset wait_ticks for the newly running process
+            process::set_wait_ticks(next_pid, 0);
             TickResult {
                 old_pid,
                 new_pid: next_pid,
@@ -182,7 +249,8 @@ pub fn init() {
     }
     drop(sched);
     SCHEDULER_ACTIVE.store(true, Ordering::SeqCst);
-    crate::serial_println!("[SCHEDULER] Initialized with {} processes", process::active_count());
+    crate::serial_println!("[SCHEDULER] Initialized with {} processes (aging threshold: {} ticks)",
+        process::active_count(), AGING_THRESHOLD);
 }
 
 /// Enqueue a newly spawned process
@@ -229,6 +297,7 @@ pub fn metrics() -> SchedulerMetrics {
         context_switches: sched.context_switches,
         current_pid: sched.current_pid,
         queue_lengths,
+        aging_boosts: sched.aging_boosts,
     }
 }
 
@@ -237,10 +306,16 @@ pub fn current_pid() -> u64 {
     SCHEDULER.lock().current_pid
 }
 
+/// Get the aging boost count
+pub fn aging_boosts() -> u64 {
+    SCHEDULER.lock().aging_boosts
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SchedulerMetrics {
     pub total_ticks: u64,
     pub context_switches: u64,
     pub current_pid: u64,
     pub queue_lengths: [usize; 5],
+    pub aging_boosts: u64,
 }
