@@ -196,7 +196,9 @@ extern "x86-interrupt" fn security_exception_handler(stack_frame: InterruptStack
 // ===== IRQ Handlers =====
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    // Tick du timer PIT
+    // Couche 7: Scheduler tick on every PIT timer interrupt
+    crate::scheduler::tick();
+
     // SAFETY: Sends EOI for timer IRQ (vector 32) to acknowledge the PIC.
     // Required so the PIC will deliver subsequent timer interrupts.
     unsafe {

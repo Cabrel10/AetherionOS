@@ -1,23 +1,23 @@
 [package]
 name = "aetherion-kernel"
-version = "0.5.0"
+version = "0.8.0"
 edition = "2021"
 authors = ["MORNINGSTAR <morningstar@aetherion.dev>"]
 license = "MIT"
-description = "Aetherion OS Kernel - Couche 5 Verifier (Policy Engine) with Security Hardening"
+description = "Aetherion OS Kernel - Couche 8: Priority Scheduler + GPU VRAM Stub"
 
 [dependencies]
 # Bootloader 0.9.23 - compatible with nightly-2023-08-01
 # CRITICAL: La feature "map_physical_memory" est REQUISE pour physical_memory_offset
 bootloader = { version = "=0.9.23", features = ["map_physical_memory"] }
 
-# Serial port pour debug
+# Serial port for debug
 uart_16550 = "0.2"
 
 # Spin mutex (no_std)
 spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
 
-# Lazy static pour initialisation
+# Lazy static for initialization
 lazy_static = { version = "1.4", features = ["spin_no_std"] }
 
 # x86_64 architecture support - GDT, IDT, TSS
@@ -33,7 +33,7 @@ sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
 # ArrayString for macros (no_std)
 arrayvec = { version = "0.7", default-features = false }
 
-# Heap allocator pour alloc (Box, Vec)
+# Heap allocator for alloc (Box, Vec)
 linked_list_allocator = "0.10.5"
 
 # Cognitive Bus - Lock-free MPMC queue (no_std compatible)
@@ -41,26 +41,13 @@ crossbeam-queue = { version = "0.3", default-features = false, features = ["allo
 
 [profile.dev]
 panic = "abort"
-opt-level = 1      # Faster dev builds
+opt-level = 1
 
 [profile.release]
 panic = "abort"
-lto = false        # Disabled LTO to avoid OOM on low-memory sandbox
-opt-level = 2      # Optimize for size and speed
-codegen-units = 4  # More codegen units = less memory per unit
+lto = false
+opt-level = 2
+codegen-units = 4     # More CUs = less memory per unit
 
-# =============================================================================
-# Bootloader Configuration (bootloader 0.9.x)
-# =============================================================================
-# Ces options configurent comment le bootloader configure la mémoire avant
-# de passer le contrôle au kernel.
-# 
-# CRITICAL: map-physical-memory doit être activé pour que physical_memory_offset
-# soit disponible dans BootInfo. Sans cela, memory::init() échouera.
-# 
-# Référence: https://docs.rs/bootloader/0.9.23/bootloader/
-# =============================================================================
 [package.metadata.bootloader]
-# Offset to map physical memory in virtual space
-# Default: dynamically chosen by bootloader if not specified
 physical-memory-offset = "0xFFFF800000000000"

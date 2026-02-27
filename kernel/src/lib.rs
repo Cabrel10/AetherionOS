@@ -20,6 +20,9 @@ pub mod memory;
 pub mod ipc;
 pub mod fs;
 pub mod verifier;
+pub mod process;
+pub mod scheduler;
+pub mod gpu;
 
 pub mod tests;
 

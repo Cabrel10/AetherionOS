@@ -4,31 +4,25 @@ pub mod gdt;
 pub mod idt;
 pub mod interrupts;
 pub mod timer;
+pub mod pci;
 
-/// Initialise tous les modules HAL x86_64
-/// Ordre critique: GDT -> IDT -> Interrupts
+/// Initialize all x86_64 HAL modules
+/// Critical order: GDT -> IDT -> Interrupts
 pub fn init() {
-    // 1. GDT doit être chargée en premier (segments et TSS)
+    // 1. GDT must be loaded first (segments and TSS)
     gdt::init();
 
-    // 2. IDT dépend du TSS (pour IST double-fault)
-    // L'IDT est chargée ici, les handlers IRQ seront ajoutés après PIC init
+    // 2. IDT depends on TSS (for IST double-fault)
     idt::init();
 
-    // 3. PIC et interrupts - handlers IRQ ajoutés dans init_idt_handlers
+    // 3. PIC and interrupts
     interrupts::init();
 
-    // 4. Finaliser avec les handlers IRQ spécifiques
+    // 4. Finalize with specific IRQ handlers
     init_idt_handlers();
 }
 
-/// Ajoute les handlers IRQ à l'IDT après initialisation PIC
-/// Doit être appelé après idt::init() mais avant interrupts::enable()
+/// Add IRQ handlers to IDT after PIC initialization
 fn init_idt_handlers() {
-    // Les handlers sont déjà définis dans idt.rs avec set_handler_fn
-    // mais pour les IRQs dynamiques, on les configure via la fonction externe
-    // Note: En pratique, on pourrait utiliser une IDT mutable ou lazy init
-    // Pour l'instant, les handlers sont statiques dans idt.rs
-
     crate::serial_println!("[HAL] IDT handlers configured");
 }
