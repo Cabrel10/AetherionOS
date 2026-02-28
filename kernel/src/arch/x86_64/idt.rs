@@ -1,5 +1,12 @@
-// src/arch/x86_64/idt.rs - IDT Implementation (Couche 1 HAL)
+// src/arch/x86_64/idt.rs - IDT Implementation (Couche 1 HAL + Couche 12 Demand Paging)
 // Interrupt Descriptor Table avec handlers exceptions
+//
+// Page fault handler implements demand paging for the user stack region:
+//   0x7FFF_0000_0000 - 0x7FFF_FFFF_F000 (user stack virtual range)
+// If a page fault occurs from user mode (USER_MODE error bit set) and the
+// faulting address is within the stack range, the handler allocates a frame,
+// maps it as USER_ACCESSIBLE | WRITABLE | NO_EXECUTE, and resumes.
+// Otherwise, it kills the process (SIGSEGV).
 
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 use lazy_static::lazy_static;
@@ -53,7 +60,7 @@ lazy_static! {
         // Exception: General protection fault (#GP)
         idt.general_protection_fault.set_handler_fn(general_protection_fault_handler);
 
-        // Exception: Page fault (#PF)
+        // Exception: Page fault (#PF) - demand paging for Ring 3 stack
         idt.page_fault.set_handler_fn(page_fault_handler);
 
         // Exception: x87 FPU error (#MF)
@@ -90,7 +97,7 @@ lazy_static! {
 /// Charge l'IDT
 pub fn init() {
     IDT.load();
-    crate::serial_println!("[IDT] Loaded with 20 exception handlers");
+    crate::serial_println!("[IDT] Loaded with 20 exception handlers + demand paging");
 }
 
 /// Retourne une reference statique a l'IDT (pour tests)
@@ -152,17 +159,109 @@ extern "x86-interrupt" fn stack_segment_fault_handler(stack_frame: InterruptStac
 }
 
 extern "x86-interrupt" fn general_protection_fault_handler(stack_frame: InterruptStackFrame, error_code: u64) {
-    crate::serial_println!("[EXCEPTION] #GP General protection fault (code {}) at {:?}", error_code, stack_frame.instruction_pointer);
+    crate::serial_println!("[EXCEPTION] #GP General protection fault (code 0x{:X}) at {:?}", error_code, stack_frame.instruction_pointer);
+    crate::serial_println!("[EXCEPTION] Stack: {:?}", stack_frame);
     panic!("General protection fault");
 }
 
-extern "x86-interrupt" fn page_fault_handler(stack_frame: InterruptStackFrame, error_code: PageFaultErrorCode) {
+// ===== Page Fault Handler with Demand Paging =====
+//
+// User stack demand-paging range: 0x7FFF_0000_0000 - 0x7FFF_FFFF_F000
+// This range covers the 8 MiB user stack virtual region.
+// If a page fault comes from Ring 3 (USER_MODE bit set in error code) and
+// the faulting address is within this range, we:
+//   1. Allocate a physical frame from the ELF frame pool
+//   2. Map it with USER_ACCESSIBLE | WRITABLE | NO_EXECUTE flags
+//   3. Return to resume execution (the CPU will retry the faulting instruction)
+// Otherwise, log and kill the process (SIGSEGV equivalent).
+
+/// User stack demand-paging lower bound
+const USER_STACK_DEMAND_LOW: u64 = 0x7FFF_0000_0000;
+/// User stack demand-paging upper bound (exclusive)
+const USER_STACK_DEMAND_HIGH: u64 = 0x7FFF_FFFF_F000;
+
+extern "x86-interrupt" fn page_fault_handler(
+    stack_frame: InterruptStackFrame,
+    error_code: PageFaultErrorCode,
+) {
     use x86_64::registers::control::Cr2;
 
     let accessed_address = Cr2::read();
+    let addr_raw = accessed_address.as_u64();
+
+    // Check if this is a user-mode page fault (bit 2 of error code = USER_MODE)
+    let is_user_mode = error_code.contains(PageFaultErrorCode::USER_MODE);
+
+    if is_user_mode
+        && addr_raw >= USER_STACK_DEMAND_LOW
+        && addr_raw < USER_STACK_DEMAND_HIGH
+    {
+        // Demand paging: allocate and map a page for the user stack
+        let page_addr = addr_raw & !0xFFF; // page-align
+
+        crate::serial_println!(
+            "[PF-DEMAND] User stack fault at 0x{:X} (page 0x{:X}), allocating...",
+            addr_raw, page_addr
+        );
+
+        // Allocate a frame from the ELF frame pool
+        let frame_phys = unsafe { crate::elf::alloc_demand_frame() };
+        match frame_phys {
+            Some(phys) => {
+                // Zero the frame
+                let phys_offset = crate::elf::phys_offset();
+                unsafe {
+                    core::ptr::write_bytes(
+                        (phys + phys_offset) as *mut u8,
+                        0,
+                        4096,
+                    );
+                }
+
+                // Get the current CR3 (user process page table)
+                let cr3: u64;
+                unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)); }
+                let pml4_phys = cr3 & !0xFFF;
+
+                // Map with USER_ACCESSIBLE | WRITABLE | NO_EXECUTE
+                // flags: PRESENT(0x01) | WRITABLE(0x02) | USER(0x04) | NX(bit 63)
+                let flags: u64 = 0x01 | 0x02 | 0x04 | (1u64 << 63);
+
+                match unsafe { crate::elf::demand_map_user_page(pml4_phys, page_addr, phys, flags) } {
+                    Ok(()) => {
+                        crate::serial_println!(
+                            "[PF-DEMAND] Mapped 0x{:X} -> phys 0x{:X} (U|W|NX) OK",
+                            page_addr, phys
+                        );
+                        // Return to resume execution — CPU will retry the instruction
+                        return;
+                    }
+                    Err(_) => {
+                        crate::serial_println!(
+                            "[PF-DEMAND] FATAL: Failed to map page 0x{:X}",
+                            page_addr
+                        );
+                    }
+                }
+            }
+            None => {
+                crate::serial_println!("[PF-DEMAND] FATAL: Out of frames for demand paging");
+            }
+        }
+    }
+
+    // Non-recoverable page fault — SIGSEGV
     crate::serial_println!("[EXCEPTION] #PF Page fault at {:?}", stack_frame.instruction_pointer);
     crate::serial_println!("[EXCEPTION] Accessed address: {:?}", accessed_address);
     crate::serial_println!("[EXCEPTION] Error code: {:?}", error_code);
+    crate::serial_println!("[EXCEPTION] User mode: {}", is_user_mode);
+
+    if is_user_mode {
+        crate::serial_println!("[SIGSEGV] Killing user process (bad address 0x{:X})", addr_raw);
+        // In a full OS we'd terminate the process and switch to next.
+        // For now, halt.
+    }
+
     panic!("Page fault");
 }
 

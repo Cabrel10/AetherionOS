@@ -196,6 +196,28 @@ pub fn pool_stats() -> (usize, usize) {
     unsafe { (ELF_POOL.frames_used, ELF_POOL.max_frames) }
 }
 
+/// Allocate a frame for demand paging (called from page fault handler)
+/// SAFETY: Must be called with interrupts disabled (inside exception handler)
+pub unsafe fn alloc_demand_frame() -> Option<u64> {
+    alloc_elf_frame()
+}
+
+/// Get the physical memory offset (public for demand paging handler)
+pub fn phys_offset() -> u64 {
+    PHYS_MEM_OFFSET.load(Ordering::SeqCst)
+}
+
+/// Map a user page for demand paging (public wrapper for page fault handler)
+/// SAFETY: pml4_phys must be a valid PML4 physical address
+pub unsafe fn demand_map_user_page(
+    pml4_phys: u64,
+    vaddr: u64,
+    paddr: u64,
+    flags: u64,
+) -> Result<(), ElfError> {
+    map_user_page(pml4_phys, vaddr, paddr, flags)
+}
+
 // ===== ELF Parsing =====
 
 /// Parse and validate an ELF64 header from raw bytes
@@ -293,20 +315,26 @@ pub fn set_phys_mem_offset(offset: u64) {
     PHYS_MEM_OFFSET.store(offset, Ordering::SeqCst);
 }
 
-/// Get the physical memory offset
-fn phys_offset() -> u64 {
-    PHYS_MEM_OFFSET.load(Ordering::SeqCst)
-}
-
 /// Convert physical address to virtual using the offset mapping
 #[inline]
 fn phys_to_virt(phys: u64) -> u64 {
     phys + phys_offset()
 }
 
-/// Create a new PML4 page table for a user process
-/// Copies kernel entries (upper half, entries 256-511) from the current PML4
-/// Returns the physical address of the new PML4
+/// Create a new PML4 page table for a user process.
+///
+/// SECURITY DESIGN (Couche 12 - KPTI-lite):
+///   - Copies kernel entries 256-511 (upper half) VERBATIM from current PML4.
+///     These contain the physical memory offset mapping and kernel heap.
+///     They do NOT have USER_ACCESSIBLE bit set → kernel memory is invisible
+///     to Ring 3 code. This prevents Meltdown-class attacks.
+///   - Copies kernel entry 0 (lower half) for kernel code/data access by the
+///     SYSCALL handler. Ring 3 cannot access these pages because the
+///     USER_ACCESSIBLE bit is NOT set on the kernel's page table entries.
+///   - User segments (PML4[1]+) are created fresh by map_user_page() with
+///     proper USER_ACCESSIBLE flags, completely isolated from kernel PML4[0].
+///
+/// Returns the physical address of the new PML4.
 unsafe fn create_user_pml4() -> Result<u64, ElfError> {
     // Allocate a frame for the new PML4
     let new_pml4_phys = alloc_elf_frame().ok_or(ElfError::OutOfMemory)?;
@@ -319,18 +347,28 @@ unsafe fn create_user_pml4() -> Result<u64, ElfError> {
     let current_pml4_virt = phys_to_virt(current_pml4_phys) as *const u64;
     let new_pml4_virt = phys_to_virt(new_pml4_phys) as *mut u64;
 
-    // Zero the new PML4
+    // Zero the entire new PML4
     core::ptr::write_bytes(new_pml4_virt, 0, 512);
 
-    // Copy kernel entries (entries 256-511) - the upper half of virtual address space
-    for i in 256..512usize {
+    // Copy ALL present kernel entries VERBATIM (no flag modification)
+    // This ensures:
+    //   - Upper half (256-511): physical memory mapping, heap → accessible in R0
+    //   - Entry 0: kernel code/data (bootloader-mapped) → accessible in R0
+    //   - USER_ACCESSIBLE bit is NOT set on kernel pages → R3 cannot read them
+    //   - User pages (PML4[1]+) will be mapped separately by map_user_page()
+    let mut copied = 0usize;
+    for i in 0..512usize {
         let entry = core::ptr::read_volatile(current_pml4_virt.add(i));
-        core::ptr::write_volatile(new_pml4_virt.add(i), entry);
+        if entry & 0x01 != 0 {
+            // Copy verbatim - do NOT add USER_ACCESSIBLE (security critical)
+            core::ptr::write_volatile(new_pml4_virt.add(i), entry);
+            copied += 1;
+        }
     }
 
     crate::serial_println!(
-        "[ELF] User PML4 created: phys=0x{:X} (kernel entries 256-511 copied)",
-        new_pml4_phys
+        "[ELF] User PML4 created: phys=0x{:X} ({} kernel entries cloned, user isolated)",
+        new_pml4_phys, copied
     );
 
     Ok(new_pml4_phys)

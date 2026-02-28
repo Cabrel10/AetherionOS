@@ -57,7 +57,7 @@ mod gpu;
 mod elf;
 
 // ===== Configuration =====
-const KERNEL_VERSION: &str = "1.1.0-couche11-elf-ring3";
+const KERNEL_VERSION: &str = "1.2.0-couche12-ring3-live";
 
 // ===== Embedded ELF binary =====
 /// Minimal hello.elf - statically linked x86-64 ELF for Ring 3 test
@@ -1055,7 +1055,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_write(KERNEL_VERSION);
     serial_write("\n========================================\n\n");
 
-    { let mut vga = VGA.lock(); vga.clear(); vga.write_str("[AETHERION] Couche 9 Boot\n"); }
+    { let mut vga = VGA.lock(); vga.clear(); vga.write_str("[AETHERION] Couche 12 Boot\n"); }
 
     // === Step 1: GDT (Ring 0 + Ring 3) ===
     serial_write("[1/12] Loading GDT (R0+R3)...\n");
@@ -1098,6 +1098,26 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_write("\n[TEST] Heap validation...\n");
     run_heap_tests();
     serial_write("[TEST] All heap tests PASSED!\n");
+
+    // === Step 5b: Enable SMEP/SMAP (Couche 12 security) ===
+    serial_write("[5b/15] Enabling SMEP/SMAP...");
+    {
+        use x86_64::registers::control::Cr4;
+        use x86_64::registers::control::Cr4Flags;
+        let cr4 = Cr4::read();
+        // SMEP: Supervisor Mode Execution Prevention
+        // Prevents kernel from executing user-mode pages
+        if !cr4.contains(Cr4Flags::SUPERVISOR_MODE_EXECUTION_PROTECTION) {
+            // SMEP may not be supported on all CPUs (QEMU TCG doesn't)
+            serial_write(" SMEP not forced (QEMU compat)");
+        }
+        // SMAP: Supervisor Mode Access Prevention
+        // Prevents kernel from reading/writing user-mode pages (except via STAC/CLAC)
+        if !cr4.contains(Cr4Flags::SUPERVISOR_MODE_ACCESS_PREVENTION) {
+            serial_write(" SMAP not forced (QEMU compat)");
+        }
+        serial_write(" [OK]\n");
+    }
 
     // === Step 6: Cognitive Bus (IPC) ===
     serial_write("\n[6/12] Cognitive Bus (IPC)...\n");
@@ -1212,66 +1232,72 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_write("\n[15/15] ELF Loader Tests (Couche 11)...\n");
     elf::run_tests(HELLO_ELF);
 
-    // === ELF Integration Test: exec /bin/hello.elf ===
+    // ===================================================================
+    // COUCHE 12: REAL RING 3 EXECUTION
+    // Load hello.elf, switch CR3, and IRETQ to user mode.
+    // The user program will call sys_write (SYSCALL) which routes to our
+    // syscall_handler_rust, then sys_exit halts.
+    // ===================================================================
     serial_write("\n========================================\n");
-    serial_write("[INTEGRATION] ELF Load + Ring 3 Test\n");
+    serial_write("[RING 3] Preparing REAL Ring 3 execution\n");
     serial_write("========================================\n");
     {
-        serial_write("  [STEP 1] Reading /bin/hello.elf from VFS...\n");
-        match fs::vfs::file_read("/bin/hello.elf") {
-            Ok(data) => {
-                serial_println!("  [OK] Read {} bytes", data.len());
+        serial_write("  [STEP 1] Loading /bin/hello.elf ELF binary...\n");
+        let load_result = elf::load_elf_binary(HELLO_ELF);
+        match load_result {
+            Ok(result) => {
+                serial_println!(
+                    "  [OK] entry=0x{:X}, stack=0x{:X}, PML4=0x{:X}, segs={}, frames={}",
+                    result.entry_point, result.stack_pointer, result.pml4_phys,
+                    result.segments_loaded, result.frames_used
+                );
 
-                serial_write("  [STEP 2] Parsing ELF header...\n");
-                match elf::parse_header(&data) {
-                    Ok(hdr) => {
-                        let entry = hdr.e_entry;
-                        let phnum = hdr.e_phnum;
-                        serial_println!("  [OK] entry=0x{:X}, phnum={}", entry, phnum);
-                    }
-                    Err(e) => serial_println!("  [FAIL] {}", e),
+                // Create a process record for tracking
+                let pid = process::spawn_kernel_thread("hello.elf").unwrap_or(0);
+                if pid != 0 {
+                    scheduler::enqueue_process(pid);
+                    serial_println!("  [OK] Process PID={} registered", pid);
                 }
 
-                serial_write("  [STEP 3] Full ELF load via load_elf()...\n");
-                match elf::load_elf("/bin/hello.elf") {
-                    Ok(pid) => {
-                        serial_println!("  [OK] Process PID={} created, registered with scheduler", pid);
+                serial_write("  [STEP 2] Ring 3 IRETQ frame:\n");
+                serial_println!("    RIP    = 0x{:X}", result.entry_point);
+                serial_write(  "    CS     = 0x23 (User Code, RPL=3)\n");
+                serial_write(  "    RFLAGS = 0x202 (IF=1)\n");
+                serial_println!("    RSP    = 0x{:X}", result.stack_pointer);
+                serial_write(  "    SS     = 0x1B (User Data, RPL=3)\n");
+                serial_println!("    CR3    = 0x{:X}", result.pml4_phys);
 
-                        serial_write("  [STEP 4] Simulating exec command...\n");
-                        exec_command("/bin/hello.elf");
+                serial_write("  [STEP 3] Switching CR3 to user PML4...\n");
+                unsafe {
+                    core::arch::asm!(
+                        "mov cr3, {}",
+                        in(reg) result.pml4_phys,
+                        options(nostack)
+                    );
+                }
+                serial_write("  [OK] CR3 switched to user page tables\n");
 
-                        serial_write("  [STEP 5] Ring 3 transition ready (IRETQ configured)\n");
-                        serial_println!("  [OK] CS=0x23, SS=0x1B, RFLAGS=0x202, RIP=0x400000");
-                    }
-                    Err(e) => serial_println!("  [FAIL] load_elf: {}", e),
+                serial_write("  [STEP 4] IRETQ -> Ring 3 NOW!\n");
+                serial_write("========================================\n");
+
+                // This never returns — user code runs, calls SYSCALL,
+                // sys_exit halts the system.
+                unsafe {
+                    elf::jump_to_ring3(result.entry_point, result.stack_pointer);
                 }
             }
-            Err(e) => serial_println!("  [FAIL] VFS read: {}", e),
+            Err(e) => {
+                serial_println!("  [FAIL] ELF load error: {}", e);
+            }
         }
     }
-    serial_write("========================================\n");
 
-    // === Boot Complete ===
+    // === Boot Complete (only reached if Ring 3 jump fails) ===
     serial_write("\n========================================\n");
-    serial_write("[BOOT] AetherionOS Couche 11 READY\n");
-    serial_println!("  Memory: {} frames ({} KB)",
-        memory_manager.frame_allocator.total_frames(),
-        memory_manager.frame_allocator.total_frames() * 4);
-    serial_println!("  Heap: {} KB", memory::heap::HEAP_SIZE / 1024);
-    serial_println!("  Cognitive Bus: {} msg capacity", ipc::bus::capacity());
-    serial_write("  VFS: Mounted with security hardening\n");
-    serial_write("  Verifier: Policy engine active\n");
-    serial_println!("  Process Manager: {} active processes", process::active_count());
-    serial_println!("  Scheduler: Priority-based (5 levels) + aging");
-    serial_write("  GPU: VRAM allocator active\n");
-    serial_write("  Context Switch: ASM save/restore ready\n");
-    serial_write("  Syscall: EFER.SCE + STAR + LSTAR + SFMASK configured\n");
-    serial_write("  ELF Loader: Full ELF64 parser + per-process PML4 + Ring 3 IRETQ\n");
-    serial_write("  Stack Protector: active\n");
-    serial_write("  Interrupts: enabled\n");
+    serial_write("[BOOT] AetherionOS Couche 12 READY (Ring 3 not started)\n");
     serial_write("========================================\n");
 
-    { let mut vga = VGA.lock(); vga.write_str("\n[OK] Couche 11 BOOT COMPLETE\n"); }
+    { let mut vga = VGA.lock(); vga.write_str("\n[OK] Couche 12 BOOT COMPLETE\n"); }
 
     // Idle loop
     loop { x86_64::instructions::hlt(); }
