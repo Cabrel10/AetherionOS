@@ -24,6 +24,7 @@ pub mod verifier;
 pub mod process;
 pub mod scheduler;
 pub mod gpu;
+pub mod elf;
 
 pub mod tests;
 

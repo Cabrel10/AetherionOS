@@ -146,6 +146,12 @@ lazy_static! {
     static ref VFS_ROOT: Mutex<BTreeMap<String, VfsNode>> = Mutex::new(BTreeMap::new());
 }
 
+/// Public accessor to lock the VFS root for kernel-internal operations
+/// (e.g., mounting ELF binaries during boot). Bypasses normal VFS API.
+pub fn lock_root() -> spin::MutexGuard<'static, BTreeMap<String, VfsNode>> {
+    VFS_ROOT.lock()
+}
+
 // ===== Path Validation (Security) =====
 
 /// Maximum allowed path length (prevent DoS via huge paths)
