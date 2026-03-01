@@ -59,13 +59,15 @@ mod gpu;
 mod elf;
 
 // ===== Configuration =====
-const KERNEL_VERSION: &str = "1.3.0-couche13-multi-process";
+const KERNEL_VERSION: &str = "1.5.0-couche15-agents-mmap";
 
 // ===== Embedded ELF binaries =====
 /// Minimal hello.elf - statically linked x86-64 ELF for Ring 3 test
 static HELLO_ELF: &[u8] = include_bytes!("../../userspace/hello.elf");
 /// Interactive shell.elf - Ring 3 shell with POSIX syscalls
 static SHELL_ELF: &[u8] = include_bytes!("../../userspace/shell.elf");
+/// Math Agent - Ring 3 agent with mmap, linear regression, matrix ops, bus publish
+static AGENT_MATH_ELF: &[u8] = include_bytes!("../../userspace/agent_math.elf");
 
 // VGA text buffer
 const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
@@ -1235,6 +1237,19 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             }
         }
 
+        // Write agent_math.elf into VFS
+        let agent_size = AGENT_MATH_ELF.len();
+        {
+            let mut root = crate::fs::vfs::lock_root();
+            if let Some(fs::vfs::VfsNode::Directory(ref mut bin_dir)) = root.get_mut("bin") {
+                bin_dir.insert(
+                    alloc::string::String::from("agent_math.elf"),
+                    fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_MATH_ELF)),
+                );
+                serial_println!("       [OK] /bin/agent_math.elf mounted ({} bytes)", agent_size);
+            }
+        }
+
         // Create /sys/version file
         {
             let version_str = alloc::format!("AetherionOS v{}\n", KERNEL_VERSION);
@@ -1254,17 +1269,23 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     elf::run_tests(HELLO_ELF);
 
     // ===================================================================
-    // COUCHE 13: RING 3 INTERACTIVE SHELL LAUNCH
-    // Load shell.elf (instead of hello.elf), switch CR3, and IRETQ to
-    // user mode. The shell will use POSIX syscalls (read, write, exec,
-    // fork, wait, ps) to provide an interactive experience.
+    // COUCHE 15: RING 3 AGENT LAUNCH
+    // Load agent_math.elf - proves mmap, math computation, bus publish,
+    // VGA output, and clean exit from Ring 3.
     // ===================================================================
     serial_write("\n========================================\n");
-    serial_write("[RING 3] Preparing Ring 3 Interactive Shell\n");
+    serial_write("[RING 3] Launching Rust Agent: agent_math.elf\n");
     serial_write("========================================\n");
     {
-        serial_write("  [STEP 1] Loading /bin/shell.elf...\n");
-        let load_result = elf::load_elf_binary(SHELL_ELF);
+        // Drain old messages from bus
+        {
+            let mut drained = 0u32;
+            while crate::ipc::bus::consume().is_ok() { drained += 1; }
+            serial_println!("  [IPC] Drained {} old messages from Cognitive Bus", drained);
+        }
+
+        serial_write("  [STEP 1] Loading /bin/agent_math.elf...\n");
+        let load_result = elf::load_elf_binary(AGENT_MATH_ELF);
         match load_result {
             Ok(result) => {
                 serial_println!(
@@ -1273,14 +1294,14 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     result.segments_loaded, result.frames_used
                 );
 
-                // Create a process record for the shell
-                let shell_pid = process::spawn_userspace(
-                    "/bin/shell.elf", 0,
+                // Create a process record for the agent
+                let agent_pid = process::spawn_userspace(
+                    "/bin/agent_math.elf", 0,
                     result.entry_point, result.stack_pointer, result.pml4_phys
                 ).unwrap_or(0);
-                if shell_pid != 0 {
-                    scheduler::enqueue_process(shell_pid);
-                    serial_println!("  [OK] Shell process PID={} registered", shell_pid);
+                if agent_pid != 0 {
+                    scheduler::enqueue_process(agent_pid);
+                    serial_println!("  [OK] Agent process PID={} registered", agent_pid);
                 }
 
                 serial_write("  [STEP 2] Ring 3 IRETQ frame:\n");
@@ -1307,11 +1328,12 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 // Simulate keyboard input for demo/testing
                 // Push "help\n" then "ps\n" then "version\n" to keyboard buffer
                 // so the shell has input to process in QEMU -nographic mode
-                let demo_input = b"help\nps\nversion\necho AetherionOS is alive!\n";
+                // agent_math runs autonomously, no keyboard input needed
+                let demo_input = b"";
                 for &byte in demo_input {
                     process::kbd_push_byte(byte);
                 }
-                serial_write("  [DEMO] Pre-loaded keyboard buffer with demo commands\n");
+                serial_write("  [INFO] Agent running autonomously (no keyboard input)\n");
 
                 // Jump to Ring 3!
                 unsafe {
@@ -1321,7 +1343,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             Err(e) => {
                 serial_println!("  [FAIL] Shell ELF load error: {}", e);
                 // Fallback: try hello.elf
-                serial_write("  [FALLBACK] Loading hello.elf instead...\n");
+                serial_write("  [FALLBACK] Loading hello.elf instead (agent_math failed)...\n");
                 match elf::load_elf_binary(HELLO_ELF) {
                     Ok(result) => {
                         let pid = process::spawn_kernel_thread("hello.elf").unwrap_or(0);
@@ -1347,10 +1369,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
     // === Boot Complete (only reached if Ring 3 jump fails) ===
     serial_write("\n========================================\n");
-    serial_write("[BOOT] AetherionOS Couche 13 READY (Multi-Process Ring 3)\n");
+    serial_write("[BOOT] AetherionOS Couche 15 READY (Agents + mmap + Bus)\n");
     serial_write("========================================\n");
 
-    { let mut vga = VGA.lock(); vga.write_str("\n[OK] Couche 13 BOOT COMPLETE\n"); }
+    { let mut vga = VGA.lock(); vga.write_str("\n[OK] Couche 15 BOOT COMPLETE\n"); }
 
     // Idle loop
     loop { x86_64::instructions::hlt(); }

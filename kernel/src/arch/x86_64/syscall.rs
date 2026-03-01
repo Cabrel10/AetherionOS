@@ -206,6 +206,7 @@ extern "C" fn syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         2  => sys_open(a1, a2 as u32),
         3  => sys_close(a1 as u32),
         8  => sys_seek(a1 as u32, a2 as i64, a3 as u32),
+        9  => sys_mmap(a1, a2, a3),
         20 => sys_getpid(),
         39 => sys_getppid(),
         57 => sys_fork(),
@@ -214,6 +215,8 @@ extern "C" fn syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         61 => sys_wait(a1),
         62 => sys_kill(a1, a2 as u32),
         200 => sys_ps(),
+        201 => sys_bus_publish(a1, a2 as u32, a3),
+        202 => sys_vga_write(a1 as usize, a2 as usize, a3),
         _ => {
             crate::serial_println!("[SYSCALL] Unknown nr={} a1=0x{:X} a2=0x{:X} a3=0x{:X}", nr, a1, a2, a3);
             ENOSYS
@@ -694,5 +697,135 @@ pub fn init() {
         crate::serial_println!("[SYSCALL] SFMASK: 0x{:04X}", SFMASK_VALUE);
     }
 
-    crate::serial_println!("[OK] SYSCALL/SYSRET fully configured (13 syscalls registered)");
+    crate::serial_println!("[OK] SYSCALL/SYSRET fully configured (16 syscalls registered)");
+}
+
+// ===== sys_mmap(addr, len, prot) =====
+/// Simplified mmap: allocates anonymous memory pages at a fixed virtual address.
+/// Returns the virtual address of the mapped region, or ENOMEM on failure.
+/// For simplicity, we always map at MMAP_BASE (0x400000000000) + offset.
+fn sys_mmap(addr_hint: u64, len: u64, _prot: u64) -> u64 {
+    const MMAP_BASE: u64 = 0x0000_4000_0000_0000; // PML4[128]
+
+    if len == 0 || len > 64 * 1024 * 1024 {
+        return EINVAL;
+    }
+
+    let num_pages = ((len + 4095) / 4096) as usize;
+    crate::serial_println!(
+        "[SYSCALL] sys_mmap(addr=0x{:X}, len={}, pages={})",
+        addr_hint, len, num_pages
+    );
+
+    // Get current process PML4 from CR3
+    let cr3: u64;
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)); }
+    let pml4_phys = cr3 & !0xFFF;
+
+    // Map pages at MMAP_BASE
+    let base_vaddr = MMAP_BASE;
+    for i in 0..num_pages {
+        let vaddr = base_vaddr + (i as u64) * 4096;
+        let frame = unsafe { crate::elf::alloc_demand_frame() };
+        match frame {
+            Some(paddr) => {
+                // Zero the frame
+                unsafe {
+                    let phys_offset = crate::elf::phys_offset();
+                    core::ptr::write_bytes(
+                        (paddr + phys_offset) as *mut u8,
+                        0,
+                        4096
+                    );
+                    // Map with USER | WRITABLE | PRESENT | NX
+                    let flags: u64 = 0x01 | 0x02 | 0x04 | (1u64 << 63);
+                    if crate::elf::demand_map_user_page(pml4_phys, vaddr, paddr, flags).is_err() {
+                        crate::serial_println!("[SYSCALL] mmap: page mapping failed at 0x{:X}", vaddr);
+                        return ENOMEM;
+                    }
+                }
+            }
+            None => {
+                crate::serial_println!("[SYSCALL] mmap: out of frames at page {}", i);
+                return ENOMEM;
+            }
+        }
+    }
+
+    // Flush TLB
+    unsafe {
+        core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack));
+    }
+
+    crate::serial_println!(
+        "[SYSCALL] mmap: mapped {} pages ({} KB) at 0x{:X}",
+        num_pages, num_pages * 4, base_vaddr
+    );
+    base_vaddr
+}
+
+// ===== sys_bus_publish(intent, priority, data) =====
+/// Publish a message to the Cognitive Bus from userspace.
+/// intent: 16-bit intent code
+/// priority: 0=Low, 1=Normal, 2=High, 3=Critical
+/// data: 64-bit payload
+fn sys_bus_publish(intent: u64, priority: u32, data: u64) -> u64 {
+    use crate::ipc::{IntentMessage, ComponentId, Priority};
+
+    let prio = match priority {
+        0 => Priority::Low,
+        1 => Priority::Normal,
+        2 => Priority::High,
+        _ => Priority::Critical,
+    };
+
+    let msg = IntentMessage::new(
+        ComponentId::Worker,
+        ComponentId::Orchestrator,
+        intent as u32,
+        prio,
+        data,
+    );
+
+    match crate::ipc::bus::publish(msg) {
+        Ok(()) => {
+            crate::serial_println!(
+                "[SYSCALL] bus_publish: intent=0x{:X}, prio={}, data=0x{:X}",
+                intent, priority, data
+            );
+            0
+        }
+        Err(_) => {
+            crate::serial_println!("[SYSCALL] bus_publish: queue full");
+            EAGAIN
+        }
+    }
+}
+
+// ===== sys_vga_write(row, col, color_char) =====
+/// Write a colored character to the VGA text buffer.
+/// color_char: upper 8 bits = attribute, lower 8 bits = character
+fn sys_vga_write(row: usize, col: usize, color_char: u64) -> u64 {
+    const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
+    const VGA_WIDTH: usize = 80;
+    const VGA_HEIGHT: usize = 25;
+
+    if row >= VGA_HEIGHT || col >= VGA_WIDTH {
+        return EINVAL;
+    }
+
+    let ch = (color_char & 0xFF) as u8;
+    let attr = ((color_char >> 8) & 0xFF) as u8;
+    let offset = (row * VGA_WIDTH + col) * 2;
+
+    unsafe {
+        core::ptr::write_volatile(VGA_BUFFER.add(offset), ch);
+        core::ptr::write_volatile(VGA_BUFFER.add(offset + 1), attr);
+    }
+
+    crate::serial_println!(
+        "[SYSCALL] vga_write: row={}, col={}, char=0x{:02X}, attr=0x{:02X}",
+        row, col, ch, attr
+    );
+    0
 }

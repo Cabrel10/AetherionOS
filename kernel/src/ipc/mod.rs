@@ -38,6 +38,8 @@ pub enum ComponentId {
     Network = 6,
     /// Security subsystem
     Security = 7,
+    /// Worker agent (user-space)
+    Worker = 8,
     /// Broadcast (tous les composants)
     Broadcast = 0xFF,
 }
@@ -53,6 +55,7 @@ impl fmt::Display for ComponentId {
             Self::Filesystem => write!(f, "Filesystem"),
             Self::Network => write!(f, "Network"),
             Self::Security => write!(f, "Security"),
+            Self::Worker => write!(f, "Worker"),
             Self::Broadcast => write!(f, "Broadcast"),
         }
     }
