@@ -59,7 +59,7 @@ mod gpu;
 mod elf;
 
 // ===== Configuration =====
-const KERNEL_VERSION: &str = "1.5.0-couche15-agents-mmap";
+const KERNEL_VERSION: &str = "1.6.0-couche16-c-toolchain";
 
 // ===== Embedded ELF binaries =====
 /// Minimal hello.elf - statically linked x86-64 ELF for Ring 3 test
@@ -68,6 +68,8 @@ static HELLO_ELF: &[u8] = include_bytes!("../../userspace/hello.elf");
 static SHELL_ELF: &[u8] = include_bytes!("../../userspace/shell.elf");
 /// Math Agent - Ring 3 agent with mmap, linear regression, matrix ops, bus publish
 static AGENT_MATH_ELF: &[u8] = include_bytes!("../../userspace/agent_math.elf");
+/// Native C application - compiled with GCC, libc_stub, bare-metal
+static HELLO_C_ELF: &[u8] = include_bytes!("../../userspace/c_apps/hello_c.elf");
 
 // VGA text buffer
 const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
@@ -1250,6 +1252,19 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             }
         }
 
+        // Write hello_c.elf into VFS (Native C program - Couche 16)
+        let hello_c_size = HELLO_C_ELF.len();
+        {
+            let mut root = crate::fs::vfs::lock_root();
+            if let Some(fs::vfs::VfsNode::Directory(ref mut bin_dir)) = root.get_mut("bin") {
+                bin_dir.insert(
+                    alloc::string::String::from("hello_c.elf"),
+                    fs::vfs::VfsNode::File(alloc::vec::Vec::from(HELLO_C_ELF)),
+                );
+                serial_println!("       [OK] /bin/hello_c.elf mounted ({} bytes, native C)", hello_c_size);
+            }
+        }
+
         // Create /sys/version file
         {
             let version_str = alloc::format!("AetherionOS v{}\n", KERNEL_VERSION);
@@ -1269,12 +1284,13 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     elf::run_tests(HELLO_ELF);
 
     // ===================================================================
-    // COUCHE 15: RING 3 AGENT LAUNCH
-    // Load agent_math.elf - proves mmap, math computation, bus publish,
-    // VGA output, and clean exit from Ring 3.
+    // COUCHE 16: NATIVE C PROGRAM LAUNCH
+    // Load hello_c.elf - proves C toolchain, libc_stub, GCC compilation,
+    // Fibonacci, Factorial, mmap, bus_publish, and clean exit from Ring 3.
+    // This is the milestone: a NATIVE C BINARY runs on our custom OS.
     // ===================================================================
     serial_write("\n========================================\n");
-    serial_write("[RING 3] Launching Rust Agent: agent_math.elf\n");
+    serial_write("[RING 3] Launching Native C Program: hello_c.elf\n");
     serial_write("========================================\n");
     {
         // Drain old messages from bus
@@ -1284,8 +1300,8 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             serial_println!("  [IPC] Drained {} old messages from Cognitive Bus", drained);
         }
 
-        serial_write("  [STEP 1] Loading /bin/agent_math.elf...\n");
-        let load_result = elf::load_elf_binary(AGENT_MATH_ELF);
+        serial_write("  [STEP 1] Loading /bin/hello_c.elf (GCC-compiled C binary)...\n");
+        let load_result = elf::load_elf_binary(HELLO_C_ELF);
         match load_result {
             Ok(result) => {
                 serial_println!(
@@ -1294,14 +1310,14 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     result.segments_loaded, result.frames_used
                 );
 
-                // Create a process record for the agent
-                let agent_pid = process::spawn_userspace(
-                    "/bin/agent_math.elf", 0,
+                // Create a process record for the C program
+                let c_pid = process::spawn_userspace(
+                    "/bin/hello_c.elf", 0,
                     result.entry_point, result.stack_pointer, result.pml4_phys
                 ).unwrap_or(0);
-                if agent_pid != 0 {
-                    scheduler::enqueue_process(agent_pid);
-                    serial_println!("  [OK] Agent process PID={} registered", agent_pid);
+                if c_pid != 0 {
+                    scheduler::enqueue_process(c_pid);
+                    serial_println!("  [OK] C program process PID={} registered", c_pid);
                 }
 
                 serial_write("  [STEP 2] Ring 3 IRETQ frame:\n");
@@ -1322,18 +1338,11 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 }
                 serial_write("  [OK] CR3 switched to user page tables\n");
 
-                serial_write("  [STEP 4] IRETQ -> Ring 3 Shell NOW!\n");
+                serial_write("  [STEP 4] IRETQ -> Ring 3 C Program NOW!\n");
                 serial_write("========================================\n");
 
-                // Simulate keyboard input for demo/testing
-                // Push "help\n" then "ps\n" then "version\n" to keyboard buffer
-                // so the shell has input to process in QEMU -nographic mode
-                // agent_math runs autonomously, no keyboard input needed
-                let demo_input = b"";
-                for &byte in demo_input {
-                    process::kbd_push_byte(byte);
-                }
-                serial_write("  [INFO] Agent running autonomously (no keyboard input)\n");
+                // C program runs autonomously, no keyboard input needed
+                serial_write("  [INFO] C program running autonomously\n");
 
                 // Jump to Ring 3!
                 unsafe {
@@ -1341,9 +1350,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 }
             }
             Err(e) => {
-                serial_println!("  [FAIL] Shell ELF load error: {}", e);
+                serial_println!("  [FAIL] C ELF load error: {}", e);
                 // Fallback: try hello.elf
-                serial_write("  [FALLBACK] Loading hello.elf instead (agent_math failed)...\n");
+                serial_write("  [FALLBACK] Loading hello.elf instead (hello_c failed)...\n");
                 match elf::load_elf_binary(HELLO_ELF) {
                     Ok(result) => {
                         let pid = process::spawn_kernel_thread("hello.elf").unwrap_or(0);
@@ -1369,10 +1378,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
     // === Boot Complete (only reached if Ring 3 jump fails) ===
     serial_write("\n========================================\n");
-    serial_write("[BOOT] AetherionOS Couche 15 READY (Agents + mmap + Bus)\n");
+    serial_write("[BOOT] AetherionOS Couche 16 READY (C Toolchain + Ring 3)\n");
     serial_write("========================================\n");
 
-    { let mut vga = VGA.lock(); vga.write_str("\n[OK] Couche 15 BOOT COMPLETE\n"); }
+    { let mut vga = VGA.lock(); vga.write_str("\n[OK] Couche 16 BOOT COMPLETE\n"); }
 
     // Idle loop
     loop { x86_64::instructions::hlt(); }

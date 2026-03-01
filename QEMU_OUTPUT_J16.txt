@@ -1,0 +1,2298 @@
+c[?7l[2J[0mSeaBIOS (version 1.16.2-debian-1.16.2-1)
+
+
+iPXE (http://ipxe.org) 00:03.0 CA00 PCI2.10 PnP PMM+02FCF160+02F0F160 CA00
+Press Ctrl-B to configure iPXE (PCI 00:03.0)...                                                                               
+
+
+Booting from Hard Disk...
+Booting (first stage)...
+Booting (second stage)...
+c[?7l[2J
+========================================
+[AETHERION] Kernel v1.6.0-couche16-c-toolchain
+========================================
+
+[1/12] Loading GDT (R0+R3)...
+[GDT] Loaded: Kernel(R0) + User(R3) + TSS
+       [OK] GDT + TSS + Ring 3 selectors
+[2/12] Loading IDT...
+[IDT] Loaded with 20 exception handlers + demand paging
+       [OK] IDT with 20 handlers
+[3/12] Initializing PIC...
+[INTERRUPTS] PIC initialized (IRQs remapped 32-47)
+[INTERRUPTS] Timer (IRQ0) and Keyboard (IRQ1) enabled
+       [OK] PIC remapped (32-47)
+[4/12] Security init...
+[SECURITY] Initializing...
+[TPM] ACPI table check stub - assuming present
+[SECURITY] TPM OK, PCR0 hash initialized
+[SECURITY] PCR0: 19e0e512...
+       [OK] TPM stub + PCR0 + stack protector
+[5/12] Memory init (Couche 2)...
+
+========================================
+[MEMORY] Couche 2 - Initializing...
+========================================
+[MEMORY] Physical memory offset: 0xffff800000000000
+[MEMORY] Found 2 usable regions, total: 58284 KB
+[MEMORY] Frame allocator: 8192 frames (32768 KB)
+[MEMORY] Page table manager initialized
+[MEMORY] Couche 2 core initialized
+========================================
+
+       [OK] Memory manager ready
+[HEAP] Mapping pages...
+[HEAP] Pages mapped, initializing allocator...
+[HEAP] Ready: 100 KB at 0x444444440000
+[HEAP] Initialized: 100 KB at 0x444444440000
+       [OK] Heap allocator ready
+
+[TEST] Heap validation...
+  [TEST 1/3] Box::new(42)... OK
+  [TEST 2/3] Vec push 0..9... OK
+  [TEST 3/3] String alloc... OK
+  [STRESS] 100 allocations... OK
+[TEST] All heap tests PASSED!
+[5b/15] SMAP/SMEP Status...
+       [INFO] SMAP/SMEP not explicitly enabled to ensure compatibility
+
+[6/12] Cognitive Bus (IPC)...
+       Capacity: 128 messages
+       [OK] IPC pub/consume verified
+
+[7/12] VFS (Couche 4)...
+
+========================================
+[VFS TESTS] Starting comprehensive VFS test suite
+========================================
+
+  [TEST 1/14] VFS init... [VFS] Initializing virtual filesystem...
+[VFS] Created /dev and /tmp directories
+OK
+  [TEST 2/14] Mount /dev/ram0... [VFS] Mounted 'ram0' at /dev/ram0 (cap: 1024 bytes)
+OK
+  [TEST 3/14] Write to /dev/ram0... OK
+  [TEST 4/14] Read from /dev/ram0... OK
+  [TEST 5/14] Mount /dev/rom0 (RO)... [VFS] Mounted 'rom0' at /dev/rom0 (cap: 512 bytes)
+OK
+  [TEST 6/14] Write to RO device... [VFS][SECURITY] Write denied on read-only device: /dev/rom0
+OK (denied)
+  [TEST 7/14] Read /dev/noexist... OK
+
+  --- SECURITY TESTS ---
+
+  [TEST 8/14] Path traversal ../etc/shadow... OK (blocked)
+  [TEST 9/14] Path traversal /dev/../../root... OK (blocked)
+  [TEST 10/14] Invalid path (no /)... OK
+  [TEST 11/14] Empty path... OK
+  [TEST 12/14] Capacity overflow... [VFS][ERROR] Write overflow: 2048 bytes > 1024 capacity at /dev/ram0
+OK
+  [TEST 13/14] Invalid manifest... OK
+  [TEST 14/14] Data integrity... OK
+
+========================================
+[VFS TESTS] 14/14 passed, 0 failed
+[VFS TESTS] ALL TESTS PASSED!
+========================================
+
+========================================
+[VFS STRESS] Starting hardening test suite
+========================================
+
+  [STRESS 1/7] 1000 write/read cycles...
+    Cycle 0/1000 OK
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+    Cycle 250/1000 OK
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+    Cycle 500/1000 OK
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+    Cycle 750/1000 OK
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+  [OK] PASSED
+
+  [STRESS 2/7] Path traversal vectors...
+  [OK] All 6 attacks blocked
+
+  [STRESS 3/7] ACHA enforcement...
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS] Mounted 'test-sensor' at /dev/sensor0 (cap: 0 bytes)
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][SECURITY] Write denied on read-only device: /dev/sensor0
+[VFS][WARN] Bus publish failed: QueueFull
+  [OK] PASSED
+
+  [STRESS 4/7] Directory listing...
+  [OK] PASSED
+
+  [STRESS 5/7] Binary data integrity...
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][WARN] Bus publish failed: QueueFull
+  [OK] PASSED
+
+  [STRESS 6/7] Capacity boundary...
+[VFS][WARN] Bus publish failed: QueueFull
+[VFS][ERROR] Write overflow: 1025 bytes > 1024 capacity at /dev/ram0
+  [OK] PASSED
+
+  [STRESS 7/7] VFS metrics...
+  [OK] PASSED
+
+========================================
+[VFS STRESS] 7/7 passed, 0 failed
+[VFS STRESS] ALL STRESS TESTS PASSED!
+========================================
+
+[8/12] Verifier (Couche 5)...
+[VERIFIER] Initializing policy engine...
+[VERIFIER] Loaded 7 policy rules
+       [OK] Policy engine loaded
+
+========================================
+[VERIFIER TESTS] Couche 5
+========================================
+
+  [TEST 1/6] Write /dev/ram0 (Allow)... [VERIFIER][WARN] Bus publish failed: QueueFull
+OK
+  [TEST 2/6] Read /dev/ram0 (Allow)... [VERIFIER][WARN] Bus publish failed: QueueFull
+OK
+  [TEST 3/6] Write /sys/config (Deny)... [VERIFIER][DENY] Rule 'deny-sys-access' denied VfsWrite on '/sys/config'
+[VERIFIER][WARN] Bus publish failed: QueueFull
+OK
+  [TEST 4/6] Write /tmp/log (Audit)... [VERIFIER][AUDIT] Rule 'audit-tmp-write' auditing VfsWrite on '/tmp/log'
+[VERIFIER][WARN] Bus publish failed: QueueFull
+OK
+  [TEST 5/6] Large write 128KB (Deny)... [VERIFIER][DENY] Rule 'deny-large-writes' denied VfsWrite on '/dev/ram0'
+[VERIFIER][WARN] Bus publish failed: QueueFull
+OK
+  [TEST 6/6] Read /unknown (Deny)... [VERIFIER][DENY] Rule 'default-deny' denied VfsRead on '/unknown/path'
+[VERIFIER][WARN] Bus publish failed: QueueFull
+OK
+
+========================================
+[VERIFIER TESTS] 6/6 passed
+[VERIFIER TESTS] ALL TESTS PASSED!
+========================================
+
+[9/12] Process Manager (Couche 6)...
+[PROCESS] Manager initialized, idle PID=1
+
+========================================
+[PROCESS TESTS] Couche 6 - Matriarchal Hierarchy
+========================================
+
+  [TEST 1/12] GDT Ring 3 selectors... OK (CS=0x0023 DS=0x001b)
+  [TEST 2/12] Spawn Matriarch... OK (PID=2)
+  [TEST 3/12] Second Matriarch rejected... OK (correctly rejected)
+  [TEST 4/12] Spawn SubMatriarch Vision... OK (PID=3, ppid=2)
+  [TEST 5/12] Spawn SubMatriarch Network... OK (PID=4, ppid=2)
+  [TEST 6/12] Workers under Vision...
+    Worker 'CNN_Detector' PID=5 ppid=3
+    Worker 'YOLO_Tracker' PID=6 ppid=3
+    Worker 'Depth_Estimator' PID=7 ppid=3
+  OK
+  [TEST 7/12] Workers under Network...
+    Worker 'TCP_Stack' PID=8 ppid=4
+    Worker 'DNS_Resolver' PID=9 ppid=4
+  OK
+  [TEST 8/12] Hierarchy violation (Worker as parent)... OK (rejected)
+  [TEST 9/12] State transitions... OK (Ready->Running->Blocked->Ready, Ready->Blocked rejected)
+  [TEST 10/12] Kill protection (kernel thread)... OK (protected)
+  [TEST 11/12] Parent/child relationships... OK (Matriarch has 2 children)
+  [TEST 12/12] Active process count... OK (10 active)
+
+  --- HIERARCHY ---
+  Matriarch -> SubMatriarch -> Workers:
+    [PID 2 | Matriarch | Orchestrator_Root | READY | ppid=0]
+      [PID 3 | SubMatriarch | Vision_Domain | READY | ppid=2]
+        [PID 5 | Worker | CNN_Detector | READY | ppid=3]
+        [PID 6 | Worker | YOLO_Tracker | READY | ppid=3]
+        [PID 7 | Worker | Depth_Estimator | READY | ppid=3]
+      [PID 4 | SubMatriarch | Network_Domain | READY | ppid=2]
+        [PID 8 | Worker | TCP_Stack | READY | ppid=4]
+        [PID 9 | Worker | DNS_Resolver | READY | ppid=4]
+
+========================================
+[PROCESS TESTS] 12/12 passed, 0 failed
+[PROCESS TESTS] ALL TESTS PASSED!
+========================================
+
+[10/12] Scheduler (C7) + GPU (C8)...
+[SCHEDULER] Initialized with 10 processes (aging threshold: 100 ticks)
+
+========================================
+[SCHEDULER TESTS] Couche 7+9 - Priority Scheduler + Aging
+========================================
+
+  [TEST 1/7] Scheduler initialized... OK (queues active, PID=0)
+  [TEST 2/7] Scheduler tick... OK (tick=1, 0 -> 1, prio=CRITICAL, switched=true)
+  [TEST 3/7] Strict priority (Matriarch > Worker)...
+    High/Critical selected: 5, Low selected: 0
+  OK
+  [TEST 4/7] Multiple ticks metrics... OK (ticks=16, switches=16, current=10)
+  [TEST 5/7] Queue distribution... OK (Crit=1, High=1, Norm=2, Low=5, Idle=0)
+  [TEST 6/7] Aging anti-starvation...
+[SCHEDULER] AGING: Boosting PID 5 from LOW to NORMAL (waited 101 ticks)
+[SCHEDULER] AGING: Boosting PID 6 from LOW to NORMAL (waited 101 ticks)
+[SCHEDULER] AGING: Boosting PID 7 from LOW to NORMAL (waited 101 ticks)
+[SCHEDULER] AGING: Boosting PID 8 from LOW to NORMAL (waited 101 ticks)
+[SCHEDULER] AGING: Boosting PID 9 from LOW to NORMAL (waited 101 ticks)
+[SCHEDULER] AGING: Boosting PID 3 from NORMAL to HIGH (waited 101 ticks)
+[SCHEDULER] AGING: Boosting PID 4 from NORMAL to HIGH (waited 101 ticks)
+    Aging boosts triggered: 7 (total: 7)
+  [OK] Workers were boosted (starvation prevented)
+  [TEST 7/7] Matriarch does not starve Workers forever...
+    Low/Normal ran: 0/50 ticks
+  [WARN] Workers still starved (check aging threshold)
+
+========================================
+[SCHEDULER TESTS] 7/7 passed, 0 failed
+[SCHEDULER TESTS] ALL TESTS PASSED!
+========================================
+[GPU] Scanning PCI bus for display controllers (class 0x03)...
+[GPU] Found: GPU [1234:1111] BAR0=0xFD000000 VRAM=16MB
+[GPU] BAR0 raw=0xFD000008, address=0xFD000000
+[GPU] VRAM allocator ready: 16MB at 0xFD000000
+
+========================================
+[GPU TESTS] Couche 8 - GPU VRAM Stub
+========================================
+
+  [TEST 1/4] GPU device detected... OK (GPU [1234:1111] BAR0=0xFD000000 VRAM=16MB)
+  [TEST 2/4] BAR0 address... OK (BAR0=0xFD000000)
+  [TEST 3/4] VRAM allocation (4KB)... OK (addr=0xFD000000)
+  [TEST 4/4] VRAM metrics... OK (base=0xFD000000, used=4KB, free=16380KB, allocs=1)
+
+========================================
+[GPU TESTS] 4/4 passed, 0 failed
+[GPU TESTS] ALL TESTS PASSED!
+========================================
+
+[11/12] Syscall MSR configuration (Couche 9)...
+[SYSCALL] Initializing x86_64 SYSCALL/SYSRET...
+[SYSCALL] Kernel syscall stack: top=0x264C20, size=16384 bytes
+[SYSCALL] KERNEL_GS_BASE = 0x264C20
+[SYSCALL] EFER: 0x0000000000000D00 -> 0x0000000000000D01
+[SYSCALL] STAR: 0x0010000800000000
+[SYSCALL] LSTAR: 0x0000000000225B00
+[SYSCALL] SFMASK: 0x0700
+[OK] SYSCALL/SYSRET fully configured (16 syscalls registered)
+
+========================================
+[SYSCALL TESTS] Couche 9 - MSR Configuration
+========================================
+
+  [TEST 1/2] Syscall MSRs configured... OK (no #GP, MSRs accepted)
+  [TEST 2/2] STAR selector compatibility... OK (KCS=0x08 KDS=0x10 UDS=0x1B UCS=0x23)
+
+========================================
+[SYSCALL TESTS] 2/2 passed, 0 failed
+[SYSCALL TESTS] ALL TESTS PASSED!
+========================================
+
+[12/12] Context switch support (Couche 9)...
+       [OK] ASM context switch registered (switch_context)
+
+========================================
+[CONTEXT SWITCH TESTS] Couche 9 - ASM Switch
+========================================
+
+  [TEST 1/3] TaskContext::zero()... OK (rflags=0x200, IF=1)
+  [TEST 2/3] TaskContext::new(stack, entry)... OK
+  [TEST 3/3] Round-trip self-switch... OK (TaskContext size=72 bytes, 9 registers)
+
+========================================
+[CONTEXT SWITCH TESTS] 3/3 passed, 0 failed
+[CONTEXT SWITCH TESTS] ALL TESTS PASSED!
+========================================
+
+========================================
+[METRICS] System Metrics Report
+========================================
+  [VFS] Nodes: 5
+  [VFS] Bytes written: 11430 B
+  [VFS] Bytes read: 10406 B
+  [VFS] Operations: 2028
+  [VFS] Errors: 4
+  [VFS] Security violations: 9
+  [VFS] Bus errors: 1885
+  [VERIFIER] Rules evaluated: 24
+  [VERIFIER] Allowed: 2 | Denied: 3 | Audited: 1
+  [PROCESS] Created: 10, Terminated: 0, Active: 10
+  [SCHEDULER] Ticks: 186, Switches: 186, Current PID: 10, Aging boosts: 7
+  [GPU] VRAM base=0xFD000000 used=4KB free=16380KB allocs=1
+========================================
+
+[13/15] ELF Loader (Couche 11)...
+[ELF] Frame pool initialized: base=0x29F000, frames=512, size=2048 KB
+       [OK] ELF frame pool: 512 frames (2048 KB)
+
+[14/15] Mounting ELF binaries in VFS...
+       [OK] /bin/hello.elf mounted (8496 bytes)
+       [OK] /bin/shell.elf mounted (11168 bytes)
+       [OK] /bin/agent_math.elf mounted (10944 bytes)
+       [OK] /bin/hello_c.elf mounted (10800 bytes, native C)
+       [OK] /sys/version created
+
+[15/15] ELF Loader Tests (Couche 11)...
+
+========================================
+[ELF TESTS] Couche 11 - ELF Loader
+========================================
+
+  [TEST 1/8] ELF magic... OK
+  [TEST 2/8] Parse ELF64 header... OK (entry=0x8000000000, phnum=2)
+  [TEST 3/8] Parse program headers... OK (2 headers)
+  [TEST 4/8] PT_LOAD segments... OK (2 loadable)
+  [TEST 5/8] Full ELF load... [ELF] Header OK: entry=0x8000000000, phnum=2
+[ELF] User PML4 created: phys=0x29F000 (7 kernel entries cloned, user isolated)
+[ELF] Loading segment 0: vaddr=0x8000000000, memsz=0x25, filesz=0x25, pages=1
+[ELF] Loading segment 1: vaddr=0x8000001000, memsz=0x13, filesz=0x13, pages=1
+[ELF] Mapping user stack: 0x7FFFFFFEF000 - 0x7FFFFFFFF000 (16 pages, 64 KiB)
+[ELF] Load complete: entry=0x8000000000, stack=0x7FFFFFFFF000, segments=2, frames=25
+OK (entry=0x8000000000, stack=0x7FFFFFFFF000, segs=2, frames=25)
+  [TEST 6/8] Invalid ELF rejected... OK (BadMagic)
+  [TEST 7/8] Too-small data rejected... OK (TooSmall)
+  [TEST 8/8] Stack address range... OK (0x7FFFFFFEF000 - 0x7FFFFFFFF000)
+
+========================================
+[ELF TESTS] 8/8 passed, 0 failed
+[ELF TESTS] ALL TESTS PASSED!
+========================================
+
+========================================
+[RING 3] Launching Native C Program: hello_c.elf
+========================================
+  [IPC] Drained 128 old messages from Cognitive Bus
+  [STEP 1] Loading /bin/hello_c.elf (GCC-compiled C binary)...
+[ELF] Header OK: entry=0x80000000C0, phnum=3
+[ELF] User PML4 created: phys=0x2B8000 (7 kernel entries cloned, user isolated)
+[ELF] Loading segment 0: vaddr=0x8000000000, memsz=0x9A1, filesz=0x9A1, pages=1
+[ELF] Loading segment 1: vaddr=0x8000001000, memsz=0x4E0, filesz=0x4E0, pages=1
+[ELF] Mapping user stack: 0x7FFFFFFEF000 - 0x7FFFFFFFF000 (16 pages, 64 KiB)
+[ELF] Load complete: entry=0x80000000C0, stack=0x7FFFFFFFF000, segments=2, frames=25
+  [OK] entry=0x80000000C0, stack=0x7FFFFFFFF000, PML4=0x2B8000, segs=2, frames=25
+  [OK] C program process PID=11 registered
+  [STEP 2] Ring 3 IRETQ frame:
+    RIP    = 0x80000000C0
+    CS     = 0x23 (User Code, RPL=3)
+    RFLAGS = 0x202 (IF=1)
+    RSP    = 0x7FFFFFFFF000
+    SS     = 0x1B (User Data, RPL=3)
+    CR3    = 0x2B8000
+  [STEP 3] Switching CR3 to user PML4...
+  [OK] CR3 switched to user page tables
+  [STEP 4] IRETQ -> Ring 3 C Program NOW!
+========================================
+  [INFO] C program running autonomously
+[C-APP] ========================================
+[C-APP] Hello from a Native C program in Ring 3!
+[C-APP] AetherionOS Couche 16 - C Toolchain
+[C-APP] ========================================
+[C-APP] PID = 10
+[C-APP] Computing Fibonacci(20)... 6765 (expected: 6765)
+[C-APP] [OK] Fibonacci verified!
+[C-APP] Computing Factorial(12)... 479001600 (expected: 479001600)
+[C-APP] [OK] Factorial verified!
+[C-APP] Allocating 16 pages (64 KB) via sys_mmap...
+[SYSCALL] sys_mmap(addr=0x0, len=65536, pages=16)
+[SYSCALL] mmap: mapped 16 pages (64 KB) at 0x400000000000
+[C-APP] [OK] Heap mapped at 0x0000400000000000
+[C-APP] [OK] Memory write/read verified (256 bytes)
+[C-APP] Heap checksum = 1291518080
+[C-APP] Publishing to Cognitive Bus...
+[SYSCALL] bus_publish: intent=0x6000, prio=2, data=0x1A6D
+[C-APP] [OK] Published to Cognitive Bus (intent=0x6000)
+[C-APP] Drawing on VGA...
+[SYSCALL] vga_write: row=7, col=35, char=0x43, attr=0x2A
+[C-APP] [OK] VGA: Drew green 'C' at (7,35)
+[C-APP] ========================================
+[C-APP] All C-language tests PASSED!
+[C-APP]   Fibonacci(20) = 6765
+[C-APP]   Factorial(12) = 479001600
+[C-APP]   mmap: heap allocated and verified
+[C-APP]   Cognitive Bus: result published
+[C-APP]   VGA: color character drawn
+[C-APP] C execution validated.
+[C-APP] ========================================
+[SYSCALL] sys_exit(0) - PID 10 terminating
+[SYSCALL] PID 10 terminated (exit 0)
+========================================
+[SUCCESS] Ring 3 process PID 10 exited (code 0)
+========================================
+qemu-system-x86_64: terminating on signal 15 from pid 6942 (timeout)
