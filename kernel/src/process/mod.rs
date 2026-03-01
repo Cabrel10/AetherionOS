@@ -17,8 +17,83 @@ use spin::Mutex;
 use lazy_static::lazy_static;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-pub use task::{AgentRole, Process, ProcessState};
+pub use task::{AgentRole, Process, ProcessState, FdTable, FileDescriptor, MAX_FDS};
 pub use crate::arch::x86_64::context::TaskContext;
+
+// ===== Keyboard Input Buffer =====
+// Ring buffer for keyboard input, shared between IRQ handler and sys_read(0)
+
+const KBD_BUF_SIZE: usize = 256;
+
+struct KbdBuffer {
+    buf: [u8; KBD_BUF_SIZE],
+    read_pos: usize,
+    write_pos: usize,
+    count: usize,
+}
+
+impl KbdBuffer {
+    const fn new() -> Self {
+        KbdBuffer {
+            buf: [0; KBD_BUF_SIZE],
+            read_pos: 0,
+            write_pos: 0,
+            count: 0,
+        }
+    }
+
+    fn push(&mut self, byte: u8) {
+        if self.count < KBD_BUF_SIZE {
+            self.buf[self.write_pos] = byte;
+            self.write_pos = (self.write_pos + 1) % KBD_BUF_SIZE;
+            self.count += 1;
+        }
+    }
+
+    fn pop(&mut self) -> Option<u8> {
+        if self.count > 0 {
+            let byte = self.buf[self.read_pos];
+            self.read_pos = (self.read_pos + 1) % KBD_BUF_SIZE;
+            self.count -= 1;
+            Some(byte)
+        } else {
+            None
+        }
+    }
+
+    fn available(&self) -> usize {
+        self.count
+    }
+}
+
+lazy_static! {
+    static ref KBD_BUFFER: Mutex<KbdBuffer> = Mutex::new(KbdBuffer::new());
+}
+
+/// Push a byte into the keyboard input buffer (called from keyboard IRQ handler)
+pub fn kbd_push_byte(byte: u8) {
+    KBD_BUFFER.lock().push(byte);
+}
+
+/// Read up to `len` bytes from the keyboard buffer into a slice
+pub fn kbd_read(buf: &mut [u8], len: usize) -> usize {
+    let mut kbd = KBD_BUFFER.lock();
+    let mut read = 0;
+    let max = core::cmp::min(len, buf.len());
+    while read < max {
+        if let Some(b) = kbd.pop() {
+            buf[read] = b;
+            read += 1;
+            // Stop at newline for line-buffered input
+            if b == b'\n' {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    read
+}
 
 // ===== Error Type =====
 
@@ -38,6 +113,10 @@ pub enum ProcessError {
     KillProtected,
     /// Maximum process count reached
     LimitReached,
+    /// Process has no FD table entry
+    FdError,
+    /// Process is waiting for child
+    WaitingForChild,
 }
 
 impl core::fmt::Display for ProcessError {
@@ -50,6 +129,8 @@ impl core::fmt::Display for ProcessError {
             Self::InvalidTransition => write!(f, "Invalid state transition"),
             Self::KillProtected => write!(f, "Cannot kill protected process"),
             Self::LimitReached => write!(f, "Process limit reached"),
+            Self::FdError => write!(f, "FD table error"),
+            Self::WaitingForChild => write!(f, "Waiting for child"),
         }
     }
 }
@@ -86,6 +167,103 @@ pub fn matriarch_pid() -> Option<u64> {
     table.values()
         .find(|p| p.role == AgentRole::Matriarch && p.is_alive())
         .map(|p| p.pid)
+}
+
+/// Spawn a user-space process from an ELF load result
+pub fn spawn_userspace(name: &str, ppid: u64, entry: u64, stack: u64, pml4: u64) -> Result<u64, ProcessError> {
+    let mut table = PROCESS_TABLE.lock();
+    if table.len() >= MAX_PROCESSES {
+        return Err(ProcessError::LimitReached);
+    }
+    let proc = Process::new_userspace(name, ppid, entry, stack, pml4);
+    let pid = proc.pid;
+    table.insert(pid, proc);
+    // Add as child of parent if parent exists
+    if ppid != 0 {
+        if let Some(parent) = table.get_mut(&ppid) {
+            parent.add_child(pid);
+        }
+    }
+    PROCESSES_CREATED.fetch_add(1, Ordering::Relaxed);
+    Ok(pid)
+}
+
+/// Fork: clone a process. Returns (child_pid).
+/// The child gets a copy of the parent's FD table, name, etc.
+/// PML4 cloning is handled by the caller (syscall handler).
+pub fn fork_process(parent_pid: u64, child_pml4: u64, child_entry: u64, child_stack: u64) -> Result<u64, ProcessError> {
+    let mut table = PROCESS_TABLE.lock();
+    if table.len() >= MAX_PROCESSES {
+        return Err(ProcessError::LimitReached);
+    }
+    let parent = table.get(&parent_pid).ok_or(ProcessError::NotFound)?;
+    let parent_name = parent.name.clone();
+    let parent_uid = parent.uid;
+    let parent_gid = parent.gid;
+    let parent_fd_table = parent.fd_table.clone();
+
+    let mut child = Process::new(&parent_name, AgentRole::Worker, parent_pid, parent_uid, parent_gid);
+    child.pml4_phys = child_pml4;
+    child.entry_point = child_entry;
+    child.stack_pointer = child_stack;
+    child.fd_table = parent_fd_table;
+    child.state = ProcessState::Ready;
+    let child_pid = child.pid;
+    table.insert(child_pid, child);
+
+    // Add child to parent's children list
+    if let Some(parent) = table.get_mut(&parent_pid) {
+        parent.add_child(child_pid);
+    }
+
+    PROCESSES_CREATED.fetch_add(1, Ordering::Relaxed);
+    Ok(child_pid)
+}
+
+/// Wait for any child of parent_pid to terminate.
+/// Returns (child_pid, exit_code) or error.
+pub fn wait_for_child(parent_pid: u64) -> Result<(u64, i32), ProcessError> {
+    let table = PROCESS_TABLE.lock();
+    let parent = table.get(&parent_pid).ok_or(ProcessError::NotFound)?;
+    
+    // Look for any terminated child
+    for &child_pid in &parent.children {
+        if let Some(child) = table.get(&child_pid) {
+            if child.state == ProcessState::Terminated {
+                let exit_code = child.exit_code;
+                return Ok((child_pid, exit_code));
+            }
+        }
+    }
+    
+    // No terminated child found
+    Err(ProcessError::WaitingForChild)
+}
+
+/// Set exit code for a process
+pub fn set_exit_code(pid: u64, code: i32) {
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(proc) = table.get_mut(&pid) {
+        proc.exit_code = code;
+    }
+}
+
+/// Get the FD table entry for a process (for syscall use)
+pub fn with_fd_table<F, R>(pid: u64, f: F) -> Option<R>
+where
+    F: FnOnce(&FdTable) -> R,
+{
+    let table = PROCESS_TABLE.lock();
+    table.get(&pid).map(|p| f(&p.fd_table))
+}
+
+/// Get mutable FD table for a process
+pub fn with_fd_table_mut<F, R>(pid: u64, f: F) -> Option<R>
+where
+    F: FnOnce(&mut FdTable) -> R,
+{
+    let mut table = PROCESS_TABLE.lock();
+    table.get_mut(&pid).map(|p| f(&mut p.fd_table))
 }
 
 // ===== Spawn Functions =====

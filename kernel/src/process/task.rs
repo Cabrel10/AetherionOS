@@ -10,6 +10,106 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::fmt;
 
+// ===== File Descriptor Table =====
+
+/// Maximum number of file descriptors per process
+pub const MAX_FDS: usize = 16;
+
+/// A file descriptor entry
+#[derive(Debug, Clone)]
+pub struct FileDescriptor {
+    /// Path in VFS (or special: "stdin", "stdout", "stderr")
+    pub path: String,
+    /// Current offset for read/seek
+    pub offset: u64,
+    /// Flags (O_RDONLY=0, O_WRONLY=1, O_RDWR=2)
+    pub flags: u32,
+    /// Is this FD active?
+    pub active: bool,
+}
+
+impl FileDescriptor {
+    pub fn new(path: &str, flags: u32) -> Self {
+        FileDescriptor {
+            path: String::from(path),
+            offset: 0,
+            flags,
+            active: true,
+        }
+    }
+
+    pub fn empty() -> Self {
+        FileDescriptor {
+            path: String::new(),
+            offset: 0,
+            flags: 0,
+            active: false,
+        }
+    }
+}
+
+/// File descriptor table for a process
+#[derive(Debug, Clone)]
+pub struct FdTable {
+    pub entries: Vec<FileDescriptor>,
+}
+
+impl FdTable {
+    /// Create a new FD table with stdin(0), stdout(1), stderr(2)
+    pub fn new_with_stdio() -> Self {
+        let mut entries = Vec::with_capacity(MAX_FDS);
+        entries.push(FileDescriptor::new("stdin", 0));   // FD 0 = stdin
+        entries.push(FileDescriptor::new("stdout", 1));  // FD 1 = stdout
+        entries.push(FileDescriptor::new("stderr", 1));  // FD 2 = stderr
+        FdTable { entries }
+    }
+
+    /// Create an empty FD table (for kernel threads)
+    pub fn empty() -> Self {
+        FdTable { entries: Vec::new() }
+    }
+
+    /// Allocate a new FD, returns the FD number or None
+    pub fn alloc_fd(&mut self, path: &str, flags: u32) -> Option<usize> {
+        // Try to reuse a closed FD slot
+        for (i, entry) in self.entries.iter_mut().enumerate() {
+            if !entry.active {
+                *entry = FileDescriptor::new(path, flags);
+                return Some(i);
+            }
+        }
+        // Allocate new slot
+        if self.entries.len() < MAX_FDS {
+            let fd = self.entries.len();
+            self.entries.push(FileDescriptor::new(path, flags));
+            Some(fd)
+        } else {
+            None
+        }
+    }
+
+    /// Close a file descriptor
+    pub fn close_fd(&mut self, fd: usize) -> bool {
+        if fd < self.entries.len() && self.entries[fd].active {
+            self.entries[fd].active = false;
+            self.entries[fd].path.clear();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Get a reference to an FD entry
+    pub fn get(&self, fd: usize) -> Option<&FileDescriptor> {
+        self.entries.get(fd).filter(|e| e.active)
+    }
+
+    /// Get a mutable reference to an FD entry
+    pub fn get_mut(&mut self, fd: usize) -> Option<&mut FileDescriptor> {
+        self.entries.get_mut(fd).filter(|e| e.active)
+    }
+}
+
 use crate::arch::x86_64::context::TaskContext;
 
 // ===== Global PID Counter =====
@@ -103,6 +203,14 @@ pub struct Process {
     pub pml4_phys: u64,
     /// Number of scheduler ticks this process has been waiting (for aging)
     pub wait_ticks: u64,
+    /// File descriptor table
+    pub fd_table: FdTable,
+    /// Exit code (set when process terminates)
+    pub exit_code: i32,
+    /// Entry point address (for Ring 3 processes)
+    pub entry_point: u64,
+    /// Stack pointer (for Ring 3 processes)
+    pub stack_pointer: u64,
 }
 
 impl Process {
@@ -127,12 +235,27 @@ impl Process {
             context: TaskContext::zero(),
             pml4_phys: 0,
             wait_ticks: 0,
+            fd_table: FdTable::new_with_stdio(),
+            exit_code: 0,
+            entry_point: 0,
+            stack_pointer: 0,
         }
+    }
+
+    /// Create a new user-space process (Ring 3) with full setup
+    pub fn new_userspace(name: &str, ppid: u64, entry: u64, stack: u64, pml4: u64) -> Self {
+        let mut proc = Self::new(name, AgentRole::Worker, ppid, 1000, 1000);
+        proc.entry_point = entry;
+        proc.stack_pointer = stack;
+        proc.pml4_phys = pml4;
+        proc
     }
 
     /// Create a kernel thread (uid=0, gid=0, no parent)
     pub fn new_kernel(name: &str) -> Self {
-        Self::new(name, AgentRole::KernelThread, 0, 0, 0)
+        let mut proc = Self::new(name, AgentRole::KernelThread, 0, 0, 0);
+        proc.fd_table = FdTable::empty(); // kernel threads don't need FDs
+        proc
     }
 
     /// Add a child PID to this process
