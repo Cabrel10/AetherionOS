@@ -99,6 +99,8 @@ pub struct Process {
     pub children: Vec<u64>,
     /// CPU register context for context switching
     pub context: TaskContext,
+    /// Physical address of the process's PML4 (page map level 4) table
+    pub pml4_phys: u64,
     /// Number of scheduler ticks this process has been waiting (for aging)
     pub wait_ticks: u64,
 }
@@ -123,6 +125,7 @@ impl Process {
             priority,
             children: Vec::new(),
             context: TaskContext::zero(),
+            pml4_phys: 0,
             wait_ticks: 0,
         }
     }
@@ -159,6 +162,21 @@ impl Process {
         } else {
             false
         }
+    }
+
+    /// Set the PML4 physical address for the process.
+    pub fn set_pml4_phys(&mut self, pml4: u64) {
+        self.pml4_phys = pml4;
+    }
+
+    /// Get a mutable reference to the process's context.
+    pub fn get_context_mut(&mut self) -> &mut TaskContext {
+        &mut self.context
+    }
+
+    /// Get a reference to the process's context.
+    pub fn get_context(&self) -> &TaskContext {
+        &self.context
     }
 
     /// Is this process alive (not terminated)?

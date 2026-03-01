@@ -1099,24 +1099,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     run_heap_tests();
     serial_write("[TEST] All heap tests PASSED!\n");
 
-    // === Step 5b: Enable SMEP/SMAP (Couche 12 security) ===
-    serial_write("[5b/15] Enabling SMEP/SMAP...");
+    // === Step 5b: SMAP/SMEP Status (Couche 12 security) ===
+    serial_write("[5b/15] SMAP/SMEP Status...\n");
     {
-        use x86_64::registers::control::Cr4;
-        use x86_64::registers::control::Cr4Flags;
-        let cr4 = Cr4::read();
-        // SMEP: Supervisor Mode Execution Prevention
-        // Prevents kernel from executing user-mode pages
-        if !cr4.contains(Cr4Flags::SUPERVISOR_MODE_EXECUTION_PROTECTION) {
-            // SMEP may not be supported on all CPUs (QEMU TCG doesn't)
-            serial_write(" SMEP not forced (QEMU compat)");
-        }
-        // SMAP: Supervisor Mode Access Prevention
-        // Prevents kernel from reading/writing user-mode pages (except via STAC/CLAC)
-        if !cr4.contains(Cr4Flags::SUPERVISOR_MODE_ACCESS_PREVENTION) {
-            serial_write(" SMAP not forced (QEMU compat)");
-        }
-        serial_write(" [OK]\n");
+        serial_write("       [INFO] SMAP/SMEP not explicitly enabled to ensure compatibility\n");
     }
 
     // === Step 6: Cognitive Bus (IPC) ===
@@ -1280,8 +1266,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 serial_write("  [STEP 4] IRETQ -> Ring 3 NOW!\n");
                 serial_write("========================================\n");
 
-                // This never returns — user code runs, calls SYSCALL,
-                // sys_exit halts the system.
+                // Jump to Ring 3!
                 unsafe {
                     elf::jump_to_ring3(result.entry_point, result.stack_pointer);
                 }

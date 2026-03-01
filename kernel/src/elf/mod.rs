@@ -637,6 +637,7 @@ pub fn load_elf(path: &str) -> Result<u64, ElfError> {
 
     let pid = crate::process::spawn_kernel_thread(path)
         .map_err(|_| ElfError::ProcessError)?;
+    crate::process::set_pml4_phys(pid, result.pml4_phys).map_err(|_| ElfError::ProcessError)?;
 
     crate::serial_println!(
         "[ELF] Process created: PID={}, entry=0x{:X}, stack=0x{:X}",

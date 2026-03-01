@@ -170,6 +170,14 @@ pub fn spawn_kernel_thread(name: &str) -> Result<u64, ProcessError> {
 
 // ===== State Management =====
 
+/// Set the PML4 physical address for a process by PID
+pub fn set_pml4_phys(pid: u64, pml4: u64) -> Result<(), ProcessError> {
+    let mut table = PROCESS_TABLE.lock();
+    let proc = table.get_mut(&pid).ok_or(ProcessError::NotFound)?;
+    proc.set_pml4_phys(pml4);
+    Ok(())
+}
+
 /// Set the state of a process by PID
 pub fn set_state(pid: u64, new_state: ProcessState) -> Result<(), ProcessError> {
     let mut table = PROCESS_TABLE.lock();
@@ -237,10 +245,22 @@ pub fn list_children(pid: u64) -> Vec<u64> {
     table.get(&pid).map(|p| p.children.clone()).unwrap_or_default()
 }
 
+/// Get the context and PML4 physical address for a process
+pub fn get_context_and_pml4(pid: u64) -> Option<(TaskContext, u64)> {
+    let table = PROCESS_TABLE.lock();
+    table.get(&pid).map(|p| (p.context, p.pml4_phys))
+}
+
 /// Get the parent PID of a process
 pub fn get_ppid(pid: u64) -> Option<u64> {
     let table = PROCESS_TABLE.lock();
     table.get(&pid).map(|p| p.ppid)
+}
+
+/// Get the PML4 physical address of a process
+pub fn get_pml4_phys(pid: u64) -> Option<u64> {
+    let table = PROCESS_TABLE.lock();
+    table.get(&pid).map(|p| p.pml4_phys)
 }
 
 /// Get the role of a process
@@ -268,4 +288,23 @@ pub fn init() -> u64 {
     let idle_pid = spawn_kernel_thread("kernel_idle").expect("Failed to create idle process");
     crate::serial_println!("[PROCESS] Manager initialized, idle PID={}", idle_pid);
     idle_pid
+}
+
+/// Execute a closure with a mutable reference to a process.
+/// This avoids the need for returning a MutexGuard.
+pub fn with_process_mut<F, R>(pid: u64, f: F) -> Option<R>
+where
+    F: FnOnce(&mut Process) -> R,
+{
+    let mut table = PROCESS_TABLE.lock();
+    table.get_mut(&pid).map(f)
+}
+
+/// Execute a closure with an immutable reference to a process.
+pub fn with_process<F, R>(pid: u64, f: F) -> Option<R>
+where
+    F: FnOnce(&Process) -> R,
+{
+    let table = PROCESS_TABLE.lock();
+    table.get(&pid).map(f)
 }

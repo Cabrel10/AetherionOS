@@ -7,6 +7,7 @@ license = "MIT"
 description = "Aetherion OS Kernel - Couche 8: Priority Scheduler + GPU VRAM Stub"
 
 [dependencies]
+
 # Bootloader 0.9.23 - compatible with nightly-2023-08-01
 # CRITICAL: La feature "map_physical_memory" est REQUISE pour physical_memory_offset
 bootloader = { version = "=0.9.23", features = ["map_physical_memory"] }

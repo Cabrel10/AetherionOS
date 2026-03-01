@@ -285,6 +285,15 @@ pub fn test_tick() -> TickResult {
     SCHEDULER.lock().tick()
 }
 
+/// Manually trigger a context switch to the next process.
+pub fn schedule_next() {
+    if SCHEDULER_ACTIVE.load(Ordering::Relaxed) {
+        if let Some(mut sched) = SCHEDULER.try_lock() {
+            sched.tick();
+        }
+    }
+}
+
 /// Get current scheduler metrics
 pub fn metrics() -> SchedulerMetrics {
     let sched = SCHEDULER.lock();

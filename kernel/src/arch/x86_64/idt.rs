@@ -258,8 +258,14 @@ extern "x86-interrupt" fn page_fault_handler(
 
     if is_user_mode {
         crate::serial_println!("[SIGSEGV] Killing user process (bad address 0x{:X})", addr_raw);
-        // In a full OS we'd terminate the process and switch to next.
-        // For now, halt.
+        // Terminate the process (SIGSEGV equivalent)
+        let current_pid = crate::scheduler::current_pid();
+        if current_pid != 0 {
+            let _ = crate::process::set_state(current_pid, crate::process::ProcessState::Terminated);
+            crate::serial_println!("[SIGSEGV] PID {} terminated due to page fault", current_pid);
+            // Trigger a context switch to the next process
+            crate::scheduler::schedule_next();
+        }
     }
 
     panic!("Page fault");
