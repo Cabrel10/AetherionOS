@@ -57,9 +57,10 @@ mod process;
 mod scheduler;
 mod gpu;
 mod elf;
+mod net;
 
 // ===== Configuration =====
-const KERNEL_VERSION: &str = "1.6.0-couche16-c-toolchain";
+const KERNEL_VERSION: &str = "1.7.0-couche17-network-stack";
 
 // ===== Embedded ELF binaries =====
 /// Minimal hello.elf - statically linked x86-64 ELF for Ring 3 test
@@ -1282,6 +1283,14 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // === Step 15: ELF Loader Tests ===
     serial_write("\n[15/15] ELF Loader Tests (Couche 11)...\n");
     elf::run_tests(HELLO_ELF);
+
+    // ===================================================================
+    // COUCHE 17: NETWORK STACK
+    // VirtIO-Net driver, Ethernet, IPv4, ICMP, UDP, ARP, Sockets
+    // ===================================================================
+    serial_write("\n[16/17] Network Stack (Couche 17)...\n");
+    net::init();
+    net::run_tests();
 
     // ===================================================================
     // COUCHE 16: NATIVE C PROGRAM LAUNCH

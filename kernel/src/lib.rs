@@ -25,6 +25,7 @@ pub mod process;
 pub mod scheduler;
 pub mod gpu;
 pub mod elf;
+pub mod net;
 
 pub mod tests;
 

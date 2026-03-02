@@ -36,6 +36,22 @@ pub fn read_config_u32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
     }
 }
 
+/// Write a 32-bit value to PCI configuration space.
+pub fn write_config_u32(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
+    let address: u32 = 0x8000_0000
+        | ((bus as u32) << 16)
+        | (((device & 0x1F) as u32) << 11)
+        | (((function & 0x07) as u32) << 8)
+        | ((offset & 0xFC) as u32);
+
+    unsafe {
+        let mut addr_port = Port::<u32>::new(CONFIG_ADDRESS);
+        let mut data_port = Port::<u32>::new(CONFIG_DATA);
+        addr_port.write(address);
+        data_port.write(value);
+    }
+}
+
 /// Read the Vendor ID and Device ID of a PCI device.
 /// Returns (vendor_id, device_id). vendor_id == 0xFFFF means no device.
 pub fn read_vendor_device(bus: u8, device: u8, function: u8) -> (u16, u16) {

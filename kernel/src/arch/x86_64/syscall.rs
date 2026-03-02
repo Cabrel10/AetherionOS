@@ -209,6 +209,10 @@ extern "C" fn syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         9  => sys_mmap(a1, a2, a3),
         20 => sys_getpid(),
         39 => sys_getppid(),
+        41 => sys_socket(a1 as u32, a2 as u32, a3 as u32),
+        44 => sys_sendto(a1 as u32, a2, a3),
+        45 => sys_recvfrom(a1 as u32, a2, a3),
+        49 => sys_bind(a1 as u32, a2 as u16),
         57 => sys_fork(),
         59 => sys_exec(a1),
         60 => sys_exit(a1),
@@ -217,6 +221,7 @@ extern "C" fn syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         200 => sys_ps(),
         201 => sys_bus_publish(a1, a2 as u32, a3),
         202 => sys_vga_write(a1 as usize, a2 as usize, a3),
+        210 => sys_net_ping(a1, a2 as u16),
         _ => {
             crate::serial_println!("[SYSCALL] Unknown nr={} a1=0x{:X} a2=0x{:X} a3=0x{:X}", nr, a1, a2, a3);
             ENOSYS
@@ -828,4 +833,82 @@ fn sys_vga_write(row: usize, col: usize, color_char: u64) -> u64 {
         row, col, ch, attr
     );
     0
+}
+
+// ===== Network Syscalls (Couche 17) =====
+
+/// sys_socket(domain, type, protocol) -> fd
+fn sys_socket(domain: u32, sock_type: u32, protocol: u32) -> u64 {
+    crate::serial_println!("[SYSCALL] sys_socket(domain={}, type={}, proto={})", domain, sock_type, protocol);
+    crate::net::socket::sys_socket(domain, sock_type, protocol)
+}
+
+/// sys_sendto(fd, buf_addr, encoded_dest) -> bytes_sent
+/// encoded_dest: high 32 bits = IP as u32, low 16 bits = port
+fn sys_sendto(fd: u32, buf_addr: u64, encoded: u64) -> u64 {
+    // Decode dest: a3 has IP in upper 32 bits and port in lower 16
+    let ip_u32 = (encoded >> 16) as u32;
+    let port = (encoded & 0xFFFF) as u16;
+    let ip = crate::net::ipv4::Ipv4Addr([
+        ((ip_u32 >> 24) & 0xFF) as u8,
+        ((ip_u32 >> 16) & 0xFF) as u8,
+        ((ip_u32 >> 8) & 0xFF) as u8,
+        (ip_u32 & 0xFF) as u8,
+    ]);
+
+    // Read length from user (first 8 bytes of buf contain length)
+    let len = unsafe {
+        let ptr = buf_addr as *const u64;
+        core::ptr::read_volatile(ptr)
+    };
+
+    crate::serial_println!("[SYSCALL] sys_sendto(fd={}, buf=0x{:X}, len={}, dst={}:{})",
+        fd, buf_addr + 8, len, ip, port);
+
+    crate::net::socket::sys_sendto(fd, buf_addr + 8, len, 0, ip, port)
+}
+
+/// sys_recvfrom(fd, buf_addr, len) -> bytes_received
+fn sys_recvfrom(fd: u32, buf_addr: u64, len: u64) -> u64 {
+    if !validate_user_ptr(buf_addr, len) {
+        return EFAULT;
+    }
+    crate::net::socket::sys_recvfrom(fd, buf_addr, len)
+}
+
+/// sys_bind(fd, port) -> 0 or error
+fn sys_bind(fd: u32, port: u16) -> u64 {
+    crate::serial_println!("[SYSCALL] sys_bind(fd={}, port={})", fd, port);
+    crate::net::socket::sys_bind(fd, port)
+}
+
+/// sys_net_ping(ip_packed, sequence) -> 0 or error
+/// Custom AetherionOS syscall for ICMP ping
+/// ip_packed: IP address as (a<<24|b<<16|c<<8|d)
+fn sys_net_ping(ip_packed: u64, sequence: u16) -> u64 {
+    let ip = crate::net::ipv4::Ipv4Addr([
+        ((ip_packed >> 24) & 0xFF) as u8,
+        ((ip_packed >> 16) & 0xFF) as u8,
+        ((ip_packed >> 8) & 0xFF) as u8,
+        (ip_packed & 0xFF) as u8,
+    ]);
+
+    crate::serial_println!("[SYSCALL] sys_net_ping({}, seq={})", ip, sequence);
+
+    // Send ping
+    if crate::net::send_ping(ip, sequence) {
+        // Poll for reply with timeout
+        for _ in 0..200_000u32 {
+            crate::net::poll();
+            if let Some(reply_ip) = crate::net::check_ping_reply(sequence) {
+                crate::serial_println!("[SYSCALL] PONG from {} (seq={})", reply_ip, sequence);
+                return 0; // Success
+            }
+            unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
+        }
+        crate::serial_println!("[SYSCALL] ping timeout (seq={})", sequence);
+        (-110i64) as u64 // ETIMEDOUT
+    } else {
+        (-5i64) as u64 // EIO
+    }
 }
