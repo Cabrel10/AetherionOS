@@ -59,6 +59,7 @@ mod gpu;
 mod elf;
 mod net;
 mod drivers;
+mod framebuffer;
 
 // ===== Configuration =====
 const KERNEL_VERSION: &str = "1.9.0-couche19-storage";
@@ -80,6 +81,10 @@ static LS_ELF: &[u8] = include_bytes!("../../userspace/c_apps/ls.elf");
 static CAT_ELF: &[u8] = include_bytes!("../../userspace/c_apps/cat.elf");
 /// j19_test - Jalon 19 comprehensive validation (Couche 19)
 static J19_TEST_ELF: &[u8] = include_bytes!("../../userspace/c_apps/j19_test.elf");
+/// threads - Jalon 20 multi-threading validation (Couche 20)
+static THREADS_ELF: &[u8] = include_bytes!("../../userspace/c_apps/threads.elf");
+/// ui - Jalon 21 GUI framebuffer validation (Couche 21)
+static UI_ELF: &[u8] = include_bytes!("../../userspace/c_apps/ui.elf");
 
 // VGA text buffer
 const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
@@ -1400,17 +1405,41 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     alloc::string::String::from("j19_test.elf"),
                     fs::vfs::VfsNode::File(alloc::vec::Vec::from(J19_TEST_ELF)),
                 );
+                bin_dir.insert(
+                    alloc::string::String::from("threads.elf"),
+                    fs::vfs::VfsNode::File(alloc::vec::Vec::from(THREADS_ELF)),
+                );
+                bin_dir.insert(
+                    alloc::string::String::from("ui.elf"),
+                    fs::vfs::VfsNode::File(alloc::vec::Vec::from(UI_ELF)),
+                );
                 serial_println!("       [OK] /bin/ls.elf ({} bytes)", LS_ELF.len());
                 serial_println!("       [OK] /bin/cat.elf ({} bytes)", CAT_ELF.len());
                 serial_println!("       [OK] /bin/j19_test.elf ({} bytes)", J19_TEST_ELF.len());
+                serial_println!("       [OK] /bin/threads.elf ({} bytes)", THREADS_ELF.len());
+                serial_println!("       [OK] /bin/ui.elf ({} bytes)", UI_ELF.len());
             }
         }
     }
 
     // ===================================================================
-    // COUCHE 19: LAUNCH JALON 19 COMPREHENSIVE TEST
-    // Validates: DNS, TCP, FAT32 directory listing, FAT32 file read
-    // Fallback: wget.elf (Couche 18), then hello_c.elf (Couche 16)
+    // COUCHE 21: FRAMEBUFFER INITIALIZATION
+    // Bochs VGA Extension: switch to 1024x768x32bpp linear framebuffer
+    // ===================================================================
+    serial_write("\n[20/21] Framebuffer (Couche 21)...\n");
+    match framebuffer::init(1024, 768) {
+        Some(fb) => {
+            serial_println!("       [OK] Framebuffer: {}x{} @ 0x{:X} ({} KB)",
+                fb.width, fb.height, fb.phys_addr, fb.size / 1024);
+        }
+        None => {
+            serial_write("       [SKIP] No VBE-compatible framebuffer detected\n");
+        }
+    }
+
+    // ===================================================================
+    // COUCHE 19+20+21: LAUNCH JALON 19 + JALON 20 + JALON 21 (GUI)
+    // Validates: DNS, TCP, FAT32, then Ring 3 multi-threading via sys_clone
     // ===================================================================
     serial_write("\n========================================\n");
     if net::is_available() {
@@ -1429,6 +1458,48 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
         let elf_binary = if net::is_available() { J19_TEST_ELF } else { HELLO_C_ELF };
         let elf_name = if net::is_available() { "/bin/j19_test.elf" } else { "/bin/hello_c.elf" };
+
+        // Pre-load threads.elf as a queued process (will run after j19_test exits)
+        serial_println!("  [STEP 0] Pre-loading threads.elf for Jalon 20...");
+        match elf::load_elf_binary(THREADS_ELF) {
+            Ok(threads_result) => {
+                let threads_pid = process::spawn_userspace(
+                    "/bin/threads.elf", 0,
+                    threads_result.entry_point, threads_result.stack_pointer, threads_result.pml4_phys
+                ).unwrap_or(0);
+                if threads_pid != 0 {
+                    scheduler::enqueue_process(threads_pid);
+                    serial_println!(
+                        "  [OK] threads.elf queued as PID {} (entry=0x{:X}, stack=0x{:X})",
+                        threads_pid, threads_result.entry_point, threads_result.stack_pointer
+                    );
+                }
+            }
+            Err(e) => {
+                serial_println!("  [WARN] threads.elf pre-load failed: {}", e);
+            }
+        }
+
+        // Pre-load ui.elf as a queued process (will run after threads.elf exits)
+        serial_println!("  [STEP 0b] Pre-loading ui.elf for Jalon 21...");
+        match elf::load_elf_binary(UI_ELF) {
+            Ok(ui_result) => {
+                let ui_pid = process::spawn_userspace(
+                    "/bin/ui.elf", 0,
+                    ui_result.entry_point, ui_result.stack_pointer, ui_result.pml4_phys
+                ).unwrap_or(0);
+                if ui_pid != 0 {
+                    scheduler::enqueue_process(ui_pid);
+                    serial_println!(
+                        "  [OK] ui.elf queued as PID {} (entry=0x{:X}, stack=0x{:X})",
+                        ui_pid, ui_result.entry_point, ui_result.stack_pointer
+                    );
+                }
+            }
+            Err(e) => {
+                serial_println!("  [WARN] ui.elf pre-load failed: {}", e);
+            }
+        }
 
         serial_println!("  [STEP 1] Loading {}...", elf_name);
         let load_result = elf::load_elf_binary(elf_binary);

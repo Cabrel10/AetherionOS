@@ -76,7 +76,7 @@ GCC_FLAGS="-nostdlib -fno-builtin -fno-stack-protector -ffreestanding \
     -mno-sse -mno-sse2 -mno-mmx -mno-80387 -mno-red-zone \
     -fPIC -O2 -Wall -Wextra -mcmodel=large"
 
-# Build libc_stub.o
+# Build libc_stub.o (shared by all apps)
 echo ""
 echo "[BUILD] Compiling libc_stub.c..."
 gcc -c $GCC_FLAGS \
@@ -84,38 +84,48 @@ gcc -c $GCC_FLAGS \
     "$C_APPS_DIR/libc_stub.c"
 echo "[OK] libc_stub.o"
 
-# Build hello_c
-echo ""
-echo "[BUILD] Compiling hello_c.c..."
-gcc -c $GCC_FLAGS \
-    -o "$C_APPS_DIR/hello_c.o" \
-    "$C_APPS_DIR/hello_c.c"
-echo "[OK] hello_c.o"
+# List of all C apps to build
+APPS="hello_c j19_test ls cat wget threads ui"
 
-# Link
-echo ""
-echo "[LINK] Linking hello_c.elf..."
-ld -T "$LINKER_SCRIPT" -static \
-    -o "$OUTPUT_DIR/hello_c.elf" \
-    "$C_APPS_DIR/hello_c.o" \
-    "$C_APPS_DIR/libc_stub.o"
-echo "[OK] hello_c.elf"
+for APP in $APPS; do
+    SRC="$C_APPS_DIR/${APP}.c"
+    OBJ="$C_APPS_DIR/${APP}.o"
+    ELF="$OUTPUT_DIR/${APP}.elf"
 
-# Verify
-echo ""
-echo "[VERIFY] ELF information:"
-file "$OUTPUT_DIR/hello_c.elf"
-echo ""
-echo "Size: $(stat -c %s "$OUTPUT_DIR/hello_c.elf") bytes"
-echo ""
+    if [ ! -f "$SRC" ]; then
+        echo "[SKIP] $SRC not found"
+        continue
+    fi
 
-# Read ELF entry point
-readelf -h "$OUTPUT_DIR/hello_c.elf" 2>/dev/null | grep -E "Entry|Type|Machine" || true
+    echo ""
+    echo "[BUILD] Compiling ${APP}.c..."
+    gcc -c $GCC_FLAGS \
+        -o "$OBJ" \
+        "$SRC"
+    echo "[OK] ${APP}.o"
+
+    echo "[LINK] Linking ${APP}.elf..."
+    ld -T "$LINKER_SCRIPT" -static \
+        -o "$ELF" \
+        "$OBJ" \
+        "$C_APPS_DIR/libc_stub.o"
+    echo "[OK] ${APP}.elf ($(stat -c %s "$ELF") bytes)"
+done
+
+# Verify all ELFs
+echo ""
+echo "[VERIFY] Built ELF binaries:"
+for APP in $APPS; do
+    ELF="$OUTPUT_DIR/${APP}.elf"
+    if [ -f "$ELF" ]; then
+        echo "  $(file "$ELF") - $(stat -c %s "$ELF") bytes"
+    fi
+done
 
 # Cleanup object files
 rm -f "$C_APPS_DIR"/*.o
 
 echo ""
 echo "========================================="
-echo "[BUILD_C] SUCCESS: hello_c.elf built!"
+echo "[BUILD_C] SUCCESS: All C apps built!"
 echo "========================================="

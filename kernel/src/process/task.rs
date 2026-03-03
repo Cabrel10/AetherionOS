@@ -211,6 +211,17 @@ pub struct Process {
     pub entry_point: u64,
     /// Stack pointer (for Ring 3 processes)
     pub stack_pointer: u64,
+    /// True if this is a thread (shares parent's address space)
+    pub is_thread: bool,
+    /// Saved user RIP (for resuming parent after child threads finish)
+    pub saved_user_rip: u64,
+    /// Saved user RSP (for resuming parent after child threads finish)
+    pub saved_user_rsp: u64,
+    /// Saved kernel RSP pointing to syscall_entry register frame (for sysretq resume)
+    pub saved_kernel_rsp: u64,
+    /// Saved user registers from syscall_entry (r15,r14,r13,r12,rbx,rbp,r11,rcx)
+    /// Needed because the shared kernel syscall stack gets overwritten by child threads.
+    pub saved_syscall_regs: [u64; 8],
 }
 
 impl Process {
@@ -239,6 +250,11 @@ impl Process {
             exit_code: 0,
             entry_point: 0,
             stack_pointer: 0,
+            is_thread: false,
+            saved_user_rip: 0,
+            saved_user_rsp: 0,
+            saved_kernel_rsp: 0,
+            saved_syscall_regs: [0; 8],
         }
     }
 

@@ -220,6 +220,41 @@ pub fn fork_process(parent_pid: u64, child_pml4: u64, child_entry: u64, child_st
     Ok(child_pid)
 }
 
+/// Clone thread: create a lightweight thread sharing the parent's address space (PML4).
+/// Unlike fork, the child shares the same virtual memory — true threading.
+/// child_stack is the top of the pre-allocated stack for the new thread.
+/// child_entry is the instruction pointer where the thread begins execution.
+pub fn clone_thread(parent_pid: u64, child_stack: u64, child_entry: u64) -> Result<u64, ProcessError> {
+    let mut table = PROCESS_TABLE.lock();
+    if table.len() >= MAX_PROCESSES {
+        return Err(ProcessError::LimitReached);
+    }
+    let parent = table.get(&parent_pid).ok_or(ProcessError::NotFound)?;
+    let parent_name = parent.name.clone();
+    let parent_uid = parent.uid;
+    let parent_gid = parent.gid;
+    let parent_pml4 = parent.pml4_phys; // SHARED, not copied!
+    let parent_fd_table = parent.fd_table.clone();
+
+    let mut child = Process::new(&parent_name, AgentRole::Worker, parent_pid, parent_uid, parent_gid);
+    child.pml4_phys = parent_pml4; // Key: share the address space
+    child.entry_point = child_entry;
+    child.stack_pointer = child_stack;
+    child.fd_table = parent_fd_table;
+    child.state = ProcessState::Ready;
+    child.is_thread = true; // Mark as thread (shared memory)
+    let child_pid = child.pid;
+    table.insert(child_pid, child);
+
+    // Add child to parent's children list
+    if let Some(parent) = table.get_mut(&parent_pid) {
+        parent.add_child(child_pid);
+    }
+
+    PROCESSES_CREATED.fetch_add(1, Ordering::Relaxed);
+    Ok(child_pid)
+}
+
 /// Wait for any child of parent_pid to terminate.
 /// Returns (child_pid, exit_code) or error.
 pub fn wait_for_child(parent_pid: u64) -> Result<(u64, i32), ProcessError> {
@@ -238,6 +273,46 @@ pub fn wait_for_child(parent_pid: u64) -> Result<(u64, i32), ProcessError> {
     
     // No terminated child found
     Err(ProcessError::WaitingForChild)
+}
+
+/// Find a Ready child thread of parent_pid.
+/// Returns (child_pid, entry_point, stack_pointer, pml4_phys) or None.
+pub fn find_ready_child_thread(parent_pid: u64) -> Option<(u64, u64, u64, u64)> {
+    let table = PROCESS_TABLE.lock();
+    let parent = table.get(&parent_pid)?;
+
+    for &child_pid in &parent.children {
+        if let Some(child) = table.get(&child_pid) {
+            if child.is_thread && child.state == ProcessState::Ready {
+                return Some((child_pid, child.entry_point, child.stack_pointer, child.pml4_phys));
+            }
+        }
+    }
+    None
+}
+
+/// Find the next Ready userspace process (not a thread, not the given PID).
+/// Returns (pid, entry_point, stack_pointer, pml4_phys, name) or None.
+pub fn find_next_ready_userspace(exclude_pid: u64) -> Option<(u64, u64, u64, u64, String)> {
+    let table = PROCESS_TABLE.lock();
+    for (_, proc) in table.iter() {
+        if proc.pid != exclude_pid
+            && proc.state == ProcessState::Ready
+            && !proc.is_thread
+            && proc.entry_point != 0
+            && proc.pml4_phys != 0
+            && proc.role != AgentRole::KernelThread
+        {
+            return Some((
+                proc.pid,
+                proc.entry_point,
+                proc.stack_pointer,
+                proc.pml4_phys,
+                proc.name.clone(),
+            ));
+        }
+    }
+    None
 }
 
 /// Set exit code for a process

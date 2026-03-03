@@ -27,6 +27,7 @@ pub mod gpu;
 pub mod elf;
 pub mod net;
 pub mod drivers;
+pub mod framebuffer;
 
 pub mod tests;
 
