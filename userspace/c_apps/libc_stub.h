@@ -95,4 +95,24 @@ long tcp_shutdown(int fd);
 /* DNS resolve */
 long gethostbyname(const char *name);
 
+/* ========================================
+ * Threading syscalls (Couche 20)
+ * ======================================== */
+
+/* sys_clone: create a thread sharing the parent's address space.
+ * child_stack: top of allocated stack with function pointer at (stack_top - 8).
+ * Returns: child PID to parent. */
+long sys_clone(void *child_stack);
+
+/* sys_yield: voluntarily yield CPU to another thread */
+long sys_yield(void);
+
+/* sys_wait: wait for any child to terminate.
+ * Returns: (child_pid << 16) | exit_code, or negative error. */
+long sys_wait(long pid);
+
+/* thread_create: allocate a 64 KiB stack, store fn pointer, call sys_clone.
+ * Returns: child PID or negative error. */
+long thread_create(void (*start_routine)(void));
+
 #endif /* _LIBC_STUB_H */

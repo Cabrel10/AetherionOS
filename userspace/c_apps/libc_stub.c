@@ -242,3 +242,49 @@ long tcp_shutdown(int fd) {
 long gethostbyname(const char *name) {
     return syscall1(211, (long)name);
 }
+
+/* ========================================
+ * Threading syscalls (Couche 20)
+ * ======================================== */
+
+/* sys_clone: syscall 56(child_stack)
+ * Creates a new thread sharing the parent address space.
+ * child_stack must have the function pointer at (stack_top - 8). */
+long sys_clone(void *child_stack) {
+    return syscall1(56, (long)child_stack);
+}
+
+/* sys_yield: syscall 24 - voluntarily yield CPU */
+long sys_yield(void) {
+    return syscall1(24, 0);
+}
+
+/* sys_wait: syscall 61(pid) - wait for child to terminate */
+long sys_wait(long pid) {
+    return syscall1(61, pid);
+}
+
+/* thread_create: high-level wrapper
+ * 1. Allocates a 64 KiB stack via mmap
+ * 2. Writes function pointer at (stack_top - 8)
+ * 3. Calls sys_clone with the new stack top
+ * Returns child PID or negative error */
+long thread_create(void (*start_routine)(void)) {
+    /* Allocate 64 KiB for the thread stack */
+    unsigned long stack_size = 65536;
+    void *stack_base = mmap(0, stack_size, 0, 0, 0, 0);
+    if ((long)stack_base < 0) {
+        return -1; /* mmap failed */
+    }
+
+    /* Stack grows downward: top is base + size */
+    unsigned long stack_top = (unsigned long)stack_base + stack_size;
+
+    /* Write function pointer at (stack_top - 8) — the kernel reads this */
+    unsigned long *fn_slot = (unsigned long *)(stack_top - 8);
+    *fn_slot = (unsigned long)start_routine;
+
+    /* Call sys_clone with the stack top */
+    long ret = sys_clone((void *)stack_top);
+    return ret;
+}

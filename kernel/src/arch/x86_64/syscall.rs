@@ -34,6 +34,14 @@
 //   0x20  User Code   (Ring 3)
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+/// Saved kernel RSP for parent resume after child threads complete.
+/// When sys_wait IRETQs to a child, we save the kernel stack pointer here.
+/// This RSP points to the stack frame with saved user registers from syscall_entry.
+/// On resume, we restore this RSP and return through the normal sysretq path,
+/// which restores all callee-saved registers correctly.
+static mut PARENT_RESUME_KERNEL_RSP: u64 = 0;
 
 // ===== MSR addresses =====
 const IA32_EFER: u32       = 0xC000_0080;
@@ -72,16 +80,18 @@ struct AlignedStack([u8; KERNEL_SYSCALL_STACK_SIZE]);
 static mut SYSCALL_STACK: AlignedStack = AlignedStack([0; KERNEL_SYSCALL_STACK_SIZE]);
 
 /// Per-CPU data structure accessed via GS base after swapgs.
-/// Layout is ABI-critical: offset 0 = kernel_rsp, offset 8 = user_rsp.
+/// Layout is ABI-critical: offset 0 = kernel_rsp, offset 8 = user_rsp, offset 16 = user_rip.
 #[repr(C)]
 struct PerCpuData {
     kernel_rsp: u64,  // offset 0: kernel RSP loaded on SYSCALL entry
     user_rsp: u64,    // offset 8: user RSP saved during SYSCALL
+    user_rip: u64,    // offset 16: user RIP saved on SYSCALL entry (from RCX)
 }
 
 static mut PER_CPU: PerCpuData = PerCpuData {
     kernel_rsp: 0,
     user_rsp: 0,
+    user_rip: 0,
 };
 
 // ===== MSR helpers =====
@@ -107,6 +117,20 @@ unsafe fn wrmsr(msr: u32, value: u64) {
         in("eax") lo,
         in("edx") hi,
         options(nomem, nostack));
+}
+
+// ===== Helpers to get saved user state (for thread context save/restore) =====
+
+/// Return the user-mode RIP that was saved on SYSCALL entry (from RCX).
+#[inline]
+fn saved_user_rip() -> u64 {
+    unsafe { PER_CPU.user_rip }
+}
+
+/// Return the user-mode RSP that was saved on SYSCALL entry.
+#[inline]
+fn saved_user_rsp() -> u64 {
+    unsafe { PER_CPU.user_rsp }
 }
 
 // ===== User pointer validation =====
@@ -142,8 +166,9 @@ unsafe extern "C" fn syscall_entry() {
         // 1. Switch to kernel GS
         "swapgs",
 
-        // 2. Save user RSP, load kernel RSP
+        // 2. Save user RSP and RIP, load kernel RSP
         "mov gs:[8], rsp",
+        "mov gs:[16], rcx",   // save user RIP (RCX holds return addr from SYSCALL)
         "mov rsp, gs:[0]",
 
         // 3. Build a stack frame with all user state
@@ -155,6 +180,11 @@ unsafe extern "C" fn syscall_entry() {
         "push r13",
         "push r14",
         "push r15",
+
+        // 3b. Save the kernel RSP (pointing to saved regs) into global.
+        // This is overwritten on every syscall; sys_wait copies it to the
+        // process struct before launching a child thread.
+        "mov [{save_rsp}], rsp",
 
         // 4. Prepare arguments for Rust handler
         //    syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64)
@@ -190,6 +220,7 @@ unsafe extern "C" fn syscall_entry() {
         "sysretq",
 
         handler = sym syscall_handler_rust,
+        save_rsp = sym PARENT_RESUME_KERNEL_RSP,
         options(noreturn),
     );
 }
@@ -207,7 +238,9 @@ extern "C" fn syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         3  => sys_close(a1 as u32),
         8  => sys_seek(a1 as u32, a2 as i64, a3 as u32),
         9  => sys_mmap(a1, a2, a3),
+        10 => sys_mmap_fb(a1),
         20 => sys_getpid(),
+        24 => sys_yield(),
         39 => sys_getppid(),
         41 => sys_socket(a1 as u32, a2 as u32, a3 as u32),
         42 => sys_tcp_connect(a1 as u32, a2, a3),
@@ -215,6 +248,7 @@ extern "C" fn syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         45 => sys_recvfrom(a1 as u32, a2, a3),
         47 => sys_tcp_shutdown_syscall(a1 as u32),
         49 => sys_bind(a1 as u32, a2 as u16),
+        56 => sys_clone(a1),
         57 => sys_fork(),
         59 => sys_exec(a1),
         60 => sys_exit(a1),
@@ -438,6 +472,58 @@ fn sys_getppid() -> u64 {
 
 // ===== sys_fork() =====
 
+// ===== sys_clone(child_stack) =====
+
+/// Create a lightweight thread sharing the parent's address space.
+/// Unlike fork, the child reuses the same PML4 — true shared memory threading.
+/// child_stack: top of a pre-allocated stack for the new thread.
+///   The stack must have the function pointer at (child_stack - 8).
+/// Returns: child_pid to the parent, 0 to the child thread.
+fn sys_clone(child_stack: u64) -> u64 {
+    let current_pid = crate::scheduler::current_pid();
+
+    crate::serial_println!("[SYSCALL] sys_clone(stack=0x{:X}) from PID {}", child_stack, current_pid);
+
+    if child_stack == 0 {
+        crate::serial_println!("[SYSCALL] clone: invalid child_stack 0x{:X}", child_stack);
+        return EINVAL;
+    }
+
+    // Read the function pointer from (child_stack - 8)
+    // The C wrapper writes: *(stack_top - 8) = (uint64_t)start_routine;
+    let fn_ptr = unsafe { core::ptr::read_volatile((child_stack - 8) as *const u64) };
+    crate::serial_println!("[SYSCALL] clone: fn_ptr=0x{:X}", fn_ptr);
+
+    // Create the child thread (shares PML4 = shared address space)
+    match crate::process::clone_thread(current_pid, child_stack - 16, fn_ptr) {
+        Ok(child_pid) => {
+            // Enqueue the child in the scheduler
+            crate::scheduler::enqueue_process(child_pid);
+            crate::serial_println!(
+                "[SYSCALL] clone: thread PID {} created (shared PML4, stack=0x{:X}, fn=0x{:X})",
+                child_pid, child_stack - 16, fn_ptr
+            );
+            child_pid
+        }
+        Err(e) => {
+            crate::serial_println!("[SYSCALL] clone: error: {}", e);
+            ENOMEM
+        }
+    }
+}
+
+// ===== sys_yield() =====
+
+/// Voluntarily yield the CPU to another ready process.
+/// Essential for cooperative multitasking and userspace spinlocks/mutexes.
+fn sys_yield() -> u64 {
+    // Re-enqueue current process and pick the next one
+    crate::scheduler::schedule_next();
+    // Pause briefly
+    unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
+    0 // Success
+}
+
 /// Fork the current process.
 /// Returns: 0 in child, child_pid in parent.
 /// MVP: Deep copy of page tables (no COW).
@@ -563,6 +649,9 @@ fn sys_exec(path_addr: u64) -> u64 {
                     in(reg) result.pml4_phys,
                     options(nostack)
                 );
+                // swapgs before IRETQ: we're inside a syscall handler (GS=PER_CPU)
+                // Must restore user GS (=0) before returning to Ring 3
+                core::arch::asm!("swapgs", options(nomem, nostack));
                 crate::elf::jump_to_ring3(result.entry_point, result.stack_pointer);
             }
         }
@@ -575,12 +664,14 @@ fn sys_exec(path_addr: u64) -> u64 {
 
 // ===== sys_exit(code) =====
 
-/// Terminate the current user process.
+/// Terminate the current user process or thread.
 fn sys_exit(code: u64) -> u64 {
     let current = crate::scheduler::current_pid();
+    let is_thread = crate::process::with_process(current, |p| p.is_thread).unwrap_or(false);
+
     crate::serial_println!(
-        "[SYSCALL] sys_exit({}) - PID {} terminating",
-        code, current
+        "[SYSCALL] sys_exit({}) - {} {} terminating",
+        code, if is_thread { "Thread" } else { "Process" }, current
     );
 
     if current != 0 {
@@ -592,12 +683,200 @@ fn sys_exit(code: u64) -> u64 {
         crate::serial_println!("[SYSCALL] PID {} terminated (exit {})", current, code);
     }
 
+    if is_thread {
+        // Thread exit: find the parent and check for more siblings
+        let parent_pid = crate::process::with_process(current, |p| p.ppid).unwrap_or(0);
+        if parent_pid != 0 {
+            crate::serial_println!("[SYSCALL] Thread {} done, checking siblings for parent PID {}", current, parent_pid);
+
+            // Check if parent has more child threads to run
+            if let Some((next_child, child_entry, child_stack, child_pml4)) =
+                crate::process::find_ready_child_thread(parent_pid)
+            {
+                // Launch next sibling thread
+                crate::serial_println!(
+                    "[SYSCALL] Launching next thread PID {} (entry=0x{:X}, stack=0x{:X})",
+                    next_child, child_entry, child_stack
+                );
+                let _ = crate::process::set_state(next_child, crate::process::ProcessState::Running);
+                crate::scheduler::set_current_pid(next_child);
+                unsafe {
+                    core::arch::asm!("mov cr3, {}", in(reg) child_pml4, options(nostack));
+                    core::arch::asm!(
+                        "swapgs",           // Restore user GS before Ring 3
+                        "push 0x1B",        // SS
+                        "push {stack}",     // RSP
+                        "push 0x202",       // RFLAGS
+                        "push 0x23",        // CS
+                        "push {entry}",     // RIP
+                        "iretq",
+                        stack = in(reg) child_stack,
+                        entry = in(reg) child_entry,
+                        options(noreturn),
+                    );
+                }
+            }
+
+            // No more child threads — resume parent at its saved context.
+            // The parent's full register state was saved on the kernel syscall stack
+            // by syscall_entry. We restore the kernel RSP to that point and let the
+            // normal pop + sysretq path run, which correctly restores all user registers.
+            let parent_info = crate::process::with_process(parent_pid, |p| {
+                (p.saved_user_rip, p.saved_user_rsp, p.pml4_phys, p.saved_kernel_rsp, p.saved_syscall_regs)
+            });
+
+            if let Some((saved_rip, saved_rsp, pml4, saved_kernel_rsp, saved_regs)) = parent_info {
+                crate::serial_println!(
+                    "[SYSCALL] All threads done, resuming parent PID {} at RIP=0x{:X} RSP=0x{:X}",
+                    parent_pid, saved_rip, saved_rsp
+                );
+
+                // Set scheduler to parent
+                crate::scheduler::set_current_pid(parent_pid);
+                let _ = crate::process::set_state(parent_pid, crate::process::ProcessState::Running);
+
+                // Switch CR3 to parent PML4
+                unsafe {
+                    core::arch::asm!("mov cr3, {}", in(reg) pml4, options(nostack));
+                }
+
+                // Resume parent via sysretq through the normal syscall_entry return path.
+                // This restores all user registers (r15-r12, rbx, rbp, r11=RFLAGS, rcx=RIP)
+                // that were saved by syscall_entry when the parent called sys_wait.
+                let wait_result = ((current & 0xFFFF) << 16) | (code & 0xFFFF);
+                crate::serial_println!(
+                    "[SYSCALL] sysretq to parent: RAX=0x{:X}, regs saved={}",
+                    wait_result, saved_regs[7] != 0
+                );
+
+                if saved_regs[7] != 0 {
+                    // Restore the full register state from saved_regs and return via sysretq.
+                    // saved_regs: [r15, r14, r13, r12, rbx, rbp, r11(RFLAGS), rcx(RIP)]
+                    let r15 = saved_regs[0];
+                    let r14 = saved_regs[1];
+                    let r13 = saved_regs[2];
+                    let r12 = saved_regs[3];
+                    let rbx = saved_regs[4];
+                    let rbp = saved_regs[5];
+                    let r11 = saved_regs[6]; // user RFLAGS
+                    let rcx = saved_regs[7]; // user RIP
+
+                    // Write parent's user RSP into PER_CPU.user_rsp (gs:[8])
+                    unsafe { PER_CPU.user_rsp = saved_rsp; }
+
+                    crate::serial_println!(
+                        "[SYSCALL] Restoring regs: RCX(RIP)=0x{:X} R11(RFLAGS)=0x{:X} RBP=0x{:X} RBX=0x{:X}",
+                        rcx, r11, rbp, rbx
+                    );
+
+                    unsafe {
+                        core::arch::asm!(
+                            "mov r15, {v_r15}",
+                            "mov r14, {v_r14}",
+                            "mov r13, {v_r13}",
+                            "mov r12, {v_r12}",
+                            "mov rbx, {v_rbx}",
+                            "mov rbp, {v_rbp}",
+                            "mov r11, {v_r11}",
+                            "mov rcx, {v_rcx}",
+                            "mov rax, {result}",
+                            "mov rsp, gs:[8]",      // Restore user RSP
+                            "swapgs",               // Swap back to user GS
+                            "sysretq",              // Return to Ring 3
+                            v_r15 = in(reg) r15,
+                            v_r14 = in(reg) r14,
+                            v_r13 = in(reg) r13,
+                            v_r12 = in(reg) r12,
+                            v_rbx = in(reg) rbx,
+                            v_rbp = in(reg) rbp,
+                            v_r11 = in(reg) r11,
+                            v_rcx = in(reg) rcx,
+                            result = in(reg) wait_result,
+                            options(noreturn),
+                        );
+                    }
+                } else if saved_rip != 0 && saved_rsp != 0 {
+                } else if saved_rip != 0 && saved_rsp != 0 {
+                    // Fallback: kernel_rsp not saved, use IRETQ (may lose callee-saved regs)
+                    crate::serial_println!(
+                        "[SYSCALL] Fallback IRETQ to parent: RIP=0x{:X}, RSP=0x{:X}",
+                        saved_rip, saved_rsp
+                    );
+                    unsafe {
+                        core::arch::asm!(
+                            "mov rax, {result}",
+                            "swapgs",
+                            "push 0x1B",
+                            "push {stack}",
+                            "push 0x202",
+                            "push 0x23",
+                            "push {entry}",
+                            "iretq",
+                            result = in(reg) wait_result,
+                            stack = in(reg) saved_rsp,
+                            entry = in(reg) saved_rip,
+                            options(noreturn),
+                        );
+                    }
+                } else {
+                    // Fallback: restart parent from entry_point
+                    let entry = crate::process::with_process(parent_pid, |p| p.entry_point).unwrap_or(0);
+                    let stack = crate::process::with_process(parent_pid, |p| p.stack_pointer).unwrap_or(0);
+                    crate::serial_println!(
+                        "[SYSCALL] Fallback: restarting parent at entry=0x{:X}",
+                        entry
+                    );
+                    unsafe {
+                        core::arch::asm!(
+                            "swapgs",           // Restore user GS before Ring 3
+                            "push 0x1B",
+                            "push {stack}",
+                            "push 0x202",
+                            "push 0x23",
+                            "push {entry}",
+                            "iretq",
+                            stack = in(reg) stack,
+                            entry = in(reg) entry,
+                            options(noreturn),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Main process exit — print the banner
     crate::serial_println!("========================================");
     crate::serial_println!("[SUCCESS] Ring 3 process PID {} exited (code {})", current, code);
     crate::serial_println!("========================================");
 
-    // Schedule next process or halt
-    crate::scheduler::schedule_next();
+    // Try to launch the next queued userspace process (e.g., threads.elf after j19_test.elf)
+    // Look for any Ready userspace process to launch
+    let next_ready = crate::process::find_next_ready_userspace(current);
+    crate::serial_println!("[SYSCALL] Looking for next userspace process: {:?}", next_ready);
+    if let Some((next_pid, entry, stack, pml4, name)) = next_ready {
+        crate::serial_println!(
+            "[SYSCALL] Launching next process: PID {} ({}) entry=0x{:X}",
+            next_pid, name, entry
+        );
+        crate::scheduler::set_current_pid(next_pid);
+        let _ = crate::process::set_state(next_pid, crate::process::ProcessState::Running);
+        unsafe {
+            core::arch::asm!("mov cr3, {}", in(reg) pml4, options(nostack));
+            core::arch::asm!(
+                "swapgs",           // Restore user GS before Ring 3
+                "push 0x1B",        // SS
+                "push {stack}",     // RSP
+                "push 0x202",       // RFLAGS
+                "push 0x23",        // CS
+                "push {entry}",     // RIP
+                "iretq",
+                stack = in(reg) stack,
+                entry = in(reg) entry,
+                options(noreturn),
+            );
+        }
+    }
 
     // If we reach here, no more processes to run
     loop { unsafe { asm!("hlt", options(nomem, nostack)); } }
@@ -605,19 +884,96 @@ fn sys_exit(code: u64) -> u64 {
 
 // ===== sys_wait(pid) =====
 
-/// Wait for a child process to terminate.
+/// Wait for a child process/thread to terminate.
 /// pid=0 means wait for any child.
+/// For threads: launches the child by doing IRETQ to its entry/stack,
+/// saves the parent's user context so it can be resumed when all children are done.
 fn sys_wait(pid: u64) -> u64 {
     let current = crate::scheduler::current_pid();
     crate::serial_println!("[SYSCALL] sys_wait({}) from PID {}", pid, current);
 
-    // Poll for child termination (MVP: busy wait with yield)
+    // Save the parent's user-mode return address so we can resume after threads
+    let parent_rip = saved_user_rip();
+    let parent_rsp = saved_user_rsp();
+    // PARENT_RESUME_KERNEL_RSP was set by syscall_entry for THIS syscall (parent's).
+    // Save it now before any child syscalls overwrite it.
+    let parent_kernel_rsp = unsafe { PARENT_RESUME_KERNEL_RSP };
+    // Copy the 8 saved registers from the kernel stack into the process struct.
+    // The shared kernel syscall stack will be overwritten by child thread syscalls.
+    // Stack layout (from RSP upward): r15, r14, r13, r12, rbx, rbp, r11(RFLAGS), rcx(RIP)
+    let saved_regs: [u64; 8] = if parent_kernel_rsp != 0 {
+        let ptr = parent_kernel_rsp as *const u64;
+        unsafe {
+            [
+                core::ptr::read_volatile(ptr),          // r15
+                core::ptr::read_volatile(ptr.add(1)),   // r14
+                core::ptr::read_volatile(ptr.add(2)),   // r13
+                core::ptr::read_volatile(ptr.add(3)),   // r12
+                core::ptr::read_volatile(ptr.add(4)),   // rbx
+                core::ptr::read_volatile(ptr.add(5)),   // rbp
+                core::ptr::read_volatile(ptr.add(6)),   // r11 (RFLAGS)
+                core::ptr::read_volatile(ptr.add(7)),   // rcx (RIP)
+            ]
+        }
+    } else {
+        [0; 8]
+    };
+    crate::process::with_process_mut(current, |p| {
+        p.saved_user_rip = parent_rip;
+        p.saved_user_rsp = parent_rsp;
+        p.saved_kernel_rsp = parent_kernel_rsp;
+        p.saved_syscall_regs = saved_regs;
+    });
+    crate::serial_println!(
+        "[SYSCALL] wait: saved parent context RIP=0x{:X} RSP=0x{:X} KRSP=0x{:X}",
+        parent_rip, parent_rsp, parent_kernel_rsp
+    );
+
+    // Check for ready child threads to run
+    let child_info = crate::process::find_ready_child_thread(current);
+
+    if let Some((child_pid, child_entry, child_stack, child_pml4)) = child_info {
+        // We have a child thread to run!
+        crate::serial_println!(
+            "[SYSCALL] wait: launching thread PID {} (entry=0x{:X}, stack=0x{:X})",
+            child_pid, child_entry, child_stack
+        );
+
+        // Mark child as Running, parent as Blocked
+        let _ = crate::process::set_state(child_pid, crate::process::ProcessState::Running);
+        let _ = crate::process::set_state(current, crate::process::ProcessState::Blocked);
+        // Set scheduler's current PID to child
+        crate::scheduler::set_current_pid(child_pid);
+
+        // Switch CR3 to child's PML4 (same as parent for threads)
+        unsafe {
+            core::arch::asm!("mov cr3, {}", in(reg) child_pml4, options(nostack));
+        }
+
+        // IRETQ to the child thread!
+        unsafe {
+            core::arch::asm!(
+                "swapgs",           // Restore user GS before Ring 3
+                "push 0x1B",        // SS
+                "push {stack}",     // RSP
+                "push 0x202",       // RFLAGS (IF=1)
+                "push 0x23",        // CS
+                "push {entry}",     // RIP
+                "iretq",
+                stack = in(reg) child_stack,
+                entry = in(reg) child_entry,
+                options(noreturn),
+            );
+        }
+    }
+
+    // No child threads to launch — poll for already-terminated children
     let max_iters = 50_000_000u64;
     for _ in 0..max_iters {
         match crate::process::wait_for_child(current) {
             Ok((child_pid, exit_code)) => {
                 crate::serial_println!("[SYSCALL] wait: child PID {} exited with {}", child_pid, exit_code);
-                // Return child PID in upper 32 bits, exit code in lower 32
+                // Return child PID in upper 16 bits, exit code in lower 16
                 return ((child_pid & 0xFFFF) << 16) | (exit_code as u64 & 0xFFFF);
             }
             Err(crate::process::ProcessError::WaitingForChild) => {
@@ -713,6 +1069,9 @@ pub fn init() {
 /// Simplified mmap: allocates anonymous memory pages at a fixed virtual address.
 /// Returns the virtual address of the mapped region, or ENOMEM on failure.
 /// For simplicity, we always map at MMAP_BASE (0x400000000000) + offset.
+/// Atomic counter for mmap allocations (each call gets a unique region)
+static MMAP_NEXT_OFFSET: AtomicU64 = AtomicU64::new(0);
+
 fn sys_mmap(addr_hint: u64, len: u64, _prot: u64) -> u64 {
     const MMAP_BASE: u64 = 0x0000_4000_0000_0000; // PML4[128]
 
@@ -721,9 +1080,13 @@ fn sys_mmap(addr_hint: u64, len: u64, _prot: u64) -> u64 {
     }
 
     let num_pages = ((len + 4095) / 4096) as usize;
+
+    // Atomically reserve space: each mmap gets a unique address range
+    let page_offset = MMAP_NEXT_OFFSET.fetch_add(num_pages as u64, AtomicOrdering::SeqCst);
+
     crate::serial_println!(
-        "[SYSCALL] sys_mmap(addr=0x{:X}, len={}, pages={})",
-        addr_hint, len, num_pages
+        "[SYSCALL] sys_mmap(addr=0x{:X}, len={}, pages={}, offset={})",
+        addr_hint, len, num_pages, page_offset
     );
 
     // Get current process PML4 from CR3
@@ -731,8 +1094,8 @@ fn sys_mmap(addr_hint: u64, len: u64, _prot: u64) -> u64 {
     unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)); }
     let pml4_phys = cr3 & !0xFFF;
 
-    // Map pages at MMAP_BASE
-    let base_vaddr = MMAP_BASE;
+    // Map pages at unique offset from MMAP_BASE
+    let base_vaddr = MMAP_BASE + page_offset * 4096;
     for i in 0..num_pages {
         let vaddr = base_vaddr + (i as u64) * 4096;
         let frame = unsafe { crate::elf::alloc_demand_frame() };
@@ -771,6 +1134,57 @@ fn sys_mmap(addr_hint: u64, len: u64, _prot: u64) -> u64 {
         num_pages, num_pages * 4, base_vaddr
     );
     base_vaddr
+}
+
+// ===== sys_mmap_fb(info_buf) =====
+/// Map the framebuffer into the calling process's address space.
+/// info_buf: user pointer to a buffer of at least 4 u64s where we write:
+///   [0] = framebuffer virtual address
+///   [1] = width
+///   [2] = height
+///   [3] = stride (bytes per row)
+/// Returns: the virtual address of the framebuffer, or ENOMEM on failure.
+fn sys_mmap_fb(info_buf: u64) -> u64 {
+    crate::serial_println!("[SYSCALL] sys_mmap_fb(info_buf=0x{:X})", info_buf);
+
+    let fb_info = match crate::framebuffer::get_info() {
+        Some(info) => info,
+        None => {
+            crate::serial_println!("[SYSCALL] mmap_fb: no framebuffer available");
+            return ENOENT;
+        }
+    };
+
+    // Get current process PML4 from CR3
+    let cr3: u64;
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)); }
+    let pml4_phys = cr3 & !0xFFF;
+
+    // Map framebuffer into user address space
+    let fb_vaddr = match crate::framebuffer::map_fb_for_user(pml4_phys) {
+        Some(addr) => addr,
+        None => {
+            crate::serial_println!("[SYSCALL] mmap_fb: mapping failed");
+            return ENOMEM;
+        }
+    };
+
+    // Write info to user buffer if provided
+    if info_buf != 0 && validate_user_ptr(info_buf, 32) {
+        unsafe {
+            let buf = info_buf as *mut u64;
+            core::ptr::write_volatile(buf, fb_vaddr);
+            core::ptr::write_volatile(buf.add(1), fb_info.width as u64);
+            core::ptr::write_volatile(buf.add(2), fb_info.height as u64);
+            core::ptr::write_volatile(buf.add(3), fb_info.stride as u64);
+        }
+        crate::serial_println!(
+            "[SYSCALL] mmap_fb: wrote info to user buf: vaddr=0x{:X} {}x{} stride={}",
+            fb_vaddr, fb_info.width, fb_info.height, fb_info.stride
+        );
+    }
+
+    fb_vaddr
 }
 
 // ===== sys_bus_publish(intent, priority, data) =====
