@@ -110,7 +110,7 @@ impl FdTable {
     }
 }
 
-use crate::arch::x86_64::context::TaskContext;
+use crate::arch::x86_64::context::{TaskContext, FpuState};
 
 // ===== Global PID Counter =====
 
@@ -222,6 +222,9 @@ pub struct Process {
     /// Saved user registers from syscall_entry (r15,r14,r13,r12,rbx,rbp,r11,rcx)
     /// Needed because the shared kernel syscall stack gets overwritten by child threads.
     pub saved_syscall_regs: [u64; 8],
+    /// FPU/SSE state (512 bytes, 16-byte aligned) for fxsave/fxrstor
+    /// Preserves XMM0-XMM15, MXCSR, x87 FPU registers across context switches
+    pub fpu_state: FpuState,
 }
 
 impl Process {
@@ -255,6 +258,7 @@ impl Process {
             saved_user_rsp: 0,
             saved_kernel_rsp: 0,
             saved_syscall_regs: [0; 8],
+            fpu_state: FpuState::zero(),
         }
     }
 

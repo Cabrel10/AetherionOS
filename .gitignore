@@ -41,3 +41,5 @@ benchmark_results/
 # Temporary files
 tmp/
 temp/
+*.tar.gz
+*.tar.xz
