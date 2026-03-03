@@ -19,18 +19,32 @@ use lazy_static::lazy_static;
 const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
 // Task State Segment - contains stack pointers for exceptions
+// RING3_INT_STACK: Dedicated kernel stack for Ring 3 -> Ring 0 transitions
+// (interrupts, exceptions from user mode use TSS.privilege_stack_table[0] = RSP0)
+const RING3_INT_STACK_SIZE: usize = 4096 * 64; // 256 KiB for deep VFS/FAT32/VirtIO chains
+
 lazy_static! {
     static ref TSS: TaskStateSegment = {
         let mut tss = TaskStateSegment::new();
+
+        // IST[0]: Double-fault stack (separate, always valid)
         tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
             const STACK_SIZE: usize = 4096 * 5;  // 20KB stack for double-fault
             static mut STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
-            // SAFETY: STACK is a static mut [u8; STACK_SIZE], only accessed here
-            // during lazy_static initialization (runs exactly once). Taking a pointer
-            // to it is safe because no other code reads/writes this array.
             let stack_start = VirtAddr::from_ptr(unsafe { &STACK });
             stack_start + STACK_SIZE as u64  // Stack grows downwards
         };
+
+        // RSP0 (privilege_stack_table[0]): Kernel stack for Ring 3 -> Ring 0
+        // When any interrupt/exception occurs in Ring 3, the CPU loads RSP from
+        // TSS.privilege_stack_table[0]. Without this, Ring 3 exceptions (page faults,
+        // timer ticks, etc.) write to RSP=0 causing immediate double fault.
+        tss.privilege_stack_table[0] = {
+            static mut RING3_STACK: [u8; RING3_INT_STACK_SIZE] = [0; RING3_INT_STACK_SIZE];
+            let stack_start = VirtAddr::from_ptr(unsafe { &RING3_STACK });
+            stack_start + RING3_INT_STACK_SIZE as u64
+        };
+
         tss
     };
 

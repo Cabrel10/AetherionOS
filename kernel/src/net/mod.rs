@@ -21,6 +21,8 @@ pub mod icmp;
 pub mod arp;
 pub mod virtio_net;
 pub mod udp;
+pub mod tcp;
+pub mod dns;
 pub mod socket;
 
 use alloc::collections::BTreeMap;
@@ -335,7 +337,8 @@ fn process_ipv4(data: &[u8]) {
 
     match ip_pkt.protocol {
         ipv4::PROTO_ICMP => process_icmp(&ip_pkt),
-        ipv4::PROTO_UDP => udp::process_udp(&ip_pkt),
+        ipv4::PROTO_TCP => tcp::process_tcp(&ip_pkt),
+        ipv4::PROTO_UDP => process_udp_dispatch(&ip_pkt),
         _ => {}
     }
 }
@@ -426,6 +429,29 @@ pub fn send_udp(dst_ip: Ipv4Addr, src_port: u16, dst_port: u16, data: &[u8]) -> 
             false
         }
     }
+}
+
+/// Process incoming UDP packet, routing DNS responses to dns module
+fn process_udp_dispatch(ip_pkt: &ipv4::Ipv4Packet) {
+    let udp_pkt = match udp::UdpPacket::parse(ip_pkt.payload) {
+        Some(p) => p,
+        None => return,
+    };
+
+    crate::serial_println!(
+        "[UDP] {}:{} -> {}:{} ({} bytes)",
+        ip_pkt.src_ip, udp_pkt.src_port,
+        ip_pkt.dst_ip, udp_pkt.dst_port,
+        udp_pkt.data.len()
+    );
+
+    // Route DNS responses (source port 53) to DNS module
+    if udp_pkt.src_port == dns::DNS_PORT {
+        dns::process_dns_response(udp_pkt.data);
+    }
+
+    // Also deliver to socket layer for general UDP sockets
+    socket::deliver_udp(ip_pkt.src_ip, udp_pkt.src_port, udp_pkt.dst_port, udp_pkt.data);
 }
 
 /// Get network statistics
@@ -597,4 +623,11 @@ pub fn run_tests() {
     crate::serial_println!("[NET TESTS] {}/{} passed, {} failed", passed, passed + failed, failed);
     if failed == 0 { crate::serial_write("[NET TESTS] ALL TESTS PASSED!\n"); }
     crate::serial_println!("========================================");
+
+    // Run Couche 18 tests (TCP + DNS)
+    crate::serial_println!("\n========================================");
+    crate::serial_println!("[NET TESTS] Couche 18 - TCP/DNS Stack");
+    crate::serial_println!("========================================\n");
+    tcp::run_tests();
+    dns::run_tests();
 }

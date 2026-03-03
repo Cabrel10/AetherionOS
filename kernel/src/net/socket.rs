@@ -17,11 +17,13 @@ use lazy_static::lazy_static;
 use super::ipv4::Ipv4Addr;
 
 /// Socket types
+pub const SOCK_STREAM: u32 = 1;
 pub const SOCK_RAW: u32 = 3;
 pub const SOCK_DGRAM: u32 = 2;
 
 /// Protocol numbers
 pub const IPPROTO_ICMP: u32 = 1;
+pub const IPPROTO_TCP: u32 = 6;
 pub const IPPROTO_UDP: u32 = 17;
 
 /// Address family
@@ -48,11 +50,16 @@ pub struct Socket {
     pub protocol: u32,
     pub bind_port: u16,
     pub recv_queue: Vec<RecvDatagram>,
+    // TCP connection state
+    pub tcp_local_port: u16,
+    pub tcp_remote_ip: super::ipv4::Ipv4Addr,
+    pub tcp_remote_port: u16,
+    pub tcp_connected: bool,
 }
 
 // Socket file descriptor table
 lazy_static! {
-    static ref SOCKET_TABLE: Mutex<BTreeMap<u32, Socket>> = Mutex::new(BTreeMap::new());
+    pub static ref SOCKET_TABLE: Mutex<BTreeMap<u32, Socket>> = Mutex::new(BTreeMap::new());
 }
 
 /// Next socket file descriptor (start at 100 to avoid collision with VFS FDs)
@@ -68,6 +75,7 @@ pub fn sys_socket(domain: u32, sock_type: u32, protocol: u32) -> u64 {
     match sock_type {
         SOCK_RAW if protocol == IPPROTO_ICMP => {},
         SOCK_DGRAM if protocol == IPPROTO_UDP || protocol == 0 => {},
+        SOCK_STREAM if protocol == IPPROTO_TCP || protocol == 6 => {},
         _ => return (-22i64) as u64, // EINVAL
     }
 
@@ -79,6 +87,10 @@ pub fn sys_socket(domain: u32, sock_type: u32, protocol: u32) -> u64 {
         protocol: if protocol == 0 { IPPROTO_UDP } else { protocol },
         bind_port: 0, // unbound
         recv_queue: Vec::new(),
+        tcp_local_port: 0,
+        tcp_remote_ip: super::ipv4::Ipv4Addr::new(0, 0, 0, 0),
+        tcp_remote_port: 0,
+        tcp_connected: false,
     };
 
     {
@@ -190,6 +202,169 @@ pub fn sys_bind(fd: u32, port: u16) -> u64 {
             0
         }
         None => (-9i64) as u64, // EBADF
+    }
+}
+
+/// TCP connect: initiate 3-way handshake
+pub fn sys_connect(fd: u32, ip_a: u8, ip_b: u8, ip_c: u8, ip_d: u8, port: u16) -> u64 {
+    let remote_ip = super::ipv4::Ipv4Addr::new(ip_a, ip_b, ip_c, ip_d);
+
+    // Verify socket exists and is a TCP socket
+    {
+        let table = SOCKET_TABLE.lock();
+        match table.get(&fd) {
+            Some(s) if s.sock_type == SOCK_STREAM => {},
+            Some(_) => return (-22i64) as u64, // EINVAL
+            None => return (-9i64) as u64, // EBADF
+        }
+    }
+
+    crate::serial_println!("[SOCKET] sys_connect fd={} -> {}:{}", fd, remote_ip, port);
+
+    // Perform TCP connect
+    match super::tcp::tcp_connect(remote_ip, port) {
+        Ok(local_port) => {
+            // Update socket with TCP connection info
+            let mut table = SOCKET_TABLE.lock();
+            if let Some(socket) = table.get_mut(&fd) {
+                socket.tcp_local_port = local_port;
+                socket.tcp_remote_ip = remote_ip;
+                socket.tcp_remote_port = port;
+                socket.tcp_connected = true;
+            }
+            crate::serial_println!("[SOCKET] TCP connected fd={} local_port={}", fd, local_port);
+            0 // Success
+        }
+        Err(e) => e as u64, // Negative error code
+    }
+}
+
+/// TCP send data
+pub fn sys_tcp_send(fd: u32, buf_addr: u64, len: u64) -> u64 {
+    let (local_port, remote_ip, remote_port, connected) = {
+        let table = SOCKET_TABLE.lock();
+        match table.get(&fd) {
+            Some(s) if s.tcp_connected => (s.tcp_local_port, s.tcp_remote_ip, s.tcp_remote_port, true),
+            _ => return (-9i64) as u64,
+        }
+    };
+
+    if !connected {
+        return (-107i64) as u64; // ENOTCONN
+    }
+
+    // Read data from user buffer
+    let data = unsafe {
+        let buf = buf_addr as *const u8;
+        let mut v = Vec::with_capacity(len as usize);
+        for i in 0..len as usize {
+            v.push(core::ptr::read_volatile(buf.add(i)));
+        }
+        v
+    };
+
+    match super::tcp::tcp_send(local_port, remote_ip, remote_port, &data) {
+        Ok(sent) => sent as u64,
+        Err(e) => e as u64,
+    }
+}
+
+/// TCP receive data
+pub fn sys_tcp_recv(fd: u32, buf_addr: u64, len: u64) -> u64 {
+    let (local_port, remote_ip, remote_port, connected) = {
+        let table = SOCKET_TABLE.lock();
+        match table.get(&fd) {
+            Some(s) if s.tcp_connected => (s.tcp_local_port, s.tcp_remote_ip, s.tcp_remote_port, true),
+            _ => return (-9i64) as u64,
+        }
+    };
+
+    if !connected {
+        return (-107i64) as u64; // ENOTCONN
+    }
+
+    // Allocate a temp buffer on kernel side
+    let mut temp_buf = Vec::with_capacity(len as usize);
+    temp_buf.resize(len as usize, 0u8);
+
+    match super::tcp::tcp_recv(local_port, remote_ip, remote_port, &mut temp_buf) {
+        Ok(bytes_read) => {
+            // Copy to user buffer
+            if bytes_read > 0 {
+                unsafe {
+                    let dst = buf_addr as *mut u8;
+                    for i in 0..bytes_read {
+                        core::ptr::write_volatile(dst.add(i), temp_buf[i]);
+                    }
+                }
+            }
+            bytes_read as u64
+        }
+        Err(e) => e as u64,
+    }
+}
+
+/// TCP shutdown
+pub fn sys_tcp_shutdown(fd: u32) -> u64 {
+    let (local_port, remote_ip, remote_port, connected) = {
+        let table = SOCKET_TABLE.lock();
+        match table.get(&fd) {
+            Some(s) if s.tcp_connected => (s.tcp_local_port, s.tcp_remote_ip, s.tcp_remote_port, true),
+            _ => return (-9i64) as u64,
+        }
+    };
+
+    if !connected {
+        return 0; // Already closed
+    }
+
+    let result = match super::tcp::tcp_close(local_port, remote_ip, remote_port) {
+        Ok(()) => 0u64,
+        Err(e) => e as u64,
+    };
+
+    // Mark socket as disconnected
+    {
+        let mut table = SOCKET_TABLE.lock();
+        if let Some(socket) = table.get_mut(&fd) {
+            socket.tcp_connected = false;
+        }
+    }
+
+    result
+}
+
+/// DNS resolution: gethostbyname
+pub fn sys_gethostbyname(name_addr: u64) -> u64 {
+    // Read domain name from user space
+    let domain = unsafe {
+        let mut buf = Vec::with_capacity(256);
+        let ptr = name_addr as *const u8;
+        for i in 0..256usize {
+            let byte = core::ptr::read_volatile(ptr.add(i));
+            if byte == 0 { break; }
+            buf.push(byte);
+        }
+        match alloc::string::String::from_utf8(buf) {
+            Ok(s) => s,
+            Err(_) => return (-22i64) as u64, // EINVAL
+        }
+    };
+
+    crate::serial_println!("[SOCKET] sys_gethostbyname('{}')", domain);
+
+    match super::dns::resolve(&domain) {
+        Ok(ip) => {
+            // Return IP as packed u32: (a<<24 | b<<16 | c<<8 | d)
+            let octets = ip.0;
+            let packed = ((octets[0] as u64) << 24)
+                       | ((octets[1] as u64) << 16)
+                       | ((octets[2] as u64) << 8)
+                       | (octets[3] as u64);
+            crate::serial_println!("[SOCKET] DNS resolved: {} -> 0x{:08X}", domain, packed);
+            packed
+        }
+        Err(e) => e as u64,
     }
 }
 
