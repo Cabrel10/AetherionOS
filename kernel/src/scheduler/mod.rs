@@ -315,6 +315,11 @@ pub fn current_pid() -> u64 {
     SCHEDULER.lock().current_pid
 }
 
+/// Set the current PID (used when directly launching a Ring 3 process via IRETQ)
+pub fn set_current_pid(pid: u64) {
+    SCHEDULER.lock().current_pid = pid;
+}
+
 /// Get the aging boost count
 pub fn aging_boosts() -> u64 {
     SCHEDULER.lock().aging_boosts

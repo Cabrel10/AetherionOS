@@ -9,9 +9,16 @@
  *   1   sys_write(fd, buf, len)
  *   9   sys_mmap(addr, len, prot, flags, fd, offset)
  *  20   sys_getpid()
+ *  41   sys_socket(domain, type, protocol)
+ *  42   sys_connect(fd, ip_packed, port)
+ *  44   sys_sendto(fd, buf_encoded, dest_encoded)
+ *  47   sys_shutdown(fd)
  *  60   sys_exit(code)
  * 201   sys_bus_publish(intent, priority, data)
  * 202   sys_vga_write(row, col, color_char)
+ * 210   sys_net_ping(ip, seq)
+ * 211   sys_gethostbyname(name)
+ * 212   sys_tcp_read(fd, buf, len)
  */
 
 #ifndef _LIBC_STUB_H
@@ -56,5 +63,36 @@ void puts(const char *s);
 
 /* Print a formatted integer */
 void print_int(long val);
+
+/* Print hex */
+void print_hex(unsigned long val);
+
+/* ========================================
+ * Network syscalls (Couche 17+18)
+ * ======================================== */
+
+/* Pack IP address into u32: (a<<24 | b<<16 | c<<8 | d) */
+static inline unsigned long pack_ip(int a, int b, int c, int d) {
+    return ((unsigned long)a << 24) | ((unsigned long)b << 16) |
+           ((unsigned long)c << 8) | (unsigned long)d;
+}
+
+/* ICMP ping */
+long net_ping(int a, int b, int c, int d, int seq);
+
+/* TCP connect: fd, ip octets, port -> 0 on success */
+long tcp_connect(int fd, int a, int b, int c, int d, int port);
+
+/* TCP send data */
+long tcp_send(int fd, const void *buf, size_t len);
+
+/* TCP read data */
+long tcp_read(int fd, void *buf, size_t len);
+
+/* TCP shutdown */
+long tcp_shutdown(int fd);
+
+/* DNS resolve */
+long gethostbyname(const char *name);
 
 #endif /* _LIBC_STUB_H */

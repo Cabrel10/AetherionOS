@@ -14,8 +14,8 @@ use linked_list_allocator::LockedHeap;
 /// Adresse de debut du heap
 pub const HEAP_START: usize = 0x_4444_4444_0000;
 
-/// Taille initiale du heap (100 KB)
-pub const HEAP_SIZE: usize = 100 * 1024;
+/// Taille du heap: 8 MB (suffisant pour TCP, DNS, VirtIO-Block, FAT32 cache)
+pub const HEAP_SIZE: usize = 8 * 1024 * 1024;
 
 /// Nombre de pages necessaires pour le heap
 const HEAP_PAGES: usize = (HEAP_SIZE + 4095) / 4096;

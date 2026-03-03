@@ -47,10 +47,9 @@ const PAGE_SIZE: u64 = 4096;
 /// User stack top virtual address (grows down from here)
 /// Stack occupies: 0x7FFF_FFFF_F000 - stack_size to 0x7FFF_FFFF_F000
 const USER_STACK_TOP: u64 = 0x7FFF_FFFF_F000;
-/// User stack size: 8 MiB (2048 pages) — but we map only 16 pages (64 KiB)
-/// during initial load to conserve frames. The full 8 MiB is the virtual
-/// range reserved; demand paging will handle the rest in the future.
-const USER_STACK_PAGES: u64 = 16; // 64 KiB initial mapping
+/// User stack size: 8 MiB virtual range reserved.
+/// 256 pages (1 MiB) initially mapped — sufficient for TCP, DNS, FAT32 ops.
+const USER_STACK_PAGES: u64 = 256; // 1 MiB initial mapping
 
 /// Maximum valid user-space address
 const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;

@@ -94,15 +94,22 @@ Aetherion OS est un système d'exploitation expérimental visant à repousser le
 |-------|-----|-------|--------|---------|
 | **0** | Fondations | 1 sem | COMPLETE | Kernel minimal bootable |
 | **1** | HAL (Couche 1) | 1 sem | COMPLETE | GDT/IDT/PIC/Security |
-| **2** | Memory (Couche 2) | 1 sem | COMPLETE | Frame alloc/Paging/Heap |
+| **2** | Memory (Couche 2) | 1 sem | COMPLETE | Frame alloc/Paging/Heap (8 MiB) |
 | **3** | Cognitive Bus (Couche 3) | 1 sem | COMPLETE | Lock-free MPMC IPC |
 | **4** | VFS (Couche 4) | 1 sem | COMPLETE | Virtual Filesystem + Security |
-| **5** | Verifier (Couche 5) | 2 sem | PLANNED | Syscall filtering + Policy engine |
-| **6** | Reseau | 2 sem | PLANNED | TCP/IP stack |
-| **7** | ML Scheduler | 2 sem | PLANNED | Ordonnanceur intelligent |
-| **8** | Tests & QA | 2 sem | PLANNED | Test suite complete |
+| **5** | Verifier (Couche 5) | 1 sem | COMPLETE | Policy engine + Syscall filtering |
+| **6** | Process Manager (Couche 6) | 1 sem | COMPLETE | Matriarchal hierarchy + Ring 3 |
+| **7** | Scheduler (Couche 7) | 1 sem | COMPLETE | Priority scheduler + aging |
+| **8** | GPU Stub (Couche 8) | 1 sem | COMPLETE | PCI GPU detection + VRAM alloc |
+| **9** | Syscalls + Context Switch (Couche 9) | 1 sem | COMPLETE | SYSCALL/SYSRET + MSR config |
+| **11** | ELF Loader (Couche 11) | 1 sem | COMPLETE | ELF64 loader + per-process paging |
+| **13** | POSIX Syscalls (Couche 13) | 1 sem | COMPLETE | Full POSIX table + FD management |
+| **16** | C Userspace (Couche 16) | 1 sem | COMPLETE | libc_stub + hello_c.elf |
+| **17** | Network Stack (Couche 17) | 2 sem | COMPLETE | Ethernet/ARP/IPv4/UDP/TCP/DNS |
+| **18** | HTTP Client (Couche 18) | 1 sem | COMPLETE | wget.elf (DNS + TCP + HTTP) |
+| **19** | Storage Layer (Couche 19) | 2 sem | COMPLETE | VirtIO-Block + FAT32 + ls/cat/j19_test |
 
-**Durée Totale** : ~15 semaines (3.5 mois)
+**Durée Totale** : ~19 couches en 16 semaines
 
 ### Couche 1 HAL - COMPLETE
 
@@ -143,11 +150,12 @@ Aetherion OS est un système d'exploitation expérimental visant à repousser le
 
 ## 💻 Installation
 
-### Prérequis
+### Prerequis
 
-- **Rust** : nightly toolchain (≥ 1.75.0)
-- **QEMU** : x86_64 system emulator
-- **Build Tools** : nasm, ld, make
+- **Rust** : nightly-2023-08-01 (strict version)
+- **bootimage** : 0.10.3 (strict version)
+- **QEMU** : x86_64 system emulator (qemu-system-x86)
+- **Build Tools** : gcc, nasm, mtools, ld
 - **Git** : pour cloner le repo
 
 ### Installation Automatique
@@ -289,7 +297,7 @@ Les contributions sont bienvenues ! Veuillez suivre ces étapes :
 - [x] Kernel minimal bootable + HAL (GDT/IDT/PIC/Security)
 
 ### v0.2.0 - Milestone "Memory" - COMPLETE
-- [x] Frame allocator + Paging + Heap (100 KB)
+- [x] Frame allocator + Paging + Heap (8 MiB)
 
 ### v0.3.0 - Milestone "IPC" - COMPLETE
 - [x] Cognitive Bus (lock-free MPMC, Intent-based messages)
@@ -300,25 +308,45 @@ Les contributions sont bienvenues ! Veuillez suivre ces étapes :
 - [x] Capability-based device access + Metrics
 - [x] 14 tests (7 functional + 7 security), 0 warnings
 
-### v0.5.0 - Milestone "Verifier" (NEXT)
-- [ ] Policy engine + Syscall filtering + VFS hooks
+### v0.5.0 - Milestone "Verifier + Process" - COMPLETE
+- [x] Policy engine + Syscall filtering + VFS hooks
+- [x] Matriarchal process hierarchy (Couche 6)
 
-### v1.0.0 - Milestone "Production Ready"
+### v0.8.0 - Milestone "Ring 3 Userspace" - COMPLETE
+- [x] SYSCALL/SYSRET + ELF64 loader + per-process paging
+- [x] Priority scheduler with aging + GPU stub
+- [x] C userspace (libc_stub + hello_c.elf)
+
+### v0.9.0 - Milestone "Jalon 19 - Storage" - COMPLETE
+- [x] Full TCP/IP + DNS + HTTP network stack (Couches 17-18)
+- [x] VirtIO-Block driver + FAT32 read-only filesystem (Couche 19)
+- [x] Ring 3 apps: wget.elf, ls.elf, cat.elf, j19_test.elf
+- [x] TSS RSP0 for Ring 3 interrupt safety
+- [x] 256 KiB kernel syscall stack (deep VFS/FAT32/VirtIO chains)
+- [x] All 12 test suites passing + J19 comprehensive validation 5/5
+
+### v1.0.0 - Milestone "Production Ready" (NEXT)
+- [ ] Writable FAT32 (sys_write to /disk/)
+- [ ] Multithreading (clone syscall)
 - [ ] ML Scheduler + Full test suite + Documentation
 
 ---
 
-## 📊 Métriques Actuelles
+## 📊 Metriques Actuelles (Jalon 19 Stable)
 
-| Métrique | Valeur | Target | Status |
+| Metrique | Valeur | Target | Status |
 |----------|--------|--------|--------|
-| Boot Time | TBD | <10s | 🟡 |
-| Binary Size | ~2.0 MB (debug) | <5 MB | ✅ |
-| HAL Build | ~3s | <5s | ✅ |
-| RAM Usage | ~10 MB | <150 MB | ✅ |
-| Test Coverage | 4/4 tests | ≥80% | ✅ |
-| Documentation | 1000+ lines | Complete | ✅ |
-| **Tag Release** | `v0.1.0-hal` | - | ✅ |
+| Boot Time | ~2s (QEMU) | <10s | OK |
+| Binary Size | ~2.0 MB (release) | <5 MB | OK |
+| Kernel Heap | 8 MiB | - | OK |
+| Syscall Stack | 256 KiB | - | OK |
+| User Stack | 1 MiB (256 pages) | - | OK |
+| ELF Frame Pool | 16 MiB (4096 frames) | - | OK |
+| RAM Usage | ~32 MB (QEMU 256M) | <150 MB | OK |
+| Test Suites | 12/12 pass | 100% | OK |
+| J19 Validation | 5/5 pass | 100% | OK |
+| Ring 3 Programs | 6 (hello_c, wget, ls, cat, j19_test, shell) | - | OK |
+| Toolchain | nightly-2023-08-01 + bootimage 0.10.3 | strict | OK |
 
 ---
 

@@ -64,7 +64,7 @@ const ENOENT: u64 = (-2i64) as u64;
 const EMFILE: u64 = (-24i64) as u64;
 
 // ===== Kernel syscall stack =====
-const KERNEL_SYSCALL_STACK_SIZE: usize = 16384; // 16 KiB for more complex syscalls
+const KERNEL_SYSCALL_STACK_SIZE: usize = 262144; // 256 KiB - Deep call chains: SYSCALL -> VFS -> FAT32 -> VirtIO-Block -> serial
 
 #[repr(align(16))]
 struct AlignedStack([u8; KERNEL_SYSCALL_STACK_SIZE]);
@@ -210,8 +210,10 @@ extern "C" fn syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         20 => sys_getpid(),
         39 => sys_getppid(),
         41 => sys_socket(a1 as u32, a2 as u32, a3 as u32),
+        42 => sys_tcp_connect(a1 as u32, a2, a3),
         44 => sys_sendto(a1 as u32, a2, a3),
         45 => sys_recvfrom(a1 as u32, a2, a3),
+        47 => sys_tcp_shutdown_syscall(a1 as u32),
         49 => sys_bind(a1 as u32, a2 as u16),
         57 => sys_fork(),
         59 => sys_exec(a1),
@@ -222,6 +224,8 @@ extern "C" fn syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         201 => sys_bus_publish(a1, a2 as u32, a3),
         202 => sys_vga_write(a1 as usize, a2 as usize, a3),
         210 => sys_net_ping(a1, a2 as u16),
+        211 => sys_gethostbyname(a1),
+        212 => sys_tcp_read(a1 as u32, a2, a3),
         _ => {
             crate::serial_println!("[SYSCALL] Unknown nr={} a1=0x{:X} a2=0x{:X} a3=0x{:X}", nr, a1, a2, a3);
             ENOSYS
@@ -844,9 +848,28 @@ fn sys_socket(domain: u32, sock_type: u32, protocol: u32) -> u64 {
 }
 
 /// sys_sendto(fd, buf_addr, encoded_dest) -> bytes_sent
-/// encoded_dest: high 32 bits = IP as u32, low 16 bits = port
+/// For UDP: encoded_dest has IP in upper 32 bits and port in lower 16
+/// For TCP: encoded_dest == 0, uses connected remote; length in first 8 bytes of buf
 fn sys_sendto(fd: u32, buf_addr: u64, encoded: u64) -> u64 {
-    // Decode dest: a3 has IP in upper 32 bits and port in lower 16
+    // Check if this is a TCP socket (encoded == 0 means use connected remote)
+    {
+        let is_tcp = {
+            let table = crate::net::socket::SOCKET_TABLE.lock();
+            table.get(&fd).map(|s| s.sock_type == crate::net::socket::SOCK_STREAM).unwrap_or(false)
+        };
+
+        if is_tcp {
+            // TCP send: read length prefix from buf, then send data
+            let len = unsafe {
+                let ptr = buf_addr as *const u64;
+                core::ptr::read_volatile(ptr)
+            };
+            crate::serial_println!("[SYSCALL] sys_sendto/TCP(fd={}, len={})", fd, len);
+            return crate::net::socket::sys_tcp_send(fd, buf_addr + 8, len);
+        }
+    }
+
+    // UDP/ICMP: decode dest from a3
     let ip_u32 = (encoded >> 16) as u32;
     let port = (encoded & 0xFFFF) as u16;
     let ip = crate::net::ipv4::Ipv4Addr([
@@ -911,4 +934,40 @@ fn sys_net_ping(ip_packed: u64, sequence: u16) -> u64 {
     } else {
         (-5i64) as u64 // EIO
     }
+}
+
+// ===== TCP Connect Syscall (Couche 18) =====
+
+/// sys_tcp_connect(fd, encoded_ip, port)
+/// encoded_ip: a<<24 | b<<16 | c<<8 | d
+fn sys_tcp_connect(fd: u32, encoded_ip: u64, port: u64) -> u64 {
+    let ip_a = ((encoded_ip >> 24) & 0xFF) as u8;
+    let ip_b = ((encoded_ip >> 16) & 0xFF) as u8;
+    let ip_c = ((encoded_ip >> 8) & 0xFF) as u8;
+    let ip_d = (encoded_ip & 0xFF) as u8;
+    crate::serial_println!("[SYSCALL] sys_tcp_connect(fd={}, {}.{}.{}.{}:{})", fd, ip_a, ip_b, ip_c, ip_d, port);
+    crate::net::socket::sys_connect(fd, ip_a, ip_b, ip_c, ip_d, port as u16)
+}
+
+/// sys_tcp_shutdown(fd)
+fn sys_tcp_shutdown_syscall(fd: u32) -> u64 {
+    crate::serial_println!("[SYSCALL] sys_tcp_shutdown(fd={})", fd);
+    crate::net::socket::sys_tcp_shutdown(fd)
+}
+
+/// sys_gethostbyname(name_addr) -> packed IP or negative error
+fn sys_gethostbyname(name_addr: u64) -> u64 {
+    if !validate_user_ptr(name_addr, 1) {
+        return EFAULT;
+    }
+    crate::serial_println!("[SYSCALL] sys_gethostbyname(addr=0x{:X})", name_addr);
+    crate::net::socket::sys_gethostbyname(name_addr)
+}
+
+/// sys_tcp_read(fd, buf_addr, len) -> bytes read or negative error
+fn sys_tcp_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
+    if !validate_user_ptr(buf_addr, len) {
+        return EFAULT;
+    }
+    crate::net::socket::sys_tcp_recv(fd, buf_addr, len)
 }

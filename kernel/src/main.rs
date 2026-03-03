@@ -58,9 +58,10 @@ mod scheduler;
 mod gpu;
 mod elf;
 mod net;
+mod drivers;
 
 // ===== Configuration =====
-const KERNEL_VERSION: &str = "1.7.0-couche17-network-stack";
+const KERNEL_VERSION: &str = "1.9.0-couche19-storage";
 
 // ===== Embedded ELF binaries =====
 /// Minimal hello.elf - statically linked x86-64 ELF for Ring 3 test
@@ -71,6 +72,14 @@ static SHELL_ELF: &[u8] = include_bytes!("../../userspace/shell.elf");
 static AGENT_MATH_ELF: &[u8] = include_bytes!("../../userspace/agent_math.elf");
 /// Native C application - compiled with GCC, libc_stub, bare-metal
 static HELLO_C_ELF: &[u8] = include_bytes!("../../userspace/c_apps/hello_c.elf");
+/// wget - Ring 3 HTTP client (TCP/DNS validation - Couche 18)
+static WGET_ELF: &[u8] = include_bytes!("../../userspace/c_apps/wget.elf");
+/// ls - Ring 3 directory listing (Couche 19)
+static LS_ELF: &[u8] = include_bytes!("../../userspace/c_apps/ls.elf");
+/// cat - Ring 3 file display (Couche 19)
+static CAT_ELF: &[u8] = include_bytes!("../../userspace/c_apps/cat.elf");
+/// j19_test - Jalon 19 comprehensive validation (Couche 19)
+static J19_TEST_ELF: &[u8] = include_bytes!("../../userspace/c_apps/j19_test.elf");
 
 // VGA text buffer
 const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
@@ -1180,8 +1189,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         elf::set_phys_mem_offset(phys_offset);
 
         // Initialize ELF frame pool using frames from our allocator
-        // We allocate a contiguous block of 256 frames (1 MiB) for ELF loading
-        let pool_frames = 512usize;
+        // We allocate a contiguous block of 4096 frames (16 MiB) for ELF loading
+        // Increased from 768 to handle 1 MiB user stacks + TCP/DNS + FAT32
+        let pool_frames = 4096usize;
         if let Some(first_frame) = memory_manager.frame_allocator.alloc_frame_kernel() {
             let base_phys = first_frame.start_address().as_u64();
             // Allocate remaining frames to ensure they're contiguous in the pool
@@ -1266,6 +1276,19 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             }
         }
 
+        // Write wget.elf into VFS (HTTP client - Couche 18)
+        let wget_size = WGET_ELF.len();
+        {
+            let mut root = crate::fs::vfs::lock_root();
+            if let Some(fs::vfs::VfsNode::Directory(ref mut bin_dir)) = root.get_mut("bin") {
+                bin_dir.insert(
+                    alloc::string::String::from("wget.elf"),
+                    fs::vfs::VfsNode::File(alloc::vec::Vec::from(WGET_ELF)),
+                );
+                serial_println!("       [OK] /bin/wget.elf mounted ({} bytes, TCP/DNS client)", wget_size);
+            }
+        }
+
         // Create /sys/version file
         {
             let version_str = alloc::format!("AetherionOS v{}\n", KERNEL_VERSION);
@@ -1293,13 +1316,108 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     net::run_tests();
 
     // ===================================================================
-    // COUCHE 16: NATIVE C PROGRAM LAUNCH
-    // Load hello_c.elf - proves C toolchain, libc_stub, GCC compilation,
-    // Fibonacci, Factorial, mmap, bus_publish, and clean exit from Ring 3.
-    // This is the milestone: a NATIVE C BINARY runs on our custom OS.
+    // COUCHE 19: PERSISTENT STORAGE
+    // VirtIO-Block driver, FAT32 filesystem, VFS integration
+    // ===================================================================
+    serial_write("\n[17/19] VirtIO-Block Driver (Couche 19)...\n");
+    drivers::virtio_blk::init();
+    drivers::virtio_blk::run_tests();
+
+    serial_write("\n[18/19] FAT32 Filesystem (Couche 19)...\n");
+    fs::fat32::init();
+    fs::fat32::run_tests();
+
+    // Mount FAT32 files into VFS under /disk/
+    serial_write("\n[19/19] Mounting FAT32 into VFS (/disk/)...\n");
+    {
+        // Create /disk directory
+        {
+            let mut root = crate::fs::vfs::lock_root();
+            root.insert(
+                alloc::string::String::from("disk"),
+                fs::vfs::VfsNode::Directory(alloc::collections::BTreeMap::new()),
+            );
+        }
+
+        if fs::fat32::is_mounted() {
+            // List root directory and create .dir pseudo-file
+            let entries = fs::fat32::list_root();
+            let mut dir_listing = String::new();
+
+            for entry in &entries {
+                if entry.is_directory {
+                    dir_listing.push_str(&alloc::format!("<DIR>  {}\n", entry.name));
+                } else {
+                    dir_listing.push_str(&alloc::format!("       {} ({} bytes)\n", entry.name, entry.file_size));
+                }
+
+                // Mount each file into VFS
+                if !entry.is_directory {
+                    if let Some(data) = fs::fat32::read_file(&entry.name) {
+                        let vfs_path = alloc::format!("/disk/{}", entry.name);
+                        let mut root = crate::fs::vfs::lock_root();
+                        if let Some(fs::vfs::VfsNode::Directory(ref mut disk_dir)) = root.get_mut("disk") {
+                            disk_dir.insert(
+                                entry.name.clone(),
+                                fs::vfs::VfsNode::File(data.clone()),
+                            );
+                            serial_println!("       [OK] {} mounted ({} bytes)", vfs_path, data.len());
+                        }
+                    }
+                }
+            }
+
+            // Create .dir pseudo-file for ls command
+            {
+                let mut root = crate::fs::vfs::lock_root();
+                if let Some(fs::vfs::VfsNode::Directory(ref mut disk_dir)) = root.get_mut("disk") {
+                    disk_dir.insert(
+                        alloc::string::String::from(".dir"),
+                        fs::vfs::VfsNode::File(dir_listing.into_bytes()),
+                    );
+                    serial_write("       [OK] /disk/.dir created\n");
+                }
+            }
+
+            serial_println!("       [OK] {} files from FAT32 mounted under /disk/", entries.len());
+        } else {
+            serial_write("       [SKIP] No FAT32 filesystem (no VirtIO-Block disk)\n");
+        }
+
+        // Mount ls.elf, cat.elf and j19_test.elf into /bin
+        {
+            let mut root = crate::fs::vfs::lock_root();
+            if let Some(fs::vfs::VfsNode::Directory(ref mut bin_dir)) = root.get_mut("bin") {
+                bin_dir.insert(
+                    alloc::string::String::from("ls.elf"),
+                    fs::vfs::VfsNode::File(alloc::vec::Vec::from(LS_ELF)),
+                );
+                bin_dir.insert(
+                    alloc::string::String::from("cat.elf"),
+                    fs::vfs::VfsNode::File(alloc::vec::Vec::from(CAT_ELF)),
+                );
+                bin_dir.insert(
+                    alloc::string::String::from("j19_test.elf"),
+                    fs::vfs::VfsNode::File(alloc::vec::Vec::from(J19_TEST_ELF)),
+                );
+                serial_println!("       [OK] /bin/ls.elf ({} bytes)", LS_ELF.len());
+                serial_println!("       [OK] /bin/cat.elf ({} bytes)", CAT_ELF.len());
+                serial_println!("       [OK] /bin/j19_test.elf ({} bytes)", J19_TEST_ELF.len());
+            }
+        }
+    }
+
+    // ===================================================================
+    // COUCHE 19: LAUNCH JALON 19 COMPREHENSIVE TEST
+    // Validates: DNS, TCP, FAT32 directory listing, FAT32 file read
+    // Fallback: wget.elf (Couche 18), then hello_c.elf (Couche 16)
     // ===================================================================
     serial_write("\n========================================\n");
-    serial_write("[RING 3] Launching Native C Program: hello_c.elf\n");
+    if net::is_available() {
+        serial_write("[RING 3] Launching j19_test.elf (Couche 19 Full Validation)\n");
+    } else {
+        serial_write("[RING 3] Launching hello_c.elf (Couche 16 C Program)\n");
+    }
     serial_write("========================================\n");
     {
         // Drain old messages from bus
@@ -1309,8 +1427,11 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             serial_println!("  [IPC] Drained {} old messages from Cognitive Bus", drained);
         }
 
-        serial_write("  [STEP 1] Loading /bin/hello_c.elf (GCC-compiled C binary)...\n");
-        let load_result = elf::load_elf_binary(HELLO_C_ELF);
+        let elf_binary = if net::is_available() { J19_TEST_ELF } else { HELLO_C_ELF };
+        let elf_name = if net::is_available() { "/bin/j19_test.elf" } else { "/bin/hello_c.elf" };
+
+        serial_println!("  [STEP 1] Loading {}...", elf_name);
+        let load_result = elf::load_elf_binary(elf_binary);
         match load_result {
             Ok(result) => {
                 serial_println!(
@@ -1319,14 +1440,16 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     result.segments_loaded, result.frames_used
                 );
 
-                // Create a process record for the C program
-                let c_pid = process::spawn_userspace(
-                    "/bin/hello_c.elf", 0,
+                // Create a process record
+                let pid = process::spawn_userspace(
+                    elf_name, 0,
                     result.entry_point, result.stack_pointer, result.pml4_phys
                 ).unwrap_or(0);
-                if c_pid != 0 {
-                    scheduler::enqueue_process(c_pid);
-                    serial_println!("  [OK] C program process PID={} registered", c_pid);
+                if pid != 0 {
+                    scheduler::enqueue_process(pid);
+                    // Set the scheduler's current_pid so syscalls use the correct FD table
+                    scheduler::set_current_pid(pid);
+                    serial_println!("  [OK] Process PID={} registered (set as current)", pid);
                 }
 
                 serial_write("  [STEP 2] Ring 3 IRETQ frame:\n");
@@ -1347,11 +1470,8 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 }
                 serial_write("  [OK] CR3 switched to user page tables\n");
 
-                serial_write("  [STEP 4] IRETQ -> Ring 3 C Program NOW!\n");
+                serial_write("  [STEP 4] IRETQ -> Ring 3 NOW!\n");
                 serial_write("========================================\n");
-
-                // C program runs autonomously, no keyboard input needed
-                serial_write("  [INFO] C program running autonomously\n");
 
                 // Jump to Ring 3!
                 unsafe {
@@ -1359,9 +1479,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 }
             }
             Err(e) => {
-                serial_println!("  [FAIL] C ELF load error: {}", e);
+                serial_println!("  [FAIL] ELF load error: {}", e);
                 // Fallback: try hello.elf
-                serial_write("  [FALLBACK] Loading hello.elf instead (hello_c failed)...\n");
+                serial_write("  [FALLBACK] Loading hello.elf instead...\n");
                 match elf::load_elf_binary(HELLO_ELF) {
                     Ok(result) => {
                         let pid = process::spawn_kernel_thread("hello.elf").unwrap_or(0);
@@ -1387,10 +1507,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
     // === Boot Complete (only reached if Ring 3 jump fails) ===
     serial_write("\n========================================\n");
-    serial_write("[BOOT] AetherionOS Couche 16 READY (C Toolchain + Ring 3)\n");
+    serial_write("[BOOT] AetherionOS Couche 19 READY (Storage + TCP/DNS)\n");
     serial_write("========================================\n");
 
-    { let mut vga = VGA.lock(); vga.write_str("\n[OK] Couche 16 BOOT COMPLETE\n"); }
+    { let mut vga = VGA.lock(); vga.write_str("\n[OK] Couche 19 BOOT COMPLETE\n"); }
 
     // Idle loop
     loop { x86_64::instructions::hlt(); }
