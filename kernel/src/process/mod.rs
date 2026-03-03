@@ -341,6 +341,37 @@ where
     table.get_mut(&pid).map(|p| f(&mut p.fd_table))
 }
 
+// ===== FD Convenience Wrappers (used by syscall layer) =====
+
+/// Allocate a new file descriptor in a process's FD table.
+/// Returns Some(fd_number) on success, None if table is full.
+pub fn alloc_fd(pid: u64, path: &str, flags: u32) -> Option<usize> {
+    with_fd_table_mut(pid, |fdt| fdt.alloc_fd(path, flags))?
+}
+
+/// Get the path associated with a file descriptor.
+pub fn get_fd_path(pid: u64, fd: usize) -> Option<alloc::string::String> {
+    with_fd_table(pid, |fdt| {
+        fdt.get(fd).map(|entry| entry.path.clone())
+    }).flatten()
+}
+
+/// Set (or overwrite) a specific FD slot to point at the given path.
+pub fn set_fd(pid: u64, fd: usize, path: &str, flags: u32) {
+    with_fd_table_mut(pid, |fdt| {
+        // Ensure enough capacity
+        while fdt.entries.len() <= fd {
+            fdt.entries.push(task::FileDescriptor {
+                path: alloc::string::String::new(),
+                flags: 0,
+                offset: 0,
+                active: false,
+            });
+        }
+        fdt.entries[fd] = task::FileDescriptor::new(path, flags);
+    });
+}
+
 // ===== Spawn Functions =====
 
 /// Spawn the unique Matriarch process (root of the hierarchy)
