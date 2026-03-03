@@ -85,7 +85,7 @@ gcc -c $GCC_FLAGS \
 echo "[OK] libc_stub.o"
 
 # List of all C apps to build
-APPS="hello_c j19_test ls cat wget threads ui"
+APPS="hello_c j19_test ls cat wget threads ui agent_ai agent_rag"
 
 for APP in $APPS; do
     SRC="$C_APPS_DIR/${APP}.c"

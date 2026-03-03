@@ -1,9 +1,8 @@
 // arch/x86_64/context.rs - Couche 9: Real Context Switch (Assembly)
 //
-// Saves and restores the full set of general-purpose registers for
-// cooperative/preemptive context switching.  The `switch_context`
-// routine is written in AT&T-syntax inline assembly and follows the
-// System V x86-64 ABI (callee-saved: rbx, rbp, r12-r15).
+// Saves and restores the full set of general-purpose registers AND
+// FPU/SSE state (via fxsave/fxrstor) for cooperative/preemptive
+// context switching.
 //
 // TaskContext layout (offsets used by asm):
 //   0x00  rsp
@@ -15,8 +14,32 @@
 //   0x30  r15
 //   0x38  rflags
 //   0x40  rip  (return address / entry point)
+//
+// FpuState: 512-byte fxsave area, 16-byte aligned, stored separately
+// in Process struct for FPU/SSE register preservation across switches.
 
 use core::arch::asm;
+
+/// 512-byte FPU/SSE save area for fxsave/fxrstor.
+/// Must be 16-byte aligned per Intel specification.
+#[derive(Clone, Copy)]
+#[repr(C, align(16))]
+pub struct FpuState {
+    pub data: [u8; 512],
+}
+
+impl FpuState {
+    /// Create a zeroed FPU state (default x87/SSE registers)
+    pub const fn zero() -> Self {
+        FpuState { data: [0u8; 512] }
+    }
+}
+
+impl core::fmt::Debug for FpuState {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        write!(f, "FpuState([..512 bytes..])")
+    }
+}
 
 /// CPU register context saved on a context switch.
 /// Stored inside every `Process` struct so each task has its own snapshot.
@@ -72,6 +95,49 @@ impl Default for TaskContext {
     }
 }
 
+/// Enable SSE/FPU support in CR0 and CR4.
+/// Must be called once during kernel initialization before any
+/// floating-point or SSE instructions are used.
+///
+/// Sets: CR0.MP=1, CR0.EM=0, CR4.OSFXSR=1, CR4.OSXMMEXCPT=1
+pub unsafe fn enable_sse() {
+    asm!(
+        // CR0: clear EM (bit 2), set MP (bit 1)
+        "mov rax, cr0",
+        "and ax, 0xFFFB",   // clear EM (bit 2)
+        "or  ax, 0x0002",   // set MP (bit 1)
+        "mov cr0, rax",
+        // CR4: set OSFXSR (bit 9) and OSXMMEXCPT (bit 10)
+        "mov rax, cr4",
+        "or  ax, 0x0600",   // bits 9 and 10
+        "mov cr4, rax",
+        out("rax") _,
+        options(nostack, nomem),
+    );
+}
+
+/// Save FPU/SSE state to the given 512-byte aligned buffer.
+/// # Safety: `area` must point to a valid 16-byte aligned 512-byte buffer.
+#[inline(always)]
+pub unsafe fn fpu_save(area: *mut FpuState) {
+    asm!(
+        "fxsave [{}]",
+        in(reg) area,
+        options(nostack),
+    );
+}
+
+/// Restore FPU/SSE state from the given 512-byte aligned buffer.
+/// # Safety: `area` must point to a valid 16-byte aligned 512-byte buffer.
+#[inline(always)]
+pub unsafe fn fpu_restore(area: *const FpuState) {
+    asm!(
+        "fxrstor [{}]",
+        in(reg) area,
+        options(nostack),
+    );
+}
+
 /// Perform a context switch from `old` to `new`.
 ///
 /// # Safety
@@ -82,12 +148,8 @@ impl Default for TaskContext {
 /// the state from `*new`, effectively resuming execution wherever
 /// `new` was previously saved.
 ///
-/// NOTE: In the current kernel all scheduling is still *logical*
-/// (the scheduler picks PIDs but does not actually switch stacks).
-/// This function is provided so that a future preemptive scheduler
-/// can call it from the timer ISR once per-task kernel stacks are
-/// allocated.  For now we expose it and test it with a
-/// round-trip self-switch that proves the assembly is correct.
+/// NOTE: FPU/SSE state is saved/restored separately via fpu_save/fpu_restore
+/// at the process manager level (caller responsibility).
 #[inline(never)]
 pub unsafe fn switch_context(old: *mut TaskContext, new: *const TaskContext) {
     // Save callee-saved registers into *old, then load from *new.

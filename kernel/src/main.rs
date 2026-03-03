@@ -85,6 +85,10 @@ static J19_TEST_ELF: &[u8] = include_bytes!("../../userspace/c_apps/j19_test.elf
 static THREADS_ELF: &[u8] = include_bytes!("../../userspace/c_apps/threads.elf");
 /// ui - Jalon 21 GUI framebuffer validation (Couche 21)
 static UI_ELF: &[u8] = include_bytes!("../../userspace/c_apps/ui.elf");
+/// agent_ai - Jalon 22 Bare-metal ML inference engine (matrix ops + rdtsc benchmark)
+static AGENT_AI_ELF: &[u8] = include_bytes!("../../userspace/c_apps/agent_ai.elf");
+/// agent_rag - Jalon 23 RAG vector engine (cosine similarity + top-3)
+static AGENT_RAG_ELF: &[u8] = include_bytes!("../../userspace/c_apps/agent_rag.elf");
 
 // VGA text buffer
 const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
@@ -1085,6 +1089,11 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     arch::x86_64::gdt::init();
     serial_write("       [OK] GDT + TSS + Ring 3 selectors\n");
 
+    // === Step 1b: Enable FPU/SSE ===
+    serial_write("[1b/12] Enabling FPU/SSE...\n");
+    unsafe { arch::x86_64::context::enable_sse(); }
+    serial_write("       [OK] SSE enabled (CR0.EM=0, CR0.MP=1, CR4.OSFXSR=1, CR4.OSXMMEXCPT=1)\n");
+
     // === Step 2: IDT ===
     serial_write("[2/12] Loading IDT...\n");
     arch::x86_64::idt::init();
@@ -1413,11 +1422,21 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     alloc::string::String::from("ui.elf"),
                     fs::vfs::VfsNode::File(alloc::vec::Vec::from(UI_ELF)),
                 );
+                bin_dir.insert(
+                    alloc::string::String::from("agent_ai.elf"),
+                    fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_AI_ELF)),
+                );
+                bin_dir.insert(
+                    alloc::string::String::from("agent_rag.elf"),
+                    fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_RAG_ELF)),
+                );
                 serial_println!("       [OK] /bin/ls.elf ({} bytes)", LS_ELF.len());
                 serial_println!("       [OK] /bin/cat.elf ({} bytes)", CAT_ELF.len());
                 serial_println!("       [OK] /bin/j19_test.elf ({} bytes)", J19_TEST_ELF.len());
                 serial_println!("       [OK] /bin/threads.elf ({} bytes)", THREADS_ELF.len());
                 serial_println!("       [OK] /bin/ui.elf ({} bytes)", UI_ELF.len());
+                serial_println!("       [OK] /bin/agent_ai.elf ({} bytes)", AGENT_AI_ELF.len());
+                serial_println!("       [OK] /bin/agent_rag.elf ({} bytes)", AGENT_RAG_ELF.len());
             }
         }
     }
@@ -1498,6 +1517,48 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             }
             Err(e) => {
                 serial_println!("  [WARN] ui.elf pre-load failed: {}", e);
+            }
+        }
+
+        // Pre-load agent_ai.elf for Jalon 22 (bare-metal ML inference)
+        serial_println!("  [STEP 0c] Pre-loading agent_ai.elf for Jalon 22...");
+        match elf::load_elf_binary(AGENT_AI_ELF) {
+            Ok(ai_result) => {
+                let ai_pid = process::spawn_userspace(
+                    "/bin/agent_ai.elf", 0,
+                    ai_result.entry_point, ai_result.stack_pointer, ai_result.pml4_phys
+                ).unwrap_or(0);
+                if ai_pid != 0 {
+                    scheduler::enqueue_process(ai_pid);
+                    serial_println!(
+                        "  [OK] agent_ai.elf queued as PID {} (entry=0x{:X}, stack=0x{:X})",
+                        ai_pid, ai_result.entry_point, ai_result.stack_pointer
+                    );
+                }
+            }
+            Err(e) => {
+                serial_println!("  [WARN] agent_ai.elf pre-load failed: {}", e);
+            }
+        }
+
+        // Pre-load agent_rag.elf for Jalon 23 (RAG vector engine)
+        serial_println!("  [STEP 0d] Pre-loading agent_rag.elf for Jalon 23...");
+        match elf::load_elf_binary(AGENT_RAG_ELF) {
+            Ok(rag_result) => {
+                let rag_pid = process::spawn_userspace(
+                    "/bin/agent_rag.elf", 0,
+                    rag_result.entry_point, rag_result.stack_pointer, rag_result.pml4_phys
+                ).unwrap_or(0);
+                if rag_pid != 0 {
+                    scheduler::enqueue_process(rag_pid);
+                    serial_println!(
+                        "  [OK] agent_rag.elf queued as PID {} (entry=0x{:X}, stack=0x{:X})",
+                        rag_pid, rag_result.entry_point, rag_result.stack_pointer
+                    );
+                }
+            }
+            Err(e) => {
+                serial_println!("  [WARN] agent_rag.elf pre-load failed: {}", e);
             }
         }
 
