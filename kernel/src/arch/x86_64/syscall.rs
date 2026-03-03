@@ -254,6 +254,9 @@ extern "C" fn syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         60 => sys_exit(a1),
         61 => sys_wait(a1),
         62 => sys_kill(a1, a2 as u32),
+        22 => sys_pipe(a1),             // Jalon 24: pipe(int pipefd[2])
+        33 => sys_dup2(a1 as u32, a2 as u32), // Jalon 24: dup2(oldfd, newfd)
+        78 => sys_getdents(a1 as u32, a2, a3), // Jalon 24: getdents(fd, buf, len)
         200 => sys_ps(),
         201 => sys_bus_publish(a1, a2 as u32, a3),
         202 => sys_vga_write(a1 as usize, a2 as usize, a3),
@@ -989,6 +992,274 @@ fn sys_wait(pid: u64) -> u64 {
 }
 
 // ===== sys_kill(pid, signal) =====
+
+// ===== Jalon 24: sys_pipe, sys_dup2, sys_getdents =====
+
+/// Global pipe buffer storage.
+/// Each pipe has a 4KB circular buffer identified by a pipe_id.
+/// The pipe_id is stored in the FD path as "pipe:<id>:r" or "pipe:<id>:w".
+mod pipe {
+    use spin::Mutex;
+    
+    const PIPE_BUF_SIZE: usize = 4096;
+    const MAX_PIPES: usize = 16;
+    
+    struct PipeBuf {
+        data: [u8; PIPE_BUF_SIZE],
+        read_pos: usize,
+        write_pos: usize,
+        count: usize,       // bytes available to read
+        writer_closed: bool, // true when write end is closed
+        reader_closed: bool, // true when read end is closed
+        active: bool,
+    }
+    
+    impl PipeBuf {
+        const fn new() -> Self {
+            PipeBuf {
+                data: [0u8; PIPE_BUF_SIZE],
+                read_pos: 0,
+                write_pos: 0,
+                count: 0,
+                writer_closed: false,
+                reader_closed: false,
+                active: false,
+            }
+        }
+    }
+    
+    static PIPES: Mutex<[PipeBuf; MAX_PIPES]> = Mutex::new([
+        PipeBuf::new(), PipeBuf::new(), PipeBuf::new(), PipeBuf::new(),
+        PipeBuf::new(), PipeBuf::new(), PipeBuf::new(), PipeBuf::new(),
+        PipeBuf::new(), PipeBuf::new(), PipeBuf::new(), PipeBuf::new(),
+        PipeBuf::new(), PipeBuf::new(), PipeBuf::new(), PipeBuf::new(),
+    ]);
+    
+    /// Allocate a new pipe, returns pipe_id or None
+    pub fn alloc() -> Option<usize> {
+        let mut pipes = PIPES.lock();
+        for i in 0..MAX_PIPES {
+            if !pipes[i].active {
+                pipes[i] = PipeBuf::new();
+                pipes[i].active = true;
+                return Some(i);
+            }
+        }
+        None
+    }
+    
+    /// Write data to pipe. Returns bytes written.
+    pub fn write(pipe_id: usize, data: &[u8]) -> usize {
+        let mut pipes = PIPES.lock();
+        if pipe_id >= MAX_PIPES || !pipes[pipe_id].active {
+            return 0;
+        }
+        let pipe = &mut pipes[pipe_id];
+        let mut written = 0;
+        for &byte in data {
+            if pipe.count >= PIPE_BUF_SIZE {
+                break; // buffer full
+            }
+            pipe.data[pipe.write_pos] = byte;
+            pipe.write_pos = (pipe.write_pos + 1) % PIPE_BUF_SIZE;
+            pipe.count += 1;
+            written += 1;
+        }
+        written
+    }
+    
+    /// Read data from pipe. Returns bytes read.
+    pub fn read(pipe_id: usize, buf: &mut [u8]) -> usize {
+        let mut pipes = PIPES.lock();
+        if pipe_id >= MAX_PIPES || !pipes[pipe_id].active {
+            return 0;
+        }
+        let pipe = &mut pipes[pipe_id];
+        let mut read_count = 0;
+        for slot in buf.iter_mut() {
+            if pipe.count == 0 {
+                break; // no data
+            }
+            *slot = pipe.data[pipe.read_pos];
+            pipe.read_pos = (pipe.read_pos + 1) % PIPE_BUF_SIZE;
+            pipe.count -= 1;
+            read_count += 1;
+        }
+        read_count
+    }
+    
+    /// Close writer end
+    pub fn close_writer(pipe_id: usize) {
+        let mut pipes = PIPES.lock();
+        if pipe_id < MAX_PIPES && pipes[pipe_id].active {
+            pipes[pipe_id].writer_closed = true;
+            if pipes[pipe_id].reader_closed {
+                pipes[pipe_id].active = false;
+            }
+        }
+    }
+    
+    /// Close reader end
+    pub fn close_reader(pipe_id: usize) {
+        let mut pipes = PIPES.lock();
+        if pipe_id < MAX_PIPES && pipes[pipe_id].active {
+            pipes[pipe_id].reader_closed = true;
+            if pipes[pipe_id].writer_closed {
+                pipes[pipe_id].active = false;
+            }
+        }
+    }
+    
+    /// Get count of bytes available to read
+    pub fn available(pipe_id: usize) -> usize {
+        let pipes = PIPES.lock();
+        if pipe_id < MAX_PIPES && pipes[pipe_id].active {
+            pipes[pipe_id].count
+        } else {
+            0
+        }
+    }
+}
+
+/// sys_pipe(pipefd_ptr): creates a pipe with a 4KB kernel buffer.
+/// Writes two file descriptors to user memory: pipefd[0]=read, pipefd[1]=write.
+/// Returns 0 on success, negative on error.
+fn sys_pipe(pipefd_ptr: u64) -> u64 {
+    crate::serial_println!("[SYSCALL] sys_pipe(pipefd_ptr=0x{:X})", pipefd_ptr);
+    
+    if pipefd_ptr == 0 || pipefd_ptr >= USER_ADDR_LIMIT {
+        return EINVAL;
+    }
+    
+    // Allocate kernel pipe buffer
+    let pipe_id = match pipe::alloc() {
+        Some(id) => id,
+        None => {
+            crate::serial_println!("[SYSCALL] pipe: no free pipe slots");
+            return ENOMEM;
+        }
+    };
+    
+    // Get current process PID to allocate FDs
+    let pid = crate::scheduler::current_pid();
+    
+    // Allocate read FD
+    let read_fd = {
+        let path = alloc::format!("pipe:{}:r", pipe_id);
+        crate::process::alloc_fd(pid, &path, 0) // O_RDONLY
+    };
+    
+    // Allocate write FD
+    let write_fd = {
+        let path = alloc::format!("pipe:{}:w", pipe_id);
+        crate::process::alloc_fd(pid, &path, 1) // O_WRONLY
+    };
+    
+    match (read_fd, write_fd) {
+        (Some(rfd), Some(wfd)) => {
+            // Write [read_fd, write_fd] to user memory as two i32 values
+            let user_ptr = pipefd_ptr as *mut i32;
+            unsafe {
+                core::ptr::write_volatile(user_ptr, rfd as i32);
+                core::ptr::write_volatile(user_ptr.add(1), wfd as i32);
+            }
+            crate::serial_println!("[SYSCALL] pipe: created pipe_id={}, read_fd={}, write_fd={}", pipe_id, rfd, wfd);
+            0
+        }
+        _ => {
+            crate::serial_println!("[SYSCALL] pipe: fd allocation failed");
+            ENOMEM
+        }
+    }
+}
+
+/// sys_dup2(oldfd, newfd): duplicate file descriptor.
+/// Makes newfd refer to the same file as oldfd.
+/// Returns newfd on success, negative on error.
+fn sys_dup2(oldfd: u32, newfd: u32) -> u64 {
+    crate::serial_println!("[SYSCALL] sys_dup2({}, {})", oldfd, newfd);
+    
+    let pid = crate::scheduler::current_pid();
+    
+    // Get the path from the old FD
+    let old_path = crate::process::get_fd_path(pid, oldfd as usize);
+    
+    match old_path {
+        Some(path) => {
+            // Close newfd if it's open, then set it to the same path
+            crate::process::set_fd(pid, newfd as usize, &path, 2); // O_RDWR
+            crate::serial_println!("[SYSCALL] dup2: {} -> {} ({})", oldfd, newfd, path);
+            newfd as u64
+        }
+        None => {
+            crate::serial_println!("[SYSCALL] dup2: oldfd {} not found", oldfd);
+            EBADF
+        }
+    }
+}
+
+/// sys_getdents(fd, buf, bufsize): read directory entries.
+/// Currently only supports reading /bin directory listing.
+/// Writes entries as newline-separated filenames into buf.
+/// Returns total bytes written on success.
+fn sys_getdents(fd: u32, buf_ptr: u64, buf_size: u64) -> u64 {
+    crate::serial_println!("[SYSCALL] sys_getdents(fd={}, buf=0x{:X}, size={})", fd, buf_ptr, buf_size);
+    
+    if buf_ptr == 0 || buf_ptr >= USER_ADDR_LIMIT || buf_size == 0 {
+        return EINVAL;
+    }
+    
+    // Get the path associated with this FD
+    let pid = crate::scheduler::current_pid();
+    let path = crate::process::get_fd_path(pid, fd as usize);
+    
+    let dir_path = match path {
+        Some(p) => p,
+        None => return EBADF,
+    };
+    
+    crate::serial_println!("[SYSCALL] getdents: listing directory '{}'", dir_path);
+    
+    // Get directory listing from VFS
+    let entries = {
+        let root = crate::fs::vfs::lock_root();
+        let mut result = alloc::vec::Vec::new();
+        
+        // Parse path to find directory
+        if dir_path == "/bin" || dir_path == "bin" {
+            if let Some(crate::fs::vfs::VfsNode::Directory(ref bin_dir)) = root.get("bin") {
+                for key in bin_dir.keys() {
+                    result.push(key.clone());
+                }
+            }
+        } else if dir_path == "/" || dir_path == "." {
+            for key in root.keys() {
+                result.push(key.clone());
+            }
+        }
+        result
+    };
+    
+    // Build output buffer: entries separated by newlines
+    let mut output = alloc::string::String::new();
+    for (i, entry) in entries.iter().enumerate() {
+        if i > 0 { output.push('\n'); }
+        output.push_str(entry);
+    }
+    
+    let bytes = output.as_bytes();
+    let to_copy = core::cmp::min(bytes.len(), buf_size as usize);
+    
+    if to_copy > 0 {
+        let user_buf = buf_ptr as *mut u8;
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), user_buf, to_copy);
+        }
+    }
+    
+    crate::serial_println!("[SYSCALL] getdents: returned {} bytes ({} entries)", to_copy, entries.len());
+    to_copy as u64
+}
 
 fn sys_kill(pid: u64, _signal: u32) -> u64 {
     crate::serial_println!("[SYSCALL] sys_kill({}, {})", pid, _signal);
