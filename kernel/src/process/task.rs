@@ -228,6 +228,10 @@ pub struct Process {
     /// True if this process was created by fork() and should resume
     /// at the parent's saved RIP with RAX=0 (fork return value for child).
     pub is_forked: bool,
+    /// Per-process heap break: current end of the heap region.
+    /// Userspace calls sys_brk to grow/shrink this.
+    /// Base address: 0x0000_3000_0000_0000 (PML4[96])
+    pub heap_break: u64,
 }
 
 impl Process {
@@ -263,6 +267,7 @@ impl Process {
             saved_syscall_regs: [0; 8],
             fpu_state: FpuState::zero(),
             is_forked: false,
+            heap_break: 0x0000_3000_0000_0000, // Initial heap base (PML4[96])
         }
     }
 

@@ -39,14 +39,17 @@ echo "[SDK] Building libaetherion.a from sdk/c/ ..."
 # GCC flags for bare-metal x86_64 without SSE (kernel doesn't save FPU state)
 GCC_FLAGS="-nostdlib -fno-builtin -fno-stack-protector -ffreestanding \
     -mno-sse -mno-sse2 -mno-mmx -mno-80387 -mno-red-zone \
-    -fPIC -O2 -Wall -Wextra -mcmodel=large"
+    -fno-PIC -fno-pic -O2 -Wall -Wextra -mcmodel=large"
 
 # Compile SDK source
 gcc -c $GCC_FLAGS -o "$SDK_DIR/aetherion.o" "$SDK_DIR/aetherion.c"
 
-# Create static library
-ar rcs "$SDK_DIR/libaetherion.a" "$SDK_DIR/aetherion.o"
-echo "[OK] libaetherion.a ($(stat -c %s "$SDK_DIR/libaetherion.a") bytes)"
+# Compile CRT0 (C runtime startup with _start entry point)
+gcc -c $GCC_FLAGS -o "$SDK_DIR/crt0.o" "$SDK_DIR/crt0.c"
+
+# Create static library (crt0.o + aetherion.o)
+ar rcs "$SDK_DIR/libaetherion.a" "$SDK_DIR/crt0.o" "$SDK_DIR/aetherion.o"
+echo "[OK] libaetherion.a ($(stat -c %s "$SDK_DIR/libaetherion.a") bytes, includes crt0)"
 
 # Also build a backwards-compatible libc_stub.o for any legacy references
 # (symlink the object so old link commands still work)
@@ -65,7 +68,7 @@ echo "[OK] Linker script: $LINKER_SCRIPT"
 # =========================================
 # Phase 3: Build each C application
 # =========================================
-APPS="hello_c j19_test ls cat wget threads ui agent_ai agent_rag sh"
+APPS="hello_c j19_test ls cat wget threads ui agent_ai agent_rag sh test_malloc test_preempt"
 
 for APP in $APPS; do
     SRC="$C_APPS_DIR/${APP}.c"
@@ -84,9 +87,10 @@ for APP in $APPS; do
         "$SRC"
     echo "[OK] ${APP}.o"
 
-    echo "[LINK] Linking ${APP}.elf against libaetherion.a..."
+    echo "[LINK] Linking ${APP}.elf against crt0 + libaetherion.a..."
     ld -T "$LINKER_SCRIPT" -static \
         -o "$ELF" \
+        "$SDK_DIR/crt0.o" \
         "$OBJ" \
         -L"$SDK_DIR" -laetherion
     echo "[OK] ${APP}.elf ($(stat -c %s "$ELF") bytes)"

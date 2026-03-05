@@ -8,6 +8,7 @@ SECTIONS
 
     .text : ALIGN(4096)
     {
+        *(.text.start)
         *(.text*)
         *(.plt*)
         *(.got.plt*)

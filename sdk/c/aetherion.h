@@ -16,6 +16,7 @@
  *   0   sys_read(fd, buf, len)
  *   1   sys_write(fd, buf, len)
  *   9   sys_mmap(addr, len, prot, flags, fd, offset)
+ *  12   sys_brk(new_break) — set program break for malloc/free
  *  20   sys_getpid()
  *  41   sys_socket(domain, type, protocol)
  *  42   sys_connect(fd, ip_packed, port)
@@ -152,5 +153,49 @@ long close(int fd);
 /* getdents(fd, buf, bufsize): read directory entries.
  * Returns bytes written to buf (newline-separated names). */
 long getdents(int fd, void *buf, size_t bufsize);
+
+/* ========================================
+ * Dynamic Memory Allocation (Jalon 27)
+ * Uses sys_brk (ID 12) for heap management.
+ * First-fit allocator with block coalescing.
+ * ======================================== */
+
+/* sys_brk: set program break.
+ * brk(0) returns current break.
+ * brk(addr) sets break to addr, mapping new pages if needed. */
+long sys_brk(long addr);
+
+/* malloc: allocate size bytes from the heap.
+ * Returns pointer to allocated memory, or NULL on failure. */
+void *malloc(size_t size);
+
+/* free: release previously allocated memory. */
+void free(void *ptr);
+
+/* calloc: allocate and zero-initialize an array.
+ * Returns pointer or NULL. */
+void *calloc(size_t nmemb, size_t size);
+
+/* realloc: resize a previously allocated block.
+ * Returns pointer to new block (may move), or NULL on failure. */
+void *realloc(void *ptr, size_t new_size);
+
+/* strncpy: copy at most n chars from src to dest */
+char *strncpy(char *dest, const char *src, size_t n);
+
+/* strncmp: compare at most n chars */
+int strncmp(const char *s1, const char *s2, size_t n);
+
+/* print_dec: print a decimal integer */
+void print_dec(long val);
+
+/* strcpy: copy string */
+char *strcpy(char *dest, const char *src);
+
+/* strcat: concatenate strings */
+char *strcat(char *dest, const char *src);
+
+/* atoi: convert string to integer */
+int atoi(const char *s);
 
 #endif /* _AETHERION_H */

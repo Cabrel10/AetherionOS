@@ -617,3 +617,17 @@ where
     let table = PROCESS_TABLE.lock();
     table.get(&pid).map(f)
 }
+
+/// Get the current heap break for a process
+pub fn get_heap_break(pid: u64) -> Option<u64> {
+    with_process(pid, |p| p.heap_break)
+}
+
+/// Set the heap break for a process, returning the old value
+pub fn set_heap_break(pid: u64, new_break: u64) -> Option<u64> {
+    with_process_mut(pid, |p| {
+        let old = p.heap_break;
+        p.heap_break = new_break;
+        old
+    })
+}
