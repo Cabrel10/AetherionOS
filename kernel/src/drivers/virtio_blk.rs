@@ -418,6 +418,22 @@ pub fn capacity() -> u64 {
     }
 }
 
+/// Write multiple sectors
+pub fn write_sectors(start_lba: u64, count: usize, buf: &[u8]) -> bool {
+    if buf.len() < count * SECTOR_SIZE {
+        return false;
+    }
+    for i in 0..count {
+        let offset = i * SECTOR_SIZE;
+        let mut sector_buf = [0u8; SECTOR_SIZE];
+        sector_buf.copy_from_slice(&buf[offset..offset + SECTOR_SIZE]);
+        if !write_sector(start_lba + i as u64, &sector_buf) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Read multiple sectors
 pub fn read_sectors(start_lba: u64, count: usize, buf: &mut [u8]) -> bool {
     if buf.len() < count * SECTOR_SIZE {
