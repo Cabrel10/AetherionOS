@@ -5,8 +5,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-nightly--2023--08--01-orange.svg)](https://www.rust-lang.org)
 [![Arch](https://img.shields.io/badge/arch-x86__64-green.svg)](https://en.wikipedia.org/wiki/X86-64)
-[![Version](https://img.shields.io/badge/version-v2.0.0--unix--ready-blue.svg)](#)
-[![Jalons](https://img.shields.io/badge/jalons-26%2F26-brightgreen.svg)](#development-milestones)
+[![Version](https://img.shields.io/badge/version-v2.1.0--malloc--preempt-blue.svg)](#)
+[![Jalons](https://img.shields.io/badge/jalons-28%2F28-brightgreen.svg)](#development-milestones)
 
 ---
 
@@ -18,19 +18,21 @@ AetherionOS is an experimental bare-metal operating system written entirely in R
 where AI agents communicate through a mediated Intent Bus rather than direct hardware
 access.
 
-As of **v2.0.0** the system has crossed the **Unix Wall**: full POSIX process
-lifecycle (`fork`, `exec`, `wait`, `exit`, `pipe`), a Ring 3 interactive shell,
-network stack, persistent storage, and integrated bare-metal ML inference -- all
-running on real hardware emulated by QEMU with 256 MiB RAM.
+As of **v2.1.0** the system has crossed the **Unix Wall** and added dynamic memory
+management: full POSIX process lifecycle (`fork`, `exec`, `wait`, `exit`, `pipe`),
+`malloc`/`free`/`calloc`/`realloc` via `sys_brk`, preemptive multi-threaded scheduling,
+a Ring 3 interactive shell, network stack, persistent storage, and integrated bare-metal
+ML inference -- all running on real hardware emulated by QEMU with 256 MiB RAM.
 
-### Capabilities (v2.0.0-unix-ready)
+### Capabilities (v2.1.0-malloc-preempt)
 
 | Domain | Features |
 |--------|----------|
 | **Isolation** | Ring 0 / Ring 3 separation, per-process PML4, KPTI-lite (no USER_ACCESSIBLE on kernel pages) |
 | **Processes** | Matriarchal hierarchy (Matriarch / SubMatriarch / Worker), preemptive scheduling with priority aging |
-| **POSIX** | `fork` (deep PML4 copy), `exec` (ELF reload), `wait`/`waitpid`, `pipe`, `dup2`, `mmap`, `getdents` |
-| **Threads** | `clone` (shared address space), multi-threaded join via `sys_wait` |
+| **POSIX** | `fork` (deep PML4 copy), `exec` (ELF reload), `wait`/`waitpid`, `pipe`, `dup2`, `mmap`, `getdents`, `brk` |
+| **Memory** | `malloc`/`free`/`calloc`/`realloc` via `sys_brk`; first-fit allocator, 16-byte aligned, block coalescence |
+| **Threads** | `clone` (shared address space), multi-threaded join via `sys_wait`, preemptive timer-based scheduling |
 | **Network** | VirtIO-net, Ethernet, ARP, IPv4, UDP, TCP (3-way handshake + retransmit), DNS resolver |
 | **Storage** | VirtIO-Block driver, read-only FAT32, VFS with `/bin`, `/sys`, `/disk` mount points |
 | **Shell** | `sh.elf` -- Ring 3 POSIX shell: `AETHER>` prompt, built-ins (`help`, `ls`, `ps`, `echo`, `pid`), external command execution |

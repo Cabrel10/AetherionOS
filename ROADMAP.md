@@ -2,7 +2,7 @@
 
 **Master Plan -- From Bare Metal to AI-Native Desktop**
 
-Last updated: 2026-03-05 (post Jalon 26)
+Last updated: 2026-03-05 (post Jalon 28)
 
 ---
 
@@ -43,6 +43,8 @@ Last updated: 2026-03-05 (post Jalon 26)
 | 24 | Pipes & FD management | `sys_pipe`, `sys_dup2`, `sys_getdents` |
 | 25 | `sys_fork` (deep PML4 copy) + `sys_exec` | PML4 heap sharing fix (PML4[136]) |
 | 26 | POSIX shell (`sh.elf`) | `AETHER>` prompt, fork/exec/wait loop |
+| 27 | Dynamic memory: `sys_brk`, `malloc`/`free` | First-fit, 16-byte aligned, coalescence |
+| 28 | Preemptive scheduler + multi-threaded demo | PIT timer tick, priority queues, aging |
 
 ---
 
@@ -55,7 +57,7 @@ against AetherionOS without touching the kernel.*
 
 | Step | Description | Status |
 |------|-------------|--------|
-| 1a | Extract `libc_stub` into `sdk/c/`, build `libaetherion.a` | NEXT |
+| 1a | Extract `libc_stub` into `sdk/c/`, build `libaetherion.a` | DONE |
 | 1b | Port `newlib` stubs (malloc, stdio, string) on top of Aetherion syscalls | Planned |
 | 1c | Create `x86_64-aetherion-none` Rust target JSON | Planned |
 | 1d | Cargo wrapper (`cargo-aetherion`) to cross-compile Ring 3 crates | Planned |
