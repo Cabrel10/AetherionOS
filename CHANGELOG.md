@@ -5,6 +5,61 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [v2.1.0] -- 2026-03-05 -- Jalon 27+28: Dynamic Memory & Scheduler
+
+### Critical Fix -- Syscall ABI Clobber List
+- **Root cause**: GCC inline assembly for `syscall1/2/3/6` and `fork()` in the C-SDK
+  was missing caller-saved registers (R8, R9, R10, RSI, RDX) in the clobber list.
+  The kernel's `syscall_entry` freely uses these registers, but the compiler assumed
+  they were preserved across `syscall` instructions. This caused GCC to cache values
+  (e.g., `SYS_BRK=12`) in R8 across syscall boundaries, leading to silent corruption.
+- **Fix**: Added all caller-saved registers to clobber lists. Now GCC correctly
+  places cross-syscall values in callee-saved registers (RBX, R12-R15) which ARE
+  preserved by the kernel's `syscall_entry`/`sysretq` path.
+
+### Added -- Jalon 27: Dynamic Memory Allocator
+- `sys_brk` (syscall 12): Linux-compatible program break management.
+  - `brk(0)` returns current break; `brk(addr)` extends the heap.
+  - Heap region at PML4[96] (`0x0000_3000_0000_0000`), 256 MiB max.
+  - Per-process `heap_break` in Process struct (initialized to heap base).
+  - Demand-paged frame allocation with zero-fill and TLB flush.
+- `malloc(size)`: first-fit allocator with 16-byte alignment guarantee.
+  Block header rounded to 32 bytes to ensure returned pointers are 16-byte aligned.
+- `free(ptr)`: marks block as free, coalesces adjacent free blocks.
+- `calloc(nmemb, size)`: zero-initialized allocation.
+- `realloc(ptr, new_size)`: resize with data preservation.
+- `heap_extend()`: automatically grows heap via `sys_brk` when exhausted.
+- `test_malloc.c`: 16/16 tests pass (brk, malloc, alignment, overlap,
+  read/write, string, free/reuse, calloc, realloc, 100-item stress test).
+
+### Added -- Jalon 28: Preemptive Scheduler
+- PIT timer `tick()` maintains priority scheduling with anti-starvation aging.
+- Thread scheduling via `sys_clone` + `sys_wait` mechanism.
+- `test_preempt.c`: two compute-bound threads (500,000 iterations each)
+  both complete successfully, demonstrating multi-threaded scheduling.
+- Interleaved `[AGENT-HIGH]` / `[AGENT-NORM]` output confirms scheduling.
+
+### Added -- C Runtime Startup (CRT0)
+- `sdk/c/crt0.c`: provides a `weak _start` entry point that calls `main()`.
+  Legacy apps with their own `_start` override it automatically.
+- `sdk/c/aetherion.ld`: `.text.start` section placed first for CRT0.
+
+### Changed
+- `sdk/c/aetherion.h`: added `sys_brk`, `malloc`, `free`, `calloc`, `realloc`,
+  `strncpy`, `strncmp`, `strcpy`, `strcat`, `atoi`, `print_dec` declarations.
+- `sdk/c/aetherion.c`: full implementation of all new functions.
+- `scripts/build_c.sh`: links CRT0 before application objects, compiles with
+  `-fno-PIC -mcmodel=large` for correct absolute addressing.
+- Kernel: duplicate `return` in `sys_brk` range check removed.
+
+### Validation
+- All 12 kernel test suites pass.
+- J20 (threads), J21 (GUI), J22 (ML), J23 (RAG), J25+26 (fork+exec), 
+  J27 (malloc 16/16), J28 (preemptive scheduler) all green.
+- QEMU 256 MiB, zero panics, clean shutdown.
+
+---
+
 ## [v2.0.0] -- 2026-03-05 -- Franchissement du Mur UNIX
 
 ### Critical Fix
