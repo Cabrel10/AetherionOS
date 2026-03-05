@@ -1,8 +1,8 @@
-// kernel/src/fs/fat32.rs - FAT32 Filesystem Driver (Couche 19)
+// kernel/src/fs/fat32.rs - FAT32 Filesystem Driver (Couche 19 + Jalon 30 Write)
 //
-// Minimal read-only FAT32 implementation for AetherionOS.
+// Read/Write FAT32 implementation for AetherionOS.
 // Reads the BPB (BIOS Parameter Block), navigates the FAT,
-// and reads files from the root directory.
+// reads and writes files, manages directory entries and cluster allocation.
 //
 // FAT32 Layout:
 //   - Sector 0: Boot sector (BPB)
@@ -10,8 +10,15 @@
 //   - FAT region (BPB.num_fats * BPB.fat_size_32)
 //   - Data region (clusters start here)
 //
+// Jalon 30 additions:
+//   - find_free_cluster: scan FAT for unallocated cluster
+//   - set_fat_entry: write a FAT table entry (both copies)
+//   - write_cluster: write data to a cluster on disk
+//   - write_file_to_dir: create/overwrite a file in a directory
+//   - navigate_to_dir: resolve a path like /var/sagas to a cluster
+//
 // References:
-//   - Microsoft FAT32 File System Specification
+//   - Microsoft FAT32 File System Specification (fatgen103.doc)
 //   - https://wiki.osdev.org/FAT
 
 use alloc::vec::Vec;
@@ -20,10 +27,14 @@ use alloc::string::String;
 
 /// FAT32 cluster constants
 const FAT32_EOC: u32 = 0x0FFF_FFF8;  // End of cluster chain marker
+const FAT32_FREE: u32 = 0x0000_0000; // Free cluster marker
 const FAT32_BAD: u32 = 0x0FFF_FFF7;  // Bad cluster marker
 
 /// FAT32 directory entry size
 const DIR_ENTRY_SIZE: usize = 32;
+
+/// Maximum clusters to scan for free cluster search (safety limit)
+const MAX_CLUSTER_SCAN: u32 = 65536;
 
 /// FAT32 BPB (BIOS Parameter Block) - parsed from boot sector
 pub struct Fat32Bpb {
@@ -99,6 +110,17 @@ impl Fat32Bpb {
         let fat_offset_in_sector = (fat_offset % 512) as usize;
         (fat_sector, fat_offset_in_sector)
     }
+
+    /// Total data clusters available
+    pub fn total_data_clusters(&self) -> u32 {
+        let data_sectors = self.total_sectors_32 - self.data_start_lba();
+        data_sectors / self.sectors_per_cluster as u32
+    }
+
+    /// Cluster size in bytes
+    pub fn cluster_size(&self) -> usize {
+        self.sectors_per_cluster as usize * 512
+    }
 }
 
 /// FAT32 directory entry (short name)
@@ -171,6 +193,34 @@ impl Fat32DirEntry {
     }
 }
 
+/// Convert a filename to FAT32 8.3 format (uppercase, space-padded)
+fn name_to_8_3(filename: &str) -> [u8; 11] {
+    let mut result = [0x20u8; 11]; // space-padded
+    let upper = filename.to_ascii_uppercase();
+
+    // Split on last '.'
+    if let Some(dot_pos) = upper.rfind('.') {
+        let name_part = &upper[..dot_pos];
+        let ext_part = &upper[dot_pos + 1..];
+
+        // Copy name (up to 8 chars)
+        for (i, &b) in name_part.as_bytes().iter().take(8).enumerate() {
+            result[i] = b;
+        }
+        // Copy extension (up to 3 chars)
+        for (i, &b) in ext_part.as_bytes().iter().take(3).enumerate() {
+            result[8 + i] = b;
+        }
+    } else {
+        // No extension
+        for (i, &b) in upper.as_bytes().iter().take(8).enumerate() {
+            result[i] = b;
+        }
+    }
+
+    result
+}
+
 /// FAT32 filesystem instance
 pub struct Fat32Fs {
     pub bpb: Fat32Bpb,
@@ -217,6 +267,196 @@ impl Fat32Fs {
         } else {
             Some(next)
         }
+    }
+
+    /// Read a FAT entry for a given cluster
+    fn read_fat_entry(&self, cluster: u32) -> u32 {
+        let (fat_sector, offset) = self.bpb.fat_sector_for_cluster(cluster);
+        let mut sector_buf = [0u8; 512];
+
+        if !crate::drivers::virtio_blk::read_sector(fat_sector as u64, &mut sector_buf) {
+            return FAT32_BAD;
+        }
+
+        u32::from_le_bytes([
+            sector_buf[offset],
+            sector_buf[offset + 1],
+            sector_buf[offset + 2],
+            sector_buf[offset + 3],
+        ]) & 0x0FFF_FFFF
+    }
+
+    /// Write a FAT entry for a given cluster (updates both FAT copies)
+    fn set_fat_entry(&self, cluster: u32, value: u32) -> bool {
+        let (fat_sector, offset) = self.bpb.fat_sector_for_cluster(cluster);
+        let mut sector_buf = [0u8; 512];
+
+        // Read the FAT sector
+        if !crate::drivers::virtio_blk::read_sector(fat_sector as u64, &mut sector_buf) {
+            crate::serial_println!("[FAT32] Failed to read FAT sector {} for cluster {}", fat_sector, cluster);
+            return false;
+        }
+
+        // Preserve top 4 bits of existing entry (reserved)
+        let existing = u32::from_le_bytes([
+            sector_buf[offset], sector_buf[offset+1],
+            sector_buf[offset+2], sector_buf[offset+3],
+        ]);
+        let new_val = (existing & 0xF000_0000) | (value & 0x0FFF_FFFF);
+        let bytes = new_val.to_le_bytes();
+        sector_buf[offset] = bytes[0];
+        sector_buf[offset + 1] = bytes[1];
+        sector_buf[offset + 2] = bytes[2];
+        sector_buf[offset + 3] = bytes[3];
+
+        // Write back to FAT1
+        if !crate::drivers::virtio_blk::write_sector(fat_sector as u64, &sector_buf) {
+            crate::serial_println!("[FAT32] Failed to write FAT1 sector {}", fat_sector);
+            return false;
+        }
+
+        // Write to FAT2 (mirror) if num_fats >= 2
+        if self.bpb.num_fats >= 2 {
+            let fat2_sector = fat_sector + self.bpb.fat_size_32;
+            if !crate::drivers::virtio_blk::write_sector(fat2_sector as u64, &sector_buf) {
+                crate::serial_println!("[FAT32] Warning: Failed to mirror FAT2 sector {}", fat2_sector);
+                // Non-fatal: FAT1 was written successfully
+            }
+        }
+
+        true
+    }
+
+    /// Find a free cluster in the FAT, starting from cluster 2
+    fn find_free_cluster(&self) -> Option<u32> {
+        let max_cluster = self.bpb.total_data_clusters() + 2;
+        let limit = core::cmp::min(max_cluster, MAX_CLUSTER_SCAN + 2);
+
+        for cluster in 2..limit {
+            let entry = self.read_fat_entry(cluster);
+            if entry == FAT32_FREE {
+                return Some(cluster);
+            }
+        }
+
+        crate::serial_println!("[FAT32] ENOSPC: No free clusters found (scanned {})", limit - 2);
+        None
+    }
+
+    /// Allocate a chain of clusters for `size` bytes.
+    /// Returns the first cluster in the chain, or None if not enough space.
+    fn allocate_cluster_chain(&self, size: usize) -> Option<u32> {
+        if size == 0 {
+            return Some(0); // No data needs no clusters
+        }
+
+        let cluster_size = self.bpb.cluster_size();
+        let clusters_needed = (size + cluster_size - 1) / cluster_size;
+
+        let mut chain: Vec<u32> = Vec::with_capacity(clusters_needed);
+        let max_cluster = self.bpb.total_data_clusters() + 2;
+        let limit = core::cmp::min(max_cluster, MAX_CLUSTER_SCAN + 2);
+        let mut search_start = 2u32;
+
+        for _ in 0..clusters_needed {
+            let mut found = false;
+            for cluster in search_start..limit {
+                let entry = self.read_fat_entry(cluster);
+                if entry == FAT32_FREE {
+                    chain.push(cluster);
+                    search_start = cluster + 1;
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                // Not enough space — undo any allocations
+                crate::serial_println!("[FAT32] ENOSPC: Need {} clusters, found only {}", clusters_needed, chain.len());
+                return None;
+            }
+        }
+
+        // Link the chain: each cluster points to the next, last one gets EOC
+        for i in 0..chain.len() {
+            let value = if i + 1 < chain.len() {
+                chain[i + 1]
+            } else {
+                FAT32_EOC
+            };
+            if !self.set_fat_entry(chain[i], value) {
+                crate::serial_println!("[FAT32] Failed to set FAT entry for cluster {}", chain[i]);
+                return None;
+            }
+        }
+
+        crate::serial_println!("[FAT32] Allocated {} cluster(s), first={}", chain.len(), chain[0]);
+        Some(chain[0])
+    }
+
+    /// Free a cluster chain starting from `start_cluster`
+    fn free_cluster_chain(&self, start_cluster: u32) {
+        if start_cluster < 2 {
+            return;
+        }
+        let mut cluster = start_cluster;
+        let mut count = 0u32;
+        loop {
+            if count > 10000 { break; } // Safety limit
+            let next = self.read_fat_entry(cluster);
+            self.set_fat_entry(cluster, FAT32_FREE);
+            count += 1;
+
+            if next >= FAT32_EOC || next == FAT32_BAD || next < 2 {
+                break;
+            }
+            cluster = next;
+        }
+        crate::serial_println!("[FAT32] Freed {} cluster(s) from chain starting at {}", count, start_cluster);
+    }
+
+    /// Write data to a cluster's sectors on disk
+    fn write_cluster(&self, cluster: u32, data: &[u8]) -> bool {
+        let lba = self.bpb.cluster_to_lba(cluster);
+        let sectors = self.bpb.sectors_per_cluster as usize;
+        let cluster_size = sectors * 512;
+
+        // Pad data to full cluster size
+        let mut buf = vec![0u8; cluster_size];
+        let copy_len = core::cmp::min(data.len(), cluster_size);
+        buf[..copy_len].copy_from_slice(&data[..copy_len]);
+
+        crate::drivers::virtio_blk::write_sectors(lba as u64, sectors, &buf)
+    }
+
+    /// Write data following a cluster chain
+    fn write_file_data(&self, start_cluster: u32, data: &[u8]) -> bool {
+        let cluster_size = self.bpb.cluster_size();
+        let mut cluster = start_cluster;
+        let mut offset = 0usize;
+        let mut iterations = 0;
+
+        while offset < data.len() {
+            if iterations > 1000 { break; } // Safety
+            iterations += 1;
+
+            let end = core::cmp::min(offset + cluster_size, data.len());
+            if !self.write_cluster(cluster, &data[offset..end]) {
+                crate::serial_println!("[FAT32] Failed to write cluster {}", cluster);
+                return false;
+            }
+            offset = end;
+
+            if offset < data.len() {
+                match self.next_cluster(cluster) {
+                    Some(next) => cluster = next,
+                    None => {
+                        crate::serial_println!("[FAT32] Cluster chain too short for data");
+                        return false;
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Read all sectors of a cluster into a buffer
@@ -336,6 +576,188 @@ impl Fat32Fs {
 
         None
     }
+
+    /// Navigate a path like "var/sagas" from root, returning the cluster of the final directory.
+    /// Each component must be an existing directory.
+    pub fn navigate_to_dir(&self, path_components: &[&str]) -> Option<u32> {
+        let mut current_cluster = self.bpb.root_cluster;
+
+        for component in path_components {
+            let target = component.to_ascii_lowercase();
+            let entries = self.list_directory(current_cluster);
+            let mut found = false;
+
+            for entry in &entries {
+                if entry.name == target && entry.is_directory {
+                    current_cluster = entry.first_cluster;
+                    found = true;
+                    break;
+                }
+            }
+
+            if !found {
+                crate::serial_println!("[FAT32] Directory component '{}' not found", component);
+                return None;
+            }
+        }
+
+        Some(current_cluster)
+    }
+
+    /// Write (create or overwrite) a file in a given directory cluster.
+    ///
+    /// Steps:
+    /// 1. Scan directory for existing entry with matching name
+    /// 2. If found, free its old cluster chain
+    /// 3. Allocate new cluster chain for the data
+    /// 4. Write data to clusters
+    /// 5. Update (or create) the directory entry with new cluster and size
+    ///
+    /// Returns true on success.
+    pub fn write_file_to_dir(&self, dir_cluster: u32, filename: &str, data: &[u8]) -> bool {
+        let name_8_3 = name_to_8_3(filename);
+        let target_lower = filename.to_ascii_lowercase();
+
+        crate::serial_println!("[FAT32-W] write_file_to_dir: dir_cluster={}, file='{}', size={}",
+            dir_cluster, filename, data.len());
+
+        // Step 1+2: Scan directory for existing entry
+        let mut found_entry_cluster = 0u32;
+        let mut found_entry_offset = 0usize;
+        let mut found_old_cluster = 0u32;
+        let mut entry_found = false;
+
+        // Also track the first free slot (0xE5 or 0x00) for creating new entries
+        let mut free_slot_cluster = 0u32;
+        let mut free_slot_offset = 0usize;
+        let mut free_slot_found = false;
+
+        let mut scan_cluster = dir_cluster;
+        let mut iterations = 0;
+
+        'outer: loop {
+            if iterations > 100 { break; }
+            iterations += 1;
+
+            let cluster_data = match self.read_cluster(scan_cluster) {
+                Some(d) => d,
+                None => break,
+            };
+
+            let num_entries = cluster_data.len() / DIR_ENTRY_SIZE;
+            for i in 0..num_entries {
+                let off = i * DIR_ENTRY_SIZE;
+                let raw = &cluster_data[off..off + DIR_ENTRY_SIZE];
+
+                // Free/deleted entry — remember as potential slot
+                if (raw[0] == 0x00 || raw[0] == 0xE5) && !free_slot_found {
+                    free_slot_cluster = scan_cluster;
+                    free_slot_offset = off;
+                    free_slot_found = true;
+                }
+
+                // End of directory marker
+                if raw[0] == 0x00 {
+                    break 'outer;
+                }
+
+                // Check if this is our target file
+                if let Some(entry) = Fat32DirEntry::parse(raw) {
+                    if entry.name == target_lower && !entry.is_directory {
+                        found_entry_cluster = scan_cluster;
+                        found_entry_offset = off;
+                        found_old_cluster = entry.first_cluster;
+                        entry_found = true;
+                        break 'outer;
+                    }
+                }
+            }
+
+            match self.next_cluster(scan_cluster) {
+                Some(next) => scan_cluster = next,
+                None => break,
+            }
+        }
+
+        // Step 2: Free old cluster chain if overwriting
+        if entry_found && found_old_cluster >= 2 {
+            crate::serial_println!("[FAT32-W] Overwriting existing file, freeing old chain from cluster {}", found_old_cluster);
+            self.free_cluster_chain(found_old_cluster);
+        }
+
+        // Step 3: Allocate new cluster chain
+        let new_first_cluster = if data.is_empty() {
+            0u32
+        } else {
+            match self.allocate_cluster_chain(data.len()) {
+                Some(c) => c,
+                None => {
+                    crate::serial_println!("[FAT32-W] Failed to allocate clusters for {} bytes", data.len());
+                    return false;
+                }
+            }
+        };
+
+        // Step 4: Write data to the new clusters
+        if !data.is_empty() && new_first_cluster >= 2 {
+            if !self.write_file_data(new_first_cluster, data) {
+                crate::serial_println!("[FAT32-W] Failed to write file data");
+                return false;
+            }
+        }
+
+        // Step 5: Build the 32-byte directory entry
+        let mut dir_entry = [0u8; 32];
+        dir_entry[0..11].copy_from_slice(&name_8_3);
+        dir_entry[11] = 0x20; // Archive attribute
+        // Cluster high word (bytes 20-21)
+        let cluster_hi = ((new_first_cluster >> 16) & 0xFFFF) as u16;
+        dir_entry[20] = (cluster_hi & 0xFF) as u8;
+        dir_entry[21] = ((cluster_hi >> 8) & 0xFF) as u8;
+        // Cluster low word (bytes 26-27)
+        let cluster_lo = (new_first_cluster & 0xFFFF) as u16;
+        dir_entry[26] = (cluster_lo & 0xFF) as u8;
+        dir_entry[27] = ((cluster_lo >> 8) & 0xFF) as u8;
+        // File size (bytes 28-31)
+        let size_bytes = (data.len() as u32).to_le_bytes();
+        dir_entry[28] = size_bytes[0];
+        dir_entry[29] = size_bytes[1];
+        dir_entry[30] = size_bytes[2];
+        dir_entry[31] = size_bytes[3];
+
+        // Step 6: Write directory entry to disk
+        let (target_cluster, target_offset) = if entry_found {
+            (found_entry_cluster, found_entry_offset)
+        } else if free_slot_found {
+            (free_slot_cluster, free_slot_offset)
+        } else {
+            crate::serial_println!("[FAT32-W] No free directory entry slot found");
+            return false;
+        };
+
+        // Read the cluster containing the directory entry
+        let mut cluster_data = match self.read_cluster(target_cluster) {
+            Some(d) => d,
+            None => {
+                crate::serial_println!("[FAT32-W] Failed to read dir cluster {}", target_cluster);
+                return false;
+            }
+        };
+
+        // Overwrite the 32-byte entry
+        cluster_data[target_offset..target_offset + 32].copy_from_slice(&dir_entry);
+
+        // Write the cluster back
+        if !self.write_cluster(target_cluster, &cluster_data) {
+            crate::serial_println!("[FAT32-W] Failed to write back dir cluster {}", target_cluster);
+            return false;
+        }
+
+        crate::serial_println!("[FAT32-W] File '{}' written: {} bytes, first_cluster={}",
+            filename, data.len(), new_first_cluster);
+
+        true
+    }
 }
 
 /// Global FAT32 instance
@@ -380,6 +802,80 @@ pub fn read_file(name: &str) -> Option<Vec<u8>> {
         } else {
             None
         }
+    }
+}
+
+/// Write a file to a path on the FAT32 disk.
+///
+/// `disk_path` is the relative path inside /disk/ (e.g., "var/sagas/001.bin").
+/// Navigates directories, then writes the file into the final directory.
+///
+/// Returns true on success.
+pub fn write_file(disk_path: &str, data: &[u8]) -> bool {
+    unsafe {
+        let fs = match FAT32_FS {
+            Some(ref f) => f,
+            None => {
+                crate::serial_println!("[FAT32] write_file: No filesystem mounted");
+                return false;
+            }
+        };
+
+        crate::serial_println!("[FAT32-W] write_file('{}', {} bytes)", disk_path, data.len());
+
+        // Parse the path into directory components + filename
+        let parts: Vec<&str> = disk_path.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() {
+            crate::serial_println!("[FAT32-W] Empty path");
+            return false;
+        }
+
+        let filename = parts[parts.len() - 1];
+        let dir_parts = &parts[..parts.len() - 1];
+
+        // Navigate to the target directory
+        let dir_cluster = if dir_parts.is_empty() {
+            fs.bpb.root_cluster
+        } else {
+            match fs.navigate_to_dir(dir_parts) {
+                Some(c) => c,
+                None => {
+                    crate::serial_println!("[FAT32-W] Directory path not found: {:?}", dir_parts);
+                    return false;
+                }
+            }
+        };
+
+        // Write the file
+        fs.write_file_to_dir(dir_cluster, filename, data)
+    }
+}
+
+/// Read a file from a full path on the FAT32 disk.
+///
+/// `disk_path` is the relative path inside /disk/ (e.g., "var/sagas/001.bin").
+pub fn read_file_path(disk_path: &str) -> Option<Vec<u8>> {
+    unsafe {
+        let fs = match FAT32_FS {
+            Some(ref f) => f,
+            None => return None,
+        };
+
+        let parts: Vec<&str> = disk_path.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() {
+            return None;
+        }
+
+        let filename = parts[parts.len() - 1];
+        let dir_parts = &parts[..parts.len() - 1];
+
+        let dir_cluster = if dir_parts.is_empty() {
+            fs.bpb.root_cluster
+        } else {
+            fs.navigate_to_dir(dir_parts)?
+        };
+
+        fs.read_file_in_dir(dir_cluster, filename)
     }
 }
 

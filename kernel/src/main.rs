@@ -101,6 +101,9 @@ static TEST_PREEMPT_ELF: &[u8] = include_bytes!("../../userspace/c_apps/test_pre
 /// agent_rust - Jalon 29 Native Rust Ring 3 agent (Vec alloc + Bus publish)
 static AGENT_RUST_ELF: &[u8] = include_bytes!("../../userspace/c_apps/agent_rust.elf");
 
+/// agent_saga - Jalon 30/31 Persistence agent (FAT32 write + Sagas/Almanach)
+static AGENT_SAGA_ELF: &[u8] = include_bytes!("../../userspace/c_apps/agent_saga.elf");
+
 // VGA text buffer
 const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
 const VGA_WIDTH: usize = 80;
@@ -1456,6 +1459,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     alloc::string::String::from("agent_rust.elf"),
                     fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_RUST_ELF)),
                 );
+                bin_dir.insert(
+                    alloc::string::String::from("agent_saga.elf"),
+                    fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_SAGA_ELF)),
+                );
                 serial_println!("       [OK] /bin/ls.elf ({} bytes)", LS_ELF.len());
                 serial_println!("       [OK] /bin/cat.elf ({} bytes)", CAT_ELF.len());
                 serial_println!("       [OK] /bin/j19_test.elf ({} bytes)", J19_TEST_ELF.len());
@@ -1467,6 +1474,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 serial_println!("       [OK] /bin/test_malloc.elf ({} bytes)", TEST_MALLOC_ELF.len());
                 serial_println!("       [OK] /bin/test_preempt.elf ({} bytes)", TEST_PREEMPT_ELF.len());
                 serial_println!("       [OK] /bin/agent_rust.elf ({} bytes)", AGENT_RUST_ELF.len());
+                serial_println!("       [OK] /bin/agent_saga.elf ({} bytes)", AGENT_SAGA_ELF.len());
             }
         }
     }
@@ -1689,6 +1697,31 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             }
             Err(e) => {
                 serial_println!("  [WARN] agent_rust.elf pre-load failed: {}", e);
+            }
+        }
+
+        // Pre-load agent_saga.elf for Jalon 30/31 (FAT32 write + Sagas/Almanach)
+        serial_println!("  [STEP 0i] Pre-loading agent_saga.elf for Jalon 30/31...");
+        match elf::load_elf_binary(AGENT_SAGA_ELF) {
+            Ok(as_result) => {
+                match process::spawn_userspace(
+                    "/bin/agent_saga.elf", 0,
+                    as_result.entry_point, as_result.stack_pointer, as_result.pml4_phys
+                ) {
+                    Ok(as_pid) => {
+                        scheduler::enqueue_process(as_pid);
+                        serial_println!(
+                            "  [OK] agent_saga.elf queued as PID {} (entry=0x{:X}, stack=0x{:X})",
+                            as_pid, as_result.entry_point, as_result.stack_pointer
+                        );
+                    }
+                    Err(e) => {
+                        serial_println!("  [WARN] agent_saga.elf spawn failed: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                serial_println!("  [WARN] agent_saga.elf pre-load failed: {}", e);
             }
         }
 

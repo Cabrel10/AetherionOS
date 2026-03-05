@@ -35,6 +35,8 @@ use linked_list_allocator::Heap;
 // ============================================================
 pub const SYS_READ:         u64 = 0;
 pub const SYS_WRITE:        u64 = 1;
+pub const SYS_OPEN:         u64 = 2;
+pub const SYS_CLOSE:        u64 = 3;
 pub const SYS_MMAP:         u64 = 9;
 pub const SYS_BRK:          u64 = 12;
 pub const SYS_GETPID:       u64 = 20;
@@ -44,6 +46,13 @@ pub const SYS_EXIT:         u64 = 60;
 pub const SYS_WAIT:         u64 = 61;
 pub const SYS_BUS_PUBLISH:  u64 = 201;
 pub const SYS_VGA_WRITE:    u64 = 202;
+
+// POSIX open flags
+pub const O_RDONLY: u32 = 0;
+pub const O_WRONLY: u32 = 1;
+pub const O_RDWR: u32   = 2;
+pub const O_CREAT: u32  = 0o100;  // 64
+pub const O_TRUNC: u32  = 0o1000; // 512
 
 // ============================================================
 // Raw Syscall Primitives
@@ -185,6 +194,146 @@ pub fn sys_bus_publish(intent: u64, priority: u32, data: u64) -> i64 {
 /// Write a colored character to VGA text buffer.
 pub fn sys_vga_write(row: u32, col: u32, color_char: u64) -> i64 {
     syscall3(SYS_VGA_WRITE, row as u64, col as u64, color_char) as i64
+}
+
+/// Open a file. Returns a file descriptor (>= 0) or negative error.
+/// `path` must be a null-terminated string.
+pub fn sys_open(path: &[u8], flags: u32) -> i64 {
+    syscall2(SYS_OPEN, path.as_ptr() as u64, flags as u64) as i64
+}
+
+/// Close a file descriptor. Returns 0 on success.
+pub fn sys_close(fd: u32) -> i64 {
+    syscall1(SYS_CLOSE, fd as u64) as i64
+}
+
+/// Write bytes to a file descriptor (by fd number). Returns bytes written.
+pub fn sys_write_fd(fd: u32, buf: &[u8]) -> i64 {
+    syscall3(SYS_WRITE, fd as u64, buf.as_ptr() as u64, buf.len() as u64) as i64
+}
+
+/// Read bytes from a file descriptor (by fd number). Returns bytes read.
+pub fn sys_read_fd(fd: u32, buf: &mut [u8]) -> i64 {
+    syscall3(SYS_READ, fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64) as i64
+}
+
+// ============================================================
+// ACHA Episodic Memory Structures (Jalon 31)
+// ============================================================
+
+/// Saga: a single episodic memory record.
+///
+/// Represents one completed action/intent with its outcome.
+/// Designed for binary serialization to disk (fixed 16 bytes).
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct Saga {
+    pub timestamp: u64,    // Monotonic counter or TSC value
+    pub intent_id: u32,    // Cognitive Bus intent that was executed
+    pub success: u8,       // 1 = OK, 0 = FAIL
+    pub _padding: u8,      // Alignment padding
+    pub data_hash: u16,    // Truncated hash of result data
+}
+
+impl Saga {
+    pub const SIZE: usize = 16;
+
+    pub fn new(timestamp: u64, intent_id: u32, success: bool, data_hash: u16) -> Self {
+        Saga {
+            timestamp,
+            intent_id,
+            success: if success { 1 } else { 0 },
+            _padding: 0,
+            data_hash,
+        }
+    }
+
+    /// Serialize to a byte array for writing to disk.
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut buf = [0u8; Self::SIZE];
+        let ts = self.timestamp.to_le_bytes();
+        buf[0..8].copy_from_slice(&ts);
+        let id = self.intent_id.to_le_bytes();
+        buf[8..12].copy_from_slice(&id);
+        buf[12] = self.success;
+        buf[13] = self._padding;
+        let dh = self.data_hash.to_le_bytes();
+        buf[14..16].copy_from_slice(&dh);
+        buf
+    }
+
+    /// Deserialize from a byte array.
+    pub fn from_bytes(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::SIZE {
+            return None;
+        }
+        Some(Saga {
+            timestamp: u64::from_le_bytes([buf[0], buf[1], buf[2], buf[3],
+                                           buf[4], buf[5], buf[6], buf[7]]),
+            intent_id: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
+            success: buf[12],
+            _padding: buf[13],
+            data_hash: u16::from_le_bytes([buf[14], buf[15]]),
+        })
+    }
+
+    /// MAGIC header for saga files (4 bytes): "SAGA"
+    pub const MAGIC: [u8; 4] = [b'S', b'A', b'G', b'A'];
+    pub const VERSION: u8 = 1;
+}
+
+/// AlmanacEntry: registry entry for a known agent.
+///
+/// Fixed 12-byte record tracking agent identity and trust.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+pub struct AlmanacEntry {
+    pub agent_id: u32,     // Unique agent identifier
+    pub trust_score: u8,   // 0-255 trust level
+    pub _padding: [u8; 3], // Alignment
+    pub memory_kb: u32,    // Memory usage in KiB
+}
+
+impl AlmanacEntry {
+    pub const SIZE: usize = 12;
+
+    pub fn new(agent_id: u32, trust_score: u8, memory_kb: u32) -> Self {
+        AlmanacEntry {
+            agent_id,
+            trust_score,
+            _padding: [0; 3],
+            memory_kb,
+        }
+    }
+
+    /// Serialize to a byte array for writing to disk.
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut buf = [0u8; Self::SIZE];
+        let id = self.agent_id.to_le_bytes();
+        buf[0..4].copy_from_slice(&id);
+        buf[4] = self.trust_score;
+        buf[5..8].copy_from_slice(&self._padding);
+        let mem = self.memory_kb.to_le_bytes();
+        buf[8..12].copy_from_slice(&mem);
+        buf
+    }
+
+    /// Deserialize from a byte array.
+    pub fn from_bytes(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::SIZE {
+            return None;
+        }
+        Some(AlmanacEntry {
+            agent_id: u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
+            trust_score: buf[4],
+            _padding: [buf[5], buf[6], buf[7]],
+            memory_kb: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
+        })
+    }
+
+    /// MAGIC header for almanac files (4 bytes): "ALMC"
+    pub const MAGIC: [u8; 4] = [b'A', b'L', b'M', b'C'];
+    pub const VERSION: u8 = 1;
 }
 
 // ============================================================

@@ -70,6 +70,15 @@ const EINVAL: u64 = (-22i64) as u64;
 const ECHILD: u64 = (-10i64) as u64;
 const ENOENT: u64 = (-2i64) as u64;
 const EMFILE: u64 = (-24i64) as u64;
+const ENOSPC: u64 = (-28i64) as u64;
+const EEXIST: u64 = (-17i64) as u64;
+
+// POSIX open flags
+const O_RDONLY: u32 = 0;
+const O_WRONLY: u32 = 1;
+const O_RDWR: u32   = 2;
+const O_CREAT: u32  = 0o100;  // 64
+const O_TRUNC: u32  = 0o1000; // 512
 
 // ===== Kernel syscall stack =====
 const KERNEL_SYSCALL_STACK_SIZE: usize = 262144; // 256 KiB - Deep call chains: SYSCALL -> VFS -> FAT32 -> VirtIO-Block -> serial
@@ -273,13 +282,9 @@ extern "C" fn syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 
 // ===== sys_write(fd, buf, len) =====
 
-/// POSIX write: fd=1 or fd=2 -> serial output.
+/// POSIX write: fd=1 or fd=2 -> serial output. fd>=3 -> VFS/FAT32 file write.
 /// SECURITY: buf and buf+len must be < USER_ADDR_LIMIT.
 fn sys_write(fd: u64, buf_addr: u64, len: u64) -> u64 {
-    // Validate fd (stdout=1, stderr=2)
-    if fd != 1 && fd != 2 {
-        return EBADF;
-    }
     if len == 0 { return 0; }
 
     // SECURITY: validate user pointer
@@ -288,25 +293,114 @@ fn sys_write(fd: u64, buf_addr: u64, len: u64) -> u64 {
         return EFAULT;
     }
 
-    // Write bytes to COM1 serial port (0x3F8) using direct port I/O.
-    unsafe {
-        let buf = buf_addr as *const u8;
-        for i in 0..len as usize {
-            let byte = core::ptr::read_volatile(buf.add(i));
-            // Wait for THR empty (LSR bit 5)
-            loop {
-                let lsr: u8;
-                asm!("in al, dx", out("al") lsr, in("dx") 0x3FDu16,
+    // stdout/stderr -> serial output
+    if fd == 1 || fd == 2 {
+        unsafe {
+            let buf = buf_addr as *const u8;
+            for i in 0..len as usize {
+                let byte = core::ptr::read_volatile(buf.add(i));
+                // Wait for THR empty (LSR bit 5)
+                loop {
+                    let lsr: u8;
+                    asm!("in al, dx", out("al") lsr, in("dx") 0x3FDu16,
+                         options(nomem, nostack));
+                    if lsr & 0x20 != 0 { break; }
+                }
+                // Send byte
+                asm!("out dx, al", in("al") byte, in("dx") 0x3F8u16,
                      options(nomem, nostack));
-                if lsr & 0x20 != 0 { break; }
             }
-            // Send byte
-            asm!("out dx, al", in("al") byte, in("dx") 0x3F8u16,
-                 options(nomem, nostack));
         }
+        return len;
     }
 
-    len  // Return number of bytes written
+    // fd >= 3: write to a file via FD table
+    let current_pid = crate::scheduler::current_pid();
+
+    // Get file path and flags from FD table
+    let fd_info = crate::process::with_fd_table(current_pid, |fd_table| {
+        if let Some(entry) = fd_table.get(fd as usize) {
+            Some((entry.path.clone(), entry.flags, entry.offset))
+        } else {
+            None
+        }
+    }).flatten();
+
+    match fd_info {
+        Some((path, flags, offset)) => {
+            // Check write permission (O_WRONLY or O_RDWR)
+            let access_mode = flags & 0x3;
+            if access_mode != O_WRONLY && access_mode != O_RDWR {
+                crate::serial_println!("[SYSCALL] sys_write: FD {} not opened for writing (flags=0x{:X})", fd, flags);
+                return EBADF;
+            }
+
+            // Copy user data to kernel buffer
+            let user_data = unsafe {
+                let buf = buf_addr as *const u8;
+                let mut data = alloc::vec::Vec::with_capacity(len as usize);
+                for i in 0..len as usize {
+                    data.push(core::ptr::read_volatile(buf.add(i)));
+                }
+                data
+            };
+
+            // Route to FAT32 if path starts with /disk/
+            if path.starts_with("/disk/") {
+                let disk_path = &path[6..]; // strip "/disk/"
+                crate::serial_println!("[SYSCALL] sys_write: FAT32 write to '{}' ({} bytes)", disk_path, user_data.len());
+
+                // For FAT32, we do a full-file write (read-modify-write if appending)
+                // Since FAT32 write_file does a complete overwrite, we handle offset-based writes
+                // by reading existing data, inserting new data, and writing back
+                let success = if offset > 0 {
+                    // Append/overwrite at offset: read existing, extend, write
+                    let mut existing = crate::fs::fat32::read_file_path(disk_path)
+                        .unwrap_or_else(alloc::vec::Vec::new);
+                    let off = offset as usize;
+                    if off > existing.len() {
+                        existing.resize(off, 0); // pad with zeros
+                    }
+                    if off + user_data.len() > existing.len() {
+                        existing.resize(off + user_data.len(), 0);
+                    }
+                    existing[off..off + user_data.len()].copy_from_slice(&user_data);
+                    crate::fs::fat32::write_file(disk_path, &existing)
+                } else {
+                    // Simple overwrite from start
+                    crate::fs::fat32::write_file(disk_path, &user_data)
+                };
+
+                if success {
+                    // Update offset
+                    crate::process::with_fd_table_mut(current_pid, |fd_table| {
+                        if let Some(entry) = fd_table.get_mut(fd as usize) {
+                            entry.offset += len;
+                        }
+                    });
+                    crate::serial_println!("[SYSCALL] sys_write: FAT32 write OK, {} bytes", len);
+                    len
+                } else {
+                    crate::serial_println!("[SYSCALL] sys_write: FAT32 write FAILED");
+                    ENOSPC
+                }
+            } else {
+                // Write to VFS in-memory file
+                match crate::fs::vfs::file_write(&path, &user_data) {
+                    Ok(n) => {
+                        crate::process::with_fd_table_mut(current_pid, |fd_table| {
+                            if let Some(entry) = fd_table.get_mut(fd as usize) {
+                                entry.offset += n as u64;
+                            }
+                        });
+                        n as u64
+                    }
+                    Err(_) => EBADF,
+                }
+            }
+        }
+        None => EBADF,
+    }
 }
 
 // ===== sys_read(fd, buf, len) =====
@@ -351,32 +445,47 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
 
     match path_and_offset {
         Some((path, offset)) => {
-            // Read from VFS
-            match crate::fs::vfs::file_read(&path) {
-                Ok(data) => {
-                    let start = offset as usize;
-                    if start >= data.len() {
-                        return 0; // EOF
-                    }
-                    let avail = data.len() - start;
-                    let to_copy = core::cmp::min(avail, len as usize);
-                    // Copy to user buffer
-                    unsafe {
-                        let dst = buf_addr as *mut u8;
-                        for i in 0..to_copy {
-                            core::ptr::write_volatile(dst.add(i), data[start + i]);
+            // Route /disk/ paths directly to FAT32 for fresh reads
+            let data = if path.starts_with("/disk/") {
+                let disk_path = &path[6..];
+                crate::serial_println!("[SYSCALL] sys_read: FAT32 read '{}' offset={}", disk_path, offset);
+                match crate::fs::fat32::read_file_path(disk_path) {
+                    Some(d) => d,
+                    None => {
+                        // Fallback to VFS
+                        match crate::fs::vfs::file_read(&path) {
+                            Ok(d) => d,
+                            Err(_) => return ENOENT,
                         }
                     }
-                    // Update offset
-                    crate::process::with_fd_table_mut(current_pid, |fd_table| {
-                        if let Some(entry) = fd_table.get_mut(fd as usize) {
-                            entry.offset += to_copy as u64;
-                        }
-                    });
-                    to_copy as u64
                 }
-                Err(_) => ENOENT,
+            } else {
+                match crate::fs::vfs::file_read(&path) {
+                    Ok(d) => d,
+                    Err(_) => return ENOENT,
+                }
+            };
+
+            let start = offset as usize;
+            if start >= data.len() {
+                return 0; // EOF
             }
+            let avail = data.len() - start;
+            let to_copy = core::cmp::min(avail, len as usize);
+            // Copy to user buffer
+            unsafe {
+                let dst = buf_addr as *mut u8;
+                for i in 0..to_copy {
+                    core::ptr::write_volatile(dst.add(i), data[start + i]);
+                }
+            }
+            // Update offset
+            crate::process::with_fd_table_mut(current_pid, |fd_table| {
+                if let Some(entry) = fd_table.get_mut(fd as usize) {
+                    entry.offset += to_copy as u64;
+                }
+            });
+            to_copy as u64
         }
         None => EBADF,
     }
@@ -385,6 +494,7 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
 // ===== sys_open(path, flags) =====
 
 /// POSIX open: validate path, check VFS, allocate FD.
+/// Supports O_CREAT for creating files on /disk/ (FAT32).
 fn sys_open(path_addr: u64, flags: u32) -> u64 {
     if !validate_user_ptr(path_addr, 1) {
         return EFAULT;
@@ -397,12 +507,101 @@ fn sys_open(path_addr: u64, flags: u32) -> u64 {
 
     let current_pid = crate::scheduler::current_pid();
 
-    // Check the file exists in VFS (try to read it)
+    crate::serial_println!("[SYSCALL] sys_open(\"{}\", flags=0x{:X}) from PID {}", path, flags, current_pid);
+
+    // For /disk/ paths with O_CREAT, we allow creating files that don't exist yet
+    if path.starts_with("/disk/") && (flags & O_CREAT) != 0 {
+        // Check if file already exists by trying to read
+        let disk_path = &path[6..]; // strip "/disk/"
+        let exists = crate::fs::fat32::read_file_path(disk_path).is_some();
+
+        if !exists {
+            // Create an empty file on FAT32
+            crate::serial_println!("[SYSCALL] sys_open: O_CREAT, creating empty file '{}'", disk_path);
+            if !crate::fs::fat32::write_file(disk_path, &[]) {
+                crate::serial_println!("[SYSCALL] sys_open: Failed to create file '{}'", disk_path);
+                // Don't fail — the file might be writable but the directory doesn't exist
+                // We'll still allocate the FD and let write handle it
+            }
+        }
+
+        // Also register in VFS for FD tracking (as an empty file placeholder)
+        // We need the VFS to have the path so file_read doesn't fail during sys_open check
+        {
+            let mut root = crate::fs::vfs::lock_root();
+            // Navigate/create intermediate directories in VFS
+            let parts: alloc::vec::Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+            let mut current = &mut *root;
+            for (i, comp) in parts.iter().enumerate() {
+                if i == parts.len() - 1 {
+                    // Create the file node if it doesn't exist
+                    current.entry(alloc::string::String::from(*comp))
+                        .or_insert_with(|| crate::fs::vfs::VfsNode::File(alloc::vec::Vec::new()));
+                    break;
+                }
+                current.entry(alloc::string::String::from(*comp))
+                    .or_insert_with(|| crate::fs::vfs::VfsNode::Directory(
+                        alloc::collections::BTreeMap::new()
+                    ));
+                if let Some(crate::fs::vfs::VfsNode::Directory(ref mut children)) = current.get_mut(*comp) {
+                    current = children;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Allocate FD
+        match crate::process::with_fd_table_mut(current_pid, |fd_table| {
+            fd_table.alloc_fd(&path, flags)
+        }) {
+            Some(Some(fd)) => {
+                crate::serial_println!("[SYSCALL] sys_open(\"{}\") = FD {} (O_CREAT)", path, fd);
+                return fd as u64;
+            }
+            _ => return EMFILE,
+        }
+    }
+
+    // Standard open: check the file exists in VFS
     if crate::fs::vfs::file_read(&path).is_err() {
         // Try with /bin prefix
         let bin_path = alloc::format!("/bin/{}", path);
         if crate::fs::vfs::file_read(&bin_path).is_err() {
-            return ENOENT;
+            // For /disk/ paths, try reading from FAT32 directly
+            if path.starts_with("/disk/") {
+                let disk_path = &path[6..];
+                if crate::fs::fat32::read_file_path(disk_path).is_none() {
+                    crate::serial_println!("[SYSCALL] sys_open: not found '{}'", path);
+                    return ENOENT;
+                }
+                // File exists on disk — register in VFS
+                if let Some(data) = crate::fs::fat32::read_file_path(disk_path) {
+                    let mut root = crate::fs::vfs::lock_root();
+                    let parts: alloc::vec::Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+                    let mut current = &mut *root;
+                    for (i, comp) in parts.iter().enumerate() {
+                        if i == parts.len() - 1 {
+                            current.insert(
+                                alloc::string::String::from(*comp),
+                                crate::fs::vfs::VfsNode::File(data),
+                            );
+                            break;
+                        }
+                        current.entry(alloc::string::String::from(*comp))
+                            .or_insert_with(|| crate::fs::vfs::VfsNode::Directory(
+                                alloc::collections::BTreeMap::new()
+                            ));
+                        if let Some(crate::fs::vfs::VfsNode::Directory(ref mut children)) = current.get_mut(*comp) {
+                            current = children;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                return ENOENT;
+            }
         }
     }
 
