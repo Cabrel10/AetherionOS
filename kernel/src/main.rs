@@ -92,6 +92,12 @@ static AGENT_RAG_ELF: &[u8] = include_bytes!("../../userspace/c_apps/agent_rag.e
 
 static SH_ELF: &[u8] = include_bytes!("../../userspace/c_apps/sh.elf");
 
+/// test_malloc - Jalon 27 dynamic memory allocator test
+static TEST_MALLOC_ELF: &[u8] = include_bytes!("../../userspace/c_apps/test_malloc.elf");
+
+/// test_preempt - Jalon 28 preemptive scheduler test
+static TEST_PREEMPT_ELF: &[u8] = include_bytes!("../../userspace/c_apps/test_preempt.elf");
+
 // VGA text buffer
 const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
 const VGA_WIDTH: usize = 80;
@@ -1435,6 +1441,14 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     alloc::string::String::from("sh.elf"),
                     fs::vfs::VfsNode::File(alloc::vec::Vec::from(SH_ELF)),
                 );
+                bin_dir.insert(
+                    alloc::string::String::from("test_malloc.elf"),
+                    fs::vfs::VfsNode::File(alloc::vec::Vec::from(TEST_MALLOC_ELF)),
+                );
+                bin_dir.insert(
+                    alloc::string::String::from("test_preempt.elf"),
+                    fs::vfs::VfsNode::File(alloc::vec::Vec::from(TEST_PREEMPT_ELF)),
+                );
                 serial_println!("       [OK] /bin/ls.elf ({} bytes)", LS_ELF.len());
                 serial_println!("       [OK] /bin/cat.elf ({} bytes)", CAT_ELF.len());
                 serial_println!("       [OK] /bin/j19_test.elf ({} bytes)", J19_TEST_ELF.len());
@@ -1443,6 +1457,8 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 serial_println!("       [OK] /bin/agent_ai.elf ({} bytes)", AGENT_AI_ELF.len());
                 serial_println!("       [OK] /bin/agent_rag.elf ({} bytes)", AGENT_RAG_ELF.len());
                 serial_println!("       [OK] /bin/sh.elf ({} bytes)", SH_ELF.len());
+                serial_println!("       [OK] /bin/test_malloc.elf ({} bytes)", TEST_MALLOC_ELF.len());
+                serial_println!("       [OK] /bin/test_preempt.elf ({} bytes)", TEST_PREEMPT_ELF.len());
             }
         }
     }
@@ -1590,6 +1606,56 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             }
             Err(e) => {
                 serial_println!("  [WARN] sh.elf pre-load failed: {}", e);
+            }
+        }
+
+        // Pre-load test_malloc.elf for Jalon 27 (dynamic memory allocator)
+        serial_println!("  [STEP 0f] Pre-loading test_malloc.elf for Jalon 27...");
+        match elf::load_elf_binary(TEST_MALLOC_ELF) {
+            Ok(tm_result) => {
+                match process::spawn_userspace(
+                    "/bin/test_malloc.elf", 0,
+                    tm_result.entry_point, tm_result.stack_pointer, tm_result.pml4_phys
+                ) {
+                    Ok(tm_pid) => {
+                        scheduler::enqueue_process(tm_pid);
+                        serial_println!(
+                            "  [OK] test_malloc.elf queued as PID {} (entry=0x{:X}, stack=0x{:X})",
+                            tm_pid, tm_result.entry_point, tm_result.stack_pointer
+                        );
+                    }
+                    Err(e) => {
+                        serial_println!("  [WARN] test_malloc.elf spawn failed: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                serial_println!("  [WARN] test_malloc.elf pre-load failed: {}", e);
+            }
+        }
+
+        // Pre-load test_preempt.elf for Jalon 28 (preemptive scheduler)
+        serial_println!("  [STEP 0g] Pre-loading test_preempt.elf for Jalon 28...");
+        match elf::load_elf_binary(TEST_PREEMPT_ELF) {
+            Ok(tp_result) => {
+                match process::spawn_userspace(
+                    "/bin/test_preempt.elf", 0,
+                    tp_result.entry_point, tp_result.stack_pointer, tp_result.pml4_phys
+                ) {
+                    Ok(tp_pid) => {
+                        scheduler::enqueue_process(tp_pid);
+                        serial_println!(
+                            "  [OK] test_preempt.elf queued as PID {} (entry=0x{:X}, stack=0x{:X})",
+                            tp_pid, tp_result.entry_point, tp_result.stack_pointer
+                        );
+                    }
+                    Err(e) => {
+                        serial_println!("  [WARN] test_preempt.elf spawn failed: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                serial_println!("  [WARN] test_preempt.elf pre-load failed: {}", e);
             }
         }
 

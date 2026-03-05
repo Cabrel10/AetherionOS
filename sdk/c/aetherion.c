@@ -24,7 +24,7 @@ long syscall1(long n, long a1) {
     asm volatile("syscall"
         : "=a"(ret)
         : "a"(n), "D"(a1)
-        : "rcx", "r11", "memory");
+        : "rcx", "r11", "r8", "r9", "r10", "rsi", "rdx", "memory");
     return ret;
 }
 
@@ -33,7 +33,7 @@ long syscall2(long n, long a1, long a2) {
     asm volatile("syscall"
         : "=a"(ret)
         : "a"(n), "D"(a1), "S"(a2)
-        : "rcx", "r11", "memory");
+        : "rcx", "r11", "r8", "r9", "r10", "rdx", "memory");
     return ret;
 }
 
@@ -42,7 +42,7 @@ long syscall3(long n, long a1, long a2, long a3) {
     asm volatile("syscall"
         : "=a"(ret)
         : "a"(n), "D"(a1), "S"(a2), "d"(a3)
-        : "rcx", "r11", "memory");
+        : "rcx", "r11", "r8", "r9", "r10", "memory");
     return ret;
 }
 
@@ -55,6 +55,7 @@ long syscall6(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
         : "=a"(ret)
         : "a"(n), "D"(a1), "S"(a2), "d"(a3), "r"(r10), "r"(r8), "r"(r9)
         : "rcx", "r11", "memory");
+    /* r10, r8, r9 are inputs so already handled */
     return ret;
 }
 
@@ -299,7 +300,7 @@ long fork(void) {
     asm volatile("syscall"
         : "=a"(ret)
         : "a"(57)
-        : "rcx", "r11", "memory");
+        : "rcx", "r11", "r8", "r9", "r10", "rdi", "rsi", "rdx", "memory");
     return ret;
 }
 
@@ -328,4 +329,216 @@ long close(int fd) {
 /* getdents(fd, buf, bufsize): syscall 78(fd, buf, len) - read directory entries */
 long getdents(int fd, void *buf, size_t bufsize) {
     return syscall3(78, (long)fd, (long)buf, (long)bufsize);
+}
+
+/* ========================================
+ * Dynamic Memory Allocation (Jalon 27)
+ *
+ * First-fit allocator using sys_brk for heap growth.
+ * Block header: size + free flag + next pointer.
+ * Coalescing on free() merges adjacent free blocks.
+ * Thread-unsafe (single-threaded userspace assumed).
+ * ======================================== */
+
+#define SYS_BRK 12
+
+/* sys_brk: set/get program break */
+long sys_brk(long addr) {
+    return syscall1(SYS_BRK, addr);
+}
+
+/* Block header for malloc free-list */
+typedef struct block_header {
+    size_t size;                 /* Usable size (excluding header) */
+    int    free;                 /* 1 = free, 0 = allocated */
+    struct block_header *next;   /* Next block in linked list */
+} block_header_t;
+
+#define BLOCK_HDR_SIZE  ((sizeof(block_header_t) + 15) & ~((size_t)15))  /* Rounded up to 16 */
+#define ALIGN_16(x)     (((x) + 15) & ~((size_t)15))  /* 16-byte alignment */
+#define INITIAL_HEAP    (128 * 1024)  /* 128 KiB initial heap expansion */
+
+static block_header_t *heap_head = NULL;
+static int heap_initialized = 0;
+
+/* Initialize the heap: call brk(0) to get base, then expand by INITIAL_HEAP */
+static int heap_init(void) {
+    long base = sys_brk(0);
+    if (base <= 0) return -1;
+
+    long end = sys_brk(base + INITIAL_HEAP);
+    if (end <= base) return -1;
+
+    /* Set up the first free block spanning the whole initial heap */
+    heap_head = (block_header_t *)(unsigned long)base;
+    heap_head->size = INITIAL_HEAP - BLOCK_HDR_SIZE;
+    heap_head->free = 1;
+    heap_head->next = NULL;
+    heap_initialized = 1;
+    return 0;
+}
+
+/* Extend the heap by at least `min_bytes` beyond the current break */
+static block_header_t *heap_extend(size_t min_bytes) {
+    size_t total = ALIGN_16(min_bytes + BLOCK_HDR_SIZE);
+    if (total < 64 * 1024) total = 64 * 1024;  /* Minimum 64 KiB growth */
+
+    long cur = sys_brk(0);
+    if (cur <= 0) return NULL;
+
+    long new_end = sys_brk(cur + (long)total);
+    if (new_end <= cur) return NULL;
+
+    block_header_t *blk = (block_header_t *)(unsigned long)cur;
+    blk->size = total - BLOCK_HDR_SIZE;
+    blk->free = 1;
+    blk->next = NULL;
+
+    /* Link to end of existing list */
+    block_header_t *p = heap_head;
+    while (p->next) p = p->next;
+    p->next = blk;
+
+    return blk;
+}
+
+/* Split a block if it has enough extra space */
+static void block_split(block_header_t *blk, size_t needed) {
+    size_t remaining = blk->size - needed;
+    if (remaining > BLOCK_HDR_SIZE + 16) {
+        /* Create a new free block after the allocated region */
+        block_header_t *new_blk = (block_header_t *)((char *)blk + BLOCK_HDR_SIZE + needed);
+        new_blk->size = remaining - BLOCK_HDR_SIZE;
+        new_blk->free = 1;
+        new_blk->next = blk->next;
+        blk->size = needed;
+        blk->next = new_blk;
+    }
+}
+
+void *malloc(size_t size) {
+    if (size == 0) return NULL;
+
+    size = ALIGN_16(size);  /* Ensure 16-byte alignment */
+
+    if (!heap_initialized) {
+        if (heap_init() < 0) return NULL;
+    }
+
+    /* First-fit search */
+    block_header_t *blk = heap_head;
+    while (blk) {
+        if (blk->free && blk->size >= size) {
+            block_split(blk, size);
+            blk->free = 0;
+            return (void *)((char *)blk + BLOCK_HDR_SIZE);
+        }
+        blk = blk->next;
+    }
+
+    /* No suitable block found — extend heap */
+    blk = heap_extend(size);
+    if (!blk) return NULL;
+
+    block_split(blk, size);
+    blk->free = 0;
+    return (void *)((char *)blk + BLOCK_HDR_SIZE);
+}
+
+void free(void *ptr) {
+    if (!ptr) return;
+
+    block_header_t *blk = (block_header_t *)((char *)ptr - BLOCK_HDR_SIZE);
+    blk->free = 1;
+
+    /* Coalesce with next block if also free */
+    if (blk->next && blk->next->free) {
+        blk->size += BLOCK_HDR_SIZE + blk->next->size;
+        blk->next = blk->next->next;
+    }
+
+    /* Coalesce from head: scan for adjacent free pairs */
+    block_header_t *p = heap_head;
+    while (p && p->next) {
+        if (p->free && p->next->free) {
+            p->size += BLOCK_HDR_SIZE + p->next->size;
+            p->next = p->next->next;
+            /* Don't advance — check again in case of triple merge */
+        } else {
+            p = p->next;
+        }
+    }
+}
+
+void *calloc(size_t nmemb, size_t size) {
+    size_t total = nmemb * size;
+    if (total == 0) return NULL;
+    void *p = malloc(total);
+    if (p) memset(p, 0, total);
+    return p;
+}
+
+void *realloc(void *ptr, size_t new_size) {
+    if (!ptr) return malloc(new_size);
+    if (new_size == 0) { free(ptr); return NULL; }
+
+    block_header_t *blk = (block_header_t *)((char *)ptr - BLOCK_HDR_SIZE);
+    if (blk->size >= new_size) return ptr;  /* Already large enough */
+
+    void *new_ptr = malloc(new_size);
+    if (!new_ptr) return NULL;
+    memcpy(new_ptr, ptr, blk->size);
+    free(ptr);
+    return new_ptr;
+}
+
+/* ========================================
+ * Additional String Utilities (Jalon 27+)
+ * ======================================== */
+
+char *strncpy(char *dest, const char *src, size_t n) {
+    size_t i;
+    for (i = 0; i < n && src[i]; i++)
+        dest[i] = src[i];
+    for (; i < n; i++)
+        dest[i] = '\0';
+    return dest;
+}
+
+int strncmp(const char *s1, const char *s2, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (s1[i] != s2[i]) return (unsigned char)s1[i] - (unsigned char)s2[i];
+        if (s1[i] == '\0') return 0;
+    }
+    return 0;
+}
+
+void print_dec(long val) {
+    print_int(val);
+}
+
+char *strcpy(char *dest, const char *src) {
+    char *d = dest;
+    while ((*d++ = *src++));
+    return dest;
+}
+
+char *strcat(char *dest, const char *src) {
+    char *d = dest;
+    while (*d) d++;
+    while ((*d++ = *src++));
+    return dest;
+}
+
+int atoi(const char *s) {
+    int result = 0;
+    int sign = 1;
+    while (*s == ' ' || *s == '\t') s++;
+    if (*s == '-') { sign = -1; s++; }
+    else if (*s == '+') { s++; }
+    while (*s >= '0' && *s <= '9') {
+        result = result * 10 + (*s - '0');
+        s++;
+    }
+    return sign * result;
 }

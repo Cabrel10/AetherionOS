@@ -239,6 +239,7 @@ extern "C" fn syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         8  => sys_seek(a1 as u32, a2 as i64, a3 as u32),
         9  => sys_mmap(a1, a2, a3),
         10 => sys_mmap_fb(a1),
+        12 => sys_brk(a1),             // Jalon 27: brk(new_break) for userspace malloc
         20 => sys_getpid(),
         24 => sys_yield(),
         39 => sys_getppid(),
@@ -2033,4 +2034,97 @@ fn sys_tcp_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
         return EFAULT;
     }
     crate::net::socket::sys_tcp_recv(fd, buf_addr, len)
+}
+
+// ===== sys_brk(new_break) - Jalon 27 =====
+/// Linux-compatible brk syscall for userspace dynamic memory allocation.
+///
+/// - brk(0) returns the current program break.
+/// - brk(addr) attempts to set the program break to `addr`.
+///   If `addr` > current break, new pages are allocated and mapped.
+///   If `addr` < current break, the break is moved down (pages NOT freed for simplicity).
+///   Returns the new (or current) program break on success, or the old break on failure.
+///
+/// Heap region: 0x0000_3000_0000_0000 .. 0x0000_3000_1000_0000 (256 MiB max)
+fn sys_brk(new_break: u64) -> u64 {
+    const HEAP_BASE: u64 = 0x0000_3000_0000_0000;  // PML4[96] user heap
+    const HEAP_MAX:  u64 = 0x0000_3000_1000_0000;  // 256 MiB limit
+
+    let current = crate::scheduler::current_pid();
+    if current == 0 {
+        return 0;
+    }
+
+    let old_break = crate::process::get_heap_break(current).unwrap_or(HEAP_BASE);
+
+    crate::serial_println!(
+        "[SYSCALL] sys_brk(0x{:X}) PID={} old_break=0x{:X}",
+        new_break, current, old_break
+    );
+
+    // brk(0) → return current break
+    if new_break == 0 {
+        return old_break;
+    }
+
+    // Validate range
+    if new_break < HEAP_BASE || new_break > HEAP_MAX {
+        crate::serial_println!(
+            "[SYSCALL] brk: REJECTED 0x{:X} outside [{:X}, {:X}]",
+            new_break, HEAP_BASE, HEAP_MAX
+        );
+        return old_break; // refuse out-of-range
+    }
+
+    // If growing, allocate new pages
+    if new_break > old_break {
+        let old_page = (old_break + 4095) / 4096 * 4096;  // round up
+        let new_page = (new_break + 4095) / 4096 * 4096;
+
+        if new_page > old_page {
+            let pages_needed = ((new_page - old_page) / 4096) as usize;
+            let cr3: u64;
+            unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)); }
+            let pml4_phys = cr3 & !0xFFF;
+
+            for i in 0..pages_needed {
+                let vaddr = old_page + (i as u64) * 4096;
+                let frame = unsafe { crate::elf::alloc_demand_frame() };
+                match frame {
+                    Some(paddr) => {
+                        unsafe {
+                            let phys_offset = crate::elf::phys_offset();
+                            core::ptr::write_bytes(
+                                (paddr + phys_offset) as *mut u8,
+                                0,
+                                4096,
+                            );
+                            // USER | WRITABLE | PRESENT | NX
+                            let flags: u64 = 0x01 | 0x02 | 0x04 | (1u64 << 63);
+                            if crate::elf::demand_map_user_page(pml4_phys, vaddr, paddr, flags).is_err() {
+                                crate::serial_println!("[SYSCALL] brk: mapping failed at 0x{:X}", vaddr);
+                                return old_break;
+                            }
+                        }
+                    }
+                    None => {
+                        crate::serial_println!("[SYSCALL] brk: out of frames at page {}", i);
+                        return old_break;
+                    }
+                }
+            }
+
+            // Flush TLB
+            unsafe { core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack)); }
+
+            crate::serial_println!(
+                "[SYSCALL] sys_brk: PID {} grew heap by {} pages ({} KB), break 0x{:X} -> 0x{:X}",
+                current, pages_needed, pages_needed * 4, old_break, new_break
+            );
+        }
+    }
+
+    // Update process heap break
+    crate::process::set_heap_break(current, new_break);
+    new_break
 }
