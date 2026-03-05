@@ -1,0 +1,9 @@
+[package]
+name = "aetherion_sdk"
+version = "0.1.0"
+edition = "2021"
+authors = ["MORNINGSTAR <morningstar@aetherion.dev>"]
+description = "AetherionOS Rust Userspace SDK - Ring 3 syscall wrappers and global allocator"
+
+[dependencies]
+linked_list_allocator = "0.10.5"

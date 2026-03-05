@@ -98,6 +98,9 @@ static TEST_MALLOC_ELF: &[u8] = include_bytes!("../../userspace/c_apps/test_mall
 /// test_preempt - Jalon 28 preemptive scheduler test
 static TEST_PREEMPT_ELF: &[u8] = include_bytes!("../../userspace/c_apps/test_preempt.elf");
 
+/// agent_rust - Jalon 29 Native Rust Ring 3 agent (Vec alloc + Bus publish)
+static AGENT_RUST_ELF: &[u8] = include_bytes!("../../userspace/c_apps/agent_rust.elf");
+
 // VGA text buffer
 const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
 const VGA_WIDTH: usize = 80;
@@ -1449,6 +1452,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     alloc::string::String::from("test_preempt.elf"),
                     fs::vfs::VfsNode::File(alloc::vec::Vec::from(TEST_PREEMPT_ELF)),
                 );
+                bin_dir.insert(
+                    alloc::string::String::from("agent_rust.elf"),
+                    fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_RUST_ELF)),
+                );
                 serial_println!("       [OK] /bin/ls.elf ({} bytes)", LS_ELF.len());
                 serial_println!("       [OK] /bin/cat.elf ({} bytes)", CAT_ELF.len());
                 serial_println!("       [OK] /bin/j19_test.elf ({} bytes)", J19_TEST_ELF.len());
@@ -1459,6 +1466,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 serial_println!("       [OK] /bin/sh.elf ({} bytes)", SH_ELF.len());
                 serial_println!("       [OK] /bin/test_malloc.elf ({} bytes)", TEST_MALLOC_ELF.len());
                 serial_println!("       [OK] /bin/test_preempt.elf ({} bytes)", TEST_PREEMPT_ELF.len());
+                serial_println!("       [OK] /bin/agent_rust.elf ({} bytes)", AGENT_RUST_ELF.len());
             }
         }
     }
@@ -1656,6 +1664,31 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             }
             Err(e) => {
                 serial_println!("  [WARN] test_preempt.elf pre-load failed: {}", e);
+            }
+        }
+
+        // Pre-load agent_rust.elf for Jalon 29 (Rust Ring 3 agent)
+        serial_println!("  [STEP 0h] Pre-loading agent_rust.elf for Jalon 29...");
+        match elf::load_elf_binary(AGENT_RUST_ELF) {
+            Ok(ar_result) => {
+                match process::spawn_userspace(
+                    "/bin/agent_rust.elf", 0,
+                    ar_result.entry_point, ar_result.stack_pointer, ar_result.pml4_phys
+                ) {
+                    Ok(ar_pid) => {
+                        scheduler::enqueue_process(ar_pid);
+                        serial_println!(
+                            "  [OK] agent_rust.elf queued as PID {} (entry=0x{:X}, stack=0x{:X})",
+                            ar_pid, ar_result.entry_point, ar_result.stack_pointer
+                        );
+                    }
+                    Err(e) => {
+                        serial_println!("  [WARN] agent_rust.elf spawn failed: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                serial_println!("  [WARN] agent_rust.elf pre-load failed: {}", e);
             }
         }
 
