@@ -203,6 +203,7 @@ pub fn fork_process(parent_pid: u64, child_pml4: u64, child_entry: u64, child_st
     let parent_fd_table = parent.fd_table.clone();
 
     let mut child = Process::new(&parent_name, AgentRole::Worker, parent_pid, parent_uid, parent_gid);
+    crate::serial_println!("[FORK] child created: pid={} ppid={}", child.pid, child.ppid);
     child.pml4_phys = child_pml4;
     child.entry_point = child_entry;
     child.stack_pointer = child_stack;
@@ -273,6 +274,30 @@ pub fn wait_for_child(parent_pid: u64) -> Result<(u64, i32), ProcessError> {
     
     // No terminated child found
     Err(ProcessError::WaitingForChild)
+}
+
+/// Find a Ready forked child of parent_pid (not a thread).
+/// If target_pid != 0, look for that specific child.
+/// Returns (child_pid, pml4_phys, saved_user_rip, saved_user_rsp, saved_syscall_regs).
+pub fn find_ready_forked_child(parent_pid: u64, target_pid: u64) -> Option<(u64, u64, u64, u64, [u64; 8])> {
+    let table = PROCESS_TABLE.lock();
+    let parent = table.get(&parent_pid)?;
+
+    for &child_pid in &parent.children {
+        if target_pid != 0 && child_pid != target_pid { continue; }
+        if let Some(child) = table.get(&child_pid) {
+            if child.is_forked && child.state == ProcessState::Ready && !child.is_thread {
+                return Some((
+                    child_pid,
+                    child.pml4_phys,
+                    child.saved_user_rip,
+                    child.saved_user_rsp,
+                    child.saved_syscall_regs,
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// Find a Ready child thread of parent_pid.
