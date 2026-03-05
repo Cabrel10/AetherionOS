@@ -225,6 +225,9 @@ pub struct Process {
     /// FPU/SSE state (512 bytes, 16-byte aligned) for fxsave/fxrstor
     /// Preserves XMM0-XMM15, MXCSR, x87 FPU registers across context switches
     pub fpu_state: FpuState,
+    /// True if this process was created by fork() and should resume
+    /// at the parent's saved RIP with RAX=0 (fork return value for child).
+    pub is_forked: bool,
 }
 
 impl Process {
@@ -259,6 +262,7 @@ impl Process {
             saved_kernel_rsp: 0,
             saved_syscall_regs: [0; 8],
             fpu_state: FpuState::zero(),
+            is_forked: false,
         }
     }
 

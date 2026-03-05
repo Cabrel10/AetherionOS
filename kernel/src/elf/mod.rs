@@ -55,7 +55,8 @@ const USER_STACK_PAGES: u64 = 256; // 1 MiB initial mapping
 const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
 
 /// ELF frame pool: dedicated frames for ELF loading
-const ELF_FRAME_POOL_SIZE: usize = 4096; // Up to 16 MiB of user pages
+/// Increased for sys_fork deep page-table copy (Jalon 25)
+const ELF_FRAME_POOL_SIZE: usize = 16384; // Up to 64 MiB of user pages
 
 // ===== ELF64 Header (C-compatible, packed) =====
 

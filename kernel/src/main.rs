@@ -90,6 +90,8 @@ static AGENT_AI_ELF: &[u8] = include_bytes!("../../userspace/c_apps/agent_ai.elf
 /// agent_rag - Jalon 23 RAG vector engine (cosine similarity + top-3)
 static AGENT_RAG_ELF: &[u8] = include_bytes!("../../userspace/c_apps/agent_rag.elf");
 
+static SH_ELF: &[u8] = include_bytes!("../../userspace/c_apps/sh.elf");
+
 // VGA text buffer
 const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
 const VGA_WIDTH: usize = 80;
@@ -1203,9 +1205,8 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         elf::set_phys_mem_offset(phys_offset);
 
         // Initialize ELF frame pool using frames from our allocator
-        // We allocate a contiguous block of 4096 frames (16 MiB) for ELF loading
-        // Increased from 768 to handle 1 MiB user stacks + TCP/DNS + FAT32
-        let pool_frames = 4096usize;
+        // Allocate 16384 frames (64 MiB) to support sys_fork deep page-table copy (Jalon 25)
+        let pool_frames = 16384usize;
         if let Some(first_frame) = memory_manager.frame_allocator.alloc_frame_kernel() {
             let base_phys = first_frame.start_address().as_u64();
             // Allocate remaining frames to ensure they're contiguous in the pool
@@ -1430,6 +1431,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     alloc::string::String::from("agent_rag.elf"),
                     fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_RAG_ELF)),
                 );
+                bin_dir.insert(
+                    alloc::string::String::from("sh.elf"),
+                    fs::vfs::VfsNode::File(alloc::vec::Vec::from(SH_ELF)),
+                );
                 serial_println!("       [OK] /bin/ls.elf ({} bytes)", LS_ELF.len());
                 serial_println!("       [OK] /bin/cat.elf ({} bytes)", CAT_ELF.len());
                 serial_println!("       [OK] /bin/j19_test.elf ({} bytes)", J19_TEST_ELF.len());
@@ -1437,6 +1442,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 serial_println!("       [OK] /bin/ui.elf ({} bytes)", UI_ELF.len());
                 serial_println!("       [OK] /bin/agent_ai.elf ({} bytes)", AGENT_AI_ELF.len());
                 serial_println!("       [OK] /bin/agent_rag.elf ({} bytes)", AGENT_RAG_ELF.len());
+                serial_println!("       [OK] /bin/sh.elf ({} bytes)", SH_ELF.len());
             }
         }
     }
@@ -1559,6 +1565,31 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             }
             Err(e) => {
                 serial_println!("  [WARN] agent_rag.elf pre-load failed: {}", e);
+            }
+        }
+
+        // Pre-load sh.elf for Jalon 26 (POSIX shell with fork+exec)
+        serial_println!("  [STEP 0e] Pre-loading sh.elf for Jalon 26...");
+        match elf::load_elf_binary(SH_ELF) {
+            Ok(sh_result) => {
+                match process::spawn_userspace(
+                    "/bin/sh.elf", 0,
+                    sh_result.entry_point, sh_result.stack_pointer, sh_result.pml4_phys
+                ) {
+                    Ok(sh_pid) => {
+                        scheduler::enqueue_process(sh_pid);
+                        serial_println!(
+                            "  [OK] sh.elf queued as PID {} (entry=0x{:X}, stack=0x{:X})",
+                            sh_pid, sh_result.entry_point, sh_result.stack_pointer
+                        );
+                    }
+                    Err(e) => {
+                        serial_println!("  [WARN] sh.elf spawn failed: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                serial_println!("  [WARN] sh.elf pre-load failed: {}", e);
             }
         }
 

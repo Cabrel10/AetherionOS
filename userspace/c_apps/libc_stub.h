@@ -115,4 +115,34 @@ long sys_wait(long pid);
  * Returns: child PID or negative error. */
 long thread_create(void (*start_routine)(void));
 
+/* ========================================
+ * POSIX Fork/Exec syscalls (Jalon 25/26)
+ * ======================================== */
+
+/* fork(): duplicate the calling process.
+ * Returns: 0 to child, child PID to parent, negative on error. */
+long fork(void);
+
+/* execve(path): replace current process image with new ELF.
+ * path: VFS path (e.g., "/bin/ls.elf").
+ * Returns: negative on error (does NOT return on success). */
+long execve(const char *path);
+
+/* waitpid(pid): wait for child process to terminate.
+ * pid > 0: wait for specific child.
+ * pid = 0: wait for any child.
+ * Returns: (child_pid << 16) | exit_code, or negative error. */
+long waitpid(long pid);
+
+/* open(path, flags): open a file, returns FD or negative error.
+ * flags: 0=O_RDONLY, 1=O_WRONLY, 2=O_RDWR */
+long open(const char *path, int flags);
+
+/* close(fd): close a file descriptor */
+long close(int fd);
+
+/* getdents(fd, buf, bufsize): read directory entries.
+ * Returns bytes written to buf (newline-separated names). */
+long getdents(int fd, void *buf, size_t bufsize);
+
 #endif /* _LIBC_STUB_H */

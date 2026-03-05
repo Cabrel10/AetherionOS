@@ -288,3 +288,45 @@ long thread_create(void (*start_routine)(void)) {
     long ret = sys_clone((void *)stack_top);
     return ret;
 }
+
+/* ========================================
+ * POSIX Fork/Exec syscalls (Jalon 25/26)
+ * ======================================== */
+
+/* fork(): syscall 57 - duplicate the calling process.
+ * Returns: 0 to child, child PID to parent, negative on error. */
+long fork(void) {
+    long ret;
+    asm volatile("syscall"
+        : "=a"(ret)
+        : "a"(57)
+        : "rcx", "r11", "memory");
+    return ret;
+}
+
+/* execve(path): syscall 59(path_addr) - replace process image.
+ * Does NOT return on success; returns negative on error. */
+long execve(const char *path) {
+    return syscall1(59, (long)path);
+}
+
+/* waitpid(pid): syscall 61(pid) - wait for child to terminate.
+ * Same as sys_wait but named POSIX-style. */
+long waitpid(long pid) {
+    return syscall1(61, pid);
+}
+
+/* open(path, flags): syscall 2(path_addr, flags) - open a file */
+long open(const char *path, int flags) {
+    return syscall2(2, (long)path, (long)flags);
+}
+
+/* close(fd): syscall 3(fd) - close a file descriptor */
+long close(int fd) {
+    return syscall1(3, (long)fd);
+}
+
+/* getdents(fd, buf, bufsize): syscall 78(fd, buf, len) - read directory entries */
+long getdents(int fd, void *buf, size_t bufsize) {
+    return syscall3(78, (long)fd, (long)buf, (long)bufsize);
+}

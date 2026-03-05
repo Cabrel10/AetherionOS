@@ -527,44 +527,81 @@ fn sys_yield() -> u64 {
     0 // Success
 }
 
-/// Fork the current process.
-/// Returns: 0 in child, child_pid in parent.
-/// MVP: Deep copy of page tables (no COW).
+/// Fork the current process (Jalon 25a - REAL UNIX FORK).
+/// Deep-copies the entire user address space (PML4[1..255]).
+/// Returns: child_pid in parent, 0 in child (via saved register state).
 fn sys_fork() -> u64 {
     let current_pid = crate::scheduler::current_pid();
 
-    crate::serial_println!("[SYSCALL] sys_fork() from PID {}", current_pid);
+    let (pool_used, pool_max) = crate::elf::pool_stats();
+    crate::serial_println!("[SYSCALL] sys_fork() from PID {} (frame pool {}/{} used)", current_pid, pool_used, pool_max);
 
     // Get the current process's PML4 and info
-    let (parent_pml4, parent_entry, parent_stack) = match crate::process::with_process(current_pid, |p| {
+    let parent_info = match crate::process::with_process(current_pid, |p| {
         (p.pml4_phys, p.entry_point, p.stack_pointer)
     }) {
         Some(info) => info,
         None => return ENOMEM,
     };
+    let (parent_pml4, parent_entry, parent_stack) = parent_info;
 
-    // Clone the PML4 (deep copy for MVP - copies all mapped pages)
+    // Deep-copy the PML4 (user pages get fresh frames with copied data)
     let child_pml4 = unsafe {
-        match clone_pml4(parent_pml4) {
+        match clone_pml4_deep(parent_pml4) {
             Some(pml4) => pml4,
             None => {
-                crate::serial_println!("[SYSCALL] fork: failed to clone PML4");
+                crate::serial_println!("[SYSCALL] fork: failed to deep-clone PML4");
                 return ENOMEM;
             }
         }
     };
 
-    // Create the child process
+    // Capture parent's current user-mode return state from this syscall.
+    // syscall_entry saved: user RIP in RCX -> gs:[16], user RSP -> gs:[8].
+    // The kernel stack has: [r15, r14, r13, r12, rbx, rbp, r11(RFLAGS), rcx(RIP)]
+    let parent_rip = saved_user_rip();
+    let parent_rsp = saved_user_rsp();
+    let parent_kernel_rsp = unsafe { PARENT_RESUME_KERNEL_RSP };
+    let saved_regs: [u64; 8] = if parent_kernel_rsp != 0 {
+        let ptr = parent_kernel_rsp as *const u64;
+        unsafe {
+            [
+                core::ptr::read_volatile(ptr),          // r15
+                core::ptr::read_volatile(ptr.add(1)),   // r14
+                core::ptr::read_volatile(ptr.add(2)),   // r13
+                core::ptr::read_volatile(ptr.add(3)),   // r12
+                core::ptr::read_volatile(ptr.add(4)),   // rbx
+                core::ptr::read_volatile(ptr.add(5)),   // rbp
+                core::ptr::read_volatile(ptr.add(6)),   // r11 (RFLAGS)
+                core::ptr::read_volatile(ptr.add(7)),   // rcx (RIP)
+            ]
+        }
+    } else {
+        [0; 8]
+    };
+
+    // Create the child process with deep-copied PML4
     match crate::process::fork_process(current_pid, child_pml4, parent_entry, parent_stack) {
         Ok(child_pid) => {
-            crate::serial_println!("[SYSCALL] fork: child PID {} created (PML4=0x{:X})", child_pid, child_pml4);
+            crate::serial_println!(
+                "[SYSCALL] fork: child PID {} created (PML4=0x{:X}, RIP=0x{:X}, RSP=0x{:X})",
+                child_pid, child_pml4, parent_rip, parent_rsp
+            );
+
+            // Store the parent's exact register state into the child's process struct.
+            // When the child is scheduled, it will resume at this RIP with these regs,
+            // but with RAX=0 (the fork return value for the child).
+            crate::process::with_process_mut(child_pid, |child| {
+                child.saved_user_rip = parent_rip;
+                child.saved_user_rsp = parent_rsp;
+                child.saved_syscall_regs = saved_regs;
+                child.is_forked = true;  // Flag: resume via sysretq with RAX=0
+            });
 
             // Enqueue child in scheduler
             crate::scheduler::enqueue_process(child_pid);
 
-            // Return child PID to parent
-            // Note: In a real fork, the child would get 0 returned via its saved context.
-            // For our MVP, we rely on the child being a new process starting from its entry point.
+            // Return child PID to parent (RAX = child_pid)
             child_pid
         }
         Err(e) => {
@@ -574,27 +611,118 @@ fn sys_fork() -> u64 {
     }
 }
 
-/// Clone a PML4 page table (deep copy of user pages, shared kernel pages)
-unsafe fn clone_pml4(src_pml4_phys: u64) -> Option<u64> {
+/// Deep-copy a PML4 page table (Jalon 25a).
+/// Kernel entries (PML4[0] and PML4[256..511]) are shared verbatim.
+/// User entries (PML4[1..255]) are walked to the leaf PT level:
+/// for each mapped 4K page, a NEW physical frame is allocated and the
+/// 4096 bytes of data are copied byte-for-byte.
+unsafe fn clone_pml4_deep(src_pml4_phys: u64) -> Option<u64> {
     let phys_offset = crate::elf::phys_offset();
 
     // Allocate a new PML4 frame
     let new_pml4_phys = crate::elf::alloc_demand_frame()?;
-    let new_pml4_virt = (new_pml4_phys + phys_offset) as *mut u64;
-    let src_pml4_virt = (src_pml4_phys + phys_offset) as *const u64;
+    let new_pml4 = (new_pml4_phys + phys_offset) as *mut u64;
+    let src_pml4 = (src_pml4_phys + phys_offset) as *const u64;
 
     // Zero the new PML4
-    core::ptr::write_bytes(new_pml4_virt, 0, 512);
+    core::ptr::write_bytes(new_pml4, 0, 512);
 
-    // Copy all entries (kernel entries verbatim, user entries deep-copied)
-    for i in 0..512usize {
-        let entry = core::ptr::read_volatile(src_pml4_virt.add(i));
-        if entry & 0x01 != 0 {
-            // For kernel entries (typically 256-511 and entry 0), share directly
-            // For user entries, also share for MVP (simpler than full deep copy)
-            core::ptr::write_volatile(new_pml4_virt.add(i), entry);
+    let mut user_pages_copied = 0usize;
+
+    for pml4_i in 0..512usize {
+        let pml4_entry = core::ptr::read_volatile(src_pml4.add(pml4_i));
+        if pml4_entry & 0x01 == 0 { continue; } // not present
+
+        // Kernel entries: PML4[0], PML4[256..511], or any entry WITHOUT USER_ACCESSIBLE — share verbatim
+        // CRITICAL: The kernel heap at 0x4444_4444_0000 maps to PML4[136] which must be shared,
+        // not deep-copied, so child processes see the same kernel data structures (PROCESS_TABLE etc.)
+        if pml4_i == 0 || pml4_i >= 256 || (pml4_entry & 0x04) == 0 {
+            core::ptr::write_volatile(new_pml4.add(pml4_i), pml4_entry);
+            continue;
         }
+
+        // User entry (PML4[1..255]) — deep copy
+        let src_pdpt_phys = pml4_entry & 0x000F_FFFF_FFFF_F000;
+        let src_pdpt = (src_pdpt_phys + phys_offset) as *const u64;
+
+        // Allocate new PDPT
+        let new_pdpt_phys = crate::elf::alloc_demand_frame()?;
+        let new_pdpt = (new_pdpt_phys + phys_offset) as *mut u64;
+        core::ptr::write_bytes(new_pdpt, 0, 512);
+
+        for pdpt_i in 0..512usize {
+            let pdpt_entry = core::ptr::read_volatile(src_pdpt.add(pdpt_i));
+            if pdpt_entry & 0x01 == 0 { continue; }
+            // 1G huge page check (bit 7) — unlikely but skip
+            if pdpt_entry & 0x80 != 0 {
+                core::ptr::write_volatile(new_pdpt.add(pdpt_i), pdpt_entry);
+                continue;
+            }
+
+            let src_pd_phys = pdpt_entry & 0x000F_FFFF_FFFF_F000;
+            let src_pd = (src_pd_phys + phys_offset) as *const u64;
+
+            // Allocate new PD
+            let new_pd_phys = crate::elf::alloc_demand_frame()?;
+            let new_pd = (new_pd_phys + phys_offset) as *mut u64;
+            core::ptr::write_bytes(new_pd, 0, 512);
+
+            for pd_i in 0..512usize {
+                let pd_entry = core::ptr::read_volatile(src_pd.add(pd_i));
+                if pd_entry & 0x01 == 0 { continue; }
+                // 2M huge page check (bit 7) — unlikely but skip
+                if pd_entry & 0x80 != 0 {
+                    core::ptr::write_volatile(new_pd.add(pd_i), pd_entry);
+                    continue;
+                }
+
+                let src_pt_phys = pd_entry & 0x000F_FFFF_FFFF_F000;
+                let src_pt = (src_pt_phys + phys_offset) as *const u64;
+
+                // Allocate new PT
+                let new_pt_phys = crate::elf::alloc_demand_frame()?;
+                let new_pt = (new_pt_phys + phys_offset) as *mut u64;
+                core::ptr::write_bytes(new_pt, 0, 512);
+
+                for pt_i in 0..512usize {
+                    let pt_entry = core::ptr::read_volatile(src_pt.add(pt_i));
+                    if pt_entry & 0x01 == 0 { continue; }
+
+                    // Extract physical address (bits 12-51) and flags
+                    let src_frame_phys = pt_entry & 0x000F_FFFF_FFFF_F000;
+                    // Preserve all flag bits (lower 12 + NX bit 63)
+                    let flag_bits = pt_entry & 0x8000_0000_0000_0FFF;
+
+                    // Allocate a NEW physical frame and copy 4096 bytes
+                    let new_frame_phys = crate::elf::alloc_demand_frame()?;
+                    let src_data = (src_frame_phys.wrapping_add(phys_offset)) as *const u8;
+                    let dst_data = (new_frame_phys.wrapping_add(phys_offset)) as *mut u8;
+                    core::ptr::copy_nonoverlapping(src_data, dst_data, 4096);
+
+                    // Map with same flags
+                    core::ptr::write_volatile(new_pt.add(pt_i), new_frame_phys | flag_bits);
+                    user_pages_copied += 1;
+                }
+
+                // Map new PT in new PD with same flags
+                let pd_flags = pd_entry & 0x8000_0000_0000_0FFF;
+                core::ptr::write_volatile(new_pd.add(pd_i), new_pt_phys | pd_flags);
+            }
+
+            // Map new PD in new PDPT with same flags
+            let pdpt_flags = pdpt_entry & 0x8000_0000_0000_0FFF;
+            core::ptr::write_volatile(new_pdpt.add(pdpt_i), new_pd_phys | pdpt_flags);
+        }
+
+        // Map new PDPT in new PML4 with same flags
+        let pml4_flags = pml4_entry & 0x8000_0000_0000_0FFF;
+        core::ptr::write_volatile(new_pml4.add(pml4_i), new_pdpt_phys | pml4_flags);
     }
+
+    crate::serial_println!(
+        "[FORK] Deep-copied PML4: src=0x{:X} -> dst=0x{:X}, {} user pages copied ({} KB)",
+        src_pml4_phys, new_pml4_phys, user_pages_copied, user_pages_copied * 4
+    );
 
     Some(new_pml4_phys)
 }
@@ -630,19 +758,26 @@ fn sys_exec(path_addr: u64) -> u64 {
         }
     };
 
-    // Load the ELF binary
+    // Load the ELF binary (Jalon 25b - real sys_exec)
     match crate::elf::load_elf_binary(&elf_data) {
         Ok(result) => {
             let current_pid = crate::scheduler::current_pid();
             crate::serial_println!("[SYSCALL] exec: loaded {} for PID {}, entry=0x{:X}",
                 vfs_path, current_pid, result.entry_point);
 
-            // Update process with new PML4 and entry point
+            // Replace the current process's address space and state
             crate::process::with_process_mut(current_pid, |p| {
                 p.pml4_phys = result.pml4_phys;
                 p.entry_point = result.entry_point;
                 p.stack_pointer = result.stack_pointer;
                 p.name = alloc::string::String::from(&vfs_path[..]);
+                // Reset FD table to just stdio (exec replaces everything)
+                p.fd_table = crate::process::FdTable::new_with_stdio();
+                // Clear saved state
+                p.saved_user_rip = 0;
+                p.saved_user_rsp = 0;
+                p.saved_syscall_regs = [0; 8];
+                p.is_forked = false;
             });
 
             // Switch CR3 and jump to Ring 3
@@ -799,7 +934,6 @@ fn sys_exit(code: u64) -> u64 {
                         );
                     }
                 } else if saved_rip != 0 && saved_rsp != 0 {
-                } else if saved_rip != 0 && saved_rsp != 0 {
                     // Fallback: kernel_rsp not saved, use IRETQ (may lose callee-saved regs)
                     crate::serial_println!(
                         "[SYSCALL] Fallback IRETQ to parent: RIP=0x{:X}, RSP=0x{:X}",
@@ -846,6 +980,122 @@ fn sys_exit(code: u64) -> u64 {
                 }
             }
         }
+    } else {
+        // ===== Forked child exit: resume blocked parent (Jalon 25 - CRITICAL FIX) =====
+        // When a forked child (not a thread) exits, the parent is Blocked in sys_wait.
+        // We must unblock the parent and restore its context so it receives the wait result.
+        let parent_pid_opt = crate::process::with_process(current, |p| p.ppid);
+        let parent_pid = parent_pid_opt.unwrap_or(0);
+        crate::serial_println!("[SYSCALL] Forked child exit: current={} ppid_opt={:?} ppid={}", current, parent_pid_opt, parent_pid);
+
+        if parent_pid != 0 {
+            let parent_blocked = crate::process::with_process(parent_pid, |p| {
+                p.state == crate::process::ProcessState::Blocked
+            });
+            crate::serial_println!("[SYSCALL] parent_blocked={:?}", parent_blocked);
+
+            if parent_blocked == Some(true) {
+                crate::serial_println!(
+                    "[SYSCALL] Forked child PID {} exited (code {}), resuming parent PID {}",
+                    current, code, parent_pid
+                );
+
+                let parent_ctx = crate::process::with_process(parent_pid, |p| {
+                    (p.saved_user_rip, p.saved_user_rsp, p.saved_kernel_rsp,
+                     p.saved_syscall_regs, p.pml4_phys)
+                });
+
+                if let Some((saved_rip, saved_rsp, _parent_kernel_rsp, saved_regs, pml4)) = parent_ctx {
+                    if saved_regs[7] != 0 {
+                        // Set parent back to Running
+                        let _ = crate::process::set_state(
+                            parent_pid,
+                            crate::process::ProcessState::Running,
+                        );
+                        crate::scheduler::set_current_pid(parent_pid);
+
+                        // Build wait result: (child_pid << 16) | exit_code
+                        let wait_result = ((current & 0xFFFF) << 16) | (code & 0xFFFF);
+
+                        let r15 = saved_regs[0];
+                        let r14 = saved_regs[1];
+                        let r13 = saved_regs[2];
+                        let r12 = saved_regs[3];
+                        let rbx = saved_regs[4];
+                        let rbp = saved_regs[5];
+                        let r11 = saved_regs[6]; // RFLAGS
+                        let rcx = saved_regs[7]; // RIP
+
+                        unsafe { PER_CPU.user_rsp = saved_rsp; }
+
+                        crate::serial_println!(
+                            "[SYSCALL] Resuming parent PID {} via sysretq: RAX=0x{:X} RIP=0x{:X} RSP=0x{:X}",
+                            parent_pid, wait_result, rcx, saved_rsp
+                        );
+
+                        unsafe {
+                            core::arch::asm!("mov cr3, {}", in(reg) pml4, options(nostack));
+                            core::arch::asm!(
+                                "mov r15, {v_r15}",
+                                "mov r14, {v_r14}",
+                                "mov r13, {v_r13}",
+                                "mov r12, {v_r12}",
+                                "mov rbx, {v_rbx}",
+                                "mov rbp, {v_rbp}",
+                                "mov r11, {v_r11}",
+                                "mov rcx, {v_rcx}",
+                                "mov rax, {result}",
+                                "mov rsp, gs:[8]",
+                                "swapgs",
+                                "sysretq",
+                                v_r15 = in(reg) r15,
+                                v_r14 = in(reg) r14,
+                                v_r13 = in(reg) r13,
+                                v_r12 = in(reg) r12,
+                                v_rbx = in(reg) rbx,
+                                v_rbp = in(reg) rbp,
+                                v_r11 = in(reg) r11,
+                                v_rcx = in(reg) rcx,
+                                result = in(reg) wait_result,
+                                options(noreturn),
+                            );
+                        }
+                    } else if saved_rip != 0 && saved_rsp != 0 {
+                        // Fallback: IRETQ if no kernel registers saved
+                        let _ = crate::process::set_state(
+                            parent_pid,
+                            crate::process::ProcessState::Running,
+                        );
+                        crate::scheduler::set_current_pid(parent_pid);
+
+                        let wait_result = ((current & 0xFFFF) << 16) | (code & 0xFFFF);
+                        crate::serial_println!(
+                            "[SYSCALL] Fallback IRETQ to parent PID {}: RIP=0x{:X}",
+                            parent_pid, saved_rip
+                        );
+
+                        unsafe {
+                            core::arch::asm!("mov cr3, {}", in(reg) pml4, options(nostack));
+                            core::arch::asm!(
+                                "mov rax, {result}",
+                                "swapgs",
+                                "push 0x1B",
+                                "push {stack}",
+                                "push 0x202",
+                                "push 0x23",
+                                "push {entry}",
+                                "iretq",
+                                result = in(reg) wait_result,
+                                stack = in(reg) saved_rsp,
+                                entry = in(reg) saved_rip,
+                                options(noreturn),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        // Fallthrough: parent not blocked or no parent → normal process exit below
     }
 
     // Main process exit — print the banner
@@ -853,11 +1103,83 @@ fn sys_exit(code: u64) -> u64 {
     crate::serial_println!("[SUCCESS] Ring 3 process PID {} exited (code {})", current, code);
     crate::serial_println!("========================================");
 
-    // Try to launch the next queued userspace process (e.g., threads.elf after j19_test.elf)
-    // Look for any Ready userspace process to launch
-    let next_ready = crate::process::find_next_ready_userspace(current);
+    // Try to launch the next queued userspace process
+    launch_next_userspace_process(current);
+
+    // If we reach here, no more processes to run
+    loop { unsafe { asm!("hlt", options(nomem, nostack)); } }
+}
+
+// ===== sys_wait(pid) =====
+
+/// Launch the next ready userspace process (used by sys_exit and sys_wait).
+/// Handles both normal processes (IRETQ to entry_point) and forked children
+/// (sysretq to parent's saved RIP with RAX=0).
+fn launch_next_userspace_process(exclude_pid: u64) {
+    let next_ready = crate::process::find_next_ready_userspace(exclude_pid);
     crate::serial_println!("[SYSCALL] Looking for next userspace process: {:?}", next_ready);
+
     if let Some((next_pid, entry, stack, pml4, name)) = next_ready {
+        // Check if this is a forked child that should resume at parent's saved RIP
+        let fork_info = crate::process::with_process(next_pid, |p| {
+            (p.is_forked, p.saved_user_rip, p.saved_user_rsp, p.saved_syscall_regs)
+        });
+
+        if let Some((true, saved_rip, saved_rsp, saved_regs)) = fork_info {
+            if saved_regs[7] != 0 {
+                // Forked child: resume at parent's exact RIP with RAX=0
+                crate::serial_println!(
+                    "[SYSCALL] Launching FORKED child PID {} ({}) via sysretq with RAX=0, RIP=0x{:X}",
+                    next_pid, name, saved_rip
+                );
+
+                crate::scheduler::set_current_pid(next_pid);
+                let _ = crate::process::set_state(next_pid, crate::process::ProcessState::Running);
+                // Clear the forked flag so it won't re-trigger
+                crate::process::with_process_mut(next_pid, |p| { p.is_forked = false; });
+
+                let r15 = saved_regs[0];
+                let r14 = saved_regs[1];
+                let r13 = saved_regs[2];
+                let r12 = saved_regs[3];
+                let rbx = saved_regs[4];
+                let rbp = saved_regs[5];
+                let r11 = saved_regs[6]; // RFLAGS
+                let rcx = saved_regs[7]; // RIP
+
+                // Write child's user RSP into PER_CPU
+                unsafe { PER_CPU.user_rsp = saved_rsp; }
+
+                unsafe {
+                    core::arch::asm!("mov cr3, {}", in(reg) pml4, options(nostack));
+                    core::arch::asm!(
+                        "mov r15, {v_r15}",
+                        "mov r14, {v_r14}",
+                        "mov r13, {v_r13}",
+                        "mov r12, {v_r12}",
+                        "mov rbx, {v_rbx}",
+                        "mov rbp, {v_rbp}",
+                        "mov r11, {v_r11}",
+                        "mov rcx, {v_rcx}",
+                        "xor eax, eax",         // RAX = 0 (fork return for child!)
+                        "mov rsp, gs:[8]",      // Restore user RSP
+                        "swapgs",               // Swap back to user GS
+                        "sysretq",              // Return to Ring 3
+                        v_r15 = in(reg) r15,
+                        v_r14 = in(reg) r14,
+                        v_r13 = in(reg) r13,
+                        v_r12 = in(reg) r12,
+                        v_rbx = in(reg) rbx,
+                        v_rbp = in(reg) rbp,
+                        v_r11 = in(reg) r11,
+                        v_rcx = in(reg) rcx,
+                        options(noreturn),
+                    );
+                }
+            }
+        }
+
+        // Normal process launch: IRETQ to entry_point
         crate::serial_println!(
             "[SYSCALL] Launching next process: PID {} ({}) entry=0x{:X}",
             next_pid, name, entry
@@ -880,12 +1202,7 @@ fn sys_exit(code: u64) -> u64 {
             );
         }
     }
-
-    // If we reach here, no more processes to run
-    loop { unsafe { asm!("hlt", options(nomem, nostack)); } }
 }
-
-// ===== sys_wait(pid) =====
 
 /// Wait for a child process/thread to terminate.
 /// pid=0 means wait for any child.
@@ -965,6 +1282,67 @@ fn sys_wait(pid: u64) -> u64 {
                 "iretq",
                 stack = in(reg) child_stack,
                 entry = in(reg) child_entry,
+                options(noreturn),
+            );
+        }
+    }
+
+    // No child threads to launch — check for forked children to launch
+    // A forked child has is_forked=true and should be launched with sysretq(RAX=0).
+    let forked_child = crate::process::find_ready_forked_child(current, pid);
+    if let Some((child_pid, child_pml4, child_rip, child_rsp, child_regs)) = forked_child {
+        crate::serial_println!(
+            "[SYSCALL] wait: launching FORKED child PID {} (RIP=0x{:X}, RSP=0x{:X})",
+            child_pid, child_rip, child_rsp
+        );
+        crate::serial_println!(
+            "[FORK-LAUNCH] regs: r15=0x{:X} r14=0x{:X} r13=0x{:X} r12=0x{:X} rbx=0x{:X} rbp=0x{:X} r11=0x{:X} rcx=0x{:X}",
+            child_regs[0], child_regs[1], child_regs[2], child_regs[3],
+            child_regs[4], child_regs[5], child_regs[6], child_regs[7]
+        );
+
+        // Mark child as Running, parent as Blocked
+        let _ = crate::process::set_state(child_pid, crate::process::ProcessState::Running);
+        let _ = crate::process::set_state(current, crate::process::ProcessState::Blocked);
+        crate::scheduler::set_current_pid(child_pid);
+
+        // Clear forked flag
+        crate::process::with_process_mut(child_pid, |p| { p.is_forked = false; });
+
+        let r15 = child_regs[0];
+        let r14 = child_regs[1];
+        let r13 = child_regs[2];
+        let r12 = child_regs[3];
+        let rbx = child_regs[4];
+        let rbp = child_regs[5];
+        let r11 = child_regs[6];
+        let rcx = child_regs[7];
+
+        unsafe { PER_CPU.user_rsp = child_rsp; }
+
+        unsafe {
+            core::arch::asm!("mov cr3, {}", in(reg) child_pml4, options(nostack));
+            core::arch::asm!(
+                "mov r15, {v_r15}",
+                "mov r14, {v_r14}",
+                "mov r13, {v_r13}",
+                "mov r12, {v_r12}",
+                "mov rbx, {v_rbx}",
+                "mov rbp, {v_rbp}",
+                "mov r11, {v_r11}",
+                "mov rcx, {v_rcx}",
+                "xor eax, eax",         // RAX = 0 (fork return for child!)
+                "mov rsp, gs:[8]",
+                "swapgs",
+                "sysretq",
+                v_r15 = in(reg) r15,
+                v_r14 = in(reg) r14,
+                v_r13 = in(reg) r13,
+                v_r12 = in(reg) r12,
+                v_rbx = in(reg) rbx,
+                v_rbp = in(reg) rbp,
+                v_r11 = in(reg) r11,
+                v_rcx = in(reg) rcx,
                 options(noreturn),
             );
         }

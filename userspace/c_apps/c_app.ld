@@ -9,11 +9,14 @@ SECTIONS
     .text : ALIGN(4096)
     {
         *(.text*)
+        *(.plt*)
+        *(.got.plt*)
     }
 
     .rodata : ALIGN(4096)
     {
         *(.rodata*)
+        *(.got*)
     }
 
     .data : ALIGN(4096)
