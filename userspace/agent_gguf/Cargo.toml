@@ -1,9 +1,9 @@
 [package]
 name = "agent_gguf"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["MORNINGSTAR <morningstar@aetherion.dev>"]
-description = "AetherionOS Jalon 35 - Native GGUF Model Loader in Ring 3"
+description = "AetherionOS Jalon 36 - GGUF Model Loaded from FAT32 Disk in Ring 3"
 
 [[bin]]
 name = "agent_gguf"

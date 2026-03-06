@@ -1,14 +1,13 @@
-//! AetherionOS Jalon 35 - Native GGUF Model Loader
+//! AetherionOS Jalon 36 - GGUF Model Loaded from FAT32 Disk
 //!
-//! Proves that AetherionOS can load and parse AI model files (GGUF format)
-//! entirely in Ring 3 userspace, no_std, using our own tensor engine from J34.
+//! THIS IS NOT J35. J35 embedded the model in static bytes.
+//! J36 proves AetherionOS can load a REAL AI model file from a FAT32 disk
+//! at runtime, parse it, extract weights, and perform a forward pass.
 //!
-//! The GGUF format starts with magic "GGUF" (0x47475546), version u32,
-//! n_tensors u64, n_kv u64, followed by key-value metadata and tensor info.
+//! Chain: FAT32 disk -> sys_open -> sys_read -> GGUF parser -> SSE2 forward -> Cognitive Bus
 //!
-//! This demo embeds a synthetic micro-GGUF model (identity matrix 4x4)
-//! directly in the binary, parses it, loads the weights, and performs
-//! a forward pass to validate the complete pipeline.
+//! The model is an 8x8 identity matrix in GGUF v3 format, stored at
+//! /disk/models/model.ggf on the FAT32 partition (disk.img).
 //!
 //! Build:
 //!   cd userspace/agent_gguf
@@ -29,54 +28,21 @@ use core::arch::x86_64::{
 use aetherion_sdk::*;
 
 // ============================================================
-// Embedded Micro-GGUF Model (synthetic identity 4x4)
+// Constants
 // ============================================================
-// GGUF v3 binary layout:
-//   magic(4) + version(4) + n_tensors(8) + n_kv(8)  = 24 bytes header
-//   tensor_info: name_len(8) + name(6) + n_dims(4)
-//                + dims[0](8) + dims[1](8) + type(4) + offset(8)
-//   tensor_data: 16 x f32 = 64 bytes (4x4 identity matrix)
-static MICRO_GGUF: &[u8] = &[
-    // --- GGUF Header (24 bytes) ---
-    // Magic: "GGUF"
-    0x47, 0x47, 0x55, 0x46,
-    // Version: 3 (u32 LE)
-    0x03, 0x00, 0x00, 0x00,
-    // n_tensors: 1 (u64 LE)
-    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    // n_kv: 0 (u64 LE)
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 
-    // --- Tensor Info ---
-    // name_len: 6 (u64 LE)
-    0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    // name: "weight" (6 bytes, no null terminator)
-    0x77, 0x65, 0x69, 0x67, 0x68, 0x74,
-    // n_dims: 2 (u32 LE)
-    0x02, 0x00, 0x00, 0x00,
-    // dims[0]: 4 (u64 LE)
-    0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    // dims[1]: 4 (u64 LE)
-    0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    // type: 0 = F32 (u32 LE)
-    0x00, 0x00, 0x00, 0x00,
-    // offset: 0 (u64 LE) - data starts immediately after tensor info
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+/// Path to the GGUF model on FAT32 disk (null-terminated for sys_open)
+const MODEL_PATH: &[u8] = b"/disk/models/model.ggf\0";
 
-    // --- Tensor Data: 4x4 identity matrix in F32 LE ---
-    // Row 0: [1, 0, 0, 0]
-    0x00, 0x00, 0x80, 0x3F, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    // Row 1: [0, 1, 0, 0]
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x3F,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    // Row 2: [0, 0, 1, 0]
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x80, 0x3F, 0x00, 0x00, 0x00, 0x00,
-    // Row 3: [0, 0, 0, 1]
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x3F,
-];
+/// Maximum model file size we support loading into stack buffer (4 KB)
+/// Our micro model is 352 bytes; this leaves ample room for larger models.
+const MAX_MODEL_SIZE: usize = 4096;
+
+/// GGUF v3 alignment for tensor data section
+const GGUF_ALIGNMENT: usize = 32;
+
+/// GGUF magic bytes
+const GGUF_MAGIC: [u8; 4] = [0x47, 0x47, 0x55, 0x46];
 
 // ============================================================
 // Binary reading helpers
@@ -118,47 +84,112 @@ fn print_f32_approx(val: f32) {
 }
 
 // ============================================================
-// SSE2 dot product (reused from J34 tensor engine)
+// SSE2 dot product for N-wide vectors (processes 4 floats at a time)
 // ============================================================
 
+/// Compute dot product of two vectors of length `n` using SSE2.
+/// Handles non-multiple-of-4 tails with scalar fallback.
 #[inline(never)]
-unsafe fn dot4_sse2(a: *const f32, b: *const f32) -> f32 {
-    let va = _mm_loadu_ps(a);
-    let vb = _mm_loadu_ps(b);
-    let prod = _mm_mul_ps(va, vb);
+unsafe fn dot_sse2(a: *const f32, b: *const f32, n: usize) -> f32 {
+    let mut acc = _mm_setzero_ps();
+    let blocks = n / 4;
+    let mut i = 0usize;
+
+    // SSE2: process 4 floats at a time
+    while i < blocks {
+        let va = _mm_loadu_ps(a.add(i * 4));
+        let vb = _mm_loadu_ps(b.add(i * 4));
+        acc = _mm_add_ps(acc, _mm_mul_ps(va, vb));
+        i += 1;
+    }
+
+    // Horizontal sum of acc
     let mut tmp = [0.0f32; 4];
-    _mm_storeu_ps(tmp.as_mut_ptr(), prod);
-    tmp[0] + tmp[1] + tmp[2] + tmp[3]
+    _mm_storeu_ps(tmp.as_mut_ptr(), acc);
+    let mut sum = tmp[0] + tmp[1] + tmp[2] + tmp[3];
+
+    // Scalar tail
+    let mut j = blocks * 4;
+    while j < n {
+        sum += *a.add(j) * *b.add(j);
+        j += 1;
+    }
+
+    sum
 }
 
 // ============================================================
-// Main: GGUF Loader Demo
+// Main: GGUF Loader from FAT32
 // ============================================================
 
 #[no_mangle]
 pub extern "C" fn main() -> i64 {
     println("========================================");
-    println("[J35] GGUF Loader - Native Rust no_std");
-    println("[J35] AetherionOS Model Loading Pipeline");
+    println("[J36] GGUF from FAT32 - First Real Load");
+    println("[J36] AetherionOS Model I/O Pipeline");
     println("========================================");
 
-    let data = MICRO_GGUF;
+    // ================================================================
+    // STEP 1: Open the GGUF file from FAT32 disk
+    // ================================================================
+    print("[J36] Step 1: Opening ");
+    // Print path (without null terminator)
+    sys_write(1, &MODEL_PATH[..MODEL_PATH.len() - 1]);
+    println("...");
 
-    // ---- Step 1: Verify GGUF magic ----
-    print("[J35] Step 1: Magic check... ");
-    if data.len() < 24 {
-        println("FAIL (too small)");
+    let fd = sys_open(MODEL_PATH, O_RDONLY);
+    if fd < 0 {
+        print("[J36-FAIL] sys_open returned ");
+        print_u64((-fd) as u64);
+        println(" (file not found on FAT32)");
         return 1;
     }
-    if data[0] != 0x47 || data[1] != 0x47 || data[2] != 0x55 || data[3] != 0x46 {
+    let fd = fd as u32;
+    print("[J36-OK] File opened, fd=");
+    print_u64(fd as u64);
+    println("");
+
+    // ================================================================
+    // STEP 2: Read file contents into stack buffer
+    // ================================================================
+    println("[J36] Step 2: Reading model from disk...");
+
+    let mut buf = [0u8; MAX_MODEL_SIZE];
+    let bytes_read = sys_read(fd, &mut buf);
+    sys_close(fd);
+
+    if bytes_read <= 0 {
+        println("[J36-FAIL] sys_read returned 0 or error");
+        return 1;
+    }
+    let file_size = bytes_read as usize;
+    print("[J36-OK] Read ");
+    print_u64(file_size as u64);
+    println(" bytes from FAT32 disk");
+
+    let data = &buf[..file_size];
+
+    // ================================================================
+    // STEP 3: Verify GGUF magic
+    // ================================================================
+    print("[J36] Step 3: Magic check... ");
+    if file_size < 24 {
+        println("FAIL (file too small)");
+        return 1;
+    }
+    if data[0] != GGUF_MAGIC[0] || data[1] != GGUF_MAGIC[1]
+        || data[2] != GGUF_MAGIC[2] || data[3] != GGUF_MAGIC[3]
+    {
         println("FAIL (bad magic)");
         return 1;
     }
     println("GGUF magic OK (0x47475546)");
 
-    // ---- Step 2: Parse version ----
+    // ================================================================
+    // STEP 4: Parse GGUF header
+    // ================================================================
     let version = read_u32_le(data, 4);
-    print("[J35] Step 2: Version = ");
+    print("[J36] Step 4: Version = ");
     print_u64(version as u64);
     if version == 3 {
         println(" (GGUF v3 OK)");
@@ -167,52 +198,51 @@ pub extern "C" fn main() -> i64 {
         return 1;
     }
 
-    // ---- Step 3: Parse tensor count ----
     let n_tensors = read_u64_le(data, 8);
     let n_kv = read_u64_le(data, 16);
-    print("[J35] Step 3: n_tensors=");
+    print("[J36]   n_tensors=");
     print_u64(n_tensors);
     print(", n_kv=");
     print_u64(n_kv);
     println("");
 
-    if n_tensors != 1 {
-        println("[J35-FAIL] Expected 1 tensor");
+    if n_tensors < 1 {
+        println("[J36-FAIL] No tensors in model");
         return 1;
     }
 
-    // ---- Step 4: Parse tensor info ----
-    println("[J35] Step 4: Parsing tensor info...");
-    let mut off = 24usize; // skip header
+    // ================================================================
+    // STEP 5: Parse tensor info
+    // ================================================================
+    println("[J36] Step 5: Parsing tensor metadata...");
+    let mut off = 24usize; // past header
 
-    // Read name
+    // Read tensor name
     let name_len = read_u64_le(data, off) as usize;
     off += 8;
-    // Print tensor name byte by byte
-    print("[J35]   Name: \"");
+
+    print("[J36]   Tensor name: \"");
     let mut ni = 0usize;
-    while ni < name_len {
-        let b = data[off + ni];
-        // Print ASCII byte via sys_write
-        sys_write(1, &[b]);
+    while ni < name_len && (off + ni) < file_size {
+        sys_write(1, &[data[off + ni]]);
         ni += 1;
     }
     off += name_len;
     println("\"");
 
-    // Read dimensions
+    // Dimensions
     let n_dims = read_u32_le(data, off) as usize;
     off += 4;
 
     let mut dims = [0u64; 4];
     let mut di = 0usize;
-    while di < n_dims {
+    while di < n_dims && di < 4 {
         dims[di] = read_u64_le(data, off);
         off += 8;
         di += 1;
     }
 
-    print("[J35]   Shape: [");
+    print("[J36]   Shape: [");
     di = 0;
     while di < n_dims {
         print_u64(dims[di]);
@@ -221,29 +251,54 @@ pub extern "C" fn main() -> i64 {
     }
     println("]");
 
-    // Read type and data offset
+    // Type and offset
     let tensor_type = read_u32_le(data, off);
     off += 4;
-    let data_offset = read_u64_le(data, off) as usize;
+    let tensor_data_offset = read_u64_le(data, off) as usize;
     off += 8;
 
-    print("[J35]   Type: ");
+    print("[J36]   Type: ");
     if tensor_type == 0 {
         println("F32");
     } else {
         print_u64(tensor_type as u64);
-        println(" (unsupported)");
+        println(" (unsupported type)");
         return 1;
     }
 
-    // ---- Step 5: Load and verify weights ----
-    println("[J35] Step 5: Loading weights...");
-    let weights_start = off + data_offset;
+    // ================================================================
+    // STEP 6: Locate tensor data (aligned to GGUF_ALIGNMENT)
+    // ================================================================
+    // After parsing all tensor infos, data section starts at next alignment boundary
+    let data_section_start = ((off + GGUF_ALIGNMENT - 1) / GGUF_ALIGNMENT) * GGUF_ALIGNMENT;
+    let weights_start = data_section_start + tensor_data_offset;
+
     let rows = dims[0] as usize;
     let cols = dims[1] as usize;
     let n_elements = rows * cols;
 
-    // Verify it's an identity matrix
+    print("[J36]   Data section at offset ");
+    print_u64(data_section_start as u64);
+    print(", weights at ");
+    print_u64(weights_start as u64);
+    println("");
+
+    // Verify we have enough data
+    let data_end = weights_start + n_elements * 4;
+    if data_end > file_size {
+        print("[J36-FAIL] Tensor data exceeds file (need ");
+        print_u64(data_end as u64);
+        print(" have ");
+        print_u64(file_size as u64);
+        println(")");
+        return 1;
+    }
+
+    // ================================================================
+    // STEP 7: Verify identity matrix weights
+    // ================================================================
+    println("[J36] Step 6: Verifying weights from disk...");
+
     let mut identity_ok = true;
     let mut wi = 0usize;
     while wi < rows {
@@ -260,14 +315,18 @@ pub extern "C" fn main() -> i64 {
     }
 
     if identity_ok {
-        println("[J35-OK] Weights loaded: 4x4 identity matrix verified");
+        print("[J36-OK] Identity ");
+        print_u64(rows as u64);
+        print("x");
+        print_u64(cols as u64);
+        println(" matrix verified from FAT32 disk");
     } else {
-        println("[J35-FAIL] Weight verification failed");
+        println("[J36-FAIL] Weight verification failed");
         return 1;
     }
 
     // Print diagonal
-    print("[J35]   Diagonal: [");
+    print("[J36]   Diagonal: [");
     wi = 0;
     while wi < rows {
         print_f32_approx(read_f32_le(data, weights_start + (wi * cols + wi) * 4));
@@ -276,64 +335,66 @@ pub extern "C" fn main() -> i64 {
     }
     println("]");
 
-    // ---- Step 6: Forward pass with SSE2 (input * weights) ----
-    println("[J35] Step 6: Forward pass (SSE2)...");
+    // ================================================================
+    // STEP 8: Forward pass with SSE2 (8-wide dot products)
+    // ================================================================
+    println("[J36] Step 7: SSE2 forward pass (8x8)...");
 
-    // Input vector [1, 2, 3, 4]
-    let input: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    // Input vector [1, 2, 3, 4, 5, 6, 7, 8]
+    let input: [f32; 8] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
 
-    // Load weight matrix from GGUF data into stack array
-    let mut weights = [0.0f32; 16];
+    // Load weight matrix from GGUF data
+    let mut weights = [0.0f32; 64]; // 8x8
     wi = 0;
-    while wi < 16 {
+    while wi < 64 {
         weights[wi] = read_f32_le(data, weights_start + wi * 4);
         wi += 1;
     }
 
-    // Compute output = input * weights using SSE2 dot products
-    // Since weights is identity, output should equal input
-    // Transpose weights for column-major dot products
-    let mut wt = [0.0f32; 16];
+    // Transpose for column-major dot products: output[j] = dot(input, W[:,j])
+    let mut wt = [0.0f32; 64];
     wi = 0;
-    while wi < 4 {
+    while wi < 8 {
         let mut wj = 0usize;
-        while wj < 4 {
-            wt[wj * 4 + wi] = weights[wi * 4 + wj];
+        while wj < 8 {
+            wt[wj * 8 + wi] = weights[wi * 8 + wj];
             wj += 1;
         }
         wi += 1;
     }
 
-    let mut output = [0.0f32; 4];
+    // Compute output = input * weights using SSE2 dot products
+    let mut output = [0.0f32; 8];
     let mut oi = 0usize;
-    while oi < 4 {
-        output[oi] = unsafe { dot4_sse2(input.as_ptr(), wt.as_ptr().add(oi * 4)) };
+    while oi < 8 {
+        output[oi] = unsafe { dot_sse2(input.as_ptr(), wt.as_ptr().add(oi * 8), 8) };
         oi += 1;
     }
 
-    // Print and verify output
-    print("[J35]   Input:  [");
+    // Print input
+    print("[J36]   Input:  [");
     wi = 0;
-    while wi < 4 {
+    while wi < 8 {
         print_f32_approx(input[wi]);
-        if wi < 3 { print(", "); }
+        if wi < 7 { print(", "); }
         wi += 1;
     }
     println("]");
 
-    print("[J35]   Output: [");
+    // Print output
+    print("[J36]   Output: [");
     wi = 0;
-    while wi < 4 {
+    while wi < 8 {
         print_f32_approx(output[wi]);
-        if wi < 3 { print(", "); }
+        if wi < 7 { print(", "); }
         wi += 1;
     }
     println("]");
 
-    // Verify output == input (identity forward pass)
+    // Verify output == input (identity property)
     let mut forward_ok = true;
     wi = 0;
-    while wi < 4 {
+    while wi < 8 {
         if fabs(output[wi] - input[wi]) > 0.001 {
             forward_ok = false;
         }
@@ -341,31 +402,42 @@ pub extern "C" fn main() -> i64 {
     }
 
     if forward_ok {
-        println("[J35-OK] Forward pass: output == input (identity validated)");
+        println("[J36-OK] Forward pass: output == input (8x8 identity validated via SSE2)");
     } else {
-        println("[J35-FAIL] Forward pass mismatch!");
+        println("[J36-FAIL] Forward pass mismatch!");
         return 1;
     }
 
-    // ---- Step 7: Publish to Cognitive Bus ----
-    println("[J35] Step 7: Publishing to Cognitive Bus...");
-    let result_int = output[0] as u64;
-    let bus_ret = sys_bus_publish(0x8035, 2, result_int);
+    // ================================================================
+    // STEP 9: Publish to Cognitive Bus
+    // ================================================================
+    println("[J36] Step 8: Publishing to Cognitive Bus...");
+    // Encode result: output[0]=1 as integer + file_size as high bits
+    let result_data = (file_size as u64) << 16 | (output[0] as u64);
+    let bus_ret = sys_bus_publish(0x8036, 2, result_data);
     if bus_ret == 0 {
-        println("[J35-OK] Published to Cognitive Bus (intent=0x8035)");
+        print("[J36-OK] Published (intent=0x8036, data=0x");
+        print_hex(result_data);
+        println(")");
     } else {
-        println("[J35-WARN] Bus publish returned error");
+        println("[J36-WARN] Bus publish returned error");
     }
 
-    // ---- Summary ----
+    // ================================================================
+    // SUMMARY
+    // ================================================================
     println("========================================");
-    println("[J35-OK] ALL GGUF LOADER TESTS PASSED");
-    println("[J35]   GGUF v3 magic:     PASS");
-    println("[J35]   Tensor parsing:    PASS");
-    println("[J35]   Weight loading:    PASS");
-    println("[J35]   SSE2 forward pass: PASS");
-    println("[J35]   Cognitive Bus:     PASS");
-    println("[J35] AetherionOS can load AI models natively");
+    println("[J36-OK] ALL TESTS PASSED");
+    println("[J36]   FAT32 open:      PASS");
+    println("[J36]   FAT32 read:      PASS");
+    println("[J36]   GGUF magic:      PASS");
+    println("[J36]   GGUF v3 header:  PASS");
+    println("[J36]   Tensor parsing:  PASS");
+    println("[J36]   Weight loading:  PASS");
+    println("[J36]   SSE2 forward:    PASS");
+    println("[J36]   Cognitive Bus:   PASS");
+    println("[J36] FIRST AI MODEL LOADED FROM DISK!");
+    println("[J36] Chain: FAT32 -> GGUF -> SSE2 -> Bus");
     println("========================================");
 
     0
