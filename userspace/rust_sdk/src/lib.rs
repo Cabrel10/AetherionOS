@@ -23,6 +23,7 @@
 
 #![no_std]
 #![feature(alloc_error_handler)]
+#![feature(naked_functions)]
 
 extern crate alloc;
 
@@ -575,14 +576,39 @@ fn print_u64_to_fd(fd: u32, val: u64) {
 // ============================================================
 // _start Entry Point
 // Calls user-defined main() and exits with its return value.
+//
+// IMPORTANT: _start is the ELF entry point, reached via IRETQ from the
+// kernel. RSP is ALREADY 16-byte aligned on entry (page-aligned stack top).
+// Unlike a normal function (where RSP = 8 mod 16 after the CALL pushes
+// the return address), _start sees RSP = 0 mod 16. We must NOT add any
+// extra push before calling main(); the CALL instruction itself will push
+// the return address, giving main() the standard ABI alignment (RSP = 8
+// mod 16 on entry). Using inline asm ensures the compiler doesn't insert
+// an extra push rax that would break stack alignment for movaps.
 // ============================================================
 
 extern "C" {
     fn main() -> i64;
 }
 
+/// Raw assembly _start: call main, then syscall exit with return value.
+/// Ensures no compiler-generated stack realignment that would break
+/// the 16-byte alignment invariant required by SSE movaps instructions.
+#[naked]
 #[no_mangle]
-pub extern "C" fn _start() -> ! {
-    let code = unsafe { main() };
-    sys_exit(code as i32);
+pub unsafe extern "C" fn _start() -> ! {
+    core::arch::asm!(
+        // RSP is 16-byte aligned here (from IRETQ).
+        // CALL pushes 8-byte return address -> RSP becomes 8 mod 16.
+        // This is exactly what the x86_64 SysV ABI expects on function entry.
+        "call main",
+        // main() returned in RAX. Use it as exit code.
+        "mov rdi, rax",      // exit code = main() return value
+        "mov eax, 60",       // syscall 60 = exit
+        "syscall",
+        // Unreachable: halt loop as safety net
+        "2: hlt",
+        "jmp 2b",
+        options(noreturn),
+    )
 }

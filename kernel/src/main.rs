@@ -107,6 +107,9 @@ static AGENT_SAGA_ELF: &[u8] = include_bytes!("../../userspace/c_apps/agent_saga
 /// agent_sse - Jalon 33 SSE/AVX Ring 3 validation agent
 static AGENT_SSE_ELF: &[u8] = include_bytes!("../../userspace/c_apps/agent_sse.elf");
 
+/// agent_ai_native - Jalon 34 Native Rust Tensor Engine (SSE2 matmul in Ring 3)
+static AGENT_AI_NATIVE_ELF: &[u8] = include_bytes!("../../userspace/agent_ai_native/target/x86_64-aetherion-user/release/agent_ai_native");
+
 // VGA text buffer
 const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
 const VGA_WIDTH: usize = 80;
@@ -1476,6 +1479,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     alloc::string::String::from("agent_sse.elf"),
                     fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_SSE_ELF)),
                 );
+                bin_dir.insert(
+                    alloc::string::String::from("agent_ai_native.elf"),
+                    fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_AI_NATIVE_ELF)),
+                );
                 serial_println!("       [OK] /bin/ls.elf ({} bytes)", LS_ELF.len());
                 serial_println!("       [OK] /bin/cat.elf ({} bytes)", CAT_ELF.len());
                 serial_println!("       [OK] /bin/j19_test.elf ({} bytes)", J19_TEST_ELF.len());
@@ -1489,6 +1496,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 serial_println!("       [OK] /bin/agent_rust.elf ({} bytes)", AGENT_RUST_ELF.len());
                 serial_println!("       [OK] /bin/agent_saga.elf ({} bytes)", AGENT_SAGA_ELF.len());
                 serial_println!("       [OK] /bin/agent_sse.elf ({} bytes)", AGENT_SSE_ELF.len());
+                serial_println!("       [OK] /bin/agent_ai_native.elf ({} bytes)", AGENT_AI_NATIVE_ELF.len());
             }
         }
     }
@@ -1516,7 +1524,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     if net::is_available() {
         serial_write("[RING 3] Launching j19_test.elf (Couche 19 Full Validation)\n");
     } else {
-        serial_write("[RING 3] Launching hello_c.elf + agent_sse.elf (Jalon 33)\n");
+        serial_write("[RING 3] Launching agent_ai_native.elf (Jalon 34 Tensor Engine)\n");
     }
     serial_write("========================================\n");
     {
@@ -1527,9 +1535,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             serial_println!("  [IPC] Drained {} old messages from Cognitive Bus", drained);
         }
 
-        // Jalon 33: Launch hello_c.elf as main, with agent_sse queued to run next.
-        let elf_binary = if net::is_available() { J19_TEST_ELF } else { HELLO_C_ELF };
-        let elf_name = if net::is_available() { "/bin/j19_test.elf" } else { "/bin/hello_c.elf" };
+        // Jalon 34: Launch agent_ai_native.elf for tensor engine validation.
+        let elf_binary = if net::is_available() { J19_TEST_ELF } else { AGENT_AI_NATIVE_ELF };
+        let elf_name = if net::is_available() { "/bin/j19_test.elf" } else { "/bin/agent_ai_native.elf" };
 
         // NOTE: Additional agent pre-loads disabled for J33 to avoid pre-existing
         // demand-paging issue with multiple ELF loads.
