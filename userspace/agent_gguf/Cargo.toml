@@ -1,0 +1,19 @@
+[package]
+name = "agent_gguf"
+version = "0.1.0"
+edition = "2021"
+authors = ["MORNINGSTAR <morningstar@aetherion.dev>"]
+description = "AetherionOS Jalon 35 - Native GGUF Model Loader in Ring 3"
+
+[[bin]]
+name = "agent_gguf"
+path = "src/main.rs"
+
+[dependencies]
+aetherion_sdk = { path = "../rust_sdk" }
+
+[profile.release]
+opt-level = 2
+lto = true
+panic = "abort"
+codegen-units = 1
