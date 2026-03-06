@@ -110,7 +110,7 @@ static AGENT_SSE_ELF: &[u8] = include_bytes!("../../userspace/c_apps/agent_sse.e
 /// agent_ai_native - Jalon 34 Native Rust Tensor Engine (SSE2 matmul in Ring 3)
 static AGENT_AI_NATIVE_ELF: &[u8] = include_bytes!("../../userspace/agent_ai_native/target/x86_64-aetherion-user/release/agent_ai_native");
 
-/// agent_gguf - Jalon 35 Native GGUF Model Loader (Ring 3)
+/// agent_gguf - Jalon 36 GGUF Model Loaded from FAT32 Disk (Ring 3)
 static AGENT_GGUF_ELF: &[u8] = include_bytes!("../../userspace/agent_gguf/target/x86_64-aetherion-user/release/agent_gguf");
 
 // VGA text buffer
@@ -1532,7 +1532,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     if net::is_available() {
         serial_write("[RING 3] Launching j19_test.elf (Couche 19 Full Validation)\n");
     } else {
-        serial_write("[RING 3] Launching agent_gguf.elf (Jalon 35 GGUF Loader)\n");
+        serial_write("[RING 3] Launching agent_gguf.elf (Jalon 36 GGUF from FAT32)\n");
     }
     serial_write("========================================\n");
     {
@@ -1543,7 +1543,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             serial_println!("  [IPC] Drained {} old messages from Cognitive Bus", drained);
         }
 
-        // Jalon 35: Launch agent_gguf.elf for GGUF model loading validation.
+        // Jalon 36: Launch agent_gguf.elf for GGUF loading from FAT32 disk.
         let elf_binary = if net::is_available() { J19_TEST_ELF } else { AGENT_GGUF_ELF };
         let elf_name = if net::is_available() { "/bin/j19_test.elf" } else { "/bin/agent_gguf.elf" };
 
