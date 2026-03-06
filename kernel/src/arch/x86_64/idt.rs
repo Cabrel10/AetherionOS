@@ -90,6 +90,10 @@ lazy_static! {
         idt[super::interrupts::PIC1_OFFSET as usize + 1]
             .set_handler_fn(keyboard_interrupt_handler);
 
+        // Mouse (IRQ 12 -> vector 44)
+        idt[super::interrupts::PIC2_OFFSET as usize + 4]
+            .set_handler_fn(mouse_interrupt_handler);
+
         idt
     };
 }
@@ -348,6 +352,19 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     // acknowledge the interrupt and re-enable subsequent keyboard IRQs.
     unsafe {
         super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET + 1);
+    }
+
+    // Push keyboard event to HID ring buffer for J38
+    crate::drivers::mouse::push_key_event(scancode, scancode & 0x80 != 0);
+}
+
+/// PS/2 Mouse IRQ 12 handler (Jalon 38)
+extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    crate::drivers::mouse::handle_irq();
+
+    // EOI for IRQ 12 (slave PIC vector 44)
+    unsafe {
+        super::interrupts::end_of_interrupt(super::interrupts::PIC2_OFFSET + 4);
     }
 }
 

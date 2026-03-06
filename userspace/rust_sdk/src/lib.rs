@@ -47,6 +47,15 @@ pub const SYS_EXIT:         u64 = 60;
 pub const SYS_WAIT:         u64 = 61;
 pub const SYS_BUS_PUBLISH:  u64 = 201;
 pub const SYS_VGA_WRITE:    u64 = 202;
+pub const SYS_NET_PING:     u64 = 210;
+pub const SYS_GETHOSTBYNAME:u64 = 211;
+pub const SYS_MMAP_FB:      u64 = 10;
+pub const SYS_POLL_HID:     u64 = 11;
+pub const SYS_FB_FILL_RECT: u64 = 220;
+pub const SYS_FB_DRAW_CHAR: u64 = 221;
+pub const SYS_FB_DRAW_STR:  u64 = 222;
+pub const SYS_FB_GET_INFO:  u64 = 223;
+pub const SYS_RDTSC:        u64 = 230;
 
 // POSIX open flags
 pub const O_RDONLY: u32 = 0;
@@ -335,6 +344,77 @@ impl AlmanacEntry {
     /// MAGIC header for almanac files (4 bytes): "ALMC"
     pub const MAGIC: [u8; 4] = [b'A', b'L', b'M', b'C'];
     pub const VERSION: u8 = 1;
+}
+
+// ============================================================
+// Network Syscalls (J37)
+// ============================================================
+
+/// Ping an IP address. ip is big-endian packed IPv4 (e.g. 0x08080808 for 8.8.8.8).
+/// Returns RTT in microseconds or negative error code.
+pub fn sys_net_ping(ip: u32, seq: u16) -> i64 {
+    syscall2(SYS_NET_PING, ip as u64, seq as u64) as i64
+}
+
+/// DNS query. Returns packed IPv4 in big-endian (network byte order) or 0 on failure.
+pub fn sys_gethostbyname(name: &[u8]) -> u32 {
+    syscall1(SYS_GETHOSTBYNAME, name.as_ptr() as u64) as u32
+}
+
+// ============================================================
+// Framebuffer Syscalls (J39)
+// ============================================================
+
+/// Map the framebuffer into user space. Returns virtual address.
+/// info_buf: pointer to 4 u64s [vaddr, width, height, stride]
+pub fn sys_mmap_fb(info_buf: &mut [u64; 4]) -> u64 {
+    syscall1(SYS_MMAP_FB, info_buf.as_mut_ptr() as u64)
+}
+
+/// Fill a rectangle on the framebuffer.
+/// Args packed: x | (y << 16) | (w << 32) | (h << 48) and color as ARGB.
+pub fn sys_fb_fill_rect(x: u32, y: u32, w: u32, h: u32, color: u32) -> i64 {
+    let packed_xy = (x as u64) | ((y as u64) << 16);
+    let packed_wh = (w as u64) | ((h as u64) << 16);
+    syscall3(SYS_FB_FILL_RECT, packed_xy, packed_wh, color as u64) as i64
+}
+
+/// Draw a character at (x, y) with color.
+pub fn sys_fb_draw_char(x: u32, y: u32, ch: u8, color: u32) -> i64 {
+    let packed = (x as u64) | ((y as u64) << 16) | ((ch as u64) << 32);
+    syscall2(SYS_FB_DRAW_CHAR, packed, color as u64) as i64
+}
+
+/// Draw a string at (x, y) with color.
+pub fn sys_fb_draw_string(x: u32, y: u32, s: &[u8], color: u32) -> i64 {
+    let packed_pos = (x as u64) | ((y as u64) << 16);
+    let packed_str = (s.as_ptr() as u64) | ((s.len() as u64) << 48);
+    syscall3(SYS_FB_DRAW_STR, packed_pos, packed_str, color as u64) as i64
+}
+
+/// Get framebuffer info. Returns 0 if no FB, or fills info_buf.
+pub fn sys_fb_get_info(info_buf: &mut [u64; 4]) -> u64 {
+    syscall1(SYS_FB_GET_INFO, info_buf.as_mut_ptr() as u64)
+}
+
+// ============================================================
+// HID Syscalls (J38)
+// ============================================================
+
+/// Poll one HID event. Returns packed u64:
+/// [type: u8, buttons: u8, dx: i16, dy: i16, scancode: u8, _pad: u8]
+/// Returns 0 if no event available.
+pub fn sys_poll_hid() -> u64 {
+    syscall1(SYS_POLL_HID, 0)
+}
+
+// ============================================================
+// Misc Syscalls (J40)
+// ============================================================
+
+/// Read TSC (timestamp counter). Returns 64-bit cycle count.
+pub fn sys_rdtsc() -> u64 {
+    syscall0(SYS_RDTSC)
 }
 
 // ============================================================

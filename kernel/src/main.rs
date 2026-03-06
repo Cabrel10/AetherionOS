@@ -113,6 +113,9 @@ static AGENT_AI_NATIVE_ELF: &[u8] = include_bytes!("../../userspace/agent_ai_nat
 /// agent_gguf - Jalon 36 GGUF Model Loaded from FAT32 Disk (Ring 3)
 static AGENT_GGUF_ELF: &[u8] = include_bytes!("../../userspace/agent_gguf/target/x86_64-aetherion-user/release/agent_gguf");
 
+/// agent_net - Jalon 37 Network Agent (Ring 3)
+static AGENT_NET_ELF: &[u8] = include_bytes!("../../userspace/agent_net/target/x86_64-aetherion-user/release/agent_net");
+
 // VGA text buffer
 const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
 const VGA_WIDTH: usize = 80;
@@ -1365,6 +1368,11 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     drivers::virtio_blk::init();
     drivers::virtio_blk::run_tests();
 
+    // PS/2 Mouse driver (Jalon 37/38)
+    serial_write("\n[17b/19] PS/2 Mouse Driver (Jalon 38)...\n");
+    drivers::mouse::init();
+    drivers::mouse::run_tests();
+
     serial_write("\n[18/19] FAT32 Filesystem (Couche 19)...\n");
     fs::fat32::init();
     fs::fat32::run_tests();
@@ -1490,6 +1498,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     alloc::string::String::from("agent_gguf.elf"),
                     fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_GGUF_ELF)),
                 );
+                bin_dir.insert(
+                    alloc::string::String::from("agent_net.elf"),
+                    fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_NET_ELF)),
+                );
                 serial_println!("       [OK] /bin/ls.elf ({} bytes)", LS_ELF.len());
                 serial_println!("       [OK] /bin/cat.elf ({} bytes)", CAT_ELF.len());
                 serial_println!("       [OK] /bin/j19_test.elf ({} bytes)", J19_TEST_ELF.len());
@@ -1505,6 +1517,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 serial_println!("       [OK] /bin/agent_sse.elf ({} bytes)", AGENT_SSE_ELF.len());
                 serial_println!("       [OK] /bin/agent_ai_native.elf ({} bytes)", AGENT_AI_NATIVE_ELF.len());
                 serial_println!("       [OK] /bin/agent_gguf.elf ({} bytes)", AGENT_GGUF_ELF.len());
+                serial_println!("       [OK] /bin/agent_net.elf ({} bytes)", AGENT_NET_ELF.len());
             }
         }
     }
@@ -1532,7 +1545,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     if net::is_available() {
         serial_write("[RING 3] Launching j19_test.elf (Couche 19 Full Validation)\n");
     } else {
-        serial_write("[RING 3] Launching agent_gguf.elf (Jalon 36 GGUF from FAT32)\n");
+        serial_write("[RING 3] Launching agent_net.elf (Jalon 37 Network Agent)\n");
     }
     serial_write("========================================\n");
     {
@@ -1543,9 +1556,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             serial_println!("  [IPC] Drained {} old messages from Cognitive Bus", drained);
         }
 
-        // Jalon 36: Launch agent_gguf.elf for GGUF loading from FAT32 disk.
-        let elf_binary = if net::is_available() { J19_TEST_ELF } else { AGENT_GGUF_ELF };
-        let elf_name = if net::is_available() { "/bin/j19_test.elf" } else { "/bin/agent_gguf.elf" };
+        // Jalon 37: Launch agent_net.elf for network testing in Ring 3.
+        let elf_binary = if net::is_available() { J19_TEST_ELF } else { AGENT_NET_ELF };
+        let elf_name = if net::is_available() { "/bin/j19_test.elf" } else { "/bin/agent_net.elf" };
 
         // NOTE: Additional agent pre-loads disabled for J33 to avoid pre-existing
         // demand-paging issue with multiple ELF loads.
