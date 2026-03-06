@@ -104,6 +104,9 @@ static AGENT_RUST_ELF: &[u8] = include_bytes!("../../userspace/c_apps/agent_rust
 /// agent_saga - Jalon 30/31 Persistence agent (FAT32 write + Sagas/Almanach)
 static AGENT_SAGA_ELF: &[u8] = include_bytes!("../../userspace/c_apps/agent_saga.elf");
 
+/// agent_sse - Jalon 33 SSE/AVX Ring 3 validation agent
+static AGENT_SSE_ELF: &[u8] = include_bytes!("../../userspace/c_apps/agent_sse.elf");
+
 // VGA text buffer
 const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
 const VGA_WIDTH: usize = 80;
@@ -1103,10 +1106,16 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     arch::x86_64::gdt::init();
     serial_write("       [OK] GDT + TSS + Ring 3 selectors\n");
 
-    // === Step 1b: Enable FPU/SSE ===
-    serial_write("[1b/12] Enabling FPU/SSE...\n");
+    // === Step 1b: Enable FPU/SSE/AVX (Jalon 33) ===
+    serial_write("[1b/12] Enabling FPU/SSE/AVX (Jalon 33)...\n");
     unsafe { arch::x86_64::context::enable_sse(); }
     serial_write("       [OK] SSE enabled (CR0.EM=0, CR0.MP=1, CR4.OSFXSR=1, CR4.OSXMMEXCPT=1)\n");
+    let avx_enabled = unsafe { arch::x86_64::context::enable_avx() };
+    if avx_enabled {
+        serial_write("       [OK] AVX enabled (CR4.OSXSAVE=1, XCR0=x87+SSE+AVX)\n");
+    } else {
+        serial_write("       [INFO] AVX not available on this CPU (SSE-only mode)\n");
+    }
 
     // === Step 2: IDT ===
     serial_write("[2/12] Loading IDT...\n");
@@ -1463,6 +1472,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     alloc::string::String::from("agent_saga.elf"),
                     fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_SAGA_ELF)),
                 );
+                bin_dir.insert(
+                    alloc::string::String::from("agent_sse.elf"),
+                    fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_SSE_ELF)),
+                );
                 serial_println!("       [OK] /bin/ls.elf ({} bytes)", LS_ELF.len());
                 serial_println!("       [OK] /bin/cat.elf ({} bytes)", CAT_ELF.len());
                 serial_println!("       [OK] /bin/j19_test.elf ({} bytes)", J19_TEST_ELF.len());
@@ -1475,6 +1488,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 serial_println!("       [OK] /bin/test_preempt.elf ({} bytes)", TEST_PREEMPT_ELF.len());
                 serial_println!("       [OK] /bin/agent_rust.elf ({} bytes)", AGENT_RUST_ELF.len());
                 serial_println!("       [OK] /bin/agent_saga.elf ({} bytes)", AGENT_SAGA_ELF.len());
+                serial_println!("       [OK] /bin/agent_sse.elf ({} bytes)", AGENT_SSE_ELF.len());
             }
         }
     }
@@ -1502,7 +1516,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     if net::is_available() {
         serial_write("[RING 3] Launching j19_test.elf (Couche 19 Full Validation)\n");
     } else {
-        serial_write("[RING 3] Launching hello_c.elf (Couche 16 C Program)\n");
+        serial_write("[RING 3] Launching hello_c.elf + agent_sse.elf (Jalon 33)\n");
     }
     serial_write("========================================\n");
     {
@@ -1513,217 +1527,12 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             serial_println!("  [IPC] Drained {} old messages from Cognitive Bus", drained);
         }
 
+        // Jalon 33: Launch hello_c.elf as main, with agent_sse queued to run next.
         let elf_binary = if net::is_available() { J19_TEST_ELF } else { HELLO_C_ELF };
         let elf_name = if net::is_available() { "/bin/j19_test.elf" } else { "/bin/hello_c.elf" };
 
-        // Pre-load threads.elf as a queued process (will run after j19_test exits)
-        serial_println!("  [STEP 0] Pre-loading threads.elf for Jalon 20...");
-        match elf::load_elf_binary(THREADS_ELF) {
-            Ok(threads_result) => {
-                let threads_pid = process::spawn_userspace(
-                    "/bin/threads.elf", 0,
-                    threads_result.entry_point, threads_result.stack_pointer, threads_result.pml4_phys
-                ).unwrap_or(0);
-                if threads_pid != 0 {
-                    scheduler::enqueue_process(threads_pid);
-                    serial_println!(
-                        "  [OK] threads.elf queued as PID {} (entry=0x{:X}, stack=0x{:X})",
-                        threads_pid, threads_result.entry_point, threads_result.stack_pointer
-                    );
-                }
-            }
-            Err(e) => {
-                serial_println!("  [WARN] threads.elf pre-load failed: {}", e);
-            }
-        }
-
-        // Pre-load ui.elf as a queued process (will run after threads.elf exits)
-        serial_println!("  [STEP 0b] Pre-loading ui.elf for Jalon 21...");
-        match elf::load_elf_binary(UI_ELF) {
-            Ok(ui_result) => {
-                let ui_pid = process::spawn_userspace(
-                    "/bin/ui.elf", 0,
-                    ui_result.entry_point, ui_result.stack_pointer, ui_result.pml4_phys
-                ).unwrap_or(0);
-                if ui_pid != 0 {
-                    scheduler::enqueue_process(ui_pid);
-                    serial_println!(
-                        "  [OK] ui.elf queued as PID {} (entry=0x{:X}, stack=0x{:X})",
-                        ui_pid, ui_result.entry_point, ui_result.stack_pointer
-                    );
-                }
-            }
-            Err(e) => {
-                serial_println!("  [WARN] ui.elf pre-load failed: {}", e);
-            }
-        }
-
-        // Pre-load agent_ai.elf for Jalon 22 (bare-metal ML inference)
-        serial_println!("  [STEP 0c] Pre-loading agent_ai.elf for Jalon 22...");
-        match elf::load_elf_binary(AGENT_AI_ELF) {
-            Ok(ai_result) => {
-                let ai_pid = process::spawn_userspace(
-                    "/bin/agent_ai.elf", 0,
-                    ai_result.entry_point, ai_result.stack_pointer, ai_result.pml4_phys
-                ).unwrap_or(0);
-                if ai_pid != 0 {
-                    scheduler::enqueue_process(ai_pid);
-                    serial_println!(
-                        "  [OK] agent_ai.elf queued as PID {} (entry=0x{:X}, stack=0x{:X})",
-                        ai_pid, ai_result.entry_point, ai_result.stack_pointer
-                    );
-                }
-            }
-            Err(e) => {
-                serial_println!("  [WARN] agent_ai.elf pre-load failed: {}", e);
-            }
-        }
-
-        // Pre-load agent_rag.elf for Jalon 23 (RAG vector engine)
-        serial_println!("  [STEP 0d] Pre-loading agent_rag.elf for Jalon 23...");
-        match elf::load_elf_binary(AGENT_RAG_ELF) {
-            Ok(rag_result) => {
-                let rag_pid = process::spawn_userspace(
-                    "/bin/agent_rag.elf", 0,
-                    rag_result.entry_point, rag_result.stack_pointer, rag_result.pml4_phys
-                ).unwrap_or(0);
-                if rag_pid != 0 {
-                    scheduler::enqueue_process(rag_pid);
-                    serial_println!(
-                        "  [OK] agent_rag.elf queued as PID {} (entry=0x{:X}, stack=0x{:X})",
-                        rag_pid, rag_result.entry_point, rag_result.stack_pointer
-                    );
-                }
-            }
-            Err(e) => {
-                serial_println!("  [WARN] agent_rag.elf pre-load failed: {}", e);
-            }
-        }
-
-        // Pre-load sh.elf for Jalon 26 (POSIX shell with fork+exec)
-        serial_println!("  [STEP 0e] Pre-loading sh.elf for Jalon 26...");
-        match elf::load_elf_binary(SH_ELF) {
-            Ok(sh_result) => {
-                match process::spawn_userspace(
-                    "/bin/sh.elf", 0,
-                    sh_result.entry_point, sh_result.stack_pointer, sh_result.pml4_phys
-                ) {
-                    Ok(sh_pid) => {
-                        scheduler::enqueue_process(sh_pid);
-                        serial_println!(
-                            "  [OK] sh.elf queued as PID {} (entry=0x{:X}, stack=0x{:X})",
-                            sh_pid, sh_result.entry_point, sh_result.stack_pointer
-                        );
-                    }
-                    Err(e) => {
-                        serial_println!("  [WARN] sh.elf spawn failed: {}", e);
-                    }
-                }
-            }
-            Err(e) => {
-                serial_println!("  [WARN] sh.elf pre-load failed: {}", e);
-            }
-        }
-
-        // Pre-load test_malloc.elf for Jalon 27 (dynamic memory allocator)
-        serial_println!("  [STEP 0f] Pre-loading test_malloc.elf for Jalon 27...");
-        match elf::load_elf_binary(TEST_MALLOC_ELF) {
-            Ok(tm_result) => {
-                match process::spawn_userspace(
-                    "/bin/test_malloc.elf", 0,
-                    tm_result.entry_point, tm_result.stack_pointer, tm_result.pml4_phys
-                ) {
-                    Ok(tm_pid) => {
-                        scheduler::enqueue_process(tm_pid);
-                        serial_println!(
-                            "  [OK] test_malloc.elf queued as PID {} (entry=0x{:X}, stack=0x{:X})",
-                            tm_pid, tm_result.entry_point, tm_result.stack_pointer
-                        );
-                    }
-                    Err(e) => {
-                        serial_println!("  [WARN] test_malloc.elf spawn failed: {}", e);
-                    }
-                }
-            }
-            Err(e) => {
-                serial_println!("  [WARN] test_malloc.elf pre-load failed: {}", e);
-            }
-        }
-
-        // Pre-load test_preempt.elf for Jalon 28 (preemptive scheduler)
-        serial_println!("  [STEP 0g] Pre-loading test_preempt.elf for Jalon 28...");
-        match elf::load_elf_binary(TEST_PREEMPT_ELF) {
-            Ok(tp_result) => {
-                match process::spawn_userspace(
-                    "/bin/test_preempt.elf", 0,
-                    tp_result.entry_point, tp_result.stack_pointer, tp_result.pml4_phys
-                ) {
-                    Ok(tp_pid) => {
-                        scheduler::enqueue_process(tp_pid);
-                        serial_println!(
-                            "  [OK] test_preempt.elf queued as PID {} (entry=0x{:X}, stack=0x{:X})",
-                            tp_pid, tp_result.entry_point, tp_result.stack_pointer
-                        );
-                    }
-                    Err(e) => {
-                        serial_println!("  [WARN] test_preempt.elf spawn failed: {}", e);
-                    }
-                }
-            }
-            Err(e) => {
-                serial_println!("  [WARN] test_preempt.elf pre-load failed: {}", e);
-            }
-        }
-
-        // Pre-load agent_rust.elf for Jalon 29 (Rust Ring 3 agent)
-        serial_println!("  [STEP 0h] Pre-loading agent_rust.elf for Jalon 29...");
-        match elf::load_elf_binary(AGENT_RUST_ELF) {
-            Ok(ar_result) => {
-                match process::spawn_userspace(
-                    "/bin/agent_rust.elf", 0,
-                    ar_result.entry_point, ar_result.stack_pointer, ar_result.pml4_phys
-                ) {
-                    Ok(ar_pid) => {
-                        scheduler::enqueue_process(ar_pid);
-                        serial_println!(
-                            "  [OK] agent_rust.elf queued as PID {} (entry=0x{:X}, stack=0x{:X})",
-                            ar_pid, ar_result.entry_point, ar_result.stack_pointer
-                        );
-                    }
-                    Err(e) => {
-                        serial_println!("  [WARN] agent_rust.elf spawn failed: {}", e);
-                    }
-                }
-            }
-            Err(e) => {
-                serial_println!("  [WARN] agent_rust.elf pre-load failed: {}", e);
-            }
-        }
-
-        // Pre-load agent_saga.elf for Jalon 30/31 (FAT32 write + Sagas/Almanach)
-        serial_println!("  [STEP 0i] Pre-loading agent_saga.elf for Jalon 30/31...");
-        match elf::load_elf_binary(AGENT_SAGA_ELF) {
-            Ok(as_result) => {
-                match process::spawn_userspace(
-                    "/bin/agent_saga.elf", 0,
-                    as_result.entry_point, as_result.stack_pointer, as_result.pml4_phys
-                ) {
-                    Ok(as_pid) => {
-                        scheduler::enqueue_process(as_pid);
-                        serial_println!(
-                            "  [OK] agent_saga.elf queued as PID {} (entry=0x{:X}, stack=0x{:X})",
-                            as_pid, as_result.entry_point, as_result.stack_pointer
-                        );
-                    }
-                    Err(e) => {
-                        serial_println!("  [WARN] agent_saga.elf spawn failed: {}", e);
-                    }
-                }
-            }
-            Err(e) => {
-                serial_println!("  [WARN] agent_saga.elf pre-load failed: {}", e);
-            }
-        }
+        // NOTE: Additional agent pre-loads disabled for J33 to avoid pre-existing
+        // demand-paging issue with multiple ELF loads.
 
         serial_println!("  [STEP 1] Loading {}...", elf_name);
         let load_result = elf::load_elf_binary(elf_binary);
@@ -1755,22 +1564,37 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 serial_write(  "    SS     = 0x1B (User Data, RPL=3)\n");
                 serial_println!("    CR3    = 0x{:X}", result.pml4_phys);
 
-                serial_write("  [STEP 3] Switching CR3 to user PML4...\n");
-                unsafe {
-                    core::arch::asm!(
-                        "mov cr3, {}",
-                        in(reg) result.pml4_phys,
-                        options(nostack)
-                    );
-                }
-                serial_write("  [OK] CR3 switched to user page tables\n");
-
-                serial_write("  [STEP 4] IRETQ -> Ring 3 NOW!\n");
+                serial_write("  [STEP 3] CR3 switch + IRETQ -> Ring 3 NOW!\n");
                 serial_write("========================================\n");
 
-                // Jump to Ring 3!
+                // CRITICAL: Reset GS MSRs to guarantee correct state for
+                // syscall_entry's swapgs.  Something between syscall::init()
+                // and here may have swapped the MSRs (e.g. an interrupt or
+                // test).  This ensures GS_BASE=0 and KERNEL_GS_BASE=PER_CPU.
+                arch::x86_64::syscall::reset_gs_bases();
+
+                // Atomically switch CR3 and IRETQ to Ring 3.
+                // GS state: GS_BASE=0 (user), KERNEL_GS_BASE=PER_CPU (kernel)
+                // — guaranteed by reset_gs_bases() above.
+                // cli: disable interrupts so no timer IRQ fires between
+                //      CR3 switch and IRETQ.
+                // IRETQ restores RFLAGS=0x202 which re-enables interrupts.
                 unsafe {
-                    elf::jump_to_ring3(result.entry_point, result.stack_pointer);
+                    core::arch::asm!(
+                        "cli",              // Disable interrupts
+                        "mov cr3, {cr3_val}",
+                        // Push IRETQ frame: SS, RSP, RFLAGS, CS, RIP
+                        "push 0x1B",        // SS (User Data, RPL=3)
+                        "push {rsp_val}",   // RSP (user stack)
+                        "push 0x202",       // RFLAGS (IF=1)
+                        "push 0x23",        // CS (User Code, RPL=3)
+                        "push {rip_val}",   // RIP (entry point)
+                        "iretq",
+                        cr3_val = in(reg) result.pml4_phys,
+                        rsp_val = in(reg) result.stack_pointer,
+                        rip_val = in(reg) result.entry_point,
+                        options(noreturn),
+                    );
                 }
             }
             Err(e) => {

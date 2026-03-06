@@ -36,9 +36,12 @@ echo "[OK] GCC: $(gcc --version | head -1)"
 echo ""
 echo "[SDK] Building libaetherion.a from sdk/c/ ..."
 
-# GCC flags for bare-metal x86_64 without SSE (kernel doesn't save FPU state)
+# GCC flags for bare-metal x86_64 WITH SSE2 (Jalon 33: SSE active in Ring 3)
+# The kernel enables SSE via CR0/CR4 before jumping to Ring 3, and the kernel
+# itself is built with -sse,+soft-float so it never touches XMM/YMM registers.
+# User FPU state therefore survives syscalls automatically.
 GCC_FLAGS="-nostdlib -fno-builtin -fno-stack-protector -ffreestanding \
-    -mno-sse -mno-sse2 -mno-mmx -mno-80387 -mno-red-zone \
+    -msse2 -mfpmath=sse -mno-mmx -mno-red-zone \
     -fno-PIC -fno-pic -O2 -Wall -Wextra -mcmodel=large"
 
 # Compile SDK source

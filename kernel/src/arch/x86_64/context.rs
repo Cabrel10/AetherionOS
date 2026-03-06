@@ -95,7 +95,7 @@ impl Default for TaskContext {
     }
 }
 
-/// Enable SSE/FPU support in CR0 and CR4.
+/// Enable SSE/SSE2 support in CR0 and CR4.
 /// Must be called once during kernel initialization before any
 /// floating-point or SSE instructions are used.
 ///
@@ -114,6 +114,76 @@ pub unsafe fn enable_sse() {
         out("rax") _,
         options(nostack, nomem),
     );
+}
+
+/// Check if the CPU supports AVX via CPUID.
+/// Returns true if the AVX bit is reported in CPUID.1:ECX.
+pub fn cpu_has_avx() -> bool {
+    let ecx: u32;
+    unsafe {
+        // CPUID clobbers EAX, EBX, ECX, EDX. RBX is callee-saved and used by LLVM,
+        // so we save/restore it manually.
+        asm!(
+            "push rbx",
+            "mov eax, 1",
+            "cpuid",
+            "pop rbx",
+            out("ecx") ecx,
+            out("eax") _,
+            out("edx") _,
+            options(nomem),
+        );
+    }
+    // ECX bit 28 = AVX
+    (ecx & (1 << 28)) != 0
+}
+
+/// Enable AVX support: set CR4.OSXSAVE, then configure XCR0
+/// to save/restore both SSE (XMM) and AVX (YMM) state.
+///
+/// Prerequisites: SSE must already be enabled via enable_sse().
+/// Returns true if AVX was successfully enabled.
+pub unsafe fn enable_avx() -> bool {
+    if !cpu_has_avx() {
+        return false;
+    }
+
+    // Set CR4.OSXSAVE (bit 18)
+    asm!(
+        "mov rax, cr4",
+        "or eax, (1 << 18)",  // OSXSAVE
+        "mov cr4, rax",
+        out("rax") _,
+        options(nostack, nomem),
+    );
+
+    // Set XCR0: bit 0 = x87, bit 1 = SSE (XMM), bit 2 = AVX (YMM)
+    asm!(
+        "xor ecx, ecx",      // XCR0
+        "xgetbv",
+        "or eax, 0x07",       // x87 + SSE + AVX
+        "xsetbv",
+        out("eax") _,
+        out("ecx") _,
+        out("edx") _,
+        options(nostack, nomem),
+    );
+
+    true
+}
+
+/// Initialize a default SSE/FPU state with proper MXCSR.
+/// This sets MXCSR to the Intel default (0x1F80) which masks
+/// all SIMD exceptions for safe Ring 3 execution.
+pub fn init_default_fpu_state(state: &mut FpuState) {
+    state.data = [0u8; 512];
+    // MXCSR is at offset 24 in the FXSAVE area
+    // Default value: 0x1F80 (all exceptions masked)
+    let mxcsr: u32 = 0x1F80;
+    state.data[24..28].copy_from_slice(&mxcsr.to_le_bytes());
+    // x87 FPU Control Word at offset 0: 0x037F (default)
+    let fcw: u16 = 0x037F;
+    state.data[0..2].copy_from_slice(&fcw.to_le_bytes());
 }
 
 /// Save FPU/SSE state to the given 512-byte aligned buffer.

@@ -36,12 +36,8 @@
 use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-/// Saved kernel RSP for parent resume after child threads complete.
-/// When sys_wait IRETQs to a child, we save the kernel stack pointer here.
-/// This RSP points to the stack frame with saved user registers from syscall_entry.
-/// On resume, we restore this RSP and return through the normal sysretq path,
-/// which restores all callee-saved registers correctly.
-static mut PARENT_RESUME_KERNEL_RSP: u64 = 0;
+// PARENT_RESUME_KERNEL_RSP is now stored in PER_CPU.saved_kernel_rsp (gs:[24])
+// to avoid R_X86_64_32S relocations in the naked syscall_entry function.
 
 // ===== MSR addresses =====
 const IA32_EFER: u32       = 0xC000_0080;
@@ -81,7 +77,7 @@ const O_CREAT: u32  = 0o100;  // 64
 const O_TRUNC: u32  = 0o1000; // 512
 
 // ===== Kernel syscall stack =====
-const KERNEL_SYSCALL_STACK_SIZE: usize = 262144; // 256 KiB - Deep call chains: SYSCALL -> VFS -> FAT32 -> VirtIO-Block -> serial
+const KERNEL_SYSCALL_STACK_SIZE: usize = 1048576; // 1 MiB - Deep call chains: SYSCALL -> VFS -> FAT32 -> VirtIO-Block -> serial
 
 #[repr(align(16))]
 struct AlignedStack([u8; KERNEL_SYSCALL_STACK_SIZE]);
@@ -89,18 +85,21 @@ struct AlignedStack([u8; KERNEL_SYSCALL_STACK_SIZE]);
 static mut SYSCALL_STACK: AlignedStack = AlignedStack([0; KERNEL_SYSCALL_STACK_SIZE]);
 
 /// Per-CPU data structure accessed via GS base after swapgs.
-/// Layout is ABI-critical: offset 0 = kernel_rsp, offset 8 = user_rsp, offset 16 = user_rip.
+/// Layout is ABI-critical: offset 0 = kernel_rsp, offset 8 = user_rsp, offset 16 = user_rip,
+/// offset 24 = saved_kernel_rsp (for sys_wait parent resume).
 #[repr(C)]
 struct PerCpuData {
-    kernel_rsp: u64,  // offset 0: kernel RSP loaded on SYSCALL entry
-    user_rsp: u64,    // offset 8: user RSP saved during SYSCALL
-    user_rip: u64,    // offset 16: user RIP saved on SYSCALL entry (from RCX)
+    kernel_rsp: u64,        // offset 0: kernel RSP loaded on SYSCALL entry
+    user_rsp: u64,          // offset 8: user RSP saved during SYSCALL
+    user_rip: u64,          // offset 16: user RIP saved on SYSCALL entry (from RCX)
+    saved_kernel_rsp: u64,  // offset 24: snapshot of kernel RSP after pushes (for sys_wait)
 }
 
 static mut PER_CPU: PerCpuData = PerCpuData {
     kernel_rsp: 0,
     user_rsp: 0,
     user_rip: 0,
+    saved_kernel_rsp: 0,
 };
 
 // ===== MSR helpers =====
@@ -190,10 +189,11 @@ unsafe extern "C" fn syscall_entry() {
         "push r14",
         "push r15",
 
-        // 3b. Save the kernel RSP (pointing to saved regs) into global.
+        // 3b. Save the kernel RSP (pointing to saved regs) into per-CPU data.
         // This is overwritten on every syscall; sys_wait copies it to the
         // process struct before launching a child thread.
-        "mov [{save_rsp}], rsp",
+        // Uses GS-relative access (gs:[24]) to avoid R_X86_64_32S relocations.
+        "mov gs:[24], rsp",
 
         // 4. Prepare arguments for Rust handler
         //    syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64)
@@ -204,8 +204,12 @@ unsafe extern "C" fn syscall_entry() {
         "mov rsi, rdi",    // 2nd arg = a1
         "mov rdi, rax",    // 1st arg = syscall number
 
+        // Align RSP to 16 bytes before calling Rust (ABI requirement)
+        "mov r15, rsp",          // save current RSP in r15 (already pushed)
+        "and rsp, -16",          // align to 16-byte boundary
         // Call the Rust dispatcher
         "call {handler}",
+        "mov rsp, r15",          // restore RSP (r15 will be popped next)
 
         // RAX = return value (set by Rust handler)
 
@@ -229,7 +233,6 @@ unsafe extern "C" fn syscall_entry() {
         "sysretq",
 
         handler = sym syscall_handler_rust,
-        save_rsp = sym PARENT_RESUME_KERNEL_RSP,
         options(noreturn),
     );
 }
@@ -238,8 +241,17 @@ unsafe extern "C" fn syscall_entry() {
 
 /// Route syscall by number (Linux x86_64 ABI).
 /// Returns result in RAX.
+///
+/// Jalon 33: The kernel is compiled with -sse,+soft-float so it NEVER
+/// touches XMM/YMM registers.  User FPU state therefore survives every
+/// syscall automatically — no fxsave/fxrstor needed in the fast path.
 #[no_mangle]
 extern "C" fn syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    syscall_dispatch(nr, a1, a2, a3)
+}
+
+/// Internal syscall dispatch (separated for FPU save/restore wrapper).
+fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     match nr {
         0  => sys_read(a1 as u32, a2, a3),
         1  => sys_write(a1, a2, a3),
@@ -761,7 +773,7 @@ fn sys_fork() -> u64 {
     // The kernel stack has: [r15, r14, r13, r12, rbx, rbp, r11(RFLAGS), rcx(RIP)]
     let parent_rip = saved_user_rip();
     let parent_rsp = saved_user_rsp();
-    let parent_kernel_rsp = unsafe { PARENT_RESUME_KERNEL_RSP };
+    let parent_kernel_rsp = unsafe { PER_CPU.saved_kernel_rsp };
     let saved_regs: [u64; 8] = if parent_kernel_rsp != 0 {
         let ptr = parent_kernel_rsp as *const u64;
         unsafe {
@@ -1415,9 +1427,9 @@ fn sys_wait(pid: u64) -> u64 {
     // Save the parent's user-mode return address so we can resume after threads
     let parent_rip = saved_user_rip();
     let parent_rsp = saved_user_rsp();
-    // PARENT_RESUME_KERNEL_RSP was set by syscall_entry for THIS syscall (parent's).
+    // PER_CPU.saved_kernel_rsp was set by syscall_entry for THIS syscall (parent's).
     // Save it now before any child syscalls overwrite it.
-    let parent_kernel_rsp = unsafe { PARENT_RESUME_KERNEL_RSP };
+    let parent_kernel_rsp = unsafe { PER_CPU.saved_kernel_rsp };
     // Copy the 8 saved registers from the kernel stack into the process struct.
     // The shared kernel syscall stack will be overwritten by child thread syscalls.
     // Stack layout (from RSP upward): r15, r14, r13, r12, rbx, rbp, r11(RFLAGS), rcx(RIP)
@@ -1912,6 +1924,21 @@ pub fn init() {
     }
 
     crate::serial_println!("[OK] SYSCALL/SYSRET fully configured (16 syscalls registered)");
+}
+
+/// Ensure GS_BASE = 0 (user) and KERNEL_GS_BASE = PER_CPU (kernel).
+/// Call this right before the initial IRETQ to Ring 3 to guarantee
+/// that syscall_entry's first swapgs will work correctly.
+pub fn reset_gs_bases() {
+    unsafe {
+        let per_cpu_addr = &PER_CPU as *const PerCpuData as u64;
+        wrmsr(IA32_KERNEL_GS_BASE, per_cpu_addr);
+        wrmsr(IA32_GS_BASE, 0);
+        crate::serial_println!(
+            "[SYSCALL] GS bases reset: GS_BASE=0, KERNEL_GS_BASE=0x{:X}",
+            per_cpu_addr
+        );
+    }
 }
 
 // ===== sys_mmap(addr, len, prot) =====
