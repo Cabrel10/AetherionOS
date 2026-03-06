@@ -285,6 +285,12 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         210 => sys_net_ping(a1, a2 as u16),
         211 => sys_gethostbyname(a1),
         212 => sys_tcp_read(a1 as u32, a2, a3),
+        11 => sys_poll_hid(),                     // Jalon 38: HID event polling
+        220 => sys_fb_fill_rect(a1, a2, a3),      // Jalon 39: Framebuffer fill rect
+        221 => sys_fb_draw_char(a1, a2),           // Jalon 39: Framebuffer draw char
+        222 => sys_fb_draw_string(a1, a2, a3),     // Jalon 39: Framebuffer draw string
+        223 => sys_fb_get_info(a1),                // Jalon 39: Framebuffer get info
+        230 => sys_rdtsc(),                        // Jalon 40: Read TSC
         _ => {
             crate::serial_println!("[SYSCALL] Unknown nr={} a1=0x{:X} a2=0x{:X} a3=0x{:X}", nr, a1, a2, a3);
             ENOSYS
@@ -2353,4 +2359,185 @@ fn sys_brk(new_break: u64) -> u64 {
     // Update process heap break
     crate::process::set_heap_break(current, new_break);
     new_break
+}
+
+// ===== sys_poll_hid() -> u64 (Jalon 38: HID Event Polling) =====
+/// Returns a packed HidEvent (8 bytes) or 0 if no events.
+fn sys_poll_hid() -> u64 {
+    crate::drivers::mouse::poll_event()
+}
+
+// ===== sys_fb_fill_rect(packed_xy, packed_wh, color) -> u64 (Jalon 39) =====
+/// Fill a rectangle on the framebuffer.
+/// packed_xy = x | (y << 16), packed_wh = w | (h << 16), color = ARGB32
+fn sys_fb_fill_rect(packed_xy: u64, packed_wh: u64, color: u64) -> u64 {
+    let x = (packed_xy & 0xFFFF) as u32;
+    let y = ((packed_xy >> 16) & 0xFFFF) as u32;
+    let w = (packed_wh & 0xFFFF) as u32;
+    let h = ((packed_wh >> 16) & 0xFFFF) as u32;
+    let col = color as u32;
+
+    let info = match crate::framebuffer::get_info() {
+        Some(i) => i,
+        None => return (-2i64) as u64, // ENOENT
+    };
+
+    // Direct framebuffer write (identity-mapped at FB physical address)
+    let fb_ptr = info.phys_addr as *mut u32;
+    let stride_px = info.stride / 4;
+
+    for row in y..(y + h).min(info.height) {
+        for col_x in x..(x + w).min(info.width) {
+            let offset = (row * stride_px + col_x) as isize;
+            unsafe { fb_ptr.offset(offset).write_volatile(col); }
+        }
+    }
+    0
+}
+
+// ===== sys_fb_draw_char(packed, color) -> u64 (Jalon 39) =====
+/// Draw a single character at (x, y) in the given color.
+/// packed = x | (y << 16) | (ch << 32)
+fn sys_fb_draw_char(packed: u64, color: u64) -> u64 {
+    let x = (packed & 0xFFFF) as u32;
+    let y = ((packed >> 16) & 0xFFFF) as u32;
+    let ch = ((packed >> 32) & 0xFF) as u8;
+    let col = color as u32;
+
+    let info = match crate::framebuffer::get_info() {
+        Some(i) => i,
+        None => return (-2i64) as u64,
+    };
+
+    draw_char_on_fb(&info, x, y, ch, col);
+    0
+}
+
+// ===== sys_fb_draw_string(packed_pos, packed_str, color) -> u64 (Jalon 39) =====
+/// Draw a string at (x, y). packed_str = ptr | (len << 48)
+fn sys_fb_draw_string(packed_pos: u64, packed_str: u64, color: u64) -> u64 {
+    let x = (packed_pos & 0xFFFF) as u32;
+    let y = ((packed_pos >> 16) & 0xFFFF) as u32;
+    let ptr = (packed_str & 0x0000_FFFF_FFFF_FFFF) as *const u8;
+    let len = (packed_str >> 48) as usize;
+    let col = color as u32;
+
+    if !validate_user_ptr(ptr as u64, len as u64) {
+        return (-14i64) as u64; // EFAULT
+    }
+
+    let info = match crate::framebuffer::get_info() {
+        Some(i) => i,
+        None => return (-2i64) as u64,
+    };
+
+    let mut cx = x;
+    for i in 0..len {
+        let ch = unsafe { core::ptr::read_volatile(ptr.add(i)) };
+        if ch == b'\n' {
+            // Newline handling ignored for simplicity
+            continue;
+        }
+        draw_char_on_fb(&info, cx, y, ch, col);
+        cx += 8; // 8 pixel char width
+    }
+    0
+}
+
+// ===== sys_fb_get_info(info_buf) -> u64 (Jalon 39) =====
+/// Write framebuffer info to user buffer: [width, height, stride, bpp]
+fn sys_fb_get_info(info_buf: u64) -> u64 {
+    let info = match crate::framebuffer::get_info() {
+        Some(i) => i,
+        None => return 0,
+    };
+
+    if info_buf != 0 && validate_user_ptr(info_buf, 32) {
+        unsafe {
+            let buf = info_buf as *mut u64;
+            core::ptr::write_volatile(buf, info.width as u64);
+            core::ptr::write_volatile(buf.add(1), info.height as u64);
+            core::ptr::write_volatile(buf.add(2), info.stride as u64);
+            core::ptr::write_volatile(buf.add(3), info.bpp as u64);
+        }
+    }
+    1
+}
+
+// ===== sys_rdtsc() -> u64 (Jalon 40) =====
+/// Read the Time Stamp Counter.
+fn sys_rdtsc() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe {
+        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack));
+    }
+    ((hi as u64) << 32) | (lo as u64)
+}
+
+// ===== 8x16 bitmap font for framebuffer text rendering =====
+/// Minimal 8x16 bitmap font covering ASCII 32-126
+/// Each character is 16 bytes (one byte per row, MSB-left)
+fn get_font_glyph(ch: u8) -> [u8; 16] {
+    // Simple built-in font for printable ASCII
+    // Returns a basic bitmap for common characters
+    let mut glyph = [0u8; 16];
+    match ch {
+        b' ' => {},
+        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => {
+            // Generate a simple recognizable pattern for each character
+            let idx = if ch >= b'a' { ch - b'a' } else if ch >= b'A' { ch - b'A' } else { ch - b'0' + 26 };
+            // Simple 8x16 block letters
+            let seed = idx as u16;
+            glyph[1] = 0x3C;
+            glyph[2] = 0x66;
+            glyph[3] = if seed & 1 != 0 { 0x6E } else { 0x66 };
+            glyph[4] = 0x66;
+            glyph[5] = if seed & 2 != 0 { 0x7E } else { 0x66 };
+            glyph[6] = 0x66;
+            glyph[7] = 0x66;
+            glyph[8] = if seed & 4 != 0 { 0x7E } else { 0x66 };
+            glyph[9] = 0x66;
+            glyph[10] = if seed & 8 != 0 { 0x6E } else { 0x66 };
+            glyph[11] = 0x66;
+            glyph[12] = 0x3C;
+        },
+        b'-' => { glyph[7] = 0x7E; glyph[8] = 0x7E; },
+        b'_' => { glyph[14] = 0xFF; },
+        b'.' => { glyph[12] = 0x18; glyph[13] = 0x18; },
+        b':' => { glyph[5] = 0x18; glyph[6] = 0x18; glyph[10] = 0x18; glyph[11] = 0x18; },
+        b'/' => { glyph[3] = 0x06; glyph[5] = 0x0C; glyph[7] = 0x18; glyph[9] = 0x30; glyph[11] = 0x60; },
+        b'(' => { glyph[2] = 0x0C; glyph[3] = 0x18; glyph[4] = 0x30; glyph[5] = 0x30; glyph[6] = 0x30; glyph[7] = 0x30; glyph[8] = 0x30; glyph[9] = 0x18; glyph[10] = 0x0C; },
+        b')' => { glyph[2] = 0x30; glyph[3] = 0x18; glyph[4] = 0x0C; glyph[5] = 0x0C; glyph[6] = 0x0C; glyph[7] = 0x0C; glyph[8] = 0x0C; glyph[9] = 0x18; glyph[10] = 0x30; },
+        b'[' => { glyph[2] = 0x3C; glyph[3] = 0x30; glyph[4] = 0x30; glyph[5] = 0x30; glyph[6] = 0x30; glyph[7] = 0x30; glyph[8] = 0x30; glyph[9] = 0x30; glyph[10] = 0x3C; },
+        b']' => { glyph[2] = 0x3C; glyph[3] = 0x0C; glyph[4] = 0x0C; glyph[5] = 0x0C; glyph[6] = 0x0C; glyph[7] = 0x0C; glyph[8] = 0x0C; glyph[9] = 0x0C; glyph[10] = 0x3C; },
+        b'=' => { glyph[5] = 0x7E; glyph[6] = 0x7E; glyph[9] = 0x7E; glyph[10] = 0x7E; },
+        b'|' => { for i in 2..13 { glyph[i] = 0x18; } },
+        _ => {
+            // Unknown: draw a filled block
+            for i in 1..15 { glyph[i] = 0x7E; }
+        }
+    }
+    glyph
+}
+
+/// Draw a single character on the framebuffer
+fn draw_char_on_fb(info: &crate::framebuffer::FramebufferInfo, x: u32, y: u32, ch: u8, color: u32) {
+    let glyph = get_font_glyph(ch);
+    let fb_ptr = info.phys_addr as *mut u32;
+    let stride_px = info.stride / 4;
+
+    for row in 0..16u32 {
+        let py = y + row;
+        if py >= info.height { break; }
+        let bits = glyph[row as usize];
+        for col in 0..8u32 {
+            let px = x + col;
+            if px >= info.width { break; }
+            if bits & (0x80 >> col) != 0 {
+                let offset = (py * stride_px + px) as isize;
+                unsafe { fb_ptr.offset(offset).write_volatile(color); }
+            }
+        }
+    }
 }

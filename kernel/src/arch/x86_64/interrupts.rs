@@ -57,10 +57,10 @@ pub fn init() {
         // Remap et initialise les PICs
         PICS.lock().initialize();
 
-        // Masque: enable timer (IRQ0), keyboard (IRQ1)
-        // 0xFC = 11111100 - active IRQ0, IRQ1
-        // 0xFF = 11111111 - désactive tous les IRQ esclave pour l'instant
-        PICS.lock().write_masks(0xFC, 0xFF);
+        // Masque: enable timer (IRQ0), keyboard (IRQ1), cascade (IRQ2)
+        // 0xF8 = 11111000 - active IRQ0, IRQ1, IRQ2 (cascade for slave PIC)
+        // 0xEF = 11101111 - active IRQ12 (PS/2 mouse) on slave
+        PICS.lock().write_masks(0xF8, 0xEF);
     }
 
     // Active les interruptions (instruction STI)
