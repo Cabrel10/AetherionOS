@@ -235,7 +235,8 @@ pub struct Process {
 }
 
 impl Process {
-    /// Create a new process with full parameters
+    /// Create a new process with full parameters.
+    /// FPU state is initialized with proper MXCSR defaults for safe Ring 3 SSE/AVX usage.
     pub fn new(name: &str, role: AgentRole, ppid: u64, uid: u32, gid: u32) -> Self {
         let priority = match role {
             AgentRole::Matriarch => 20,
@@ -243,6 +244,7 @@ impl Process {
             AgentRole::Worker => 5,
             AgentRole::KernelThread => 25,
         };
+        let fpu = FpuState::zero();
         Process {
             pid: alloc_pid(),
             ppid,
@@ -265,7 +267,7 @@ impl Process {
             saved_user_rsp: 0,
             saved_kernel_rsp: 0,
             saved_syscall_regs: [0; 8],
-            fpu_state: FpuState::zero(),
+            fpu_state: fpu,
             is_forked: false,
             heap_break: 0x0000_3000_0000_0000, // Initial heap base (PML4[96])
         }
