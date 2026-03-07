@@ -417,6 +417,18 @@ pub fn sys_rdtsc() -> u64 {
     syscall0(SYS_RDTSC)
 }
 
+/// Anonymous mmap: allocate `len` bytes of virtual memory.
+/// Returns the virtual address of the mapped region.
+pub fn sys_mmap(len: usize) -> u64 {
+    syscall3(SYS_MMAP, 0, len as u64, 0x3) // PROT_READ|PROT_WRITE
+}
+
+/// Seek a file descriptor to a given offset. Returns new offset.
+/// whence: 0=SEEK_SET, 1=SEEK_CUR
+pub fn sys_lseek(fd: u32, offset: i64, whence: u32) -> i64 {
+    syscall3(8, fd as u64, offset as u64, whence as u64) as i64
+}
+
 // ============================================================
 // Print Utilities
 // ============================================================

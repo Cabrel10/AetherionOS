@@ -131,6 +131,9 @@ static AGENT_WM_ELF: &[u8] = include_bytes!("../../userspace/agent_wm/target/x86
 /// agent_terminal - Jalon 42 Interactive Terminal Window (Ring 3)
 static AGENT_TERMINAL_ELF: &[u8] = include_bytes!("../../userspace/agent_terminal/target/x86_64-aetherion-user/release/agent_terminal");
 
+/// agent_multipart - Jalon 43 Multi-Part GGUF File Merger (Ring 3)
+static AGENT_MULTIPART_ELF: &[u8] = include_bytes!("../../userspace/agent_multipart/target/x86_64-aetherion-user/release/agent_multipart");
+
 // VGA text buffer
 const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
 const VGA_WIDTH: usize = 80;
@@ -1537,6 +1540,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     alloc::string::String::from("agent_terminal.elf"),
                     fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_TERMINAL_ELF)),
                 );
+                bin_dir.insert(
+                    alloc::string::String::from("agent_multipart.elf"),
+                    fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_MULTIPART_ELF)),
+                );
                 serial_println!("       [OK] /bin/ls.elf ({} bytes)", LS_ELF.len());
                 serial_println!("       [OK] /bin/cat.elf ({} bytes)", CAT_ELF.len());
                 serial_println!("       [OK] /bin/j19_test.elf ({} bytes)", J19_TEST_ELF.len());
@@ -1558,6 +1565,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 serial_println!("       [OK] /bin/agent_sysinfo.elf ({} bytes)", AGENT_SYSINFO_ELF.len());
                 serial_println!("       [OK] /bin/agent_wm.elf ({} bytes)", AGENT_WM_ELF.len());
                 serial_println!("       [OK] /bin/agent_terminal.elf ({} bytes)", AGENT_TERMINAL_ELF.len());
+                serial_println!("       [OK] /bin/agent_multipart.elf ({} bytes)", AGENT_MULTIPART_ELF.len());
             }
         }
     }
@@ -1582,11 +1590,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // Validates: DNS, TCP, FAT32, then Ring 3 multi-threading via sys_clone
     // ===================================================================
     serial_write("\n========================================\n");
-    if net::is_available() {
-        serial_write("[RING 3] Launching j19_test.elf (Couche 19 Full Validation)\n");
-    } else {
-        serial_write("[RING 3] Launching agent_terminal.elf (Jalon 42 Interactive Terminal)\n");
-    }
+    serial_write("[RING 3] Launching agent_multipart.elf (Jalon 43 Multi-Part GGUF Merge)\n");
     serial_write("========================================\n");
     {
         // Drain old messages from bus
@@ -1596,9 +1600,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             serial_println!("  [IPC] Drained {} old messages from Cognitive Bus", drained);
         }
 
-        // Jalon 42: Launch agent_terminal.elf for interactive terminal in Ring 3.
-        let elf_binary = if net::is_available() { J19_TEST_ELF } else { AGENT_TERMINAL_ELF };
-        let elf_name = if net::is_available() { "/bin/j19_test.elf" } else { "/bin/agent_terminal.elf" };
+        // Jalon 43: Launch agent_multipart.elf for multi-part GGUF merge in Ring 3.
+        let elf_binary = AGENT_MULTIPART_ELF;
+        let elf_name = "/bin/agent_multipart.elf";
 
         // NOTE: Additional agent pre-loads disabled for J33 to avoid pre-existing
         // demand-paging issue with multiple ELF loads.
