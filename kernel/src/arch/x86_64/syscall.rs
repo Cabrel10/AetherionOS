@@ -464,24 +464,43 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
     match path_and_offset {
         Some((path, offset)) => {
             // Route /disk/ paths directly to FAT32 for fresh reads
-            let data = if path.starts_with("/disk/") {
+            // Jalon 52: Use chunked read to avoid OOM on large files
+            let is_disk = path.starts_with("/disk/");
+            if is_disk {
                 let disk_path = &path[6..];
-                crate::serial_println!("[SYSCALL] sys_read: FAT32 read '{}' offset={}", disk_path, offset);
-                match crate::fs::fat32::read_file_path(disk_path) {
-                    Some(d) => d,
+                crate::serial_println!("[SYSCALL] sys_read: FAT32 chunked read '{}' offset={} len={}", disk_path, offset, len);
+                match crate::fs::fat32::read_file_path_chunk(disk_path, offset, len) {
+                    Some(chunk) => {
+                        let to_copy = chunk.len();
+                        if to_copy == 0 {
+                            return 0; // EOF
+                        }
+                        // Copy to user buffer
+                        unsafe {
+                            let dst = buf_addr as *mut u8;
+                            for i in 0..to_copy {
+                                core::ptr::write_volatile(dst.add(i), chunk[i]);
+                            }
+                        }
+                        // Update offset
+                        crate::process::with_fd_table_mut(current_pid, |fd_table| {
+                            if let Some(entry) = fd_table.get_mut(fd as usize) {
+                                entry.offset += to_copy as u64;
+                            }
+                        });
+                        return to_copy as u64;
+                    }
                     None => {
                         // Fallback to VFS
-                        match crate::fs::vfs::file_read(&path) {
-                            Ok(d) => d,
-                            Err(_) => return ENOENT,
-                        }
+                        crate::serial_println!("[SYSCALL] sys_read: FAT32 chunk read failed, fallback to VFS");
                     }
                 }
-            } else {
-                match crate::fs::vfs::file_read(&path) {
-                    Ok(d) => d,
-                    Err(_) => return ENOENT,
-                }
+            }
+
+            // VFS path (or FAT32 fallback)
+            let data = match crate::fs::vfs::file_read(&path) {
+                Ok(d) => d,
+                Err(_) => return ENOENT,
             };
 
             let start = offset as usize;
