@@ -1,0 +1,18 @@
+[package]
+name = "agent_weight_loader"
+version = "0.1.0"
+edition = "2021"
+description = "AetherionOS Jalon 54 - GGUF Weight Loader reads tensor metadata from disk"
+
+[[bin]]
+name = "agent_weight_loader"
+path = "src/main.rs"
+
+[dependencies]
+aetherion_sdk = { path = "../rust_sdk" }
+
+[profile.release]
+opt-level = 2
+lto = true
+panic = "abort"
+codegen-units = 1
