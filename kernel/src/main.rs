@@ -150,6 +150,9 @@ static AGENT_LLAMA_ELF: &[u8] = include_bytes!("../../userspace/agent_llama/targ
 /// agent_llm_chat - Jalon 50 LLM Chat via Cognitive Bus (Ring 3)
 static AGENT_LLM_CHAT_ELF: &[u8] = include_bytes!("../../userspace/agent_llm_chat/target/x86_64-aetherion-user/release/agent_llm_chat");
 
+/// agent_mt_matmul - Jalon 51 Multithreaded MatMul (Ring 3)
+static AGENT_MT_MATMUL_ELF: &[u8] = include_bytes!("../../userspace/agent_mt_matmul/target/x86_64-aetherion-user/release/agent_mt_matmul");
+
 // VGA text buffer
 const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
 const VGA_WIDTH: usize = 80;
@@ -1580,6 +1583,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     alloc::string::String::from("agent_llm_chat.elf"),
                     fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_LLM_CHAT_ELF)),
                 );
+                bin_dir.insert(
+                    alloc::string::String::from("agent_mt_matmul.elf"),
+                    fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_MT_MATMUL_ELF)),
+                );
                 serial_println!("       [OK] /bin/ls.elf ({} bytes)", LS_ELF.len());
                 serial_println!("       [OK] /bin/cat.elf ({} bytes)", CAT_ELF.len());
                 serial_println!("       [OK] /bin/j19_test.elf ({} bytes)", J19_TEST_ELF.len());
@@ -1607,6 +1614,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 serial_println!("       [OK] /bin/agent_inference.elf ({} bytes)", AGENT_INFERENCE_ELF.len());
                 serial_println!("       [OK] /bin/agent_llama.elf ({} bytes)", AGENT_LLAMA_ELF.len());
                 serial_println!("       [OK] /bin/agent_llm_chat.elf ({} bytes)", AGENT_LLM_CHAT_ELF.len());
+                serial_println!("       [OK] /bin/agent_mt_matmul.elf ({} bytes)", AGENT_MT_MATMUL_ELF.len());
             }
         }
     }
@@ -1641,9 +1649,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             serial_println!("  [IPC] Drained {} old messages from Cognitive Bus", drained);
         }
 
-        // Jalon 50: Launch agent_llm_chat.elf for LLM chat via Cognitive Bus in Ring 3.
-        let elf_binary = AGENT_LLM_CHAT_ELF;
-        let elf_name = "/bin/agent_llm_chat.elf";
+        // Jalon 51: Launch agent_mt_matmul.elf for multithreaded matmul in Ring 3.
+        let elf_binary = AGENT_MT_MATMUL_ELF;
+        let elf_name = "/bin/agent_mt_matmul.elf";
 
         // NOTE: Additional agent pre-loads disabled for J33 to avoid pre-existing
         // demand-paging issue with multiple ELF loads.

@@ -429,6 +429,26 @@ pub fn sys_lseek(fd: u32, offset: i64, whence: u32) -> i64 {
     syscall3(8, fd as u64, offset as u64, whence as u64) as i64
 }
 
+/// Clone (create a lightweight thread sharing the parent's address space).
+/// stack_ptr: top of a pre-allocated stack for the new thread.
+/// The function pointer must be written at (stack_ptr - 8) before calling.
+/// Returns: child PID to parent, 0 to child.
+pub fn sys_clone(stack_ptr: u64) -> i64 {
+    syscall1(SYS_CLONE, stack_ptr) as i64
+}
+
+/// Wait for a child process/thread to terminate.
+/// pid: child PID to wait for (0 = wait for any child).
+/// Returns: exit code of the child, or negative error.
+pub fn sys_wait(pid: u64) -> i64 {
+    syscall1(SYS_WAIT, pid) as i64
+}
+
+/// Yield the CPU to another ready process/thread.
+pub fn sys_yield_cpu() -> i64 {
+    syscall0(SYS_YIELD) as i64
+}
+
 // ============================================================
 // Print Utilities
 // ============================================================
