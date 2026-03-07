@@ -153,6 +153,9 @@ static AGENT_LLM_CHAT_ELF: &[u8] = include_bytes!("../../userspace/agent_llm_cha
 /// agent_mt_matmul - Jalon 51 Multithreaded MatMul (Ring 3)
 static AGENT_MT_MATMUL_ELF: &[u8] = include_bytes!("../../userspace/agent_mt_matmul/target/x86_64-aetherion-user/release/agent_mt_matmul");
 
+/// agent_chunk_reader - Jalon 53 Sequential Chunk Reader (Ring 3)
+static AGENT_CHUNK_READER_ELF: &[u8] = include_bytes!("../../userspace/agent_chunk_reader/target/x86_64-aetherion-user/release/agent_chunk_reader");
+
 // VGA text buffer
 const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
 const VGA_WIDTH: usize = 80;
@@ -1587,6 +1590,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     alloc::string::String::from("agent_mt_matmul.elf"),
                     fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_MT_MATMUL_ELF)),
                 );
+                bin_dir.insert(
+                    alloc::string::String::from("agent_chunk_reader.elf"),
+                    fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_CHUNK_READER_ELF)),
+                );
                 serial_println!("       [OK] /bin/ls.elf ({} bytes)", LS_ELF.len());
                 serial_println!("       [OK] /bin/cat.elf ({} bytes)", CAT_ELF.len());
                 serial_println!("       [OK] /bin/j19_test.elf ({} bytes)", J19_TEST_ELF.len());
@@ -1615,6 +1622,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 serial_println!("       [OK] /bin/agent_llama.elf ({} bytes)", AGENT_LLAMA_ELF.len());
                 serial_println!("       [OK] /bin/agent_llm_chat.elf ({} bytes)", AGENT_LLM_CHAT_ELF.len());
                 serial_println!("       [OK] /bin/agent_mt_matmul.elf ({} bytes)", AGENT_MT_MATMUL_ELF.len());
+                serial_println!("       [OK] /bin/agent_chunk_reader.elf ({} bytes)", AGENT_CHUNK_READER_ELF.len());
             }
         }
     }
@@ -1649,9 +1657,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             serial_println!("  [IPC] Drained {} old messages from Cognitive Bus", drained);
         }
 
-        // Jalon 52: Launch agent_multipart.elf to test FAT32 chunked reads.
-        let elf_binary = AGENT_MULTIPART_ELF;
-        let elf_name = "/bin/agent_multipart.elf";
+        // Jalon 53: Launch agent_chunk_reader.elf for sequential chunk read validation.
+        let elf_binary = AGENT_CHUNK_READER_ELF;
+        let elf_name = "/bin/agent_chunk_reader.elf";
 
         // NOTE: Additional agent pre-loads disabled for J33 to avoid pre-existing
         // demand-paging issue with multiple ELF loads.
