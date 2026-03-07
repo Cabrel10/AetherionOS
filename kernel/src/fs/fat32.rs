@@ -563,6 +563,64 @@ impl Fat32Fs {
         Some(data)
     }
 
+    /// Jalon 52: Read a chunk of a file without loading the entire file into memory.
+    /// Navigates the cluster chain to skip to the correct offset, then reads only
+    /// the needed clusters. This prevents OOM for large files (e.g., 2 GB models).
+    pub fn read_file_chunk(&self, start_cluster: u32, file_size: u32, offset: u64, len: u64) -> Option<Vec<u8>> {
+        let file_size = file_size as u64;
+        if offset >= file_size {
+            return Some(Vec::new()); // EOF
+        }
+
+        let cluster_size = self.bpb.cluster_size() as u64;
+        if cluster_size == 0 { return None; }
+
+        // How many bytes we actually want
+        let available = file_size - offset;
+        let to_read = core::cmp::min(available, len) as usize;
+        if to_read == 0 {
+            return Some(Vec::new());
+        }
+
+        // Skip clusters to reach the offset
+        let clusters_to_skip = offset / cluster_size;
+        let offset_in_cluster = (offset % cluster_size) as usize;
+
+        let mut cluster = start_cluster;
+        for _ in 0..clusters_to_skip {
+            cluster = self.next_cluster(cluster)?;
+        }
+
+        // Now read from 'cluster' at 'offset_in_cluster', collecting 'to_read' bytes
+        let mut result = Vec::with_capacity(to_read);
+        let mut remaining = to_read;
+        let mut first = true;
+        let mut iterations = 0u32;
+
+        loop {
+            if remaining == 0 || iterations > 10000 { break; }
+            iterations += 1;
+
+            let cluster_data = self.read_cluster(cluster)?;
+            let start_in_cluster = if first { offset_in_cluster } else { 0 };
+            first = false;
+
+            let avail_in_cluster = cluster_data.len() - start_in_cluster;
+            let to_copy = core::cmp::min(remaining, avail_in_cluster);
+            result.extend_from_slice(&cluster_data[start_in_cluster..start_in_cluster + to_copy]);
+            remaining -= to_copy;
+
+            if remaining == 0 { break; }
+
+            match self.next_cluster(cluster) {
+                Some(next) => cluster = next,
+                None => break,
+            }
+        }
+
+        Some(result)
+    }
+
     /// Find and read a file in a subdirectory
     pub fn read_file_in_dir(&self, dir_cluster: u32, name: &str) -> Option<Vec<u8>> {
         let entries = self.list_directory(dir_cluster);
@@ -949,6 +1007,33 @@ pub fn read_file_path(disk_path: &str) -> Option<Vec<u8>> {
             crate::serial_println!("[FAT32] read_file_path: SUCCESS '{}' = {} bytes", disk_path, data.len());
         } else {
             crate::serial_println!("[FAT32] read_file_path: file '{}' not found in cluster {}", filename, dir_cluster);
+        }
+        result
+    }
+}
+
+/// Jalon 52: Read a chunk of a file by path, using offset-based cluster navigation.
+/// This avoids loading the entire file into kernel heap, preventing OOM for large files.
+/// `disk_path` is relative to /disk/ (e.g. "models/part1").
+pub fn read_file_path_chunk(disk_path: &str, offset: u64, len: u64) -> Option<Vec<u8>> {
+    unsafe {
+        let fs = match FAT32_FS {
+            Some(ref f) => f,
+            None => return None,
+        };
+
+        // Find the directory entry to get start_cluster and file_size
+        let entry = fs.find_directory_entry(disk_path)?;
+        if entry.is_directory {
+            return None;
+        }
+
+        crate::serial_println!("[FAT32] read_file_path_chunk: '{}' offset={} len={} file_size={}",
+            disk_path, offset, len, entry.file_size);
+
+        let result = fs.read_file_chunk(entry.first_cluster, entry.file_size, offset, len);
+        if let Some(ref data) = result {
+            crate::serial_println!("[FAT32] read_file_path_chunk: OK, returned {} bytes", data.len());
         }
         result
     }

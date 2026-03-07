@@ -1649,9 +1649,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             serial_println!("  [IPC] Drained {} old messages from Cognitive Bus", drained);
         }
 
-        // Jalon 51: Launch agent_mt_matmul.elf for multithreaded matmul in Ring 3.
-        let elf_binary = AGENT_MT_MATMUL_ELF;
-        let elf_name = "/bin/agent_mt_matmul.elf";
+        // Jalon 52: Launch agent_multipart.elf to test FAT32 chunked reads.
+        let elf_binary = AGENT_MULTIPART_ELF;
+        let elf_name = "/bin/agent_multipart.elf";
 
         // NOTE: Additional agent pre-loads disabled for J33 to avoid pre-existing
         // demand-paging issue with multiple ELF loads.
