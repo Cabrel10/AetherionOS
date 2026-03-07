@@ -1,0 +1,18 @@
+[package]
+name = "agent_tokenizer"
+version = "0.1.0"
+edition = "2021"
+description = "AetherionOS Jalon 46 - Static BPE Tokenizer Agent (Ring 3)"
+
+[[bin]]
+name = "agent_tokenizer"
+path = "src/main.rs"
+
+[dependencies]
+aetherion_sdk = { path = "../rust_sdk" }
+
+[profile.release]
+opt-level = 2
+lto = true
+panic = "abort"
+codegen-units = 1
