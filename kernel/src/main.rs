@@ -140,6 +140,9 @@ static AGENT_BENCH_ELF: &[u8] = include_bytes!("../../userspace/agent_bench/targ
 /// agent_tokenizer - Jalon 46 Static BPE Tokenizer (Ring 3)
 static AGENT_TOKENIZER_ELF: &[u8] = include_bytes!("../../userspace/agent_tokenizer/target/x86_64-aetherion-user/release/agent_tokenizer");
 
+/// agent_inference - Jalon 47 GGUF Tensor Metadata Inspector (Ring 3)
+static AGENT_INFERENCE_ELF: &[u8] = include_bytes!("../../userspace/agent_inference/target/x86_64-aetherion-user/release/agent_inference");
+
 // VGA text buffer
 const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
 const VGA_WIDTH: usize = 80;
@@ -1558,6 +1561,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     alloc::string::String::from("agent_tokenizer.elf"),
                     fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_TOKENIZER_ELF)),
                 );
+                bin_dir.insert(
+                    alloc::string::String::from("agent_inference.elf"),
+                    fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_INFERENCE_ELF)),
+                );
                 serial_println!("       [OK] /bin/ls.elf ({} bytes)", LS_ELF.len());
                 serial_println!("       [OK] /bin/cat.elf ({} bytes)", CAT_ELF.len());
                 serial_println!("       [OK] /bin/j19_test.elf ({} bytes)", J19_TEST_ELF.len());
@@ -1582,6 +1589,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 serial_println!("       [OK] /bin/agent_multipart.elf ({} bytes)", AGENT_MULTIPART_ELF.len());
                 serial_println!("       [OK] /bin/agent_bench.elf ({} bytes)", AGENT_BENCH_ELF.len());
                 serial_println!("       [OK] /bin/agent_tokenizer.elf ({} bytes)", AGENT_TOKENIZER_ELF.len());
+                serial_println!("       [OK] /bin/agent_inference.elf ({} bytes)", AGENT_INFERENCE_ELF.len());
             }
         }
     }
@@ -1616,9 +1624,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             serial_println!("  [IPC] Drained {} old messages from Cognitive Bus", drained);
         }
 
-        // Jalon 46: Launch agent_tokenizer.elf for tokenizer round-trip in Ring 3.
-        let elf_binary = AGENT_TOKENIZER_ELF;
-        let elf_name = "/bin/agent_tokenizer.elf";
+        // Jalon 47: Launch agent_inference.elf for GGUF tensor inspection in Ring 3.
+        let elf_binary = AGENT_INFERENCE_ELF;
+        let elf_name = "/bin/agent_inference.elf";
 
         // NOTE: Additional agent pre-loads disabled for J33 to avoid pre-existing
         // demand-paging issue with multiple ELF loads.
