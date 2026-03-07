@@ -2477,49 +2477,9 @@ fn sys_rdtsc() -> u64 {
 }
 
 // ===== 8x16 bitmap font for framebuffer text rendering =====
-/// Minimal 8x16 bitmap font covering ASCII 32-126
-/// Each character is 16 bytes (one byte per row, MSB-left)
+/// Minimal 8x16 bitmap font - delegates to kernel/src/font.rs (Jalon 48)
 fn get_font_glyph(ch: u8) -> [u8; 16] {
-    // Simple built-in font for printable ASCII
-    // Returns a basic bitmap for common characters
-    let mut glyph = [0u8; 16];
-    match ch {
-        b' ' => {},
-        b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' => {
-            // Generate a simple recognizable pattern for each character
-            let idx = if ch >= b'a' { ch - b'a' } else if ch >= b'A' { ch - b'A' } else { ch - b'0' + 26 };
-            // Simple 8x16 block letters
-            let seed = idx as u16;
-            glyph[1] = 0x3C;
-            glyph[2] = 0x66;
-            glyph[3] = if seed & 1 != 0 { 0x6E } else { 0x66 };
-            glyph[4] = 0x66;
-            glyph[5] = if seed & 2 != 0 { 0x7E } else { 0x66 };
-            glyph[6] = 0x66;
-            glyph[7] = 0x66;
-            glyph[8] = if seed & 4 != 0 { 0x7E } else { 0x66 };
-            glyph[9] = 0x66;
-            glyph[10] = if seed & 8 != 0 { 0x6E } else { 0x66 };
-            glyph[11] = 0x66;
-            glyph[12] = 0x3C;
-        },
-        b'-' => { glyph[7] = 0x7E; glyph[8] = 0x7E; },
-        b'_' => { glyph[14] = 0xFF; },
-        b'.' => { glyph[12] = 0x18; glyph[13] = 0x18; },
-        b':' => { glyph[5] = 0x18; glyph[6] = 0x18; glyph[10] = 0x18; glyph[11] = 0x18; },
-        b'/' => { glyph[3] = 0x06; glyph[5] = 0x0C; glyph[7] = 0x18; glyph[9] = 0x30; glyph[11] = 0x60; },
-        b'(' => { glyph[2] = 0x0C; glyph[3] = 0x18; glyph[4] = 0x30; glyph[5] = 0x30; glyph[6] = 0x30; glyph[7] = 0x30; glyph[8] = 0x30; glyph[9] = 0x18; glyph[10] = 0x0C; },
-        b')' => { glyph[2] = 0x30; glyph[3] = 0x18; glyph[4] = 0x0C; glyph[5] = 0x0C; glyph[6] = 0x0C; glyph[7] = 0x0C; glyph[8] = 0x0C; glyph[9] = 0x18; glyph[10] = 0x30; },
-        b'[' => { glyph[2] = 0x3C; glyph[3] = 0x30; glyph[4] = 0x30; glyph[5] = 0x30; glyph[6] = 0x30; glyph[7] = 0x30; glyph[8] = 0x30; glyph[9] = 0x30; glyph[10] = 0x3C; },
-        b']' => { glyph[2] = 0x3C; glyph[3] = 0x0C; glyph[4] = 0x0C; glyph[5] = 0x0C; glyph[6] = 0x0C; glyph[7] = 0x0C; glyph[8] = 0x0C; glyph[9] = 0x0C; glyph[10] = 0x3C; },
-        b'=' => { glyph[5] = 0x7E; glyph[6] = 0x7E; glyph[9] = 0x7E; glyph[10] = 0x7E; },
-        b'|' => { for i in 2..13 { glyph[i] = 0x18; } },
-        _ => {
-            // Unknown: draw a filled block
-            for i in 1..15 { glyph[i] = 0x7E; }
-        }
-    }
-    glyph
+    crate::font::get_font_glyph(ch)
 }
 
 /// Draw a single character on the framebuffer

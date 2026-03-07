@@ -60,6 +60,7 @@ mod elf;
 mod net;
 mod drivers;
 mod framebuffer;
+mod font;
 
 // ===== Configuration =====
 const KERNEL_VERSION: &str = "1.9.0-couche19-storage";
