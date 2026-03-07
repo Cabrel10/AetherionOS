@@ -2382,8 +2382,9 @@ fn sys_fb_fill_rect(packed_xy: u64, packed_wh: u64, color: u64) -> u64 {
         None => return (-2i64) as u64, // ENOENT
     };
 
-    // Direct framebuffer write (identity-mapped at FB physical address)
-    let fb_ptr = info.phys_addr as *mut u32;
+    // Access FB via bootloader physical memory offset mapping
+    let fb_vaddr = crate::elf::phys_offset() + info.phys_addr;
+    let fb_ptr = fb_vaddr as *mut u32;
     let stride_px = info.stride / 4;
 
     for row in y..(y + h).min(info.height) {
@@ -2524,7 +2525,8 @@ fn get_font_glyph(ch: u8) -> [u8; 16] {
 /// Draw a single character on the framebuffer
 fn draw_char_on_fb(info: &crate::framebuffer::FramebufferInfo, x: u32, y: u32, ch: u8, color: u32) {
     let glyph = get_font_glyph(ch);
-    let fb_ptr = info.phys_addr as *mut u32;
+    let fb_vaddr = crate::elf::phys_offset() + info.phys_addr;
+    let fb_ptr = fb_vaddr as *mut u32;
     let stride_px = info.stride / 4;
 
     for row in 0..16u32 {
