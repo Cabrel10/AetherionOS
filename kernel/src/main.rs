@@ -137,6 +137,9 @@ static AGENT_MULTIPART_ELF: &[u8] = include_bytes!("../../userspace/agent_multip
 /// agent_bench - Jalon 45 VirtIO Block I/O Benchmark (Ring 3)
 static AGENT_BENCH_ELF: &[u8] = include_bytes!("../../userspace/agent_bench/target/x86_64-aetherion-user/release/agent_bench");
 
+/// agent_tokenizer - Jalon 46 Static BPE Tokenizer (Ring 3)
+static AGENT_TOKENIZER_ELF: &[u8] = include_bytes!("../../userspace/agent_tokenizer/target/x86_64-aetherion-user/release/agent_tokenizer");
+
 // VGA text buffer
 const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
 const VGA_WIDTH: usize = 80;
@@ -1551,6 +1554,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     alloc::string::String::from("agent_bench.elf"),
                     fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_BENCH_ELF)),
                 );
+                bin_dir.insert(
+                    alloc::string::String::from("agent_tokenizer.elf"),
+                    fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_TOKENIZER_ELF)),
+                );
                 serial_println!("       [OK] /bin/ls.elf ({} bytes)", LS_ELF.len());
                 serial_println!("       [OK] /bin/cat.elf ({} bytes)", CAT_ELF.len());
                 serial_println!("       [OK] /bin/j19_test.elf ({} bytes)", J19_TEST_ELF.len());
@@ -1574,6 +1581,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 serial_println!("       [OK] /bin/agent_terminal.elf ({} bytes)", AGENT_TERMINAL_ELF.len());
                 serial_println!("       [OK] /bin/agent_multipart.elf ({} bytes)", AGENT_MULTIPART_ELF.len());
                 serial_println!("       [OK] /bin/agent_bench.elf ({} bytes)", AGENT_BENCH_ELF.len());
+                serial_println!("       [OK] /bin/agent_tokenizer.elf ({} bytes)", AGENT_TOKENIZER_ELF.len());
             }
         }
     }
@@ -1608,9 +1616,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             serial_println!("  [IPC] Drained {} old messages from Cognitive Bus", drained);
         }
 
-        // Jalon 45: Launch agent_bench.elf for I/O benchmark in Ring 3.
-        let elf_binary = AGENT_BENCH_ELF;
-        let elf_name = "/bin/agent_bench.elf";
+        // Jalon 46: Launch agent_tokenizer.elf for tokenizer round-trip in Ring 3.
+        let elf_binary = AGENT_TOKENIZER_ELF;
+        let elf_name = "/bin/agent_tokenizer.elf";
 
         // NOTE: Additional agent pre-loads disabled for J33 to avoid pre-existing
         // demand-paging issue with multiple ELF loads.
