@@ -128,6 +128,9 @@ static AGENT_SYSINFO_ELF: &[u8] = include_bytes!("../../userspace/agent_sysinfo/
 /// agent_wm - Jalon 41 Cognitive Desktop Window Manager (Ring 3)
 static AGENT_WM_ELF: &[u8] = include_bytes!("../../userspace/agent_wm/target/x86_64-aetherion-user/release/agent_wm");
 
+/// agent_terminal - Jalon 42 Interactive Terminal Window (Ring 3)
+static AGENT_TERMINAL_ELF: &[u8] = include_bytes!("../../userspace/agent_terminal/target/x86_64-aetherion-user/release/agent_terminal");
+
 // VGA text buffer
 const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
 const VGA_WIDTH: usize = 80;
@@ -1530,6 +1533,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     alloc::string::String::from("agent_wm.elf"),
                     fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_WM_ELF)),
                 );
+                bin_dir.insert(
+                    alloc::string::String::from("agent_terminal.elf"),
+                    fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_TERMINAL_ELF)),
+                );
                 serial_println!("       [OK] /bin/ls.elf ({} bytes)", LS_ELF.len());
                 serial_println!("       [OK] /bin/cat.elf ({} bytes)", CAT_ELF.len());
                 serial_println!("       [OK] /bin/j19_test.elf ({} bytes)", J19_TEST_ELF.len());
@@ -1550,6 +1557,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 serial_println!("       [OK] /bin/agent_gui_test.elf ({} bytes)", AGENT_GUI_TEST_ELF.len());
                 serial_println!("       [OK] /bin/agent_sysinfo.elf ({} bytes)", AGENT_SYSINFO_ELF.len());
                 serial_println!("       [OK] /bin/agent_wm.elf ({} bytes)", AGENT_WM_ELF.len());
+                serial_println!("       [OK] /bin/agent_terminal.elf ({} bytes)", AGENT_TERMINAL_ELF.len());
             }
         }
     }
@@ -1577,7 +1585,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     if net::is_available() {
         serial_write("[RING 3] Launching j19_test.elf (Couche 19 Full Validation)\n");
     } else {
-        serial_write("[RING 3] Launching agent_wm.elf (Jalon 41 Cognitive Desktop)\n");
+        serial_write("[RING 3] Launching agent_terminal.elf (Jalon 42 Interactive Terminal)\n");
     }
     serial_write("========================================\n");
     {
@@ -1588,9 +1596,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             serial_println!("  [IPC] Drained {} old messages from Cognitive Bus", drained);
         }
 
-        // Jalon 41: Launch agent_wm.elf for window manager in Ring 3.
-        let elf_binary = if net::is_available() { J19_TEST_ELF } else { AGENT_WM_ELF };
-        let elf_name = if net::is_available() { "/bin/j19_test.elf" } else { "/bin/agent_wm.elf" };
+        // Jalon 42: Launch agent_terminal.elf for interactive terminal in Ring 3.
+        let elf_binary = if net::is_available() { J19_TEST_ELF } else { AGENT_TERMINAL_ELF };
+        let elf_name = if net::is_available() { "/bin/j19_test.elf" } else { "/bin/agent_terminal.elf" };
 
         // NOTE: Additional agent pre-loads disabled for J33 to avoid pre-existing
         // demand-paging issue with multiple ELF loads.
