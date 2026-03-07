@@ -1,0 +1,18 @@
+[package]
+name = "agent_bench"
+version = "0.1.0"
+edition = "2021"
+description = "AetherionOS Jalon 45 - VirtIO Block I/O Benchmark Agent (Ring 3)"
+
+[[bin]]
+name = "agent_bench"
+path = "src/main.rs"
+
+[dependencies]
+aetherion_sdk = { path = "../rust_sdk" }
+
+[profile.release]
+opt-level = 2
+lto = true
+panic = "abort"
+codegen-units = 1
