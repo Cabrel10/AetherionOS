@@ -16,7 +16,8 @@ use spin::Mutex;
 use lazy_static::lazy_static;
 
 /// Maximum bus capacity (number of messages)
-const BUS_CAPACITY: usize = 128;
+/// J43: increased from 128 to 1024 for large-model IPC traffic
+const BUS_CAPACITY: usize = 1024;
 
 /// Priority-aware message wrapper for BinaryHeap ordering.
 ///

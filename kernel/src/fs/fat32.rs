@@ -587,8 +587,11 @@ impl Fat32Fs {
             let entries = self.list_directory(current_cluster);
             let mut found = false;
 
+            crate::serial_println!("[FAT32] navigate_to_dir: looking for '{}' in cluster {}", target, current_cluster);
+
             for entry in &entries {
                 if entry.name == target && entry.is_directory {
+                    crate::serial_println!("[FAT32] navigate_to_dir: found dir '{}' -> cluster {}", entry.name, entry.first_cluster);
                     current_cluster = entry.first_cluster;
                     found = true;
                     break;
@@ -596,12 +599,64 @@ impl Fat32Fs {
             }
 
             if !found {
-                crate::serial_println!("[FAT32] Directory component '{}' not found", component);
+                crate::serial_println!("[FAT32] Directory component '{}' not found in cluster {}", component, current_cluster);
                 return None;
             }
         }
 
         Some(current_cluster)
+    }
+
+    /// Find a directory entry by path (supports recursive subdirectories).
+    /// Path format: "models/mistral_part_aa" (no leading slash).
+    /// Returns the Fat32DirEntry if found.
+    pub fn find_directory_entry(&self, path: &str) -> Option<Fat32DirEntry> {
+        let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() {
+            return None;
+        }
+
+        let filename = parts[parts.len() - 1];
+        let dir_parts = &parts[..parts.len() - 1];
+        let target = filename.to_ascii_lowercase();
+
+        crate::serial_println!("[FAT32] find_directory_entry: path='{}' dirs={:?} file='{}'",
+            path, dir_parts, filename);
+
+        let dir_cluster = if dir_parts.is_empty() {
+            self.bpb.root_cluster
+        } else {
+            self.navigate_to_dir(dir_parts)?
+        };
+
+        let entries = self.list_directory(dir_cluster);
+        for entry in &entries {
+            if entry.name == target {
+                crate::serial_println!("[FAT32] find_directory_entry: FOUND '{}' size={} cluster={} is_dir={}",
+                    entry.name, entry.file_size, entry.first_cluster, entry.is_directory);
+                return Some(entry.clone());
+            }
+        }
+
+        crate::serial_println!("[FAT32] find_directory_entry: '{}' NOT FOUND in cluster {}", filename, dir_cluster);
+        None
+    }
+
+    /// List all entries in a subdirectory given a path.
+    /// Path format: "models" or "models/subdir".
+    pub fn list_directory_path(&self, path: &str) -> Vec<Fat32DirEntry> {
+        let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() {
+            return self.list_root();
+        }
+
+        match self.navigate_to_dir(&parts) {
+            Some(cluster) => {
+                crate::serial_println!("[FAT32] list_directory_path('{}') -> cluster {}", path, cluster);
+                self.list_directory(cluster)
+            }
+            None => Vec::new(),
+        }
     }
 
     /// Write (create or overwrite) a file in a given directory cluster.
@@ -853,7 +908,9 @@ pub fn write_file(disk_path: &str, data: &[u8]) -> bool {
 
 /// Read a file from a full path on the FAT32 disk.
 ///
-/// `disk_path` is the relative path inside /disk/ (e.g., "var/sagas/001.bin").
+/// `disk_path` is the relative path inside /disk/ (e.g., "var/sagas/001.bin"
+/// or "models/mistral_part_aa").
+/// Supports recursive subdirectory traversal.
 pub fn read_file_path(disk_path: &str) -> Option<Vec<u8>> {
     unsafe {
         let fs = match FAT32_FS {
@@ -869,17 +926,55 @@ pub fn read_file_path(disk_path: &str) -> Option<Vec<u8>> {
         let filename = parts[parts.len() - 1];
         let dir_parts = &parts[..parts.len() - 1];
 
+        crate::serial_println!("[FAT32] read_file_path: '{}' (dir={:?}, file='{}')",
+            disk_path, dir_parts, filename);
+
         let dir_cluster = if dir_parts.is_empty() {
             fs.bpb.root_cluster
         } else {
-            fs.navigate_to_dir(dir_parts)?
+            match fs.navigate_to_dir(dir_parts) {
+                Some(c) => {
+                    crate::serial_println!("[FAT32] read_file_path: subdirectory resolved -> cluster {}", c);
+                    c
+                }
+                None => {
+                    crate::serial_println!("[FAT32] read_file_path: subdirectory not found: {:?}", dir_parts);
+                    return None;
+                }
+            }
         };
 
-        fs.read_file_in_dir(dir_cluster, filename)
+        let result = fs.read_file_in_dir(dir_cluster, filename);
+        if let Some(ref data) = result {
+            crate::serial_println!("[FAT32] read_file_path: SUCCESS '{}' = {} bytes", disk_path, data.len());
+        } else {
+            crate::serial_println!("[FAT32] read_file_path: file '{}' not found in cluster {}", filename, dir_cluster);
+        }
+        result
     }
 }
 
-/// Run FAT32 self-tests
+/// Find a directory entry by path (public API).
+pub fn find_directory_entry(path: &str) -> Option<Fat32DirEntry> {
+    unsafe {
+        match FAT32_FS {
+            Some(ref fs) => fs.find_directory_entry(path),
+            None => None,
+        }
+    }
+}
+
+/// List entries in a subdirectory by path (public API).
+pub fn list_directory_path(path: &str) -> Vec<Fat32DirEntry> {
+    unsafe {
+        match FAT32_FS {
+            Some(ref fs) => fs.list_directory_path(path),
+            None => Vec::new(),
+        }
+    }
+}
+
+/// Run FAT32 self-tests (updated for J43: subdirectory traversal)
 pub fn run_tests() {
     crate::serial_println!("\n========================================");
     crate::serial_println!("[FAT32 TESTS] Couche 19 - FAT32 Filesystem");
@@ -920,11 +1015,10 @@ pub fn run_tests() {
     }
 
     // Test 3: Read index.html
-    crate::serial_write("  [TEST 3/3] Read index.html... ");
+    crate::serial_write("  [TEST 3/5] Read index.html... ");
     match read_file("index.html") {
         Some(data) => {
             crate::serial_println!("OK ({} bytes)", data.len());
-            // Print first 100 bytes
             let preview_len = core::cmp::min(data.len(), 100);
             if let Ok(s) = core::str::from_utf8(&data[..preview_len]) {
                 crate::serial_println!("    Content: {}", s);
@@ -935,6 +1029,57 @@ pub fn run_tests() {
             crate::serial_write("SKIP (no index.html on disk)\n");
             passed += 1;
         }
+    }
+
+    // Test 4: Subdirectory traversal (models/)
+    crate::serial_write("  [TEST 4/5] Subdirectory listing (models/)... ");
+    let sub_entries = list_directory_path("models");
+    if !sub_entries.is_empty() {
+        crate::serial_println!("OK ({} entries)", sub_entries.len());
+        for entry in &sub_entries {
+            if entry.is_directory {
+                crate::serial_println!("    <DIR> {}", entry.name);
+            } else {
+                crate::serial_println!("    /disk/models/{} ({} bytes)", entry.name, entry.file_size);
+            }
+        }
+        passed += 1;
+    } else {
+        crate::serial_write("SKIP (no models/ directory)\n");
+        passed += 1;
+    }
+
+    // Test 5: Read file from subdirectory
+    crate::serial_write("  [TEST 5/5] Read file from subdirectory... ");
+    if !sub_entries.is_empty() {
+        let first_file = sub_entries.iter().find(|e| !e.is_directory);
+        if let Some(entry) = first_file {
+            let path = alloc::format!("models/{}", entry.name);
+            match read_file_path(&path) {
+                Some(data) => {
+                    crate::serial_println!("OK ({} = {} bytes)", path, data.len());
+                    // Show first 16 bytes as hex
+                    let preview_len = core::cmp::min(data.len(), 16);
+                    let mut hex = alloc::string::String::with_capacity(preview_len * 3);
+                    for b in &data[..preview_len] {
+                        use core::fmt::Write;
+                        let _ = write!(hex, "{:02X} ", b);
+                    }
+                    crate::serial_println!("    First {} bytes: {}", preview_len, hex);
+                    passed += 1;
+                }
+                None => {
+                    crate::serial_println!("FAIL (cannot read '{}')", path);
+                    failed += 1;
+                }
+            }
+        } else {
+            crate::serial_write("SKIP (no files in models/)\n");
+            passed += 1;
+        }
+    } else {
+        crate::serial_write("SKIP (no models/ directory)\n");
+        passed += 1;
     }
 
     crate::serial_println!("\n========================================");
