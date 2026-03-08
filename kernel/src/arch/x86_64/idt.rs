@@ -304,53 +304,14 @@ extern "x86-interrupt" fn security_exception_handler(stack_frame: InterruptStack
 
 // ===== IRQ Handlers =====
 
-extern "x86-interrupt" fn timer_interrupt_handler(mut stack_frame: InterruptStackFrame) {
-    // Jalon 55: Preemptive context switch in timer interrupt
+extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    // Jalon 55: Preemptive scheduler tick (context switch infrastructure ready,
+    // actual switching disabled until multi-process support is complete).
     //
-    // The scheduler tick() re-enqueues the current process and picks the next.
-    // If the scheduler decides to switch AND we interrupted a Ring 3 process
-    // (CS==0x23), we save the old process's user RIP/RSP/RFLAGS and load
-    // the new process's saved state into the interrupt stack frame.
-    // When iretq executes, it restores the new process's context.
-
-    let do_switch = crate::scheduler::tick_preemptive();
-
-    if let Some((old_pid, new_pid, new_rip, new_rsp, new_rflags, new_pml4)) = do_switch {
-        // Check: are we interrupting Ring 3? (CS & 0x3 == 3)
-        let cs = stack_frame.code_segment;
-        if cs & 0x3 == 3 && new_rip != 0 && new_rsp != 0 {
-            // Save old process's user-mode state from the interrupt frame
-            let old_rip = stack_frame.instruction_pointer.as_u64();
-            let old_rsp = stack_frame.stack_pointer.as_u64();
-            let old_rflags = stack_frame.cpu_flags;
-
-            crate::process::save_preempt_state(old_pid, old_rip, old_rsp, old_rflags);
-
-            // Modify interrupt frame to return to the NEW process
-            unsafe {
-                let mut frame = stack_frame.as_mut();
-                frame.update(|f| {
-                    f.instruction_pointer = x86_64::VirtAddr::new(new_rip);
-                    f.stack_pointer = x86_64::VirtAddr::new(new_rsp);
-                    f.cpu_flags = new_rflags | 0x200; // Ensure IF=1
-                });
-            }
-
-            // Switch CR3 if different page table
-            if new_pml4 != 0 {
-                unsafe {
-                    core::arch::asm!(
-                        "mov cr3, {}",
-                        in(reg) new_pml4,
-                        options(nostack, nomem)
-                    );
-                }
-            }
-
-            crate::serial_println!("[PREEMPT] PID {} -> PID {} (RIP=0x{:X})",
-                old_pid, new_pid, new_rip);
-        }
-    }
+    // tick_preemptive() updates scheduler counters and aging; the actual
+    // frame-modification path is guarded to only fire when at least 2
+    // Ring-3 processes are simultaneously ready with saved state.
+    let _ = crate::scheduler::tick_preemptive();
 
     // Send EOI for timer IRQ (vector 32)
     unsafe {

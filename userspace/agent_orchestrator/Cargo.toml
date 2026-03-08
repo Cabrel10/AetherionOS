@@ -1,0 +1,18 @@
+[package]
+name = "agent_orchestrator"
+version = "0.1.0"
+edition = "2021"
+description = "AetherionOS Jalon 56 - Agent Orchestrator via Cognitive Bus (Ring 3)"
+
+[[bin]]
+name = "agent_orchestrator"
+path = "src/main.rs"
+
+[dependencies]
+aetherion_sdk = { path = "../rust_sdk" }
+
+[profile.release]
+opt-level = 2
+lto = true
+panic = "abort"
+codegen-units = 1

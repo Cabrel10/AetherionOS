@@ -159,6 +159,9 @@ static AGENT_CHUNK_READER_ELF: &[u8] = include_bytes!("../../userspace/agent_chu
 /// agent_weight_loader - Jalon 54 GGUF Weight Loader (Ring 3)
 static AGENT_WEIGHT_LOADER_ELF: &[u8] = include_bytes!("../../userspace/agent_weight_loader/target/x86_64-aetherion-user/release/agent_weight_loader");
 
+/// agent_orchestrator - Jalon 56 Agent Orchestrator (Ring 3)
+static AGENT_ORCHESTRATOR_ELF: &[u8] = include_bytes!("../../userspace/agent_orchestrator/target/x86_64-aetherion-user/release/agent_orchestrator");
+
 // VGA text buffer
 const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
 const VGA_WIDTH: usize = 80;
@@ -1601,6 +1604,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     alloc::string::String::from("agent_weight_loader.elf"),
                     fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_WEIGHT_LOADER_ELF)),
                 );
+                bin_dir.insert(
+                    alloc::string::String::from("agent_orchestrator.elf"),
+                    fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_ORCHESTRATOR_ELF)),
+                );
                 serial_println!("       [OK] /bin/ls.elf ({} bytes)", LS_ELF.len());
                 serial_println!("       [OK] /bin/cat.elf ({} bytes)", CAT_ELF.len());
                 serial_println!("       [OK] /bin/j19_test.elf ({} bytes)", J19_TEST_ELF.len());
@@ -1631,6 +1638,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 serial_println!("       [OK] /bin/agent_mt_matmul.elf ({} bytes)", AGENT_MT_MATMUL_ELF.len());
                 serial_println!("       [OK] /bin/agent_chunk_reader.elf ({} bytes)", AGENT_CHUNK_READER_ELF.len());
                 serial_println!("       [OK] /bin/agent_weight_loader.elf ({} bytes)", AGENT_WEIGHT_LOADER_ELF.len());
+                serial_println!("       [OK] /bin/agent_orchestrator.elf ({} bytes)", AGENT_ORCHESTRATOR_ELF.len());
             }
         }
     }
@@ -1665,9 +1673,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             serial_println!("  [IPC] Drained {} old messages from Cognitive Bus", drained);
         }
 
-        // Jalon 54: Launch agent_weight_loader.elf for GGUF tensor metadata parsing.
-        let elf_binary = AGENT_WEIGHT_LOADER_ELF;
-        let elf_name = "/bin/agent_weight_loader.elf";
+        // Jalon 56: Launch agent_orchestrator.elf for LLM pipeline orchestration.
+        let elf_binary = AGENT_ORCHESTRATOR_ELF;
+        let elf_name = "/bin/agent_orchestrator.elf";
 
         // NOTE: Additional agent pre-loads disabled for J33 to avoid pre-existing
         // demand-paging issue with multiple ELF loads.
