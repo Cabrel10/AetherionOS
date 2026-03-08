@@ -1,0 +1,18 @@
+[package]
+name = "agent_http"
+version = "0.1.0"
+edition = "2021"
+description = "AetherionOS Jalon 58 - Native Ring 3 HTTP Client Agent"
+
+[[bin]]
+name = "agent_http"
+path = "src/main.rs"
+
+[dependencies]
+aetherion_sdk = { path = "../rust_sdk" }
+
+[profile.release]
+opt-level = 2
+lto = true
+panic = "abort"
+codegen-units = 1

@@ -165,6 +165,9 @@ static AGENT_ORCHESTRATOR_ELF: &[u8] = include_bytes!("../../userspace/agent_orc
 /// agent_state - Jalon 57 Persistent State Reader (Ring 3)
 static AGENT_STATE_ELF: &[u8] = include_bytes!("../../userspace/agent_state/target/x86_64-aetherion-user/release/agent_state");
 
+/// agent_http - Jalon 58 HTTP Client Agent (Ring 3)
+static AGENT_HTTP_ELF: &[u8] = include_bytes!("../../userspace/agent_http/target/x86_64-aetherion-user/release/agent_http");
+
 // VGA text buffer
 const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
 const VGA_WIDTH: usize = 80;
@@ -1676,6 +1679,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     alloc::string::String::from("agent_state.elf"),
                     fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_STATE_ELF)),
                 );
+                bin_dir.insert(
+                    alloc::string::String::from("agent_http.elf"),
+                    fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_HTTP_ELF)),
+                );
                 serial_println!("       [OK] /bin/ls.elf ({} bytes)", LS_ELF.len());
                 serial_println!("       [OK] /bin/cat.elf ({} bytes)", CAT_ELF.len());
                 serial_println!("       [OK] /bin/j19_test.elf ({} bytes)", J19_TEST_ELF.len());
@@ -1708,6 +1715,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 serial_println!("       [OK] /bin/agent_weight_loader.elf ({} bytes)", AGENT_WEIGHT_LOADER_ELF.len());
                 serial_println!("       [OK] /bin/agent_orchestrator.elf ({} bytes)", AGENT_ORCHESTRATOR_ELF.len());
                 serial_println!("       [OK] /bin/agent_state.elf ({} bytes)", AGENT_STATE_ELF.len());
+                serial_println!("       [OK] /bin/agent_http.elf ({} bytes)", AGENT_HTTP_ELF.len());
             }
         }
     }
@@ -1742,9 +1750,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             serial_println!("  [IPC] Drained {} old messages from Cognitive Bus", drained);
         }
 
-        // Jalon 56: Launch agent_orchestrator.elf for LLM pipeline orchestration.
-        let elf_binary = AGENT_ORCHESTRATOR_ELF;
-        let elf_name = "/bin/agent_orchestrator.elf";
+        // Jalon 58: Launch agent_http.elf for HTTP API bridge.
+        let elf_binary = AGENT_HTTP_ELF;
+        let elf_name = "/bin/agent_http.elf";
 
         // NOTE: Additional agent pre-loads disabled for J33 to avoid pre-existing
         // demand-paging issue with multiple ELF loads.
