@@ -146,19 +146,27 @@ fn saved_user_rsp() -> u64 {
 /// Validate that a user pointer range [ptr, ptr+len) is within user address space
 #[inline]
 fn validate_user_ptr(addr: u64, len: u64) -> bool {
-    if addr >= USER_ADDR_LIMIT { return false; }
+    // Accept both lower-half (<0x8000_0000_0000) and userspace ELF region (0x80_0000_0000+)
+    if addr == 0 { return false; }
     if len > 0x1000_0000 { return false; } // 256 MiB sanity
-    addr.checked_add(len).map_or(false, |end| end <= USER_ADDR_LIMIT)
+    // Standard user-space: below canonical hole
+    if addr < USER_ADDR_LIMIT {
+        return addr.checked_add(len).map_or(false, |end| end <= USER_ADDR_LIMIT);
+    }
+    // User ELF region: 0x80_0000_0000 .. 0x80_1000_0000 (4 GiB window)
+    if addr >= 0x80_0000_0000 && addr < 0x80_1000_0000 {
+        return addr.checked_add(len).map_or(false, |end| end <= 0x80_1000_0000);
+    }
+    false
 }
 
 /// Read a null-terminated string from user space (max 256 bytes)
 unsafe fn read_user_string(addr: u64) -> Option<alloc::string::String> {
-    if addr >= USER_ADDR_LIMIT { return None; }
+    if !validate_user_ptr(addr, 1) { return None; }
     let mut buf = alloc::vec::Vec::with_capacity(256);
     let ptr = addr as *const u8;
     for i in 0..256usize {
-        let byte_addr = addr + i as u64;
-        if byte_addr >= USER_ADDR_LIMIT { return None; }
+        if !validate_user_ptr(addr + i as u64, 1) { return None; }
         let byte = core::ptr::read_volatile(ptr.add(i));
         if byte == 0 { break; }
         buf.push(byte);
@@ -307,7 +315,22 @@ fn sys_write(fd: u64, buf_addr: u64, len: u64) -> u64 {
 
     // SECURITY: validate user pointer
     if !validate_user_ptr(buf_addr, len) {
-        crate::serial_println!("[SYSCALL] EFAULT: write buf=0x{:X} len={}", buf_addr, len);
+        // For serial output (fd 1/2), try to write with clamped length
+        if (fd == 1 || fd == 2) && validate_user_ptr(buf_addr, 1) {
+            // Clamp len to a safe maximum and write what we can
+            let safe_len = core::cmp::min(len, 4096) as usize;
+            let ptr = buf_addr as *const u8;
+            for i in 0..safe_len {
+                if !validate_user_ptr(buf_addr + i as u64, 1) { break; }
+                let byte = unsafe { core::ptr::read_volatile(ptr.add(i)) };
+                if byte == 0 { break; }
+                unsafe {
+                    while (x86_64::instructions::port::Port::<u8>::new(0x3FD).read() & 0x20) == 0 {}
+                    x86_64::instructions::port::Port::<u8>::new(0x3F8).write(byte);
+                }
+            }
+            return safe_len as u64;
+        }
         return EFAULT;
     }
 
