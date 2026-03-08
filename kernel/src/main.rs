@@ -1691,6 +1691,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     scheduler::enqueue_process(pid);
                     // Set the scheduler's current_pid so syscalls use the correct FD table
                     scheduler::set_current_pid(pid);
+                    // Jalon 55: Save initial user-mode state for preemptive resume
+                    process::save_preempt_state(pid,
+                        result.entry_point, result.stack_pointer, 0x202);
                     serial_println!("  [OK] Process PID={} registered (set as current)", pid);
                 }
 

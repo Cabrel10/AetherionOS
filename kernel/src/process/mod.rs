@@ -592,6 +592,28 @@ pub fn set_wait_ticks(pid: u64, ticks: u64) {
     }
 }
 
+/// Jalon 55: Save user-mode state for preemptive context switch.
+/// Called from timer interrupt handler when preempting a Ring 3 process.
+pub fn save_preempt_state(pid: u64, rip: u64, rsp: u64, rflags: u64) {
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(p) = table.get_mut(&pid) {
+        p.saved_user_rip = rip;
+        p.saved_user_rsp = rsp;
+        p.context.rflags = rflags;
+    }
+}
+
+/// Jalon 55: Get user-mode state for restoring a preempted process.
+/// Returns (rip, rsp, rflags, pml4_phys).
+pub fn get_preempt_state(pid: u64) -> Option<(u64, u64, u64, u64)> {
+    let table = PROCESS_TABLE.lock();
+    if let Some(p) = table.get(&pid) {
+        Some((p.saved_user_rip, p.saved_user_rsp, p.context.rflags, p.pml4_phys))
+    } else {
+        None
+    }
+}
+
 /// Initialize the process manager (creates kernel_idle as PID 1)
 pub fn init() -> u64 {
     let idle_pid = spawn_kernel_thread("kernel_idle").expect("Failed to create idle process");

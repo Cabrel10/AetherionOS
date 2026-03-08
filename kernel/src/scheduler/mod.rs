@@ -310,6 +310,38 @@ pub fn metrics() -> SchedulerMetrics {
     }
 }
 
+/// Jalon 55: Preemptive tick — returns switch info if a context switch is needed.
+/// Called from the timer interrupt handler.
+/// Returns Some((old_pid, new_pid, new_rip, new_rsp, new_rflags, new_pml4)) if switch needed.
+pub fn tick_preemptive() -> Option<(u64, u64, u64, u64, u64, u64)> {
+    if !SCHEDULER_ACTIVE.load(Ordering::Relaxed) {
+        return None;
+    }
+    let tick_num = TICK_COUNTER.fetch_add(1, Ordering::Relaxed);
+    // Only schedule every 10 ticks (~100ms with standard PIT)
+    if tick_num % 10 != 0 {
+        return None;
+    }
+    // Try to acquire the lock; if contended, skip
+    let mut sched = SCHEDULER.try_lock()?;
+    let result = sched.tick();
+
+    if !result.switched || result.new_pid == 0 {
+        return None;
+    }
+
+    // Get the new process's saved user-mode state
+    let (new_rip, new_rsp, new_rflags, new_pml4) =
+        process::get_preempt_state(result.new_pid).unwrap_or((0, 0, 0x200, 0));
+
+    if new_rip == 0 {
+        // New process hasn't been preempted before (first run) — skip
+        return None;
+    }
+
+    Some((result.old_pid, result.new_pid, new_rip, new_rsp, new_rflags, new_pml4))
+}
+
 /// Get current running PID
 pub fn current_pid() -> u64 {
     SCHEDULER.lock().current_pid
