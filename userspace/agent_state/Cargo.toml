@@ -1,0 +1,18 @@
+[package]
+name = "agent_state"
+version = "0.1.0"
+edition = "2021"
+description = "AetherionOS Jalon 57 - Persistent State Reader Agent (Ring 3)"
+
+[[bin]]
+name = "agent_state"
+path = "src/main.rs"
+
+[dependencies]
+aetherion_sdk = { path = "../rust_sdk" }
+
+[profile.release]
+opt-level = 2
+lto = true
+panic = "abort"
+codegen-units = 1

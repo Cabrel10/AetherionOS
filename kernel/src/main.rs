@@ -162,6 +162,9 @@ static AGENT_WEIGHT_LOADER_ELF: &[u8] = include_bytes!("../../userspace/agent_we
 /// agent_orchestrator - Jalon 56 Agent Orchestrator (Ring 3)
 static AGENT_ORCHESTRATOR_ELF: &[u8] = include_bytes!("../../userspace/agent_orchestrator/target/x86_64-aetherion-user/release/agent_orchestrator");
 
+/// agent_state - Jalon 57 Persistent State Reader (Ring 3)
+static AGENT_STATE_ELF: &[u8] = include_bytes!("../../userspace/agent_state/target/x86_64-aetherion-user/release/agent_state");
+
 // VGA text buffer
 const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
 const VGA_WIDTH: usize = 80;
@@ -1423,6 +1426,67 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     fs::fat32::init();
     fs::fat32::run_tests();
 
+    // ═══════════════════════════════════════════
+    // Jalon 57: Persistent state — read boot counter from /disk/var/state.bin
+    // Format: magic(4) + boot_count(4) + last_agent(32) + last_intent(8) + timestamp(8) = 56 bytes
+    // ═══════════════════════════════════════════
+    {
+        const STATE_MAGIC: u32 = 0xAE57_A7E5;
+        let state_data = fs::fat32::read_file_path("var/state.bin");
+        match state_data {
+            Some(data) if data.len() >= 56 => {
+                let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                let boot_count = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+                if magic == STATE_MAGIC {
+                    let new_count = boot_count + 1;
+                    serial_println!("[J57] Persistent state loaded: boot #{} (prev agent bytes at offset 8)", new_count);
+                    // Write back incremented counter
+                    let mut new_data = data.clone();
+                    let new_bytes = new_count.to_le_bytes();
+                    new_data[4] = new_bytes[0];
+                    new_data[5] = new_bytes[1];
+                    new_data[6] = new_bytes[2];
+                    new_data[7] = new_bytes[3];
+                    // Write current agent name
+                    let agent_name = b"agent_orchestrator\x00";
+                    for i in 0..core::cmp::min(agent_name.len(), 31) {
+                        new_data[8 + i] = agent_name[i];
+                    }
+                    // Write timestamp (TSC)
+                    let tsc: u64 = unsafe {
+                        let lo: u32; let hi: u32;
+                        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack));
+                        ((hi as u64) << 32) | (lo as u64)
+                    };
+                    let tsc_bytes = tsc.to_le_bytes();
+                    for i in 0..8 { new_data[48 + i] = tsc_bytes[i]; }
+                    if fs::fat32::write_file("var/state.bin", &new_data) {
+                        serial_println!("[J57-OK] Boot #{} state saved to /disk/var/state.bin", new_count);
+                    } else {
+                        serial_println!("[J57] WARNING: Could not write state.bin");
+                    }
+                } else {
+                    serial_println!("[J57] state.bin: bad magic 0x{:08X}, expected 0x{:08X}", magic, STATE_MAGIC);
+                }
+            }
+            Some(data) => {
+                serial_println!("[J57] state.bin too small: {} bytes", data.len());
+            }
+            None => {
+                serial_println!("[J57] No state.bin found — first boot, creating...");
+                let mut init_state = alloc::vec![0u8; 56];
+                let magic_bytes = STATE_MAGIC.to_le_bytes();
+                init_state[0] = magic_bytes[0]; init_state[1] = magic_bytes[1];
+                init_state[2] = magic_bytes[2]; init_state[3] = magic_bytes[3];
+                init_state[4] = 1; // boot_count = 1
+                let name = b"first_boot\x00";
+                for i in 0..name.len() { init_state[8 + i] = name[i]; }
+                let _ = fs::fat32::write_file("var/state.bin", &init_state);
+                serial_println!("[J57-OK] Initial state.bin created (boot #1)");
+            }
+        }
+    }
+
     // Mount FAT32 files into VFS under /disk/
     serial_write("\n[19/19] Mounting FAT32 into VFS (/disk/)...\n");
     {
@@ -1608,6 +1672,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     alloc::string::String::from("agent_orchestrator.elf"),
                     fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_ORCHESTRATOR_ELF)),
                 );
+                bin_dir.insert(
+                    alloc::string::String::from("agent_state.elf"),
+                    fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_STATE_ELF)),
+                );
                 serial_println!("       [OK] /bin/ls.elf ({} bytes)", LS_ELF.len());
                 serial_println!("       [OK] /bin/cat.elf ({} bytes)", CAT_ELF.len());
                 serial_println!("       [OK] /bin/j19_test.elf ({} bytes)", J19_TEST_ELF.len());
@@ -1639,6 +1707,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 serial_println!("       [OK] /bin/agent_chunk_reader.elf ({} bytes)", AGENT_CHUNK_READER_ELF.len());
                 serial_println!("       [OK] /bin/agent_weight_loader.elf ({} bytes)", AGENT_WEIGHT_LOADER_ELF.len());
                 serial_println!("       [OK] /bin/agent_orchestrator.elf ({} bytes)", AGENT_ORCHESTRATOR_ELF.len());
+                serial_println!("       [OK] /bin/agent_state.elf ({} bytes)", AGENT_STATE_ELF.len());
             }
         }
     }
