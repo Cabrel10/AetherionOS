@@ -174,6 +174,9 @@ static AGENT_VISUAL_TERM_ELF: &[u8] = include_bytes!("../../userspace/agent_visu
 /// agent_q4_dequant - Jalon 61 Q4_K_M Dequantizer (Ring 3)
 static AGENT_Q4_DEQUANT_ELF: &[u8] = include_bytes!("../../userspace/agent_q4_dequant/target/x86_64-aetherion-user/release/agent_q4_dequant");
 
+/// agent_llama_core - Jalon 62/63 LLaMA Transformer Core (Ring 3)
+static AGENT_LLAMA_CORE_ELF: &[u8] = include_bytes!("../../userspace/agent_llama_core/target/x86_64-aetherion-user/release/agent_llama_core");
+
 // VGA text buffer
 const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
 const VGA_WIDTH: usize = 80;
@@ -1697,6 +1700,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     alloc::string::String::from("agent_q4_dequant.elf"),
                     fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_Q4_DEQUANT_ELF)),
                 );
+                bin_dir.insert(
+                    alloc::string::String::from("agent_llama_core.elf"),
+                    fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_LLAMA_CORE_ELF)),
+                );
                 serial_println!("       [OK] /bin/ls.elf ({} bytes)", LS_ELF.len());
                 serial_println!("       [OK] /bin/cat.elf ({} bytes)", CAT_ELF.len());
                 serial_println!("       [OK] /bin/j19_test.elf ({} bytes)", J19_TEST_ELF.len());
@@ -1732,6 +1739,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 serial_println!("       [OK] /bin/agent_http.elf ({} bytes)", AGENT_HTTP_ELF.len());
                 serial_println!("       [OK] /bin/agent_visual_term.elf ({} bytes)", AGENT_VISUAL_TERM_ELF.len());
                 serial_println!("       [OK] /bin/agent_q4_dequant.elf ({} bytes)", AGENT_Q4_DEQUANT_ELF.len());
+                serial_println!("       [OK] /bin/agent_llama_core.elf ({} bytes)", AGENT_LLAMA_CORE_ELF.len());
             }
         }
     }
@@ -1752,12 +1760,14 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     }
 
     // ===================================================================
-    // JALON 60: FULL ACHA SYSTEM INTEGRATION
-    // Launch orchestrator + visual terminal with preemptive scheduling
+    // JALON 62/63: LLaMA TRANSFORMER CORE + TOKEN STREAMING INTEGRATION
+    // Launch llama_core (primary), visual terminal + orchestrator queued
+    // Preemptive scheduling active (J55)
     // ===================================================================
     serial_write("\n========================================\n");
-    serial_write("[J60] Full ACHA System Integration\n");
-    serial_write("[J60] Orchestrator + Visual Terminal + Preemption\n");
+    serial_write("[J62] LLaMA Transformer Core Integration\n");
+    serial_write("[J63] Token Generation + Visual Terminal Streaming\n");
+    serial_write("[J60] Orchestrator + Preemption Active\n");
     serial_write("========================================\n");
     {
         // Drain old messages from bus
@@ -1769,7 +1779,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
         // ──────────────────────────────────────────────────────────
         // STEP A: Load agent_visual_term.elf as a QUEUED process
-        // (it will be launched by the scheduler when orchestrator exits)
+        // (runs after llama_core exits, displays generated tokens)
         // ──────────────────────────────────────────────────────────
         serial_write("  [J60] Loading agent_visual_term.elf (queued)...\n");
         match elf::load_elf_binary(AGENT_VISUAL_TERM_ELF) {
@@ -1815,12 +1825,13 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         }
 
         // ──────────────────────────────────────────────────────────
-        // STEP B: Load and LAUNCH agent_q4_dequant.elf (Jalon 61)
-        // (runs Q4_K_M dequantization test, then exits;
-        //  scheduler picks up orchestrator, then visual terminal)
+        // STEP B: Load and LAUNCH agent_llama_core.elf (Jalon 62/63)
+        // Runs transformer math validation, generates 128 tokens,
+        // publishes INTENT_TOKEN_GENERATED (0x8063) for each token;
+        // scheduler picks up orchestrator, then visual terminal
         // ──────────────────────────────────────────────────────────
-        let elf_binary = AGENT_Q4_DEQUANT_ELF;
-        let elf_name = "/bin/agent_q4_dequant.elf";
+        let elf_binary = AGENT_LLAMA_CORE_ELF;
+        let elf_name = "/bin/agent_llama_core.elf";
 
         serial_println!("  [J60] Loading {}...", elf_name);
         let load_result = elf::load_elf_binary(elf_binary);
@@ -1845,7 +1856,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     serial_println!("  [J60] Orchestrator PID={} registered (launching first)", pid);
                 }
 
-                serial_write("  [J60] IRETQ -> Ring 3: Orchestrator launches NOW!\n");
+                serial_write("  [J62] IRETQ -> Ring 3: LLaMA Core launches NOW!\n");
                 serial_write("========================================\n");
 
                 arch::x86_64::syscall::reset_gs_bases();
