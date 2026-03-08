@@ -571,9 +571,9 @@ fn sys_open(path_addr: u64, flags: u32) -> u64 {
 
     // For /disk/ paths with O_CREAT, we allow creating files that don't exist yet
     if path.starts_with("/disk/") && (flags & O_CREAT) != 0 {
-        // Check if file already exists by trying to read
+        // FIX #17: Use file_exists() instead of read_file_path() to avoid OOM
         let disk_path = &path[6..]; // strip "/disk/"
-        let exists = crate::fs::fat32::read_file_path(disk_path).is_some();
+        let exists = crate::fs::fat32::file_exists(disk_path).is_some();
 
         if !exists {
             // Create an empty file on FAT32
@@ -628,34 +628,39 @@ fn sys_open(path_addr: u64, flags: u32) -> u64 {
         // Try with /bin prefix
         let bin_path = alloc::format!("/bin/{}", path);
         if crate::fs::vfs::file_read(&bin_path).is_err() {
-            // For /disk/ paths, try reading from FAT32 directly
+            // For /disk/ paths, try checking existence on FAT32 directly
+            // FIX #17: Use file_exists() to avoid loading 2GB files into kernel heap
             if path.starts_with("/disk/") {
                 let disk_path = &path[6..];
-                if crate::fs::fat32::read_file_path(disk_path).is_none() {
-                    crate::serial_println!("[SYSCALL] sys_open: not found '{}'", path);
-                    return ENOENT;
-                }
-                // File exists on disk — register in VFS
-                if let Some(data) = crate::fs::fat32::read_file_path(disk_path) {
-                    let mut root = crate::fs::vfs::lock_root();
-                    let parts: alloc::vec::Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-                    let mut current = &mut *root;
-                    for (i, comp) in parts.iter().enumerate() {
-                        if i == parts.len() - 1 {
-                            current.insert(
-                                alloc::string::String::from(*comp),
-                                crate::fs::vfs::VfsNode::File(data),
-                            );
-                            break;
-                        }
-                        current.entry(alloc::string::String::from(*comp))
-                            .or_insert_with(|| crate::fs::vfs::VfsNode::Directory(
-                                alloc::collections::BTreeMap::new()
-                            ));
-                        if let Some(crate::fs::vfs::VfsNode::Directory(ref mut children)) = current.get_mut(*comp) {
-                            current = children;
-                        } else {
-                            break;
+                match crate::fs::fat32::file_exists(disk_path) {
+                    None => {
+                        crate::serial_println!("[SYSCALL] sys_open: not found '{}'", path);
+                        return ENOENT;
+                    }
+                    Some(file_size) => {
+                        crate::serial_println!("[SYSCALL] sys_open: '{}' exists on FAT32 ({} bytes), registering FD (lazy load)", disk_path, file_size);
+                        // Register a placeholder in VFS — actual data read via sys_read with chunked read
+                        {
+                            let mut root = crate::fs::vfs::lock_root();
+                            let parts: alloc::vec::Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+                            let mut current = &mut *root;
+                            for (i, comp) in parts.iter().enumerate() {
+                                if i == parts.len() - 1 {
+                                    // Insert an EMPTY placeholder — actual reads go through FAT32 chunked read
+                                    current.entry(alloc::string::String::from(*comp))
+                                        .or_insert_with(|| crate::fs::vfs::VfsNode::File(alloc::vec::Vec::new()));
+                                    break;
+                                }
+                                current.entry(alloc::string::String::from(*comp))
+                                    .or_insert_with(|| crate::fs::vfs::VfsNode::Directory(
+                                        alloc::collections::BTreeMap::new()
+                                    ));
+                                if let Some(crate::fs::vfs::VfsNode::Directory(ref mut children)) = current.get_mut(*comp) {
+                                    current = children;
+                                } else {
+                                    break;
+                                }
+                            }
                         }
                     }
                 }

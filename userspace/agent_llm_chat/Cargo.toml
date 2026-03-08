@@ -2,7 +2,7 @@
 name = "agent_llm_chat"
 version = "0.1.0"
 edition = "2021"
-description = "AetherionOS Jalon 50 - LLM Chat Agent via Cognitive Bus (Ring 3)"
+description = "AetherionOS Jalon 64 - Full LLM Chat Agent loading GGUF from FAT32 Disk"
 
 [[bin]]
 name = "agent_llm_chat"
