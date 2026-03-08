@@ -171,6 +171,9 @@ static AGENT_HTTP_ELF: &[u8] = include_bytes!("../../userspace/agent_http/target
 /// agent_visual_term - Jalon 59 Interactive Visual Terminal (Ring 3)
 static AGENT_VISUAL_TERM_ELF: &[u8] = include_bytes!("../../userspace/agent_visual_term/target/x86_64-aetherion-user/release/agent_visual_term");
 
+/// agent_q4_dequant - Jalon 61 Q4_K_M Dequantizer (Ring 3)
+static AGENT_Q4_DEQUANT_ELF: &[u8] = include_bytes!("../../userspace/agent_q4_dequant/target/x86_64-aetherion-user/release/agent_q4_dequant");
+
 // VGA text buffer
 const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
 const VGA_WIDTH: usize = 80;
@@ -1690,6 +1693,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     alloc::string::String::from("agent_visual_term.elf"),
                     fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_VISUAL_TERM_ELF)),
                 );
+                bin_dir.insert(
+                    alloc::string::String::from("agent_q4_dequant.elf"),
+                    fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_Q4_DEQUANT_ELF)),
+                );
                 serial_println!("       [OK] /bin/ls.elf ({} bytes)", LS_ELF.len());
                 serial_println!("       [OK] /bin/cat.elf ({} bytes)", CAT_ELF.len());
                 serial_println!("       [OK] /bin/j19_test.elf ({} bytes)", J19_TEST_ELF.len());
@@ -1724,6 +1731,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 serial_println!("       [OK] /bin/agent_state.elf ({} bytes)", AGENT_STATE_ELF.len());
                 serial_println!("       [OK] /bin/agent_http.elf ({} bytes)", AGENT_HTTP_ELF.len());
                 serial_println!("       [OK] /bin/agent_visual_term.elf ({} bytes)", AGENT_VISUAL_TERM_ELF.len());
+                serial_println!("       [OK] /bin/agent_q4_dequant.elf ({} bytes)", AGENT_Q4_DEQUANT_ELF.len());
             }
         }
     }
@@ -1784,12 +1792,35 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         }
 
         // ──────────────────────────────────────────────────────────
-        // STEP B: Load and LAUNCH agent_orchestrator.elf
-        // (runs the LLM pipeline, then exits; scheduler picks up
-        //  agent_visual_term from the ready queue)
+        // STEP A2: Load agent_orchestrator.elf as a QUEUED process
         // ──────────────────────────────────────────────────────────
-        let elf_binary = AGENT_ORCHESTRATOR_ELF;
-        let elf_name = "/bin/agent_orchestrator.elf";
+        serial_write("  [J60] Loading agent_orchestrator.elf (queued)...\n");
+        match elf::load_elf_binary(AGENT_ORCHESTRATOR_ELF) {
+            Ok(orch_result) => {
+                let orch_pid = process::spawn_userspace(
+                    "/bin/agent_orchestrator.elf", 0,
+                    orch_result.entry_point, orch_result.stack_pointer, orch_result.pml4_phys
+                ).unwrap_or(0);
+                if orch_pid != 0 {
+                    scheduler::enqueue_process(orch_pid);
+                    process::save_preempt_state(orch_pid,
+                        orch_result.entry_point, orch_result.stack_pointer, 0x202);
+                    serial_println!("  [J60] Orchestrator PID={} queued (entry=0x{:X})",
+                        orch_pid, orch_result.entry_point);
+                }
+            }
+            Err(e) => {
+                serial_println!("  [J60] WARN: agent_orchestrator.elf load failed: {}", e);
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────
+        // STEP B: Load and LAUNCH agent_q4_dequant.elf (Jalon 61)
+        // (runs Q4_K_M dequantization test, then exits;
+        //  scheduler picks up orchestrator, then visual terminal)
+        // ──────────────────────────────────────────────────────────
+        let elf_binary = AGENT_Q4_DEQUANT_ELF;
+        let elf_name = "/bin/agent_q4_dequant.elf";
 
         serial_println!("  [J60] Loading {}...", elf_name);
         let load_result = elf::load_elf_binary(elf_binary);
