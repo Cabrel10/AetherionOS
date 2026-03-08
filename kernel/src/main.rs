@@ -1825,6 +1825,30 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         }
 
         // ──────────────────────────────────────────────────────────
+        // STEP A3: Load agent_llm_chat.elf as QUEUED process (Jalon 64)
+        // Full LLM Chat Agent: loads GGUF from FAT32, generates tokens
+        // ──────────────────────────────────────────────────────────
+        serial_write("  [J64] Loading agent_llm_chat.elf (queued)...\n");
+        match elf::load_elf_binary(AGENT_LLM_CHAT_ELF) {
+            Ok(chat_result) => {
+                let chat_pid = process::spawn_userspace(
+                    "/bin/agent_llm_chat.elf", 0,
+                    chat_result.entry_point, chat_result.stack_pointer, chat_result.pml4_phys
+                ).unwrap_or(0);
+                if chat_pid != 0 {
+                    scheduler::enqueue_process(chat_pid);
+                    process::save_preempt_state(chat_pid,
+                        chat_result.entry_point, chat_result.stack_pointer, 0x202);
+                    serial_println!("  [J64] LLM Chat Agent PID={} queued (entry=0x{:X}, segs={}, frames={})",
+                        chat_pid, chat_result.entry_point, chat_result.segments_loaded, chat_result.frames_used);
+                }
+            }
+            Err(e) => {
+                serial_println!("  [J64] WARN: agent_llm_chat.elf load failed: {}", e);
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────
         // STEP B: Load and LAUNCH agent_llama_core.elf (Jalon 62/63)
         // Runs transformer math validation, generates 128 tokens,
         // publishes INTENT_TOKEN_GENERATED (0x8063) for each token;

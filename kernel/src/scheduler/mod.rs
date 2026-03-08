@@ -148,11 +148,14 @@ impl PriorityScheduler {
                         3 => "HIGH",
                         _ => "?",
                     };
-                    crate::serial_println!(
-                        "[SCHEDULER] AGING: Boosting PID {} from {} to {} (waited {} ticks)",
-                        pid, from_name, to_name, new_wt
-                    );
                     self.aging_boosts += 1;
+                    // Only log every 50th aging boost to avoid serial spam
+                    if self.aging_boosts % 50 == 1 {
+                        crate::serial_println!(
+                            "[SCHEDULER] AGING: Boosting PID {} from {} to {} (waited {} ticks) [boost #{}]",
+                            pid, from_name, to_name, new_wt, self.aging_boosts
+                        );
+                    }
                     // don't increment i — removal shifted elements
                 } else {
                     i += 1;

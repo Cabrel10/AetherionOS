@@ -1,13 +1,10 @@
-//! AetherionOS Jalon 62/63 – LLaMA Transformer Math Core & Token Streaming
+//! AetherionOS Jalon 62/63/64 – LLaMA Transformer Core + 128-Token Generation
 //!
 //! Implements the core Mistral/LLaMA transformer operations:
-//!   - RMSNorm (Root Mean Square Layer Normalization)
-//!   - RoPE (Rotary Positional Embeddings)
-//!   - SwiGLU (Swish-Gated Linear Unit activation)
-//!   - Multi-Head Attention with GQA (Grouped Query Attention)
+//!   - RMSNorm, RoPE, SwiGLU, Multi-Head Attention (GQA)
 //!   - KV Cache for autoregressive generation
-//!   - Softmax (numerically stable)
-//!   - Token generation loop with argmax sampling
+//!   - Temperature-based sampling with softmax
+//!   - 128 consecutive token generation loop (J64)
 //!
 //! Architecture (scaled test): dim=32, n_heads=2, n_kv_heads=1, head_dim=16
 //! Full Mistral 7B:             dim=4096, n_heads=32, n_kv_heads=8, head_dim=128
@@ -31,8 +28,8 @@ const HEAD_DIM: usize   = DIM / N_HEADS; // 16
 const KV_DIM: usize     = HEAD_DIM * N_KV_HEADS; // 16
 const HIDDEN_DIM: usize = DIM * 2;  // 64 (FFN intermediate)
 const VOCAB_SIZE: usize = 128;      // ASCII vocabulary
-const MAX_SEQ_LEN: usize = 48;      // Maximum sequence length
-const GEN_TOKENS: usize = 32;       // Tokens to generate
+const MAX_SEQ_LEN: usize = 160;     // Maximum sequence length (prompt + 128 gen)
+const GEN_TOKENS: usize = 128;      // Tokens to generate (J64)
 
 // Cognitive Bus intents
 const INTENT_TOKEN_GEN: u64   = 0x8063;
@@ -168,6 +165,24 @@ fn argmax(x: &[f32], size: usize) -> usize {
     let mut best_val = x[0];
     for i in 1..size { if x[i] > best_val { best_val = x[i]; best = i; } }
     best
+}
+
+/// Temperature sampling: scale logits by 1/temperature, apply softmax,
+/// then pick based on a simple LCG random number.
+fn sample_temperature(logits: &mut [f32], size: usize, temperature: f32, rng_state: &mut u64) -> usize {
+    if temperature <= 0.01 { return argmax(logits, size); }
+    // Scale logits
+    for i in 0..size { logits[i] /= temperature; }
+    softmax(logits, size);
+    // Random selection based on cumulative probability
+    *rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+    let r = ((*rng_state >> 33) as f32) / 2147483647.0; // [0, 1)
+    let mut cum: f32 = 0.0;
+    for i in 0..size {
+        cum += logits[i];
+        if cum >= r { return i; }
+    }
+    size - 1
 }
 
 // ═══════════════════════════════════════════════════
@@ -410,34 +425,38 @@ pub extern "C" fn main() -> i64 {
     println("[J62] ========================================");
 
     // ═══════════════════════════════════════════════════
-    // J63: Token Generation with KV Cache
+    // J63/J64: Token Generation with KV Cache (128 tokens)
     // ═══════════════════════════════════════════════════
-    println("[J63] ========================================");
-    println("[J63] KV Cache Token Generation v1.0");
-    println("[J63] ========================================");
+    println("[J64] ========================================");
+    println("[J64] Multi-Token Generation Loop (128 tokens)");
+    println("[J64] Temperature sampling + KV cache");
+    println("[J64] ========================================");
 
     let prompt: &[u8] = b"Hello AetherionOS";
     let plen = prompt.len();
+    let temperature: f32 = 0.8; // Temperature for sampling
 
-    print("[J63] Prompt: \""); sys_write(1, prompt);
+    print("[J64] Prompt: \""); sys_write(1, prompt);
     print("\" ("); print_u64(plen as u64); println(" tokens)");
-    print("[J63] Generating "); print_u64(GEN_TOKENS as u64); println(" tokens...");
+    print("[J64] Generating "); print_u64(GEN_TOKENS as u64);
+    print(" tokens (temp=0.8)...\n");
 
     let t_gen = sys_rdtsc();
 
-    // Prefill
-    print("[J63] Prefill... ");
+    // Phase 1: Prefill
+    print("[J64] Prefill... ");
     for pos in 0..plen {
         unsafe { transformer_forward(prompt[pos] as usize, pos); }
     }
     let next_token = unsafe { argmax(&LOGITS, VOCAB_SIZE) };
-    print("OK ("); print_u64(plen as u64); println(" tokens)");
+    print("OK ("); print_u64(plen as u64); println(" tokens prefilled)");
 
-    // Generate
-    print("[J63] Output: \"");
+    // Phase 2: Autoregressive generation (128 tokens)
+    print("[J64] Output: \"");
     let mut valid: u32 = 0;
     let mut cur_token = next_token;
     let limit = core::cmp::min(GEN_TOKENS, MAX_SEQ_LEN - plen);
+    let mut sample_rng: u64 = 0xDEAD_BEEF_CAFE_42;
 
     for g in 0..limit {
         let pos = plen + g;
@@ -454,31 +473,37 @@ pub extern "C" fn main() -> i64 {
         // Publish on bus
         sys_bus_publish(INTENT_TOKEN_GEN, 2, ((pos as u64) << 8) | (ch as u64));
 
-        // Next forward pass
+        // Forward pass + temperature sampling for next token
         unsafe {
             for i in 0..VOCAB_SIZE { LOGITS[i] = 0.0; }
             transformer_forward(cur_token, pos);
-            cur_token = argmax(&LOGITS, VOCAB_SIZE);
+            cur_token = sample_temperature(&mut LOGITS, VOCAB_SIZE, temperature, &mut sample_rng);
         }
+
+        // Yield every 8 tokens for fairness
+        if g % 8 == 0 { sys_yield(); }
     }
 
     let t_total = sys_rdtsc() - t_gen;
     println("\"");
 
-    println("[J63] ========================================");
-    print("[J63] Tokens generated: "); print_u64(limit as u64); println("");
-    print("[J63] Valid printable: "); print_u64(valid as u64); println("");
-    print("[J63] Total cycles: "); print_u64(t_total); println("");
+    println("[J64] ========================================");
+    print("[J64] Tokens generated: "); print_u64(limit as u64); println("");
+    print("[J64] Valid printable: "); print_u64(valid as u64); println("");
+    print("[J64] Total cycles: "); print_u64(t_total); println("");
     if limit > 0 {
-        print("[J63] Cycles/token: "); print_u64(t_total / ((plen as u64) + (limit as u64))); println("");
+        print("[J64] Cycles/token: "); print_u64(t_total / ((plen as u64) + (limit as u64))); println("");
     }
+    print("[J64] KV cache entries: "); print_u64((plen + limit) as u64); println("");
+    print("[J64] Sampling: temperature=0.8\n");
 
     sys_bus_publish(INTENT_TOKEN_GEN, 1, limit as u64);
 
-    println("[J63-OK] Token generation COMPLETE");
-    println("[J63-OK] KV cache persistent across positions");
-    println("[J63-OK] INTENT_TOKEN_GENERATED published for each token");
-    println("[J63] ========================================");
+    println("[J64-OK] 128-token generation COMPLETE");
+    println("[J64-OK] KV cache persistent across all positions");
+    println("[J64-OK] INTENT_TOKEN_GENERATED published for each token");
+    println("[J64-OK] Temperature sampling active");
+    println("[J64] ========================================");
 
     0
 }
