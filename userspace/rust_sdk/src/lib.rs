@@ -49,6 +49,12 @@ pub const SYS_BUS_PUBLISH:  u64 = 201;
 pub const SYS_VGA_WRITE:    u64 = 202;
 pub const SYS_NET_PING:     u64 = 210;
 pub const SYS_GETHOSTBYNAME:u64 = 211;
+pub const SYS_SOCKET:       u64 = 41;
+pub const SYS_TCP_CONNECT:  u64 = 42;
+pub const SYS_SENDTO:       u64 = 44;
+pub const SYS_RECVFROM:     u64 = 45;
+pub const SYS_TCP_SHUTDOWN: u64 = 47;
+pub const SYS_TCP_READ:     u64 = 212;
 pub const SYS_MMAP_FB:      u64 = 10;
 pub const SYS_POLL_HID:     u64 = 11;
 pub const SYS_FB_FILL_RECT: u64 = 220;
@@ -359,6 +365,44 @@ pub fn sys_net_ping(ip: u32, seq: u16) -> i64 {
 /// DNS query. Returns packed IPv4 in big-endian (network byte order) or 0 on failure.
 pub fn sys_gethostbyname(name: &[u8]) -> u32 {
     syscall1(SYS_GETHOSTBYNAME, name.as_ptr() as u64) as u32
+}
+
+/// Create a TCP socket. domain=2 (AF_INET), sock_type=1 (SOCK_STREAM).
+/// Returns file descriptor or negative error.
+pub fn sys_socket(domain: u32, sock_type: u32, protocol: u32) -> i64 {
+    syscall3(SYS_SOCKET, domain as u64, sock_type as u64, protocol as u64) as i64
+}
+
+/// TCP connect: fd is the socket, ip_packed is big-endian IPv4, port is the port number.
+/// ip_packed encodes as (a<<24 | b<<16 | c<<8 | d).
+pub fn sys_tcp_connect(fd: u32, ip_packed: u32, port: u16) -> i64 {
+    syscall3(SYS_TCP_CONNECT, fd as u64, ip_packed as u64, port as u64) as i64
+}
+
+/// Send data over a TCP socket.
+/// The kernel expects: first 8 bytes = length (u64 LE), followed by data.
+/// Returns bytes sent or negative error.
+pub fn sys_tcp_send(fd: u32, data: &[u8]) -> i64 {
+    // Build a buffer: [len:u64][data...]
+    // We'll use a stack buffer for small sends
+    let total = 8 + data.len();
+    if total > 4096 { return -1; }
+    let mut buf = [0u8; 4096];
+    let len_bytes = (data.len() as u64).to_le_bytes();
+    buf[0..8].copy_from_slice(&len_bytes);
+    buf[8..8+data.len()].copy_from_slice(data);
+    syscall3(SYS_SENDTO, fd as u64, buf.as_ptr() as u64, total as u64) as i64
+}
+
+/// Read data from a TCP socket.
+/// Returns bytes read or negative error.
+pub fn sys_tcp_read(fd: u32, buf: &mut [u8]) -> i64 {
+    syscall3(SYS_TCP_READ, fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64) as i64
+}
+
+/// Shutdown a TCP socket.
+pub fn sys_tcp_shutdown(fd: u32) -> i64 {
+    syscall1(SYS_TCP_SHUTDOWN, fd as u64) as i64
 }
 
 // ============================================================
