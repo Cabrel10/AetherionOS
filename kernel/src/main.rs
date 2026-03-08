@@ -1744,11 +1744,12 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     }
 
     // ===================================================================
-    // COUCHE 19+20+21: LAUNCH JALON 19 + JALON 20 + JALON 21 (GUI)
-    // Validates: DNS, TCP, FAT32, then Ring 3 multi-threading via sys_clone
+    // JALON 60: FULL ACHA SYSTEM INTEGRATION
+    // Launch orchestrator + visual terminal with preemptive scheduling
     // ===================================================================
     serial_write("\n========================================\n");
-    serial_write("[RING 3] Launching agent_multipart.elf (Jalon 43 Multi-Part GGUF Merge)\n");
+    serial_write("[J60] Full ACHA System Integration\n");
+    serial_write("[J60] Orchestrator + Visual Terminal + Preemption\n");
     serial_write("========================================\n");
     {
         // Drain old messages from bus
@@ -1758,14 +1759,39 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             serial_println!("  [IPC] Drained {} old messages from Cognitive Bus", drained);
         }
 
-        // Jalon 59: Launch agent_visual_term.elf for Interactive Terminal.
-        let elf_binary = AGENT_VISUAL_TERM_ELF;
-        let elf_name = "/bin/agent_visual_term.elf";
+        // ──────────────────────────────────────────────────────────
+        // STEP A: Load agent_visual_term.elf as a QUEUED process
+        // (it will be launched by the scheduler when orchestrator exits)
+        // ──────────────────────────────────────────────────────────
+        serial_write("  [J60] Loading agent_visual_term.elf (queued)...\n");
+        match elf::load_elf_binary(AGENT_VISUAL_TERM_ELF) {
+            Ok(vt_result) => {
+                let vt_pid = process::spawn_userspace(
+                    "/bin/agent_visual_term.elf", 0,
+                    vt_result.entry_point, vt_result.stack_pointer, vt_result.pml4_phys
+                ).unwrap_or(0);
+                if vt_pid != 0 {
+                    scheduler::enqueue_process(vt_pid);
+                    process::save_preempt_state(vt_pid,
+                        vt_result.entry_point, vt_result.stack_pointer, 0x202);
+                    serial_println!("  [J60] Visual Terminal PID={} queued (entry=0x{:X}, segs={}, frames={})",
+                        vt_pid, vt_result.entry_point, vt_result.segments_loaded, vt_result.frames_used);
+                }
+            }
+            Err(e) => {
+                serial_println!("  [J60] WARN: agent_visual_term.elf load failed: {}", e);
+            }
+        }
 
-        // NOTE: Additional agent pre-loads disabled for J33 to avoid pre-existing
-        // demand-paging issue with multiple ELF loads.
+        // ──────────────────────────────────────────────────────────
+        // STEP B: Load and LAUNCH agent_orchestrator.elf
+        // (runs the LLM pipeline, then exits; scheduler picks up
+        //  agent_visual_term from the ready queue)
+        // ──────────────────────────────────────────────────────────
+        let elf_binary = AGENT_ORCHESTRATOR_ELF;
+        let elf_name = "/bin/agent_orchestrator.elf";
 
-        serial_println!("  [STEP 1] Loading {}...", elf_name);
+        serial_println!("  [J60] Loading {}...", elf_name);
         let load_result = elf::load_elf_binary(elf_binary);
         match load_result {
             Ok(result) => {
@@ -1782,47 +1808,26 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 ).unwrap_or(0);
                 if pid != 0 {
                     scheduler::enqueue_process(pid);
-                    // Set the scheduler's current_pid so syscalls use the correct FD table
                     scheduler::set_current_pid(pid);
-                    // Jalon 55: Save initial user-mode state for preemptive resume
                     process::save_preempt_state(pid,
                         result.entry_point, result.stack_pointer, 0x202);
-                    serial_println!("  [OK] Process PID={} registered (set as current)", pid);
+                    serial_println!("  [J60] Orchestrator PID={} registered (launching first)", pid);
                 }
 
-                serial_write("  [STEP 2] Ring 3 IRETQ frame:\n");
-                serial_println!("    RIP    = 0x{:X}", result.entry_point);
-                serial_write(  "    CS     = 0x23 (User Code, RPL=3)\n");
-                serial_write(  "    RFLAGS = 0x202 (IF=1)\n");
-                serial_println!("    RSP    = 0x{:X}", result.stack_pointer);
-                serial_write(  "    SS     = 0x1B (User Data, RPL=3)\n");
-                serial_println!("    CR3    = 0x{:X}", result.pml4_phys);
-
-                serial_write("  [STEP 3] CR3 switch + IRETQ -> Ring 3 NOW!\n");
+                serial_write("  [J60] IRETQ -> Ring 3: Orchestrator launches NOW!\n");
                 serial_write("========================================\n");
 
-                // CRITICAL: Reset GS MSRs to guarantee correct state for
-                // syscall_entry's swapgs.  Something between syscall::init()
-                // and here may have swapped the MSRs (e.g. an interrupt or
-                // test).  This ensures GS_BASE=0 and KERNEL_GS_BASE=PER_CPU.
                 arch::x86_64::syscall::reset_gs_bases();
 
-                // Atomically switch CR3 and IRETQ to Ring 3.
-                // GS state: GS_BASE=0 (user), KERNEL_GS_BASE=PER_CPU (kernel)
-                // — guaranteed by reset_gs_bases() above.
-                // cli: disable interrupts so no timer IRQ fires between
-                //      CR3 switch and IRETQ.
-                // IRETQ restores RFLAGS=0x202 which re-enables interrupts.
                 unsafe {
                     core::arch::asm!(
-                        "cli",              // Disable interrupts
+                        "cli",
                         "mov cr3, {cr3_val}",
-                        // Push IRETQ frame: SS, RSP, RFLAGS, CS, RIP
-                        "push 0x1B",        // SS (User Data, RPL=3)
-                        "push {rsp_val}",   // RSP (user stack)
-                        "push 0x202",       // RFLAGS (IF=1)
-                        "push 0x23",        // CS (User Code, RPL=3)
-                        "push {rip_val}",   // RIP (entry point)
+                        "push 0x1B",
+                        "push {rsp_val}",
+                        "push 0x202",
+                        "push 0x23",
+                        "push {rip_val}",
                         "iretq",
                         cr3_val = in(reg) result.pml4_phys,
                         rsp_val = in(reg) result.stack_pointer,
