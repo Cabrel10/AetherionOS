@@ -1,0 +1,12 @@
+[package]
+name = "agent_q4_dequant"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aetherion_sdk = { path = "../rust_sdk" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
