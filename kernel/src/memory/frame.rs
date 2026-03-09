@@ -1,141 +1,241 @@
-// memory/frame.rs - Frame Allocator (Physical Memory)
-// Simple next-fit allocator tracking usable physical frames
+// memory/frame.rs - Bitmap Frame Allocator (Physical Memory)
+//
+// REWRITE: Jalon 67 - Replaced per-frame array (limited to 32 MB) with a
+// bitmap allocator that supports up to 16 GB of physical RAM.
+//
+// Design: Each bit in the bitmap represents one 4 KB frame.
+//   - 0 = free, 1 = allocated (or unusable)
+//   - Static bitmap avoids stack overflow (bitmap is in .bss)
+//   - [u64; 65536] = 512 KB bitmap = 4,194,304 bits = 16 GB coverage
 //
 // SECURITY: All index arithmetic uses checked operations to prevent
-// integer overflow (CRIT-001). In release mode, unchecked += would
-// silently wrap, potentially allowing allocation of frame 0 (BIOS/kernel).
+// integer overflow (CRIT-001). Frame 0 is never returned.
 
 use x86_64::structures::paging::PhysFrame;
 use x86_64::PhysAddr;
 
-/// Taille d'une frame (4KB standard x86_64)
+/// Size of a frame (4KB standard x86_64)
 pub const FRAME_SIZE: usize = 4096;
 
-/// Maximum number of usable frames we track
-/// Each entry stores the physical frame number
-const MAX_USABLE_FRAMES: usize = 8192;
+/// Maximum physical frames we can track.
+/// 65536 u64s × 64 bits = 4,194,304 frames = 16 GB of RAM.
+const BITMAP_ENTRIES: usize = 65536;
+const MAX_FRAMES: usize = BITMAP_ENTRIES * 64; // 4,194,304
 
-/// Frame Allocator - tracks usable physical frames
+/// Static bitmap — lives in .bss, not on the stack.
+/// Initialized to all 1s (all allocated) before regions are freed.
+/// SAFETY: Only accessed through FrameAllocator methods under a lock.
+static mut FRAME_BITMAP: [u64; BITMAP_ENTRIES] = [!0u64; BITMAP_ENTRIES];
+
+/// Bitmap Frame Allocator - tracks physical frame allocation state.
+///
+/// The bitmap itself is in a static to avoid stack overflow (512 KB).
+/// This struct just holds the metadata (counters, hints).
 ///
 /// SECURITY INVARIANTS:
-/// - next_alloc <= total_frames (enforced by checked_add)
-/// - total_frames <= MAX_USABLE_FRAMES (enforced by add_region)
-/// - Frame 0 is never returned (skip if present)
+/// - Frame 0 is always marked allocated (BIOS/IVT protection)
+/// - Kernel/reserved regions are marked allocated during init
+/// - Only bootloader Usable regions are marked free
+/// - alloc returns unique, non-overlapping frames
 pub struct FrameAllocator {
-    /// Array of usable frame physical addresses (base address / 4096)
-    usable_frames: [u64; MAX_USABLE_FRAMES],
-    /// Total number of usable frames discovered
-    total_frames: usize,
-    /// Next frame to allocate (index into usable_frames)
-    next_alloc: usize,
+    /// Total number of usable (free at init) frames
+    total_usable: usize,
+    /// Number of currently allocated frames
+    allocated_count: usize,
+    /// Hint: start searching from this index (next-fit optimization)
+    search_hint: usize,
+    /// Highest frame number that is usable (for bounds checking)
+    max_frame: usize,
 }
 
 impl FrameAllocator {
-    /// Create a new FrameAllocator from bootloader memory regions
+    /// Create a new FrameAllocator from bootloader memory regions.
+    ///
+    /// The static FRAME_BITMAP starts as all 1s (all allocated).
+    /// Only regions listed in `usable_regions` are marked free.
     ///
     /// # Safety
-    /// - `regions` must contain valid physical memory ranges from bootloader
-    /// - Each region (start, end) must be page-aligned or will be rounded
+    /// - `usable_regions` must contain valid physical memory ranges from the bootloader
     /// - Must be called once during boot, before any frame allocations
-    pub unsafe fn new(regions: &[(u64, u64)]) -> Self {
-        let mut allocator = Self {
-            usable_frames: [0u64; MAX_USABLE_FRAMES],
-            total_frames: 0,
-            next_alloc: 0,
-        };
-        
-        for (start, end) in regions.iter() {
-            allocator.add_region(*start, *end);
+    pub unsafe fn new(usable_regions: &[(u64, u64)]) -> Self {
+        // Reset bitmap to all allocated
+        for i in 0..BITMAP_ENTRIES {
+            FRAME_BITMAP[i] = !0u64;
         }
-        
+
+        let mut allocator = Self {
+            total_usable: 0,
+            allocated_count: 0,
+            search_hint: 0,
+            max_frame: 0,
+        };
+
+        // Mark usable regions as free (bit = 0)
+        for &(start, end) in usable_regions {
+            allocator.mark_region_free(start, end);
+        }
+
+        // SECURITY: Always keep frame 0 allocated (BIOS data, IVT)
+        Self::set_bit_static(0);
+
+        // Count total usable frames
+        let mut free_count = 0usize;
+        for i in 0..BITMAP_ENTRIES {
+            free_count += (64 - FRAME_BITMAP[i].count_ones()) as usize;
+        }
+        allocator.total_usable = free_count;
+
         allocator
     }
-    
-    /// Add a usable memory region
-    /// Skips frame 0 to prevent BIOS/kernel corruption (CRIT-001 hardening)
-    fn add_region(&mut self, start: u64, end: u64) {
-        // SECURITY: Validate region bounds
-        if end <= start {
-            return;
-        }
-        
-        let start_frame = (start + FRAME_SIZE as u64 - 1) / FRAME_SIZE as u64;
-        let end_frame = end / FRAME_SIZE as u64;
-        
-        let mut frame = start_frame;
-        while frame < end_frame && self.total_frames < MAX_USABLE_FRAMES {
-            // SECURITY: Skip frame 0 (BIOS data area, IVT)
-            if frame == 0 {
-                frame = 1;
-                continue;
+
+    /// Mark a physical memory region as free (usable for allocation).
+    fn mark_region_free(&mut self, start: u64, end: u64) {
+        if end <= start { return; }
+
+        let start_frame = ((start + FRAME_SIZE as u64 - 1) / FRAME_SIZE as u64) as usize;
+        let end_frame = (end / FRAME_SIZE as u64) as usize;
+
+        if start_frame >= MAX_FRAMES { return; }
+        let end_frame = core::cmp::min(end_frame, MAX_FRAMES);
+
+        for frame in start_frame..end_frame {
+            if frame == 0 { continue; } // Always keep frame 0 reserved
+            unsafe { Self::clear_bit_static(frame); }
+            if frame > self.max_frame {
+                self.max_frame = frame;
             }
-            self.usable_frames[self.total_frames] = frame;
-            // SECURITY: checked increment prevents overflow (CRIT-001)
-            self.total_frames = match self.total_frames.checked_add(1) {
-                Some(v) => v,
-                None => break, // saturate, don't wrap
-            };
-            frame = match frame.checked_add(1) {
-                Some(v) => v,
-                None => break,
-            };
         }
     }
-    
-    /// Allocate a physical frame for kernel use
+
+    /// Set bit in static bitmap (mark frame as allocated)
+    #[inline]
+    unsafe fn set_bit_static(frame: usize) {
+        if frame >= MAX_FRAMES { return; }
+        let idx = frame / 64;
+        let bit = frame % 64;
+        FRAME_BITMAP[idx] |= 1u64 << bit;
+    }
+
+    /// Clear bit in static bitmap (mark frame as free)
+    #[inline]
+    unsafe fn clear_bit_static(frame: usize) {
+        if frame >= MAX_FRAMES { return; }
+        let idx = frame / 64;
+        let bit = frame % 64;
+        FRAME_BITMAP[idx] &= !(1u64 << bit);
+    }
+
+    /// Test if a frame is allocated
+    #[inline]
+    fn is_allocated(frame: usize) -> bool {
+        if frame >= MAX_FRAMES { return true; }
+        let idx = frame / 64;
+        let bit = frame % 64;
+        unsafe { (FRAME_BITMAP[idx] >> bit) & 1 == 1 }
+    }
+
+    /// Allocate a physical frame for kernel use.
     ///
-    /// Returns None if no frames available.
-    /// Uses checked arithmetic to prevent integer overflow (CRIT-001).
+    /// Uses next-fit algorithm with bitmap scanning.
     pub fn alloc_frame_kernel(&mut self) -> Option<PhysFrame> {
-        if self.next_alloc >= self.total_frames {
-            return None;
+        let max_idx = core::cmp::min((self.max_frame / 64) + 1, BITMAP_ENTRIES);
+
+        // Phase 1: Search from hint to end
+        if let Some(frame) = self.find_free_frame(self.search_hint / 64, max_idx) {
+            return self.commit_alloc(frame);
         }
-        
-        let frame_num = self.usable_frames[self.next_alloc];
-        
-        // SECURITY: checked_add prevents wraparound to 0 (CRIT-001)
-        self.next_alloc = self.next_alloc.checked_add(1)?;
-        
-        // SECURITY: validate frame_num is non-zero
-        if frame_num == 0 {
-            crate::serial_write("[FRAME] WARNING: Skipping frame 0 allocation\n");
-            return self.alloc_frame_kernel(); // recurse to next frame
+
+        // Phase 2: Wrap around
+        let hint_idx = self.search_hint / 64;
+        if hint_idx > 0 {
+            if let Some(frame) = self.find_free_frame(0, hint_idx) {
+                return self.commit_alloc(frame);
+            }
         }
-        
-        let phys_addr = PhysAddr::new(frame_num.checked_mul(FRAME_SIZE as u64)?);
+
+        None
+    }
+
+    /// Find a free frame in bitmap range [start_idx..end_idx)
+    fn find_free_frame(&self, start_idx: usize, end_idx: usize) -> Option<usize> {
+        for idx in start_idx..end_idx {
+            let word = unsafe { FRAME_BITMAP[idx] };
+            if word != !0u64 {
+                // At least one bit is 0 (free frame)
+                let bit = (!word).trailing_zeros() as usize;
+                let frame = idx * 64 + bit;
+                if frame == 0 { continue; }
+                if frame <= self.max_frame {
+                    return Some(frame);
+                }
+            }
+        }
+        None
+    }
+
+    /// Commit a frame allocation: set the bit, update counters
+    fn commit_alloc(&mut self, frame: usize) -> Option<PhysFrame> {
+        unsafe { Self::set_bit_static(frame); }
+        self.allocated_count = self.allocated_count.saturating_add(1);
+        self.search_hint = frame + 1;
+
+        let phys_addr = PhysAddr::new((frame as u64).checked_mul(FRAME_SIZE as u64)?);
         PhysFrame::from_start_address(phys_addr).ok()
     }
-    
-    /// Total usable frames
+
+    /// Free a previously allocated frame (return it to the pool).
+    ///
+    /// # Safety
+    /// The caller must ensure the frame was previously allocated and
+    /// is no longer referenced by any page table or DMA operation.
+    pub unsafe fn free_frame(&mut self, frame_num: usize) {
+        if frame_num == 0 || frame_num >= MAX_FRAMES { return; }
+        if Self::is_allocated(frame_num) {
+            Self::clear_bit_static(frame_num);
+            self.allocated_count = self.allocated_count.saturating_sub(1);
+            if frame_num < self.search_hint {
+                self.search_hint = frame_num;
+            }
+        }
+    }
+
+    /// Total usable frames discovered at boot
     pub fn total_frames(&self) -> usize {
-        self.total_frames
+        self.total_usable
     }
-    
-    /// Used frames
+
+    /// Currently allocated frames
     pub fn used_frames(&self) -> usize {
-        self.next_alloc
+        self.allocated_count
     }
-    
-    /// Free frames
+
+    /// Currently free frames
     pub fn free_frames(&self) -> usize {
-        self.total_frames.saturating_sub(self.next_alloc)
+        self.total_usable.saturating_sub(self.allocated_count)
+    }
+
+    /// Total physical RAM tracked (in bytes)
+    pub fn total_ram_bytes(&self) -> u64 {
+        (self.total_usable as u64) * FRAME_SIZE as u64
+    }
+
+    /// Maximum frame number
+    pub fn max_frame_number(&self) -> usize {
+        self.max_frame
     }
 }
 
 impl Default for FrameAllocator {
     fn default() -> Self {
-        // SAFETY: Empty region list produces a valid but empty allocator
         unsafe { Self::new(&[]) }
     }
 }
 
-// Implement x86_64 FrameAllocator trait for page table mapping
 use x86_64::structures::paging::Size4KiB;
 
 // SAFETY: alloc_frame_kernel returns valid, unique, non-overlapping physical
-// frames from the bootloader's usable memory regions. Each frame is only
-// returned once (next_alloc monotonically increases). The frames are suitable
-// for use as page table entries by the x86_64 crate's mapper.
+// frames. Each frame is only returned once (bitmap bit 0→1). Freed frames
+// can be re-allocated. The static bitmap prevents stack overflow.
 unsafe impl x86_64::structures::paging::FrameAllocator<Size4KiB> for FrameAllocator {
     fn allocate_frame(&mut self) -> Option<PhysFrame<Size4KiB>> {
         self.alloc_frame_kernel()
