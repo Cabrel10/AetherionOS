@@ -18,6 +18,55 @@
 
 extern crate alloc;
 
+// ===== Compiler built-in memory functions required by no_std =====
+#[no_mangle]
+pub unsafe extern "C" fn memset(dest: *mut u8, c: i32, n: usize) -> *mut u8 {
+    let mut i = 0;
+    while i < n {
+        *dest.add(i) = c as u8;
+        i += 1;
+    }
+    dest
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    let mut i = 0;
+    while i < n {
+        *dest.add(i) = *src.add(i);
+        i += 1;
+    }
+    dest
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    if (dest as usize) < (src as usize) {
+        memcpy(dest, src, n)
+    } else {
+        let mut i = n;
+        while i > 0 {
+            i -= 1;
+            *dest.add(i) = *src.add(i);
+        }
+        dest
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memcmp(s1: *const u8, s2: *const u8, n: usize) -> i32 {
+    let mut i = 0;
+    while i < n {
+        let a = *s1.add(i);
+        let b = *s2.add(i);
+        if a != b {
+            return a as i32 - b as i32;
+        }
+        i += 1;
+    }
+    0
+}
+
 use alloc::vec;
 use alloc::vec::Vec;
 use aetherion_sdk::*;
@@ -188,17 +237,29 @@ impl TransformerWeights {
         //   2. 0.0f32 has the same bit pattern as [0u8; 4]
         //   3. We immediately load real weights over this memory
 
+        println("[J67] alloc: embedding...");
         let embedding = alloc_zeroed_vec(v * d);
+        println("[J67] alloc: wq...");
         let wq = alloc_zeroed_vec(d * d);
+        println("[J67] alloc: wk...");
         let wk = alloc_zeroed_vec(kv * d);
+        println("[J67] alloc: wv...");
         let wv = alloc_zeroed_vec(kv * d);
+        println("[J67] alloc: wo...");
         let wo = alloc_zeroed_vec(d * d);
+        println("[J67] alloc: rms_att...");
         let mut rms_att = alloc_zeroed_vec(d);
+        println("[J67] alloc: w_gate...");
         let w_gate = alloc_zeroed_vec(h * d);
+        println("[J67] alloc: w_up...");
         let w_up = alloc_zeroed_vec(h * d);
+        println("[J67] alloc: w_down...");
         let w_down = alloc_zeroed_vec(d * h);
+        println("[J67] alloc: rms_ffn...");
         let mut rms_ffn = alloc_zeroed_vec(d);
+        println("[J67] alloc: rms_final...");
         let mut rms_final = alloc_zeroed_vec(d);
+        println("[J67] alloc: w_output...");
         let w_output = alloc_zeroed_vec(v * d);
 
         // Initialize RMS norm weights to 1.0

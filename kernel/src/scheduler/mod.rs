@@ -283,6 +283,34 @@ pub fn schedule_next() {
     }
 }
 
+/// Yield from `current` to the next ready process. Uses a blocking lock.
+/// Returns the PID of the next process (or 0/current if no switch).
+pub fn yield_to_next(current: u64) -> u64 {
+    if !SCHEDULER_ACTIVE.load(Ordering::Relaxed) {
+        return current;
+    }
+    let mut sched = SCHEDULER.lock();  // blocking lock, guaranteed
+    // Re-enqueue current
+    if current != 0 {
+        if let Some((role, _)) = process::get_role_priority(current) {
+            let prio = role_to_priority(role);
+            sched.enqueue(current, prio);
+        }
+    }
+    // Dequeue next
+    if let Some((next_pid, _next_prio)) = sched.dequeue_next() {
+        if next_pid != current {
+            sched.context_switches += 1;
+        }
+        sched.current_pid = next_pid;
+        process::set_wait_ticks(next_pid, 0);
+        next_pid
+    } else {
+        sched.current_pid = 0;
+        0
+    }
+}
+
 /// Get current scheduler metrics
 pub fn metrics() -> SchedulerMetrics {
     let sched = SCHEDULER.lock();
@@ -324,7 +352,19 @@ pub fn tick_preemptive() -> Option<(u64, u64, u64, u64, u64, u64)> {
         process::get_preempt_state(result.new_pid).unwrap_or((0, 0, 0x200, 0));
 
     if new_rip == 0 {
-        // New process hasn't been preempted before (first run) — skip
+        // Process hasn't been preempted before — it's a fresh process.
+        // Use its entry_point and stack_pointer for first launch.
+        // This enables the preemptive scheduler to start queued processes
+        // that were never launched via the sequential launch_next path.
+        if let Some((entry, stack, pml4)) = process::get_entry_state(result.new_pid) {
+            if entry != 0 && new_pml4 != 0 {
+                crate::serial_println!(
+                    "[SCHEDULER] First-run launch PID {} entry=0x{:X}",
+                    result.new_pid, entry
+                );
+                return Some((result.old_pid, result.new_pid, entry, stack, 0x200, new_pml4));
+            }
+        }
         return None;
     }
 
