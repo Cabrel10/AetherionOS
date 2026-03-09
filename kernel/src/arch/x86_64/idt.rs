@@ -203,9 +203,10 @@ extern "x86-interrupt" fn page_fault_handler(
         // Demand paging: allocate and map a page for the user stack
         let page_addr = addr_raw & !0xFFF; // page-align
 
+        // Demand paging log (diagnostic)
         crate::serial_println!(
-            "[PF-DEMAND] User stack fault at 0x{:X} (page 0x{:X}), allocating...",
-            addr_raw, page_addr
+            "[PF-DEMAND] addr=0x{:X} page=0x{:X} PID={}",
+            addr_raw, page_addr, crate::scheduler::current_pid()
         );
 
         // Allocate a frame from the ELF frame pool
@@ -233,11 +234,7 @@ extern "x86-interrupt" fn page_fault_handler(
 
                 match unsafe { crate::elf::demand_map_user_page(pml4_phys, page_addr, phys, flags) } {
                     Ok(()) => {
-                        crate::serial_println!(
-                            "[PF-DEMAND] Mapped 0x{:X} -> phys 0x{:X} (U|W|NX) OK",
-                            page_addr, phys
-                        );
-                        // Return to resume execution — CPU will retry the instruction
+                        // Hot-path: mapped OK log disabled
                         return;
                     }
                     Err(_) => {

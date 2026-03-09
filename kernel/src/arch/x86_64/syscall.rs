@@ -577,7 +577,8 @@ fn sys_open(path_addr: u64, flags: u32) -> u64 {
 
     let current_pid = crate::scheduler::current_pid();
 
-    crate::serial_println!("[SYSCALL] sys_open(\"{}\", flags=0x{:X}) from PID {}", path, flags, current_pid);
+    // Hot-path: logging disabled
+    // crate::serial_println!("[SYSCALL] sys_open(\"{}\", flags=0x{:X}) from PID {}", path, flags, current_pid);
 
     // For /disk/ paths with O_CREAT, we allow creating files that don't exist yet
     if path.starts_with("/disk/") && (flags & O_CREAT) != 0 {
@@ -626,7 +627,7 @@ fn sys_open(path_addr: u64, flags: u32) -> u64 {
             fd_table.alloc_fd(&path, flags)
         }) {
             Some(Some(fd)) => {
-                crate::serial_println!("[SYSCALL] sys_open(\"{}\") = FD {} (O_CREAT)", path, fd);
+                // crate::serial_println!("[SYSCALL] sys_open(\"{}\") = FD {} (O_CREAT)", path, fd);
                 return fd as u64;
             }
             _ => return EMFILE,
@@ -648,7 +649,7 @@ fn sys_open(path_addr: u64, flags: u32) -> u64 {
                         return ENOENT;
                     }
                     Some(file_size) => {
-                        crate::serial_println!("[SYSCALL] sys_open: '{}' exists on FAT32 ({} bytes), registering FD (lazy load)", disk_path, file_size);
+                        // crate::serial_println!("[SYSCALL] sys_open: '{}' exists on FAT32 ({} bytes), registering FD (lazy load)", disk_path, file_size);
                         // Register a placeholder in VFS — actual data read via sys_read with chunked read
                         {
                             let mut root = crate::fs::vfs::lock_root();
@@ -793,13 +794,89 @@ fn sys_clone(child_stack: u64) -> u64 {
 // ===== sys_yield() =====
 
 /// Voluntarily yield the CPU to another ready process.
-/// Essential for cooperative multitasking and userspace spinlocks/mutexes.
+/// Performs a REAL context switch: saves current state, picks next process,
+/// and IRETQ's to it. If no other process is ready, returns immediately.
 fn sys_yield() -> u64 {
-    // Re-enqueue current process and pick the next one
-    crate::scheduler::schedule_next();
-    // Pause briefly
-    unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
-    0 // Success
+    let current = crate::scheduler::current_pid();
+    if current == 0 { return 0; }
+
+    // Save current process's user-mode state so it can be resumed later.
+    let user_rip = saved_user_rip();
+    let user_rsp = saved_user_rsp();
+    crate::process::save_preempt_state(current, user_rip, user_rsp, 0x202);
+
+    // Use yield_to_next which does a blocking lock + tick + returns result
+    // Loop to skip stale/test processes that have no valid address space
+    let mut next = 0u64;
+    for _ in 0..16 {
+        let candidate = crate::scheduler::yield_to_next(current);
+        if candidate == 0 || candidate == current {
+            next = current;
+            break;
+        }
+        // Verify the candidate has a valid PML4 (real userspace process)
+        if let Some((_e, _s, pml4)) = crate::process::get_entry_state(candidate) {
+            if pml4 != 0 {
+                next = candidate;
+                break;
+            }
+        }
+        // Invalid process: re-enqueue current and try again
+        // The invalid candidate was already dequeued and lost, which is fine
+    }
+
+    // If scheduler picked the same process (or none), just return
+    if next == 0 || next == current {
+        return 0;
+    }
+
+    // Get the next process's saved state (or entry state for first-run)
+    let (new_rip, new_rsp, new_rflags, new_pml4) =
+        if let Some((rip, rsp, rfl, pml4)) = crate::process::get_preempt_state(next) {
+            if rip != 0 {
+                (rip, rsp, rfl, pml4)
+            } else if let Some((entry, stack, pml4)) = crate::process::get_entry_state(next) {
+                // First-run process: use entry_point and stack_pointer
+                crate::serial_println!("[YIELD] First-run PID {} entry=0x{:X}", next, entry);
+                (entry, stack, 0x202u64, pml4)
+            } else {
+                return 0;
+            }
+        } else {
+            return 0;
+        };
+
+    if new_pml4 == 0 || new_rip == 0 {
+        return 0;
+    }
+
+    // Mark the old process as Ready, new as Running
+    let _ = crate::process::set_state(current, crate::process::ProcessState::Ready);
+    let _ = crate::process::set_state(next, crate::process::ProcessState::Running);
+    crate::scheduler::set_current_pid(next);
+
+    crate::serial_println!("[YIELD] PID {} -> PID {} rip=0x{:X} rsp=0x{:X} cr3=0x{:X}",
+        current, next, new_rip, new_rsp, new_pml4);
+
+    // Context switch: load new CR3 and IRETQ to new process
+    unsafe {
+        asm!(
+            "cli",
+            "mov cr3, {cr3_val}",
+            "push 0x1B",           // SS (Ring 3 data)
+            "push {rsp_val}",      // RSP
+            "push {rfl_val}",      // RFLAGS
+            "push 0x23",           // CS (Ring 3 code)
+            "push {rip_val}",      // RIP
+            "swapgs",              // Switch back to user GS
+            "iretq",
+            cr3_val = in(reg) new_pml4,
+            rsp_val = in(reg) new_rsp,
+            rfl_val = in(reg) new_rflags,
+            rip_val = in(reg) new_rip,
+            options(noreturn),
+        );
+    }
 }
 
 /// Fork the current process (Jalon 25a - REAL UNIX FORK).

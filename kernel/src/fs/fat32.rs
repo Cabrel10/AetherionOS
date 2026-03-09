@@ -241,7 +241,7 @@ impl Fat32Fs {
         }
 
         let bpb = Fat32Bpb::parse(&sector)?;
-        crate::serial_println!("[FAT32] Filesystem mounted (data starts at sector {})", bpb.data_start_lba());
+        // crate::serial_println!("[FAT32] Filesystem mounted (data starts at sector {})", bpb.data_start_lba());
 
         Some(Fat32Fs { bpb })
     }
@@ -389,7 +389,7 @@ impl Fat32Fs {
             }
         }
 
-        crate::serial_println!("[FAT32] Allocated {} cluster(s), first={}", chain.len(), chain[0]);
+        // crate::serial_println!("[FAT32] Allocated {} cluster(s), first={}", chain.len(), chain[0]);
         Some(chain[0])
     }
 
@@ -411,7 +411,7 @@ impl Fat32Fs {
             }
             cluster = next;
         }
-        crate::serial_println!("[FAT32] Freed {} cluster(s) from chain starting at {}", count, start_cluster);
+        // crate::serial_println!("[FAT32] Freed {} cluster(s) from chain starting at {}", count, start_cluster);
     }
 
     /// Write data to a cluster's sectors on disk
@@ -712,7 +712,7 @@ impl Fat32Fs {
 
         match self.navigate_to_dir(&parts) {
             Some(cluster) => {
-                crate::serial_println!("[FAT32] list_directory_path('{}') -> cluster {}", path, cluster);
+                // crate::serial_println!("[FAT32] list_directory_path('{}') -> cluster {}", path, cluster);
                 self.list_directory(cluster)
             }
             None => Vec::new(),
@@ -733,8 +733,8 @@ impl Fat32Fs {
         let name_8_3 = name_to_8_3(filename);
         let target_lower = filename.to_ascii_lowercase();
 
-        crate::serial_println!("[FAT32-W] write_file_to_dir: dir_cluster={}, file='{}', size={}",
-            dir_cluster, filename, data.len());
+        // crate::serial_println!("[FAT32-W] write_file_to_dir: dir_cluster={}, file='{}', size={}",
+        //     dir_cluster, filename, data.len());
 
         // Step 1+2: Scan directory for existing entry
         let mut found_entry_cluster = 0u32;
@@ -868,8 +868,8 @@ impl Fat32Fs {
             return false;
         }
 
-        crate::serial_println!("[FAT32-W] File '{}' written: {} bytes, first_cluster={}",
-            filename, data.len(), new_first_cluster);
+        // crate::serial_println!("[FAT32-W] File '{}' written: {} bytes, first_cluster={}",
+        //     filename, data.len(), new_first_cluster);
 
         true
     }
@@ -882,7 +882,7 @@ static mut FAT32_FS: Option<Fat32Fs> = None;
 pub fn init() -> bool {
     match Fat32Fs::mount() {
         Some(fs) => {
-            crate::serial_println!("[FAT32] Filesystem initialized");
+            // crate::serial_println!("[FAT32] Filesystem initialized");
             unsafe { FAT32_FS = Some(fs); }
             true
         }
@@ -936,7 +936,7 @@ pub fn write_file(disk_path: &str, data: &[u8]) -> bool {
             }
         };
 
-        crate::serial_println!("[FAT32-W] write_file('{}', {} bytes)", disk_path, data.len());
+        // crate::serial_println!("[FAT32-W] write_file('{}', {} bytes)", disk_path, data.len());
 
         // Parse the path into directory components + filename
         let parts: Vec<&str> = disk_path.split('/').filter(|s| !s.is_empty()).collect();
@@ -986,30 +986,21 @@ pub fn read_file_path(disk_path: &str) -> Option<Vec<u8>> {
         let filename = parts[parts.len() - 1];
         let dir_parts = &parts[..parts.len() - 1];
 
-        crate::serial_println!("[FAT32] read_file_path: '{}' (dir={:?}, file='{}')",
-            disk_path, dir_parts, filename);
+        // Hot-path logging disabled for performance
+        // crate::serial_println!("[FAT32] read_file_path: '{}' (dir={:?}, file='{}')",
+        //     disk_path, dir_parts, filename);
 
         let dir_cluster = if dir_parts.is_empty() {
             fs.bpb.root_cluster
         } else {
             match fs.navigate_to_dir(dir_parts) {
-                Some(c) => {
-                    crate::serial_println!("[FAT32] read_file_path: subdirectory resolved -> cluster {}", c);
-                    c
-                }
-                None => {
-                    crate::serial_println!("[FAT32] read_file_path: subdirectory not found: {:?}", dir_parts);
-                    return None;
-                }
+                Some(c) => c,
+                None => { return None; }
             }
         };
 
         let result = fs.read_file_in_dir(dir_cluster, filename);
-        if let Some(ref data) = result {
-            crate::serial_println!("[FAT32] read_file_path: SUCCESS '{}' = {} bytes", disk_path, data.len());
-        } else {
-            crate::serial_println!("[FAT32] read_file_path: file '{}' not found in cluster {}", filename, dir_cluster);
-        }
+        // Success/failure logging disabled for performance
         result
     }
 }

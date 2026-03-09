@@ -614,6 +614,17 @@ pub fn get_preempt_state(pid: u64) -> Option<(u64, u64, u64, u64)> {
     }
 }
 
+/// Get entry point state for a fresh (never-preempted) process.
+/// Returns (entry_point, stack_pointer, pml4_phys).
+pub fn get_entry_state(pid: u64) -> Option<(u64, u64, u64)> {
+    let table = PROCESS_TABLE.lock();
+    if let Some(p) = table.get(&pid) {
+        Some((p.entry_point, p.stack_pointer, p.pml4_phys))
+    } else {
+        None
+    }
+}
+
 /// Initialize the process manager (creates kernel_idle as PID 1)
 pub fn init() -> u64 {
     let idle_pid = spawn_kernel_thread("kernel_idle").expect("Failed to create idle process");
