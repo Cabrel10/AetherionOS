@@ -56,9 +56,11 @@ const INTENT_LLM_READY: u64        = 0x8004;
 const INTENT_GENERATION_DONE: u64   = 0x8003;
 const INTENT_TERM_CMD: u64         = 0xB065;
 
-// For automated QEMU testing: bounded loop
-// In real usage this would be u64::MAX
-const MAX_IDLE_LOOPS: u64 = 8000;
+// With blocking sys_read(fd=0), the terminal truly waits for keyboard input.
+// MAX_IDLE_LOOPS is a safety valve: each "idle" now means sys_read returned 0
+// after ~50,000 scheduler yields (no key pressed for a very long time).
+// This allows QEMU automated tests to eventually exit.
+const MAX_IDLE_LOOPS: u64 = 500;
 
 // ═══════════════════════════════════════════════════
 // Terminal State

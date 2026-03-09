@@ -457,21 +457,30 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
 
     if fd == 0 {
         // Read from stdin = keyboard buffer
-        // Non-blocking read: return whatever is available now
+        // BLOCKING: yield CPU until at least 1 byte is available.
+        // Safety valve: after MAX_YIELD iterations, return 0 so automated
+        // QEMU tests don't hang forever (real keyboard always arrives).
+        const MAX_YIELD: u32 = 50_000;
         let mut temp_buf = [0u8; 256];
         let max_read = core::cmp::min(len as usize, temp_buf.len());
-        let bytes_read = crate::process::kbd_read(&mut temp_buf, max_read);
-        if bytes_read > 0 {
-            // Copy to user buffer
-            unsafe {
-                let dst = buf_addr as *mut u8;
-                for i in 0..bytes_read {
-                    core::ptr::write_volatile(dst.add(i), temp_buf[i]);
+
+        for _attempt in 0..MAX_YIELD {
+            let bytes_read = crate::process::kbd_read(&mut temp_buf, max_read);
+            if bytes_read > 0 {
+                // Copy to user buffer
+                unsafe {
+                    let dst = buf_addr as *mut u8;
+                    for i in 0..bytes_read {
+                        core::ptr::write_volatile(dst.add(i), temp_buf[i]);
+                    }
                 }
+                return bytes_read as u64;
             }
-            return bytes_read as u64;
+            // No data yet — yield to scheduler and retry when rescheduled.
+            // This blocks the calling process without busy-waiting.
+            crate::scheduler::schedule_next();
         }
-        // No data available - return 0 (non-blocking)
+        // Safety valve: no key after MAX_YIELD yields → return 0
         return 0;
     }
 
