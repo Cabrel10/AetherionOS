@@ -1779,7 +1779,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
         // ──────────────────────────────────────────────────────────
         // STEP A: Load agent_visual_term.elf as a QUEUED process
-        // (runs after llama_core exits, displays generated tokens)
+        // (runs after primary agents exit, displays generated tokens)
         // ──────────────────────────────────────────────────────────
         serial_write("  [J60] Loading agent_visual_term.elf (queued)...\n");
         match elf::load_elf_binary(AGENT_VISUAL_TERM_ELF) {
@@ -1825,37 +1825,37 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         }
 
         // ──────────────────────────────────────────────────────────
-        // STEP A3: Load agent_llm_chat.elf as QUEUED process (Jalon 64)
-        // Full LLM Chat Agent: loads GGUF from FAT32, generates tokens
+        // STEP A3: Load agent_llama_core.elf as QUEUED process
+        // (Jalon 62/63 — runs AFTER agent_llm_chat exits)
         // ──────────────────────────────────────────────────────────
-        serial_write("  [J64] Loading agent_llm_chat.elf (queued)...\n");
-        match elf::load_elf_binary(AGENT_LLM_CHAT_ELF) {
-            Ok(chat_result) => {
-                let chat_pid = process::spawn_userspace(
-                    "/bin/agent_llm_chat.elf", 0,
-                    chat_result.entry_point, chat_result.stack_pointer, chat_result.pml4_phys
+        serial_write("  [J62] Loading agent_llama_core.elf (queued)...\n");
+        match elf::load_elf_binary(AGENT_LLAMA_CORE_ELF) {
+            Ok(core_result) => {
+                let core_pid = process::spawn_userspace(
+                    "/bin/agent_llama_core.elf", 0,
+                    core_result.entry_point, core_result.stack_pointer, core_result.pml4_phys
                 ).unwrap_or(0);
-                if chat_pid != 0 {
-                    scheduler::enqueue_process(chat_pid);
-                    process::save_preempt_state(chat_pid,
-                        chat_result.entry_point, chat_result.stack_pointer, 0x202);
-                    serial_println!("  [J64] LLM Chat Agent PID={} queued (entry=0x{:X}, segs={}, frames={})",
-                        chat_pid, chat_result.entry_point, chat_result.segments_loaded, chat_result.frames_used);
+                if core_pid != 0 {
+                    scheduler::enqueue_process(core_pid);
+                    process::save_preempt_state(core_pid,
+                        core_result.entry_point, core_result.stack_pointer, 0x202);
+                    serial_println!("  [J62] LLaMA Core PID={} queued (entry=0x{:X}, segs={}, frames={})",
+                        core_pid, core_result.entry_point, core_result.segments_loaded, core_result.frames_used);
                 }
             }
             Err(e) => {
-                serial_println!("  [J64] WARN: agent_llm_chat.elf load failed: {}", e);
+                serial_println!("  [J62] WARN: agent_llama_core.elf load failed: {}", e);
             }
         }
 
         // ──────────────────────────────────────────────────────────
-        // STEP B: Load and LAUNCH agent_llama_core.elf (Jalon 62/63)
-        // Runs transformer math validation, generates 128 tokens,
-        // publishes INTENT_TOKEN_GENERATED (0x8063) for each token;
-        // scheduler picks up orchestrator, then visual terminal
+        // STEP B: Load and LAUNCH agent_llm_chat.elf FIRST (Jalon 67)
+        // Dynamic GGUF agent: parses metadata, allocates tensors, runs
+        // inference. Launched first because it needs uninterrupted CPU
+        // for heap allocation. After it exits → llama_core → visual_term.
         // ──────────────────────────────────────────────────────────
-        let elf_binary = AGENT_LLAMA_CORE_ELF;
-        let elf_name = "/bin/agent_llama_core.elf";
+        let elf_binary = AGENT_LLM_CHAT_ELF;
+        let elf_name = "/bin/agent_llm_chat.elf";
 
         serial_println!("  [J60] Loading {}...", elf_name);
         let load_result = elf::load_elf_binary(elf_binary);
@@ -1880,7 +1880,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     serial_println!("  [J60] Orchestrator PID={} registered (launching first)", pid);
                 }
 
-                serial_write("  [J62] IRETQ -> Ring 3: LLaMA Core launches NOW!\n");
+                serial_write("  [J67] IRETQ -> Ring 3: Dynamic LLM Chat Agent launches NOW!\n");
                 serial_write("========================================\n");
 
                 arch::x86_64::syscall::reset_gs_bases();

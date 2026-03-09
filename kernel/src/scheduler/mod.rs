@@ -238,8 +238,8 @@ pub fn init() {
     }
     drop(sched);
     SCHEDULER_ACTIVE.store(true, Ordering::SeqCst);
-    crate::serial_println!("[SCHEDULER] Initialized with {} processes (aging threshold: {} ticks)",
-        process::active_count(), AGING_THRESHOLD);
+    // crate::serial_println!("[SCHEDULER] Initialized with {} processes (aging threshold: {} ticks)",
+    //     process::active_count(), AGING_THRESHOLD);
 }
 
 /// Enqueue a newly spawned process
@@ -358,10 +358,10 @@ pub fn tick_preemptive() -> Option<(u64, u64, u64, u64, u64, u64)> {
         // that were never launched via the sequential launch_next path.
         if let Some((entry, stack, pml4)) = process::get_entry_state(result.new_pid) {
             if entry != 0 && new_pml4 != 0 {
-                crate::serial_println!(
-                    "[SCHEDULER] First-run launch PID {} entry=0x{:X}",
-                    result.new_pid, entry
-                );
+                // crate::serial_println!(
+                //     "[SCHEDULER] First-run launch PID {} entry=0x{:X}",
+                //     result.new_pid, entry
+                // );
                 return Some((result.old_pid, result.new_pid, entry, stack, 0x200, new_pml4));
             }
         }

@@ -837,7 +837,7 @@ fn sys_yield() -> u64 {
                 (rip, rsp, rfl, pml4)
             } else if let Some((entry, stack, pml4)) = crate::process::get_entry_state(next) {
                 // First-run process: use entry_point and stack_pointer
-                crate::serial_println!("[YIELD] First-run PID {} entry=0x{:X}", next, entry);
+                // crate::serial_println!("[YIELD] First-run PID {} entry=0x{:X}", next, entry);
                 (entry, stack, 0x202u64, pml4)
             } else {
                 return 0;
@@ -855,8 +855,8 @@ fn sys_yield() -> u64 {
     let _ = crate::process::set_state(next, crate::process::ProcessState::Running);
     crate::scheduler::set_current_pid(next);
 
-    crate::serial_println!("[YIELD] PID {} -> PID {} rip=0x{:X} rsp=0x{:X} cr3=0x{:X}",
-        current, next, new_rip, new_rsp, new_pml4);
+    // crate::serial_println!("[YIELD] PID {} -> PID {} rip=0x{:X} rsp=0x{:X} cr3=0x{:X}",
+    //     current, next, new_rip, new_rsp, new_pml4);
 
     // Context switch: load new CR3 and IRETQ to new process
     unsafe {

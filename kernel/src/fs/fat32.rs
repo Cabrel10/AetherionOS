@@ -57,7 +57,7 @@ impl Fat32Bpb {
         // Check boot signature (0x55AA at offset 510-511)
         let sig = u16::from_le_bytes([sector[510], sector[511]]);
         if sig != 0xAA55 {
-            crate::serial_println!("[FAT32] Invalid boot signature: 0x{:04X}", sig);
+            // crate::serial_println!("[FAT32] Invalid boot signature: 0x{:04X}", sig);
             return None;
         }
 
@@ -71,16 +71,16 @@ impl Fat32Bpb {
 
         // Validate
         if bytes_per_sector != 512 {
-            crate::serial_println!("[FAT32] Unsupported sector size: {}", bytes_per_sector);
+            // crate::serial_println!("[FAT32] Unsupported sector size: {}", bytes_per_sector);
             return None;
         }
         if sectors_per_cluster == 0 || num_fats == 0 {
-            crate::serial_println!("[FAT32] Invalid BPB: spc={}, fats={}", sectors_per_cluster, num_fats);
+            // crate::serial_println!("[FAT32] Invalid BPB: spc={}, fats={}", sectors_per_cluster, num_fats);
             return None;
         }
 
-        crate::serial_println!("[FAT32] BPB: spc={}, reserved={}, fats={}, fat_size={}, root_cluster={}",
-            sectors_per_cluster, reserved_sectors, num_fats, fat_size_32, root_cluster);
+        // crate::serial_println!("[FAT32] BPB: spc={}, reserved={}, fats={}, fat_size={}, root_cluster={}",
+        //     sectors_per_cluster, reserved_sectors, num_fats, fat_size_32, root_cluster);
 
         Some(Fat32Bpb {
             bytes_per_sector,
@@ -236,7 +236,7 @@ impl Fat32Fs {
         // Read boot sector (sector 0)
         let mut sector = [0u8; 512];
         if !crate::drivers::virtio_blk::read_sector(0, &mut sector) {
-            crate::serial_println!("[FAT32] Failed to read boot sector");
+            // crate::serial_println!("[FAT32] Failed to read boot sector");
             return None;
         }
 
@@ -293,7 +293,7 @@ impl Fat32Fs {
 
         // Read the FAT sector
         if !crate::drivers::virtio_blk::read_sector(fat_sector as u64, &mut sector_buf) {
-            crate::serial_println!("[FAT32] Failed to read FAT sector {} for cluster {}", fat_sector, cluster);
+            // crate::serial_println!("[FAT32] Failed to read FAT sector {} for cluster {}", fat_sector, cluster);
             return false;
         }
 
@@ -311,7 +311,7 @@ impl Fat32Fs {
 
         // Write back to FAT1
         if !crate::drivers::virtio_blk::write_sector(fat_sector as u64, &sector_buf) {
-            crate::serial_println!("[FAT32] Failed to write FAT1 sector {}", fat_sector);
+            // crate::serial_println!("[FAT32] Failed to write FAT1 sector {}", fat_sector);
             return false;
         }
 
@@ -319,7 +319,7 @@ impl Fat32Fs {
         if self.bpb.num_fats >= 2 {
             let fat2_sector = fat_sector + self.bpb.fat_size_32;
             if !crate::drivers::virtio_blk::write_sector(fat2_sector as u64, &sector_buf) {
-                crate::serial_println!("[FAT32] Warning: Failed to mirror FAT2 sector {}", fat2_sector);
+                // crate::serial_println!("[FAT32] Warning: Failed to mirror FAT2 sector {}", fat2_sector);
                 // Non-fatal: FAT1 was written successfully
             }
         }
@@ -339,7 +339,7 @@ impl Fat32Fs {
             }
         }
 
-        crate::serial_println!("[FAT32] ENOSPC: No free clusters found (scanned {})", limit - 2);
+        // crate::serial_println!("[FAT32] ENOSPC: No free clusters found (scanned {})", limit - 2);
         None
     }
 
@@ -371,7 +371,7 @@ impl Fat32Fs {
             }
             if !found {
                 // Not enough space — undo any allocations
-                crate::serial_println!("[FAT32] ENOSPC: Need {} clusters, found only {}", clusters_needed, chain.len());
+                // crate::serial_println!("[FAT32] ENOSPC: Need {} clusters, found only {}", clusters_needed, chain.len());
                 return None;
             }
         }
@@ -384,7 +384,7 @@ impl Fat32Fs {
                 FAT32_EOC
             };
             if !self.set_fat_entry(chain[i], value) {
-                crate::serial_println!("[FAT32] Failed to set FAT entry for cluster {}", chain[i]);
+                // crate::serial_println!("[FAT32] Failed to set FAT entry for cluster {}", chain[i]);
                 return None;
             }
         }
@@ -441,7 +441,7 @@ impl Fat32Fs {
 
             let end = core::cmp::min(offset + cluster_size, data.len());
             if !self.write_cluster(cluster, &data[offset..end]) {
-                crate::serial_println!("[FAT32] Failed to write cluster {}", cluster);
+                // crate::serial_println!("[FAT32] Failed to write cluster {}", cluster);
                 return false;
             }
             offset = end;
@@ -450,7 +450,7 @@ impl Fat32Fs {
                 match self.next_cluster(cluster) {
                     Some(next) => cluster = next,
                     None => {
-                        crate::serial_println!("[FAT32] Cluster chain too short for data");
+                        // crate::serial_println!("[FAT32] Cluster chain too short for data");
                         return false;
                     }
                 }
@@ -658,7 +658,7 @@ impl Fat32Fs {
             }
 
             if !found {
-                crate::serial_println!("[FAT32] Directory component '{}' not found in cluster {}", component, current_cluster);
+                // crate::serial_println!("[FAT32] Directory component '{}' not found in cluster {}", component, current_cluster);
                 return None;
             }
         }
@@ -796,7 +796,7 @@ impl Fat32Fs {
 
         // Step 2: Free old cluster chain if overwriting
         if entry_found && found_old_cluster >= 2 {
-            crate::serial_println!("[FAT32-W] Overwriting existing file, freeing old chain from cluster {}", found_old_cluster);
+            // crate::serial_println!("[FAT32-W] Overwriting existing file, freeing old chain from cluster {}", found_old_cluster);
             self.free_cluster_chain(found_old_cluster);
         }
 
@@ -807,7 +807,7 @@ impl Fat32Fs {
             match self.allocate_cluster_chain(data.len()) {
                 Some(c) => c,
                 None => {
-                    crate::serial_println!("[FAT32-W] Failed to allocate clusters for {} bytes", data.len());
+                    // crate::serial_println!("[FAT32-W] Failed to allocate clusters for {} bytes", data.len());
                     return false;
                 }
             }
@@ -816,7 +816,7 @@ impl Fat32Fs {
         // Step 4: Write data to the new clusters
         if !data.is_empty() && new_first_cluster >= 2 {
             if !self.write_file_data(new_first_cluster, data) {
-                crate::serial_println!("[FAT32-W] Failed to write file data");
+                // crate::serial_println!("[FAT32-W] Failed to write file data");
                 return false;
             }
         }
@@ -846,7 +846,7 @@ impl Fat32Fs {
         } else if free_slot_found {
             (free_slot_cluster, free_slot_offset)
         } else {
-            crate::serial_println!("[FAT32-W] No free directory entry slot found");
+            // crate::serial_println!("[FAT32-W] No free directory entry slot found");
             return false;
         };
 
@@ -854,7 +854,7 @@ impl Fat32Fs {
         let mut cluster_data = match self.read_cluster(target_cluster) {
             Some(d) => d,
             None => {
-                crate::serial_println!("[FAT32-W] Failed to read dir cluster {}", target_cluster);
+                // crate::serial_println!("[FAT32-W] Failed to read dir cluster {}", target_cluster);
                 return false;
             }
         };
@@ -864,7 +864,7 @@ impl Fat32Fs {
 
         // Write the cluster back
         if !self.write_cluster(target_cluster, &cluster_data) {
-            crate::serial_println!("[FAT32-W] Failed to write back dir cluster {}", target_cluster);
+            // crate::serial_println!("[FAT32-W] Failed to write back dir cluster {}", target_cluster);
             return false;
         }
 
@@ -887,7 +887,7 @@ pub fn init() -> bool {
             true
         }
         None => {
-            crate::serial_println!("[FAT32] No FAT32 filesystem found");
+            // crate::serial_println!("[FAT32] No FAT32 filesystem found");
             false
         }
     }
@@ -931,7 +931,7 @@ pub fn write_file(disk_path: &str, data: &[u8]) -> bool {
         let fs = match FAT32_FS {
             Some(ref f) => f,
             None => {
-                crate::serial_println!("[FAT32] write_file: No filesystem mounted");
+                // crate::serial_println!("[FAT32] write_file: No filesystem mounted");
                 return false;
             }
         };
@@ -941,7 +941,7 @@ pub fn write_file(disk_path: &str, data: &[u8]) -> bool {
         // Parse the path into directory components + filename
         let parts: Vec<&str> = disk_path.split('/').filter(|s| !s.is_empty()).collect();
         if parts.is_empty() {
-            crate::serial_println!("[FAT32-W] Empty path");
+            // crate::serial_println!("[FAT32-W] Empty path");
             return false;
         }
 
@@ -955,7 +955,7 @@ pub fn write_file(disk_path: &str, data: &[u8]) -> bool {
             match fs.navigate_to_dir(dir_parts) {
                 Some(c) => c,
                 None => {
-                    crate::serial_println!("[FAT32-W] Directory path not found: {:?}", dir_parts);
+                    // crate::serial_println!("[FAT32-W] Directory path not found: {:?}", dir_parts);
                     return false;
                 }
             }
@@ -1071,81 +1071,81 @@ pub fn list_directory_path(path: &str) -> Vec<Fat32DirEntry> {
 
 /// Run FAT32 self-tests (updated for J43: subdirectory traversal)
 pub fn run_tests() {
-    crate::serial_println!("\n========================================");
-    crate::serial_println!("[FAT32 TESTS] Couche 19 - FAT32 Filesystem");
-    crate::serial_println!("========================================\n");
+    // crate::serial_println!("\n========================================");
+    // crate::serial_println!("[FAT32 TESTS] Couche 19 - FAT32 Filesystem");
+    // crate::serial_println!("========================================\n");
 
     let mut passed = 0u32;
     let mut failed = 0u32;
 
     // Test 1: FAT32 mounted
-    crate::serial_write("  [TEST 1/3] FAT32 mounted... ");
+    // crate::serial_write("  [TEST 1/3] FAT32 mounted... ");
     if is_mounted() {
-        crate::serial_write("OK\n");
+        // crate::serial_write("OK\n");
         passed += 1;
     } else {
-        crate::serial_write("SKIP (no FAT32 disk)\n");
-        crate::serial_println!("\n========================================");
-        crate::serial_println!("[FAT32 TESTS] Skipped (no FAT32 filesystem)");
-        crate::serial_println!("========================================");
+        // crate::serial_write("SKIP (no FAT32 disk)\n");
+        // crate::serial_println!("\n========================================");
+        // crate::serial_println!("[FAT32 TESTS] Skipped (no FAT32 filesystem)");
+        // crate::serial_println!("========================================");
         return;
     }
 
     // Test 2: List root directory
-    crate::serial_write("  [TEST 2/3] Root directory listing... ");
+    // crate::serial_write("  [TEST 2/3] Root directory listing... ");
     let entries = list_root();
     if !entries.is_empty() {
-        crate::serial_println!("OK ({} entries)", entries.len());
+        // crate::serial_println!("OK ({} entries)", entries.len());
         for entry in &entries {
             if entry.is_directory {
-                crate::serial_println!("    <DIR> {}", entry.name);
+                // crate::serial_println!("    <DIR> {}", entry.name);
             } else {
-                crate::serial_println!("    {} ({} bytes)", entry.name, entry.file_size);
+                // crate::serial_println!("    {} ({} bytes)", entry.name, entry.file_size);
             }
         }
         passed += 1;
     } else {
-        crate::serial_write("WARN (empty directory)\n");
+        // crate::serial_write("WARN (empty directory)\n");
         passed += 1; // Could be an empty disk
     }
 
     // Test 3: Read index.html
-    crate::serial_write("  [TEST 3/5] Read index.html... ");
+    // crate::serial_write("  [TEST 3/5] Read index.html... ");
     match read_file("index.html") {
         Some(data) => {
-            crate::serial_println!("OK ({} bytes)", data.len());
+            // crate::serial_println!("OK ({} bytes)", data.len());
             let preview_len = core::cmp::min(data.len(), 100);
             if let Ok(s) = core::str::from_utf8(&data[..preview_len]) {
-                crate::serial_println!("    Content: {}", s);
+                // crate::serial_println!("    Content: {}", s);
             }
             passed += 1;
         }
         None => {
-            crate::serial_write("SKIP (no index.html on disk)\n");
+            // crate::serial_write("SKIP (no index.html on disk)\n");
             passed += 1;
         }
     }
 
     // Test 4: Subdirectory traversal (models/)
-    crate::serial_write("  [TEST 4/5] Subdirectory listing (models/)... ");
+    // crate::serial_write("  [TEST 4/5] Subdirectory listing (models/)... ");
     let sub_entries = list_directory_path("models");
     if !sub_entries.is_empty() {
-        crate::serial_println!("OK ({} entries)", sub_entries.len());
+        // crate::serial_println!("OK ({} entries)", sub_entries.len());
         for entry in &sub_entries {
             if entry.is_directory {
-                crate::serial_println!("    <DIR> {}", entry.name);
+                // crate::serial_println!("    <DIR> {}", entry.name);
             } else {
-                crate::serial_println!("    /disk/models/{} ({} bytes)", entry.name, entry.file_size);
+                // crate::serial_println!("    /disk/models/{} ({} bytes)", entry.name, entry.file_size);
             }
         }
         passed += 1;
     } else {
-        crate::serial_write("SKIP (no models/ directory)\n");
+        // crate::serial_write("SKIP (no models/ directory)\n");
         passed += 1;
     }
 
     // Test 5: Read first 16 bytes of a file from subdirectory (SAFE: chunked read, no OOM)
-    crate::serial_write("  [TEST 5/5] Chunked read from subdirectory... ");
+    // crate::serial_write("  [TEST 5/5] Chunked read from subdirectory... ");
     if !sub_entries.is_empty() {
         let first_file = sub_entries.iter().find(|e| !e.is_directory);
         if let Some(entry) = first_file {
@@ -1153,7 +1153,7 @@ pub fn run_tests() {
             // CRITICAL FIX (#16): Use file_exists + chunked read instead of full read
             match file_exists(&path) {
                 Some(size) => {
-                    crate::serial_println!("EXISTS ({} = {} bytes)", path, size);
+                    // crate::serial_println!("EXISTS ({} = {} bytes)", path, size);
                     // Only read first 16 bytes for preview (safe even for 2GB files)
                     match read_file_path_chunk(&path, 0, 16) {
                         Some(data) => {
@@ -1163,31 +1163,31 @@ pub fn run_tests() {
                                 use core::fmt::Write;
                                 let _ = write!(hex, "{:02X} ", b);
                             }
-                            crate::serial_println!("    First {} bytes: {}", preview_len, hex);
+                            // crate::serial_println!("    First {} bytes: {}", preview_len, hex);
                             passed += 1;
                         }
                         None => {
-                            crate::serial_println!("WARN (chunk read failed, but file exists)");
+                            // crate::serial_println!("WARN (chunk read failed, but file exists)");
                             passed += 1;
                         }
                     }
                 }
                 None => {
-                    crate::serial_println!("FAIL (file_exists returned None for '{}')", path);
+                    // crate::serial_println!("FAIL (file_exists returned None for '{}')", path);
                     failed += 1;
                 }
             }
         } else {
-            crate::serial_write("SKIP (no files in models/)\n");
+            // crate::serial_write("SKIP (no files in models/)\n");
             passed += 1;
         }
     } else {
-        crate::serial_write("SKIP (no models/ directory)\n");
+        // crate::serial_write("SKIP (no models/ directory)\n");
         passed += 1;
     }
 
-    crate::serial_println!("\n========================================");
-    crate::serial_println!("[FAT32 TESTS] {}/{} passed, {} failed", passed, passed + failed, failed);
+    // crate::serial_println!("\n========================================");
+    // crate::serial_println!("[FAT32 TESTS] {}/{} passed, {} failed", passed, passed + failed, failed);
     if failed == 0 { crate::serial_write("[FAT32 TESTS] ALL TESTS PASSED!\n"); }
-    crate::serial_println!("========================================");
+    // crate::serial_println!("========================================");
 }
