@@ -100,9 +100,9 @@ impl MemoryManager {
         {
             use core::fmt::Write;
             let mut s = arrayvec::ArrayString::<128>::new();
-            let _ = writeln!(s, "[MEMORY] Frame allocator: {} frames ({} KB)",
+            let _ = writeln!(s, "[MEMORY] Frame allocator: {} frames ({} MB)",
                 frame_allocator.total_frames(),
-                frame_allocator.total_frames() * 4);
+                (frame_allocator.total_frames() * 4) / 1024);
             crate::serial_write(&s);
         }
         
