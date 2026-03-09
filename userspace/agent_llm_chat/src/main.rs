@@ -231,35 +231,19 @@ impl TransformerWeights {
         print_u64(total_kb as u64);
         println(" KB)...");
 
-        // FAST ALLOCATION: Use with_capacity + set_len to avoid slow element-by-element
-        // initialization. This is safe because:
-        //   1. The kernel zeroes all sys_brk pages (write_bytes(0, 4096))
-        //   2. 0.0f32 has the same bit pattern as [0u8; 4]
-        //   3. We immediately load real weights over this memory
-
-        println("[J67] alloc: embedding...");
+        // FAST ALLOCATION: 4MB heap pre-allocated by SDK. All allocations
+        // are instant (no sys_brk needed during tensor allocation).
         let embedding = alloc_zeroed_vec(v * d);
-        println("[J67] alloc: wq...");
         let wq = alloc_zeroed_vec(d * d);
-        println("[J67] alloc: wk...");
         let wk = alloc_zeroed_vec(kv * d);
-        println("[J67] alloc: wv...");
         let wv = alloc_zeroed_vec(kv * d);
-        println("[J67] alloc: wo...");
         let wo = alloc_zeroed_vec(d * d);
-        println("[J67] alloc: rms_att...");
         let mut rms_att = alloc_zeroed_vec(d);
-        println("[J67] alloc: w_gate...");
         let w_gate = alloc_zeroed_vec(h * d);
-        println("[J67] alloc: w_up...");
         let w_up = alloc_zeroed_vec(h * d);
-        println("[J67] alloc: w_down...");
         let w_down = alloc_zeroed_vec(d * h);
-        println("[J67] alloc: rms_ffn...");
         let mut rms_ffn = alloc_zeroed_vec(d);
-        println("[J67] alloc: rms_final...");
         let mut rms_final = alloc_zeroed_vec(d);
-        println("[J67] alloc: w_output...");
         let w_output = alloc_zeroed_vec(v * d);
 
         // Initialize RMS norm weights to 1.0
@@ -267,7 +251,7 @@ impl TransformerWeights {
         for val in rms_ffn.iter_mut() { *val = 1.0; }
         for val in rms_final.iter_mut() { *val = 1.0; }
 
-        println("[J67] All weight buffers allocated");
+        println("[J67] All weight buffers allocated OK");
 
         Self {
             embedding, wq, wk, wv, wo, rms_att,

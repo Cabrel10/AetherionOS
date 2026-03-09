@@ -542,10 +542,13 @@ pub fn print_hex(val: u64) {
 // ============================================================
 
 /// Initial heap size requested from the kernel (64 KiB).
-const INITIAL_HEAP_SIZE: usize = 64 * 1024;
+/// Pre-allocate a massive 4 MiB heap upfront to avoid incremental sys_brk
+/// extensions that trigger linked_list_allocator bugs in Ring 3.
+/// This is critical for LLM agents that allocate large tensor buffers.
+const INITIAL_HEAP_SIZE: usize = 4 * 1024 * 1024;
 
-/// Maximum heap growth per extension (128 KiB).
-const HEAP_GROW_SIZE: usize = 128 * 1024;
+/// Maximum heap growth per extension (1 MiB).
+const HEAP_GROW_SIZE: usize = 1024 * 1024;
 
 /// The AetherionOS global allocator.
 /// Uses `linked_list_allocator::Heap` internally, backed by `sys_brk`.
