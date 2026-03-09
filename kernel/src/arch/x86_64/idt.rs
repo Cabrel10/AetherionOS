@@ -266,10 +266,13 @@ extern "x86-interrupt" fn page_fault_handler(
             crate::serial_println!("[SIGSEGV] PID {} terminated due to page fault", current_pid);
             // Trigger a context switch to the next process
             crate::scheduler::schedule_next();
+            // CRITICAL: Return here to avoid kernel panic - the scheduler will switch to next process
+            return;
         }
     }
 
-    panic!("Page fault");
+    // Only panic if it's a kernel-mode page fault (critical kernel bug)
+    panic!("Kernel page fault at {:?}", accessed_address);
 }
 
 extern "x86-interrupt" fn x87_floating_point_handler(stack_frame: InterruptStackFrame) {

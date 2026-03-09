@@ -1197,6 +1197,11 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     arch::x86_64::interrupts::init();
     serial_write("       [OK] PIC remapped (32-47)\n");
 
+    // === Step 3.5: PS/2 Controller ===
+    serial_write("[3.5/12] Initializing PS/2 controller...\n");
+    drivers::ps2::init();
+    serial_write("       [OK] PS/2 keyboard enabled (IRQ1)\n");
+
     // === Step 4: Security ===
     serial_write("[4/12] Security init...\n");
     security::init();

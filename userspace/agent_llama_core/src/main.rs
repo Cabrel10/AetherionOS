@@ -222,6 +222,11 @@ unsafe fn init_weights() {
 // Single Transformer Forward Pass (all static buffers)
 // ═══════════════════════════════════════════════════
 unsafe fn transformer_forward(token: usize, pos: usize) {
+    // Bounds check to prevent out-of-bounds access
+    if pos >= MAX_SEQ_LEN {
+        return; // Silently skip if position exceeds max sequence length
+    }
+    
     // Step 1: Token embedding lookup
     let emb_base = (token % VOCAB_SIZE) * DIM;
     for i in 0..DIM { X_BUF[i] = EMBEDDING[emb_base + i]; }
@@ -264,9 +269,12 @@ unsafe fn transformer_forward(token: usize, pos: usize) {
 
     // Step 5: Store K, V in cache
     let kv_base = pos * KV_DIM;
-    for i in 0..KV_DIM {
-        KEY_CACHE[kv_base + i] = K_BUF[i];
-        VAL_CACHE[kv_base + i] = V_BUF[i];
+    // Bounds check before writing to cache
+    if kv_base + KV_DIM <= KEY_CACHE.len() {
+        for i in 0..KV_DIM {
+            KEY_CACHE[kv_base + i] = K_BUF[i];
+            VAL_CACHE[kv_base + i] = V_BUF[i];
+        }
     }
 
     // Step 6: Multi-Head Attention with GQA
@@ -279,18 +287,27 @@ unsafe fn transformer_forward(token: usize, pos: usize) {
 
         // Attention scores
         for t in 0..=pos {
+            if t >= MAX_SEQ_LEN { break; } // Bounds check
             let mut dot: f32 = 0.0;
             let kb = t * KV_DIM + kv_h * HEAD_DIM;
-            for d in 0..HEAD_DIM { dot += Q_BUF[qoff + d] * KEY_CACHE[kb + d]; }
+            // Bounds check before accessing cache
+            if kb + HEAD_DIM <= KEY_CACHE.len() {
+                for d in 0..HEAD_DIM { dot += Q_BUF[qoff + d] * KEY_CACHE[kb + d]; }
+            }
             SCORES[t] = dot / f32_sqrt(HEAD_DIM as f32);
         }
-        softmax(&mut SCORES[..pos+1], pos + 1);
+        let safe_pos = core::cmp::min(pos + 1, MAX_SEQ_LEN);
+        softmax(&mut SCORES[..safe_pos], safe_pos);
 
         // Weighted sum of values
         for t in 0..=pos {
+            if t >= MAX_SEQ_LEN { break; } // Bounds check
             let vb = t * KV_DIM + kv_h * HEAD_DIM;
             let w = SCORES[t];
-            for d in 0..HEAD_DIM { ATTN_OUT[qoff + d] += w * VAL_CACHE[vb + d]; }
+            // Bounds check before accessing cache
+            if vb + HEAD_DIM <= VAL_CACHE.len() {
+                for d in 0..HEAD_DIM { ATTN_OUT[qoff + d] += w * VAL_CACHE[vb + d]; }
+            }
         }
     }
 
