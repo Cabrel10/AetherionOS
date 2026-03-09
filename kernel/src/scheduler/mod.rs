@@ -136,26 +136,12 @@ impl PriorityScheduler {
                     self.queues[target_idx].push_back(pid);
                     process::set_wait_ticks(pid, 0); // reset after boost
 
-                    let from_name = match queue_idx {
-                        0 => "IDLE",
-                        1 => "LOW",
-                        2 => "NORMAL",
-                        _ => "?",
-                    };
-                    let to_name = match target_idx {
-                        1 => "LOW",
-                        2 => "NORMAL",
-                        3 => "HIGH",
-                        _ => "?",
-                    };
                     self.aging_boosts += 1;
-                    // Only log every 50th aging boost to avoid serial spam
-                    if self.aging_boosts % 50 == 1 {
-                        crate::serial_println!(
-                            "[SCHEDULER] AGING: Boosting PID {} from {} to {} (waited {} ticks) [boost #{}]",
-                            pid, from_name, to_name, new_wt, self.aging_boosts
-                        );
-                    }
+                    // PRODUCTION: AGING logging completely disabled.
+                    // Serial I/O at port 0x3F8 is extremely slow on QEMU;
+                    // writing millions of boost messages starves agent processes
+                    // of CPU time and prevents them from completing inference.
+                    // The aging mechanism itself still works — just silently.
                     // don't increment i — removal shifted elements
                 } else {
                     i += 1;
