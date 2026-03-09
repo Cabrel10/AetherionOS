@@ -645,11 +645,12 @@ impl Fat32Fs {
             let entries = self.list_directory(current_cluster);
             let mut found = false;
 
-            crate::serial_println!("[FAT32] navigate_to_dir: looking for '{}' in cluster {}", target, current_cluster);
+            // Suppress verbose logging after first few calls
+            // crate::serial_println!("[FAT32] navigate_to_dir: looking for '{}' in cluster {}", target, current_cluster);
 
             for entry in &entries {
                 if entry.name == target && entry.is_directory {
-                    crate::serial_println!("[FAT32] navigate_to_dir: found dir '{}' -> cluster {}", entry.name, entry.first_cluster);
+                    // crate::serial_println!("[FAT32] navigate_to_dir: found dir '{}' -> cluster {}", entry.name, entry.first_cluster);
                     current_cluster = entry.first_cluster;
                     found = true;
                     break;
@@ -678,8 +679,9 @@ impl Fat32Fs {
         let dir_parts = &parts[..parts.len() - 1];
         let target = filename.to_ascii_lowercase();
 
-        crate::serial_println!("[FAT32] find_directory_entry: path='{}' dirs={:?} file='{}'",
-            path, dir_parts, filename);
+        // Suppress verbose per-read logging for performance
+        // crate::serial_println!("[FAT32] find_directory_entry: path='{}' dirs={:?} file='{}'",
+        //     path, dir_parts, filename);
 
         let dir_cluster = if dir_parts.is_empty() {
             self.bpb.root_cluster
@@ -690,13 +692,13 @@ impl Fat32Fs {
         let entries = self.list_directory(dir_cluster);
         for entry in &entries {
             if entry.name == target {
-                crate::serial_println!("[FAT32] find_directory_entry: FOUND '{}' size={} cluster={} is_dir={}",
-                    entry.name, entry.file_size, entry.first_cluster, entry.is_directory);
+                // crate::serial_println!("[FAT32] find_directory_entry: FOUND '{}' size={} cluster={} is_dir={}",
+                //     entry.name, entry.file_size, entry.first_cluster, entry.is_directory);
                 return Some(entry.clone());
             }
         }
 
-        crate::serial_println!("[FAT32] find_directory_entry: '{}' NOT FOUND in cluster {}", filename, dir_cluster);
+        // crate::serial_println!("[FAT32] find_directory_entry: '{}' NOT FOUND in cluster {}", filename, dir_cluster);
         None
     }
 
@@ -1028,12 +1030,13 @@ pub fn read_file_path_chunk(disk_path: &str, offset: u64, len: u64) -> Option<Ve
             return None;
         }
 
-        crate::serial_println!("[FAT32] read_file_path_chunk: '{}' offset={} len={} file_size={}",
-            disk_path, offset, len, entry.file_size);
+        // Suppress per-read logging for performance
+        // crate::serial_println!("[FAT32] read_file_path_chunk: '{}' offset={} len={} file_size={}",
+        //     disk_path, offset, len, entry.file_size);
 
         let result = fs.read_file_chunk(entry.first_cluster, entry.file_size, offset, len);
         if let Some(ref data) = result {
-            crate::serial_println!("[FAT32] read_file_path_chunk: OK, returned {} bytes", data.len());
+            // crate::serial_println!("[FAT32] read_file_path_chunk: OK, returned {} bytes", data.len());
         }
         result
     }

@@ -500,7 +500,8 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
             let is_disk = path.starts_with("/disk/");
             if is_disk {
                 let disk_path = &path[6..];
-                crate::serial_println!("[SYSCALL] sys_read: FAT32 chunked read '{}' offset={} len={}", disk_path, offset, len);
+                // Suppress per-read logging for performance (was flooding serial)
+                // crate::serial_println!("[SYSCALL] sys_read: FAT32 chunked read '{}' offset={} len={}", disk_path, offset, len);
                 match crate::fs::fat32::read_file_path_chunk(disk_path, offset, len) {
                     Some(chunk) => {
                         let to_copy = chunk.len();
