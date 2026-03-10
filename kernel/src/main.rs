@@ -1783,25 +1783,25 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         }
 
         // ──────────────────────────────────────────────────────────
-        // STEP A: Load agent_visual_term.elf as a QUEUED process
-        // (runs after primary agents exit, displays generated tokens)
+        // STEP A1: Load agent_llm_chat.elf as a QUEUED process
+        // Dynamic GGUF agent: parses metadata, allocates tensors, runs
+        // inference. Queued so terminal can start first and display UI.
         // ──────────────────────────────────────────────────────────
-        serial_write("  [J60] Loading agent_visual_term.elf (queued)...\n");
-        match elf::load_elf_binary(AGENT_VISUAL_TERM_ELF) {
-            Ok(vt_result) => {
-                let vt_pid = process::spawn_userspace(
-                    "/bin/agent_visual_term.elf", 0,
-                    vt_result.entry_point, vt_result.stack_pointer, vt_result.pml4_phys
+        serial_write("  [J67] Loading agent_llm_chat.elf (queued)...\n");
+        match elf::load_elf_binary(AGENT_LLM_CHAT_ELF) {
+            Ok(llm_result) => {
+                let llm_pid = process::spawn_userspace(
+                    "/bin/agent_llm_chat.elf", 0,
+                    llm_result.entry_point, llm_result.stack_pointer, llm_result.pml4_phys
                 ).unwrap_or(0);
-                if vt_pid != 0 {
-                    scheduler::enqueue_process(vt_pid);
-                    // DON'T save preempt_state here — it will be saved by timer IRQ when actually preempted
-                    serial_println!("  [J60] Visual Terminal PID={} queued (entry=0x{:X}, segs={}, frames={})",
-                        vt_pid, vt_result.entry_point, vt_result.segments_loaded, vt_result.frames_used);
+                if llm_pid != 0 {
+                    scheduler::enqueue_process(llm_pid);
+                    serial_println!("  [J67] LLM Chat PID={} queued (entry=0x{:X}, segs={}, frames={})",
+                        llm_pid, llm_result.entry_point, llm_result.segments_loaded, llm_result.frames_used);
                 }
             }
             Err(e) => {
-                serial_println!("  [J60] WARN: agent_visual_term.elf load failed: {}", e);
+                serial_println!("  [J67] WARN: agent_llm_chat.elf load failed: {}", e);
             }
         }
 
@@ -1829,7 +1829,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
         // ──────────────────────────────────────────────────────────
         // STEP A3: Load agent_llama_core.elf as QUEUED process
-        // (Jalon 62/63 — runs AFTER agent_llm_chat exits)
+        // (Jalon 62/63 — runs AFTER terminal starts)
         // ──────────────────────────────────────────────────────────
         serial_write("  [J62] Loading agent_llama_core.elf (queued)...\n");
         match elf::load_elf_binary(AGENT_LLAMA_CORE_ELF) {
@@ -1851,15 +1851,14 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         }
 
         // ──────────────────────────────────────────────────────────
-        // STEP B: Load and LAUNCH agent_llm_chat.elf FIRST (Jalon 67)
-        // Dynamic GGUF agent: parses metadata, allocates tensors, runs
-        // inference. Launched first because it needs uninterrupted CPU
-        // for heap allocation. After it exits → llama_core → visual_term.
+        // STEP B: Load and LAUNCH agent_visual_term.elf FIRST (Jalon 65)
+        // Interactive terminal: displays UI, reads keyboard, shows prompt.
+        // Launched first so user sees the interface immediately.
         // ──────────────────────────────────────────────────────────
-        let elf_binary = AGENT_LLM_CHAT_ELF;
-        let elf_name = "/bin/agent_llm_chat.elf";
+        let elf_binary = AGENT_VISUAL_TERM_ELF;
+        let elf_name = "/bin/agent_visual_term.elf";
 
-        serial_println!("  [J60] Loading {}...", elf_name);
+        serial_println!("  [J65] Loading {}...", elf_name);
         let load_result = elf::load_elf_binary(elf_binary);
         match load_result {
             Ok(result) => {
@@ -1878,10 +1877,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     scheduler::enqueue_process(pid);
                     scheduler::set_current_pid(pid);
                     // DON'T save preempt_state here — it will be saved by timer IRQ when actually preempted
-                    serial_println!("  [J60] Orchestrator PID={} registered (launching first)", pid);
+                    serial_println!("  [J65] Visual Terminal PID={} registered (launching first)", pid);
                 }
 
-                serial_write("  [J67] IRETQ -> Ring 3: Dynamic LLM Chat Agent launches NOW!\n");
+                serial_write("  [J65] IRETQ -> Ring 3: Interactive Terminal launches NOW!\n");
                 serial_write("========================================\n");
 
                 arch::x86_64::syscall::reset_gs_bases();
