@@ -47,3 +47,6 @@ disk.img
 *.img
 *.gguf
 /tmp/part_*
+mistral_part_*
+*.gguf
+micro_model*
