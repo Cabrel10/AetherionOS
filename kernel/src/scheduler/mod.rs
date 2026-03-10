@@ -95,7 +95,13 @@ impl PriorityScheduler {
     fn dequeue_next(&mut self) -> Option<(u64, SchedPriority)> {
         // Scan from highest (Critical=4) to lowest (Idle=0)
         for idx in (0..5).rev() {
-            if let Some(pid) = self.queues[idx].pop_front() {
+            while let Some(pid) = self.queues[idx].pop_front() {
+                // Skip terminated processes
+                if let Some(state) = process::get_state(pid) {
+                    if state == process::ProcessState::Terminated {
+                        continue; // Skip this PID, try next
+                    }
+                }
                 let prio = match idx {
                     4 => SchedPriority::Critical,
                     3 => SchedPriority::High,
@@ -160,9 +166,14 @@ impl PriorityScheduler {
         // Re-enqueue the current process if still alive
         let old_pid = self.current_pid;
         if old_pid != 0 {
-            if let Some((role, _prio)) = process::get_role_priority(old_pid) {
-                let sched_prio = role_to_priority(role);
-                self.enqueue(old_pid, sched_prio);
+            // Check if process is still alive before re-enqueuing
+            if let Some(state) = process::get_state(old_pid) {
+                if state != process::ProcessState::Terminated {
+                    if let Some((role, _prio)) = process::get_role_priority(old_pid) {
+                        let sched_prio = role_to_priority(role);
+                        self.enqueue(old_pid, sched_prio);
+                    }
+                }
             }
         }
 
@@ -290,11 +301,15 @@ pub fn yield_to_next(current: u64) -> u64 {
         return current;
     }
     let mut sched = SCHEDULER.lock();  // blocking lock, guaranteed
-    // Re-enqueue current
+    // Re-enqueue current if still alive
     if current != 0 {
-        if let Some((role, _)) = process::get_role_priority(current) {
-            let prio = role_to_priority(role);
-            sched.enqueue(current, prio);
+        if let Some(state) = process::get_state(current) {
+            if state != process::ProcessState::Terminated {
+                if let Some((role, _)) = process::get_role_priority(current) {
+                    let prio = role_to_priority(role);
+                    sched.enqueue(current, prio);
+                }
+            }
         }
     }
     // Dequeue next

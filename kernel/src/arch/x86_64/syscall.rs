@@ -447,6 +447,14 @@ fn sys_write(fd: u64, buf_addr: u64, len: u64) -> u64 {
 // ===== sys_read(fd, buf, len) =====
 
 /// POSIX read: fd=0 -> keyboard input, other fds -> VFS read.
+///
+/// For fd=0 (stdin/keyboard): NON-BLOCKING.
+/// Returns immediately with available bytes, or 0 if the keyboard buffer
+/// is empty. Userspace must call sys_yield() between read attempts to
+/// allow other processes (and keyboard IRQs) to run.
+///
+/// Previous implementation busy-looped 50,000 times inside kernel mode
+/// with interrupts masked (SFMASK), preventing keyboard IRQs from firing.
 fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
     if len == 0 { return 0; }
     if !validate_user_ptr(buf_addr, len) {
@@ -456,31 +464,25 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
     let current_pid = crate::scheduler::current_pid();
 
     if fd == 0 {
-        // Read from stdin = keyboard buffer
-        // BLOCKING: yield CPU until at least 1 byte is available.
-        // Safety valve: after MAX_YIELD iterations, return 0 so automated
-        // QEMU tests don't hang forever (real keyboard always arrives).
-        const MAX_YIELD: u32 = 50_000;
+        // Non-blocking read from stdin = keyboard buffer.
+        // Try once and return immediately. If no data, return 0.
+        // Userspace handles the poll loop via sys_yield() which does a
+        // real context switch (IRETQ) and allows keyboard IRQs to fire.
         let mut temp_buf = [0u8; 256];
         let max_read = core::cmp::min(len as usize, temp_buf.len());
 
-        for _attempt in 0..MAX_YIELD {
-            let bytes_read = crate::process::kbd_read(&mut temp_buf, max_read);
-            if bytes_read > 0 {
-                // Copy to user buffer
-                unsafe {
-                    let dst = buf_addr as *mut u8;
-                    for i in 0..bytes_read {
-                        core::ptr::write_volatile(dst.add(i), temp_buf[i]);
-                    }
+        let bytes_read = crate::process::kbd_read(&mut temp_buf, max_read);
+        if bytes_read > 0 {
+            // Copy to user buffer
+            unsafe {
+                let dst = buf_addr as *mut u8;
+                for i in 0..bytes_read {
+                    core::ptr::write_volatile(dst.add(i), temp_buf[i]);
                 }
-                return bytes_read as u64;
             }
-            // No data yet — yield to scheduler and retry when rescheduled.
-            // This blocks the calling process without busy-waiting.
-            crate::scheduler::schedule_next();
+            return bytes_read as u64;
         }
-        // Safety valve: no key after MAX_YIELD yields → return 0
+        // No data available — return 0 (non-blocking)
         return 0;
     }
 

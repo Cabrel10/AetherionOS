@@ -501,6 +501,12 @@ pub fn set_state(pid: u64, new_state: ProcessState) -> Result<(), ProcessError> 
     }
 }
 
+/// Get the state of a process by PID
+pub fn get_state(pid: u64) -> Option<ProcessState> {
+    let table = PROCESS_TABLE.lock();
+    table.get(&pid).map(|p| p.state)
+}
+
 /// Kill a process (only non-kernel threads with uid != 0)
 pub fn kill(pid: u64) -> Result<(), ProcessError> {
     let mut table = PROCESS_TABLE.lock();

@@ -264,12 +264,65 @@ extern "x86-interrupt" fn page_fault_handler(
         if current_pid != 0 {
             let _ = crate::process::set_state(current_pid, crate::process::ProcessState::Terminated);
             crate::serial_println!("[SIGSEGV] PID {} terminated due to page fault", current_pid);
-            // Trigger a context switch to the next process
-            crate::scheduler::schedule_next();
+
+            // Find the next Ready userspace process and IRETQ to it.
+            // We CANNOT just return here: the interrupt frame on the stack
+            // still points to the faulting instruction, so IRET would
+            // resume the dead process and page-fault again (infinite loop).
+            if let Some((next_pid, entry, stack, pml4, name)) =
+                crate::process::find_next_ready_userspace(current_pid)
+            {
+                crate::scheduler::set_current_pid(next_pid);
+                let _ = crate::process::set_state(next_pid, crate::process::ProcessState::Running);
+
+                // Use saved preempt state if available, otherwise entry state
+                let (rip, rsp, rfl, cr3) =
+                    if let Some((saved_rip, saved_rsp, saved_rfl, saved_pml4)) =
+                        crate::process::get_preempt_state(next_pid)
+                    {
+                        if saved_rip != 0 {
+                            (saved_rip, saved_rsp, saved_rfl, saved_pml4)
+                        } else {
+                            (entry, stack, 0x202u64, pml4)
+                        }
+                    } else {
+                        (entry, stack, 0x202u64, pml4)
+                    };
+
+                crate::serial_println!(
+                    "[SIGSEGV] Switching to PID {} ({}) rip=0x{:X} cr3=0x{:X}",
+                    next_pid, name, rip, cr3
+                );
+
+                // IRETQ to the next process — never returns
+                unsafe {
+                    core::arch::asm!(
+                        "cli",
+                        "mov cr3, {cr3_val}",
+                        "push 0x1B",           // SS (Ring 3 data)
+                        "push {rsp_val}",      // RSP
+                        "push {rfl_val}",      // RFLAGS
+                        "push 0x23",           // CS (Ring 3 code)
+                        "push {rip_val}",      // RIP
+                        "iretq",
+                        cr3_val = in(reg) cr3,
+                        rsp_val = in(reg) rsp,
+                        rfl_val = in(reg) rfl,
+                        rip_val = in(reg) rip,
+                        options(noreturn),
+                    );
+                }
+            }
+
+            // No other Ready process — enter kernel idle loop
+            crate::serial_println!("[SIGSEGV] No other process ready, entering idle");
+            crate::scheduler::set_current_pid(0);
+            loop { x86_64::instructions::hlt(); }
         }
     }
 
-    panic!("Page fault");
+    // Only panic if it's a kernel-mode page fault (critical kernel bug)
+    panic!("Kernel page fault at {:?}", accessed_address);
 }
 
 extern "x86-interrupt" fn x87_floating_point_handler(stack_frame: InterruptStackFrame) {
