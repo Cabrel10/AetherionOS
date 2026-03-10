@@ -444,21 +444,21 @@ pub extern "C" fn main() -> i64 {
     println("[J65] ========================================");
 
     // Map framebuffer
-    print("[J65] Mapping framebuffer... ");
+    sys_write(1, b"[J65] Mapping framebuffer... ");
     let mut fb_info = [0u64; 4];
     let fb_ok = sys_fb_get_info(&mut fb_info);
     if fb_ok == 0 {
-        println("FAIL (no framebuffer)");
+        sys_write(1, b"FAIL (no framebuffer)\n");
     } else {
-        print("OK (");
-        print_u64(fb_info[0]); print("x"); print_u64(fb_info[1]);
-        println(")");
+        sys_write(1, b"OK (");
+        print_u64(fb_info[0]); sys_write(1, b"x"); print_u64(fb_info[1]);
+        sys_write(1, b")\n");
     }
 
     // Draw terminal chrome
-    print("[J65] Drawing terminal UI... ");
+    sys_write(1, b"[J65] Drawing terminal UI... ");
     draw_chrome();
-    println("OK");
+    sys_write(1, b"OK\n");
 
     // Initialize terminal
     println("[J65] Initializing terminal state...");
