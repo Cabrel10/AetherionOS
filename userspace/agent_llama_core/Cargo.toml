@@ -8,5 +8,5 @@ aetherion_sdk = { path = "../rust_sdk" }
 
 [profile.release]
 opt-level = "s"
-lto = true
+lto = false
 panic = "abort"

@@ -15,55 +15,8 @@
 
 extern crate alloc;
 
-// ===== Compiler built-in memory functions required by no_std =====
-// The Rust compiler may emit calls to these for array init, copy, etc.
-#[no_mangle]
-pub unsafe extern "C" fn memset(dest: *mut u8, c: i32, n: usize) -> *mut u8 {
-    let mut i = 0;
-    while i < n {
-        *dest.add(i) = c as u8;
-        i += 1;
-    }
-    dest
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
-    let mut i = 0;
-    while i < n {
-        *dest.add(i) = *src.add(i);
-        i += 1;
-    }
-    dest
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
-    if (dest as usize) < (src as usize) {
-        memcpy(dest, src, n)
-    } else {
-        let mut i = n;
-        while i > 0 {
-            i -= 1;
-            *dest.add(i) = *src.add(i);
-        }
-        dest
-    }
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn memcmp(s1: *const u8, s2: *const u8, n: usize) -> i32 {
-    let mut i = 0;
-    while i < n {
-        let a = *s1.add(i);
-        let b = *s2.add(i);
-        if a != b {
-            return a as i32 - b as i32;
-        }
-        i += 1;
-    }
-    0
-}
+// Memory functions (memset, memcpy, memmove, memcmp) are provided by the SDK.
+// Do NOT redefine them here — it causes "symbol multiply defined" linker errors.
 
 use aetherion_sdk::*;
 
@@ -106,11 +59,10 @@ const INTENT_LLM_READY: u64        = 0x8004;
 const INTENT_GENERATION_DONE: u64   = 0x8003;
 const INTENT_TERM_CMD: u64         = 0xB065;
 
-// With blocking sys_read(fd=0), the terminal truly waits for keyboard input.
-// MAX_IDLE_LOOPS is a safety valve: each "idle" now means sys_read returned 0
-// after ~50,000 scheduler yields (no key pressed for a very long time).
-// This allows QEMU automated tests to eventually exit.
-const MAX_IDLE_LOOPS: u64 = 500;
+// MAX_IDLE_LOOPS is a safety valve for automated QEMU tests only.
+// In real interactive use the terminal never exits unless the user types 'exit'.
+// Each idle loop is one sys_yield() call (~10ms with timer IRQ), so 50000 = ~8 min.
+const MAX_IDLE_LOOPS: u64 = 50000;
 
 // ═══════════════════════════════════════════════════
 // Terminal State
@@ -532,58 +484,61 @@ pub extern "C" fn main() -> i64 {
     println("[J65] First prompt drawn");
     println("[J65] Terminal ready, entering event loop");
 
-    // Persistent event loop: non-blocking sys_read(fd=0) + sys_yield()
-    // sys_read returns 0 immediately if no keystroke is buffered.
-    // sys_yield() does a real IRETQ context switch, allowing keyboard
-    // IRQs to fire and other processes to run.
+    // ─── Persistent event loop ───────────────────────────────────────
+    // 1. sys_read(fd=0) is NON-BLOCKING — returns 0 if no key buffered.
+    // 2. sys_yield() does a real IRETQ context switch so keyboard IRQs
+    //    can fire and other processes can run.
+    // 3. The loop runs forever until the user types 'exit' or the
+    //    safety valve triggers (for automated QEMU tests).
     let mut idle_count: u64 = 0;
-    let mut read_buf = [0u8; 16];
+    let mut read_buf = [0u8; 1]; // Read one byte at a time for responsiveness
+    println("[J65] Entering main loop (non-blocking sys_read + sys_yield)");
+
     loop {
-        // 1. Try reading keyboard input (non-blocking)
+        // 1. Try reading ONE byte from keyboard (non-blocking)
         let n = sys_read(0, &mut read_buf);
         if n > 0 {
             idle_count = 0;
-            let count = n as usize;
-            for i in 0..count {
-                let ch = read_buf[i];
-                match ch {
-                    0x08 => {
-                        // Backspace
-                        term.backspace();
-                    }
-                    b'\n' => {
-                        // Enter — execute command
-                        term.newline();
-                        process_command(&mut term);
-                        print_prompt(&mut term);
-                    }
-                    0x20..=0x7E => {
-                        // Printable ASCII — add to command buffer and display
-                        if term.cmd_len < CMD_BUF_SIZE {
-                            term.cmd_buf[term.cmd_len] = ch;
-                            term.cmd_len += 1;
-                        }
-                        term.put_char(ch, TEXT);
-                    }
-                    _ => {
-                        // Ignore non-printable / control characters
-                    }
+            let ch = read_buf[0];
+
+            match ch {
+                0x08 | 0x7F => {
+                    // Backspace
+                    term.backspace();
                 }
+                b'\n' | b'\r' => {
+                    // Enter — process the command
+                    term.newline();
+                    process_command(&mut term);
+                    print_prompt(&mut term);
+                }
+                0x20..=0x7E => {
+                    // Printable ASCII — buffer + display
+                    if term.cmd_len < CMD_BUF_SIZE {
+                        term.cmd_buf[term.cmd_len] = ch;
+                        term.cmd_len += 1;
+                    }
+                    term.put_char(ch, TEXT);
+                }
+                _ => {} // Ignore control chars
             }
         } else {
             idle_count += 1;
         }
 
-        // 2. Blink cursor animation
+        // 2. Cursor blink animation
         term.blink_tick();
 
-        // 3. Yield CPU to other processes (real IRETQ context switch)
+        // 3. Yield CPU — this is CRITICAL:
+        //    sys_yield() triggers an IRETQ context switch. While this
+        //    process sleeps, the timer tick fires keyboard IRQs that
+        //    fill the keyboard buffer. Without yield, the keyboard
+        //    would appear dead because IRQs can't fire in Ring 3.
         sys_yield();
 
-        // 4. Safety valve for automated QEMU tests:
-        //    Exit after MAX_IDLE_LOOPS consecutive reads with no input.
+        // 4. Safety valve (QEMU automated tests only)
         if idle_count >= MAX_IDLE_LOOPS {
-            println("[J65] Safety valve: no input after max idle loops, exiting");
+            println("[J65] Safety valve: exiting after long idle");
             break;
         }
     }

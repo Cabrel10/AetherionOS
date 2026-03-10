@@ -14,6 +14,6 @@ aetherion_sdk = { path = "../rust_sdk" }
 
 [profile.release]
 opt-level = 2
-lto = true
+lto = false
 panic = "abort"
 codegen-units = 1

@@ -163,9 +163,24 @@ extern "x86-interrupt" fn stack_segment_fault_handler(stack_frame: InterruptStac
 }
 
 extern "x86-interrupt" fn general_protection_fault_handler(stack_frame: InterruptStackFrame, error_code: u64) {
-    crate::serial_println!("[EXCEPTION] #GP General protection fault (code 0x{:X}) at {:?}", error_code, stack_frame.instruction_pointer);
-    crate::serial_println!("[EXCEPTION] Stack: {:?}", stack_frame);
-    panic!("General protection fault");
+    // Check if this is a Ring 3 fault (CS selector in stack frame has RPL=3)
+    let cs = stack_frame.code_segment;
+    let is_ring3 = (cs & 0x3) == 3;
+
+    crate::serial_println!(
+        "[EXCEPTION] #GP code=0x{:X} rip={:?} ring3={}",
+        error_code, stack_frame.instruction_pointer, is_ring3
+    );
+
+    if is_ring3 {
+        let current_pid = crate::scheduler::current_pid();
+        if current_pid != 0 {
+            kill_user_and_switch(current_pid, stack_frame.instruction_pointer.as_u64());
+            // kill_user_and_switch never returns if another process exists
+        }
+    }
+
+    panic!("General protection fault (kernel) code=0x{:X}", error_code);
 }
 
 // ===== Page Fault Handler with Demand Paging =====
@@ -183,6 +198,97 @@ extern "x86-interrupt" fn general_protection_fault_handler(stack_frame: Interrup
 const USER_STACK_DEMAND_LOW: u64 = 0x7FFF_0000_0000;
 /// User stack demand-paging upper bound (exclusive)
 const USER_STACK_DEMAND_HIGH: u64 = 0x7FFF_FFFF_F000;
+/// User heap demand-paging lower bound (sys_brk region)
+const USER_HEAP_DEMAND_LOW: u64  = 0x0000_3000_0000_0000;
+/// User heap demand-paging upper bound (256 MiB)
+const USER_HEAP_DEMAND_HIGH: u64 = 0x0000_3000_1000_0000;
+
+/// Helper: try to demand-map a user page at `page_addr`.
+/// Returns true if the page was successfully mapped.
+fn try_demand_map_user_page(page_addr: u64) -> bool {
+    let frame_phys = unsafe { crate::elf::alloc_demand_frame() };
+    match frame_phys {
+        Some(phys) => {
+            let phys_offset = crate::elf::phys_offset();
+            unsafe {
+                core::ptr::write_bytes((phys + phys_offset) as *mut u8, 0, 4096);
+            }
+            let cr3: u64;
+            unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)); }
+            let pml4_phys = cr3 & !0xFFF;
+            // flags: PRESENT | WRITABLE | USER | NX
+            let flags: u64 = 0x01 | 0x02 | 0x04 | (1u64 << 63);
+            match unsafe { crate::elf::demand_map_user_page(pml4_phys, page_addr, phys, flags) } {
+                Ok(()) => true,
+                Err(_) => {
+                    crate::serial_println!("[PF-DEMAND] FATAL: map failed at 0x{:X}", page_addr);
+                    false
+                }
+            }
+        }
+        None => {
+            crate::serial_println!("[PF-DEMAND] FATAL: Out of frames");
+            false
+        }
+    }
+}
+
+/// Helper: kill current Ring 3 process and IRETQ to next ready one.
+/// Never returns if a next process is found.
+fn kill_user_and_switch(current_pid: u64, addr_raw: u64) {
+    let _ = crate::process::set_state(current_pid, crate::process::ProcessState::Terminated);
+    crate::serial_println!("[SIGSEGV] PID {} terminated (addr 0x{:X})", current_pid, addr_raw);
+
+    // Find the next Ready userspace process and IRETQ to it.
+    if let Some((next_pid, entry, stack, pml4, name)) =
+        crate::process::find_next_ready_userspace(current_pid)
+    {
+        crate::scheduler::set_current_pid(next_pid);
+        let _ = crate::process::set_state(next_pid, crate::process::ProcessState::Running);
+
+        let (rip, rsp, rfl, cr3) =
+            if let Some((saved_rip, saved_rsp, saved_rfl, saved_pml4)) =
+                crate::process::get_preempt_state(next_pid)
+            {
+                if saved_rip != 0 {
+                    (saved_rip, saved_rsp, saved_rfl, saved_pml4)
+                } else {
+                    (entry, stack, 0x202u64, pml4)
+                }
+            } else {
+                (entry, stack, 0x202u64, pml4)
+            };
+
+        crate::serial_println!(
+            "[SIGSEGV] -> PID {} ({}) rip=0x{:X}",
+            next_pid, name, rip
+        );
+
+        // IRETQ to the next process — never returns
+        unsafe {
+            core::arch::asm!(
+                "cli",
+                "mov cr3, {cr3_val}",
+                "push 0x1B",           // SS (Ring 3 data)
+                "push {rsp_val}",      // RSP
+                "push {rfl_val}",      // RFLAGS
+                "push 0x23",           // CS (Ring 3 code)
+                "push {rip_val}",      // RIP
+                "iretq",
+                cr3_val = in(reg) cr3,
+                rsp_val = in(reg) rsp,
+                rfl_val = in(reg) rfl,
+                rip_val = in(reg) rip,
+                options(noreturn),
+            );
+        }
+    }
+
+    // No other Ready process — enter kernel idle loop
+    crate::serial_println!("[SIGSEGV] No other process ready, idle");
+    crate::scheduler::set_current_pid(0);
+    loop { x86_64::instructions::hlt(); }
+}
 
 extern "x86-interrupt" fn page_fault_handler(
     stack_frame: InterruptStackFrame,
@@ -192,137 +298,53 @@ extern "x86-interrupt" fn page_fault_handler(
 
     let accessed_address = Cr2::read();
     let addr_raw = accessed_address.as_u64();
-
-    // Check if this is a user-mode page fault (bit 2 of error code = USER_MODE)
     let is_user_mode = error_code.contains(PageFaultErrorCode::USER_MODE);
+    let page_addr = addr_raw & !0xFFF;
 
+    // --- Demand paging for user stack ---
     if is_user_mode
         && addr_raw >= USER_STACK_DEMAND_LOW
         && addr_raw < USER_STACK_DEMAND_HIGH
     {
-        // Demand paging: allocate and map a page for the user stack
-        let page_addr = addr_raw & !0xFFF; // page-align
-
-        // Demand paging log (diagnostic)
-        crate::serial_println!(
-            "[PF-DEMAND] addr=0x{:X} page=0x{:X} PID={}",
-            addr_raw, page_addr, crate::scheduler::current_pid()
-        );
-
-        // Allocate a frame from the ELF frame pool
-        let frame_phys = unsafe { crate::elf::alloc_demand_frame() };
-        match frame_phys {
-            Some(phys) => {
-                // Zero the frame
-                let phys_offset = crate::elf::phys_offset();
-                unsafe {
-                    core::ptr::write_bytes(
-                        (phys + phys_offset) as *mut u8,
-                        0,
-                        4096,
-                    );
-                }
-
-                // Get the current CR3 (user process page table)
-                let cr3: u64;
-                unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)); }
-                let pml4_phys = cr3 & !0xFFF;
-
-                // Map with USER_ACCESSIBLE | WRITABLE | NO_EXECUTE
-                // flags: PRESENT(0x01) | WRITABLE(0x02) | USER(0x04) | NX(bit 63)
-                let flags: u64 = 0x01 | 0x02 | 0x04 | (1u64 << 63);
-
-                match unsafe { crate::elf::demand_map_user_page(pml4_phys, page_addr, phys, flags) } {
-                    Ok(()) => {
-                        // Hot-path: mapped OK log disabled
-                        return;
-                    }
-                    Err(_) => {
-                        crate::serial_println!(
-                            "[PF-DEMAND] FATAL: Failed to map page 0x{:X}",
-                            page_addr
-                        );
-                    }
-                }
-            }
-            None => {
-                crate::serial_println!("[PF-DEMAND] FATAL: Out of frames for demand paging");
-            }
+        if try_demand_map_user_page(page_addr) {
+            return; // Resume faulting instruction
         }
+        // Fall through to SIGSEGV
     }
 
-    // Non-recoverable page fault — SIGSEGV
-    crate::serial_println!("[EXCEPTION] #PF Page fault at {:?}", stack_frame.instruction_pointer);
-    crate::serial_println!("[EXCEPTION] Accessed address: {:?}", accessed_address);
-    crate::serial_println!("[EXCEPTION] Error code: {:?}", error_code);
-    crate::serial_println!("[EXCEPTION] User mode: {}", is_user_mode);
+    // --- Demand paging for user heap (within break limit) ---
+    if is_user_mode
+        && addr_raw >= USER_HEAP_DEMAND_LOW
+        && addr_raw < USER_HEAP_DEMAND_HIGH
+    {
+        let current_pid = crate::scheduler::current_pid();
+        let heap_break = crate::process::get_heap_break(current_pid)
+            .unwrap_or(USER_HEAP_DEMAND_LOW);
+        // Only map if address is below the current break (valid heap)
+        if addr_raw < heap_break {
+            if try_demand_map_user_page(page_addr) {
+                return; // Resume
+            }
+        }
+        // Fall through to SIGSEGV
+    }
 
+    // --- Non-recoverable page fault ---
     if is_user_mode {
-        crate::serial_println!("[SIGSEGV] Killing user process (bad address 0x{:X})", addr_raw);
-        // Terminate the process (SIGSEGV equivalent)
+        crate::serial_println!(
+            "[SIGSEGV] PF addr=0x{:X} rip={:?} code={:?}",
+            addr_raw, stack_frame.instruction_pointer, error_code
+        );
         let current_pid = crate::scheduler::current_pid();
         if current_pid != 0 {
-            let _ = crate::process::set_state(current_pid, crate::process::ProcessState::Terminated);
-            crate::serial_println!("[SIGSEGV] PID {} terminated due to page fault", current_pid);
-
-            // Find the next Ready userspace process and IRETQ to it.
-            // We CANNOT just return here: the interrupt frame on the stack
-            // still points to the faulting instruction, so IRET would
-            // resume the dead process and page-fault again (infinite loop).
-            if let Some((next_pid, entry, stack, pml4, name)) =
-                crate::process::find_next_ready_userspace(current_pid)
-            {
-                crate::scheduler::set_current_pid(next_pid);
-                let _ = crate::process::set_state(next_pid, crate::process::ProcessState::Running);
-
-                // Use saved preempt state if available, otherwise entry state
-                let (rip, rsp, rfl, cr3) =
-                    if let Some((saved_rip, saved_rsp, saved_rfl, saved_pml4)) =
-                        crate::process::get_preempt_state(next_pid)
-                    {
-                        if saved_rip != 0 {
-                            (saved_rip, saved_rsp, saved_rfl, saved_pml4)
-                        } else {
-                            (entry, stack, 0x202u64, pml4)
-                        }
-                    } else {
-                        (entry, stack, 0x202u64, pml4)
-                    };
-
-                crate::serial_println!(
-                    "[SIGSEGV] Switching to PID {} ({}) rip=0x{:X} cr3=0x{:X}",
-                    next_pid, name, rip, cr3
-                );
-
-                // IRETQ to the next process — never returns
-                unsafe {
-                    core::arch::asm!(
-                        "cli",
-                        "mov cr3, {cr3_val}",
-                        "push 0x1B",           // SS (Ring 3 data)
-                        "push {rsp_val}",      // RSP
-                        "push {rfl_val}",      // RFLAGS
-                        "push 0x23",           // CS (Ring 3 code)
-                        "push {rip_val}",      // RIP
-                        "iretq",
-                        cr3_val = in(reg) cr3,
-                        rsp_val = in(reg) rsp,
-                        rfl_val = in(reg) rfl,
-                        rip_val = in(reg) rip,
-                        options(noreturn),
-                    );
-                }
-            }
-
-            // No other Ready process — enter kernel idle loop
-            crate::serial_println!("[SIGSEGV] No other process ready, entering idle");
-            crate::scheduler::set_current_pid(0);
-            loop { x86_64::instructions::hlt(); }
+            kill_user_and_switch(current_pid, addr_raw);
+            // kill_user_and_switch never returns if another process exists
         }
     }
 
-    // Only panic if it's a kernel-mode page fault (critical kernel bug)
-    panic!("Kernel page fault at {:?}", accessed_address);
+    // Kernel-mode page fault — fatal
+    crate::serial_println!("[EXCEPTION] #PF at {:?} addr=0x{:X}", stack_frame.instruction_pointer, addr_raw);
+    panic!("Kernel page fault at 0x{:X}", addr_raw);
 }
 
 extern "x86-interrupt" fn x87_floating_point_handler(stack_frame: InterruptStackFrame) {

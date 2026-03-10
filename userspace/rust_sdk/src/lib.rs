@@ -32,6 +32,64 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use linked_list_allocator::Heap;
 
 // ============================================================
+// Compiler built-in memory functions required by no_std
+// ============================================================
+// The Rust compiler emits calls to these for array init, copy, etc.
+// We provide them here in the SDK so every agent gets them automatically.
+// IMPORTANT: Do NOT define these in individual agents — it causes
+// "symbol multiply defined" errors.
+// IMPORTANT: Do NOT use -Z build-std-features=compiler-builtins-mem
+// with these definitions — it would also cause duplicate symbols.
+
+#[no_mangle]
+pub unsafe extern "C" fn memset(dest: *mut u8, c: i32, n: usize) -> *mut u8 {
+    let mut i = 0;
+    while i < n {
+        *dest.add(i) = c as u8;
+        i += 1;
+    }
+    dest
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    let mut i = 0;
+    while i < n {
+        *dest.add(i) = *src.add(i);
+        i += 1;
+    }
+    dest
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    if (dest as usize) < (src as usize) {
+        memcpy(dest, src, n)
+    } else {
+        let mut i = n;
+        while i > 0 {
+            i -= 1;
+            *dest.add(i) = *src.add(i);
+        }
+        dest
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memcmp(s1: *const u8, s2: *const u8, n: usize) -> i32 {
+    let mut i = 0;
+    while i < n {
+        let a = *s1.add(i);
+        let b = *s2.add(i);
+        if a != b {
+            return a as i32 - b as i32;
+        }
+        i += 1;
+    }
+    0
+}
+
+// ============================================================
 // Syscall Numbers (Linux x86_64 ABI, AetherionOS compatible)
 // ============================================================
 pub const SYS_READ:         u64 = 0;
@@ -541,14 +599,15 @@ pub fn print_hex(val: u64) {
 // Global Heap Allocator backed by sys_brk
 // ============================================================
 
-/// Initial heap size requested from the kernel (64 KiB).
-/// Pre-allocate a massive 4 MiB heap upfront to avoid incremental sys_brk
-/// extensions that trigger linked_list_allocator bugs in Ring 3.
-/// This is critical for LLM agents that allocate large tensor buffers.
+/// Initial heap size requested from the kernel.
+/// 4 MiB is sufficient for all agents. The allocator grows on demand
+/// via sys_brk in 4 MiB increments. The LLM agent uses streaming
+/// (layer-by-layer from disk) and never loads the full model in RAM.
 const INITIAL_HEAP_SIZE: usize = 4 * 1024 * 1024;
 
-/// Maximum heap growth per extension (1 MiB).
-const HEAP_GROW_SIZE: usize = 1024 * 1024;
+/// Heap growth per extension (4 MiB).
+/// On-demand growth avoids pre-allocating huge regions that OOM the kernel.
+const HEAP_GROW_SIZE: usize = 4 * 1024 * 1024;
 
 /// The AetherionOS global allocator.
 /// Uses `linked_list_allocator::Heap` internally, backed by `sys_brk`.
