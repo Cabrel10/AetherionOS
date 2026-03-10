@@ -1795,8 +1795,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 ).unwrap_or(0);
                 if vt_pid != 0 {
                     scheduler::enqueue_process(vt_pid);
-                    process::save_preempt_state(vt_pid,
-                        vt_result.entry_point, vt_result.stack_pointer, 0x202);
+                    // DON'T save preempt_state here — it will be saved by timer IRQ when actually preempted
                     serial_println!("  [J60] Visual Terminal PID={} queued (entry=0x{:X}, segs={}, frames={})",
                         vt_pid, vt_result.entry_point, vt_result.segments_loaded, vt_result.frames_used);
                 }
@@ -1818,8 +1817,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 ).unwrap_or(0);
                 if orch_pid != 0 {
                     scheduler::enqueue_process(orch_pid);
-                    process::save_preempt_state(orch_pid,
-                        orch_result.entry_point, orch_result.stack_pointer, 0x202);
+                    // DON'T save preempt_state here — it will be saved by timer IRQ when actually preempted
                     serial_println!("  [J60] Orchestrator PID={} queued (entry=0x{:X})",
                         orch_pid, orch_result.entry_point);
                 }
@@ -1842,8 +1840,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 ).unwrap_or(0);
                 if core_pid != 0 {
                     scheduler::enqueue_process(core_pid);
-                    process::save_preempt_state(core_pid,
-                        core_result.entry_point, core_result.stack_pointer, 0x202);
+                    // DON'T save preempt_state here — it will be saved by timer IRQ when actually preempted
                     serial_println!("  [J62] LLaMA Core PID={} queued (entry=0x{:X}, segs={}, frames={})",
                         core_pid, core_result.entry_point, core_result.segments_loaded, core_result.frames_used);
                 }
@@ -1880,8 +1877,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 if pid != 0 {
                     scheduler::enqueue_process(pid);
                     scheduler::set_current_pid(pid);
-                    process::save_preempt_state(pid,
-                        result.entry_point, result.stack_pointer, 0x202);
+                    // DON'T save preempt_state here — it will be saved by timer IRQ when actually preempted
                     serial_println!("  [J60] Orchestrator PID={} registered (launching first)", pid);
                 }
 
