@@ -1786,9 +1786,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         // STEP A1: Load agent_llm_chat.elf as a QUEUED process
         // Dynamic GGUF agent: parses metadata, allocates tensors, runs
         // inference. Queued so terminal can start first and display UI.
-        // TEMPORARILY DISABLED to test terminal without CPU competition
         // ──────────────────────────────────────────────────────────
-        /*
         serial_write("  [J67] Loading agent_llm_chat.elf (queued)...\n");
         match elf::load_elf_binary(AGENT_LLM_CHAT_ELF) {
             Ok(llm_result) => {
@@ -1806,8 +1804,6 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 serial_println!("  [J67] WARN: agent_llm_chat.elf load failed: {}", e);
             }
         }
-        */
-        serial_println!("  [J67] agent_llm_chat.elf DISABLED for terminal testing");
 
         // ──────────────────────────────────────────────────────────
         // STEP A2: Load agent_orchestrator.elf as a QUEUED process

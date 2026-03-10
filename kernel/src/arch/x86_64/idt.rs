@@ -400,6 +400,9 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
     }
 }
 
+/// PS/2 Scancode Set 2 state: tracks if we're expecting a break code
+static mut EXPECTING_BREAK: bool = false;
+
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
     use x86_64::instructions::port::Port;
 
@@ -410,9 +413,17 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     // beyond consuming the byte from the hardware buffer.
     let scancode: u8 = unsafe { port.read() };
 
-    // Convert scancode to ASCII and push to keyboard buffer
-    // Only process key-press events (bit 7 clear = press, set = release)
-    if scancode & 0x80 == 0 {
+    // PS/2 Scancode Set 2 handling:
+    // 0xF0 = break code prefix (key release follows)
+    // Other = make code (key press)
+    if scancode == 0xF0 {
+        // Next scancode will be a break code — ignore it
+        unsafe { EXPECTING_BREAK = true; }
+    } else if unsafe { EXPECTING_BREAK } {
+        // This is a break code (key release) — ignore it
+        unsafe { EXPECTING_BREAK = false; }
+    } else {
+        // This is a make code (key press) — convert to ASCII
         let ascii = scancode_to_ascii(scancode);
         if ascii != 0 {
             crate::process::kbd_push_byte(ascii);
@@ -428,10 +439,6 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
         }
     }
 
-    if scancode != 0 {
-        crate::serial_println!("[KEYBOARD] Scancode: 0x{:02x}", scancode);
-    }
-
     // Envoyer EOI au PIC
     // SAFETY: Sends EOI for keyboard IRQ (vector 33). Must be called to
     // acknowledge the interrupt and re-enable subsequent keyboard IRQs.
@@ -440,7 +447,7 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     }
 
     // Push keyboard event to HID ring buffer for J38
-    crate::drivers::mouse::push_key_event(scancode, scancode & 0x80 != 0);
+    crate::drivers::mouse::push_key_event(scancode, scancode == 0xF0 || unsafe { EXPECTING_BREAK });
 }
 
 /// PS/2 Mouse IRQ 12 handler (Jalon 38)
@@ -453,28 +460,28 @@ extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFr
     }
 }
 
-/// Convert PS/2 scancode set 1 to ASCII
+/// Convert PS/2 scancode set 2 to ASCII
 fn scancode_to_ascii(scancode: u8) -> u8 {
-    // US QWERTY layout, scancode set 1 (make codes only)
+    // US QWERTY layout, PS/2 scancode set 2 (make codes only)
     match scancode {
-        0x02 => b'1', 0x03 => b'2', 0x04 => b'3', 0x05 => b'4',
-        0x06 => b'5', 0x07 => b'6', 0x08 => b'7', 0x09 => b'8',
-        0x0A => b'9', 0x0B => b'0', 0x0C => b'-', 0x0D => b'=',
-        0x0E => 0x08, // Backspace
-        0x0F => b'\t', // Tab
-        0x10 => b'q', 0x11 => b'w', 0x12 => b'e', 0x13 => b'r',
-        0x14 => b't', 0x15 => b'y', 0x16 => b'u', 0x17 => b'i',
-        0x18 => b'o', 0x19 => b'p', 0x1A => b'[', 0x1B => b']',
-        0x1C => b'\n', // Enter
-        0x1E => b'a', 0x1F => b's', 0x20 => b'd', 0x21 => b'f',
-        0x22 => b'g', 0x23 => b'h', 0x24 => b'j', 0x25 => b'k',
-        0x26 => b'l', 0x27 => b';', 0x28 => b'\'',
-        0x29 => b'`',
-        0x2B => b'\\',
-        0x2C => b'z', 0x2D => b'x', 0x2E => b'c', 0x2F => b'v',
-        0x30 => b'b', 0x31 => b'n', 0x32 => b'm', 0x33 => b',',
-        0x34 => b'.', 0x35 => b'/',
-        0x39 => b' ', // Space
+        0x16 => b'1', 0x1E => b'2', 0x26 => b'3', 0x25 => b'4',
+        0x2E => b'5', 0x36 => b'6', 0x3D => b'7', 0x3E => b'8',
+        0x46 => b'9', 0x45 => b'0', 0x4E => b'-', 0x55 => b'=',
+        0x66 => 0x08, // Backspace
+        0x0D => b'\t', // Tab
+        0x15 => b'q', 0x1D => b'w', 0x24 => b'e', 0x2D => b'r',
+        0x2C => b't', 0x35 => b'y', 0x3C => b'u', 0x43 => b'i',
+        0x44 => b'o', 0x4D => b'p', 0x54 => b'[', 0x5B => b']',
+        0x5A => b'\n', // Enter
+        0x1C => b'a', 0x1B => b's', 0x23 => b'd', 0x2B => b'f',
+        0x34 => b'g', 0x33 => b'h', 0x3B => b'j', 0x42 => b'k',
+        0x4B => b'l', 0x4C => b';', 0x52 => b'\'',
+        0x0E => b'`',
+        0x5D => b'\\',
+        0x1A => b'z', 0x22 => b'x', 0x21 => b'c', 0x2A => b'v',
+        0x32 => b'b', 0x31 => b'n', 0x3A => b'm', 0x41 => b',',
+        0x49 => b'.', 0x4A => b'/',
+        0x29 => b' ', // Space
         _ => 0, // Unknown scancode
     }
 }

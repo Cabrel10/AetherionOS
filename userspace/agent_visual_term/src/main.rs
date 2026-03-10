@@ -410,7 +410,7 @@ fn process_command(term: &mut Terminal) {
     } else if bytes_eq(&trimmed[..trimmed_len], b"exit") || bytes_eq(&trimmed[..trimmed_len], b"quit") {
         term.put_str(b"\n", TEXT);
         term.put_str(b"Goodbye!\n", PROMPT);
-        println("[J65] Exit command received");
+        sys_write(1, b"[J65] Exit command received\n");
         sys_bus_publish(INTENT_VISUAL_TERM, 3, 0);
         sys_exit(0);
     } else if starts_with(&trimmed[..trimmed_len], b"llm ") {
@@ -438,10 +438,10 @@ fn process_command(term: &mut Terminal) {
 // ═══════════════════════════════════════════════════
 #[no_mangle]
 pub extern "C" fn main() -> i64 {
-    println("[J65] ========================================");
-    println("[J65] Persistent Interactive Terminal v2.0");
-    println("[J66] LLM Chat Integration Active");
-    println("[J65] ========================================");
+    sys_write(1, b"[J65] ========================================\n");
+    sys_write(1, b"[J65] Persistent Interactive Terminal v2.0\n");
+    sys_write(1, b"[J66] LLM Chat Integration Active\n");
+    sys_write(1, b"[J65] ========================================\n");
 
     // Map framebuffer
     sys_write(1, b"[J65] Mapping framebuffer... ");
@@ -450,39 +450,55 @@ pub extern "C" fn main() -> i64 {
     if fb_ok == 0 {
         sys_write(1, b"FAIL (no framebuffer)\n");
     } else {
-        sys_write(1, b"OK (");
-        print_u64(fb_info[0]); sys_write(1, b"x"); print_u64(fb_info[1]);
-        sys_write(1, b")\n");
+        sys_write(1, b"OK\n");
     }
 
     // Draw terminal chrome
     sys_write(1, b"[J65] Drawing terminal UI... ");
+    sys_write(1, b"[DBG] checkpoint 1\n");
     draw_chrome();
+    sys_write(1, b"[DBG] checkpoint 2\n");
     sys_write(1, b"OK\n");
 
     // Initialize terminal
-    println("[J65] Initializing terminal state...");
+    sys_write(1, b"[DBG] checkpoint 3\n");
+    sys_write(1, b"[J65] Initializing terminal state...\n");
+    sys_write(1, b"[DBG] checkpoint 4\n");
     let mut term = Terminal::new();
-    println("[J65] Terminal state initialized");
+    sys_write(1, b"[DBG] checkpoint 5\n");
+    sys_write(1, b"[J65] Terminal state initialized\n");
 
     // Welcome banner
-    println("[J65] Drawing welcome banner...");
+    sys_write(1, b"[DBG] checkpoint 6\n");
+    sys_write(1, b"[J65] Drawing welcome banner...\n");
+    sys_write(1, b"[DBG] checkpoint 7\n");
     term.put_str(b"AetherionOS v2.3 - Cognitive Agent Operating System\n", TEXT);
+    sys_write(1, b"[DBG] checkpoint 8\n");
     term.put_str(b"Kernel: x86_64 Ring 3 | FAT32 + TCP/IP + Cognitive Bus\n", DIM);
+    sys_write(1, b"[DBG] checkpoint 9\n");
     term.put_str(b"Terminal v2.0 - Persistent | LLM Integrated (J65/66)\n", DIM);
+    sys_write(1, b"[DBG] checkpoint 10\n");
     term.put_str(b"Type 'help' for commands, 'llm <prompt>' for AI chat.\n", INFO_COL);
+    sys_write(1, b"[DBG] checkpoint 11\n");
     term.put_str(b"\n", TEXT);
-    println("[J65] Welcome banner drawn");
+    sys_write(1, b"[DBG] checkpoint 12\n");
+    sys_write(1, b"[J65] Welcome banner drawn\n");
 
     // Publish init
+    sys_write(1, b"[DBG] checkpoint 13\n");
     sys_bus_publish(INTENT_VISUAL_TERM, 3, 1);
-    println("[J65] Published INTENT_VISUAL_TERM (0xB059)");
+    sys_write(1, b"[DBG] checkpoint 14\n");
+    sys_write(1, b"[J65] Published INTENT_VISUAL_TERM (0xB059)\n");
 
     // First prompt
-    println("[J65] Drawing first prompt...");
+    sys_write(1, b"[DBG] checkpoint 15\n");
+    sys_write(1, b"[J65] Drawing first prompt...\n");
+    sys_write(1, b"[DBG] checkpoint 16\n");
     print_prompt(&mut term);
-    println("[J65] First prompt drawn");
-    println("[J65] Terminal ready, entering event loop");
+    sys_write(1, b"[DBG] checkpoint 17\n");
+    sys_write(1, b"[J65] First prompt drawn\n");
+    sys_write(1, b"[DBG] checkpoint 18\n");
+    sys_write(1, b"[J65] Terminal ready, entering event loop\n");
 
     // ─── Persistent event loop ───────────────────────────────────────
     // 1. sys_read(fd=0) is NON-BLOCKING — returns 0 if no key buffered.
@@ -492,7 +508,9 @@ pub extern "C" fn main() -> i64 {
     //    safety valve triggers (for automated QEMU tests).
     let mut idle_count: u64 = 0;
     let mut read_buf = [0u8; 1]; // Read one byte at a time for responsiveness
-    println("[J65] Entering main loop (non-blocking sys_read + sys_yield)");
+    sys_write(1, b"[DBG] checkpoint 19\n");
+    sys_write(1, b"[J65] Entering main loop (non-blocking sys_read + sys_yield)\n");
+    sys_write(1, b"[DBG] checkpoint 20 - entering loop\n");
 
     loop {
         // 1. Try reading ONE byte from keyboard (non-blocking)
@@ -538,11 +556,11 @@ pub extern "C" fn main() -> i64 {
 
         // 4. Safety valve (QEMU automated tests only)
         if idle_count >= MAX_IDLE_LOOPS {
-            println("[J65] Safety valve: exiting after long idle");
+            sys_write(1, b"[J65] Safety valve: exiting after long idle\n");
             break;
         }
     }
 
-    println("[J65-OK] Terminal event loop completed");
+    sys_write(1, b"[J65-OK] Terminal event loop completed\n");
     0
 }
