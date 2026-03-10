@@ -15,6 +15,56 @@
 
 extern crate alloc;
 
+// ===== Compiler built-in memory functions required by no_std =====
+// The Rust compiler may emit calls to these for array init, copy, etc.
+#[no_mangle]
+pub unsafe extern "C" fn memset(dest: *mut u8, c: i32, n: usize) -> *mut u8 {
+    let mut i = 0;
+    while i < n {
+        *dest.add(i) = c as u8;
+        i += 1;
+    }
+    dest
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    let mut i = 0;
+    while i < n {
+        *dest.add(i) = *src.add(i);
+        i += 1;
+    }
+    dest
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    if (dest as usize) < (src as usize) {
+        memcpy(dest, src, n)
+    } else {
+        let mut i = n;
+        while i > 0 {
+            i -= 1;
+            *dest.add(i) = *src.add(i);
+        }
+        dest
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn memcmp(s1: *const u8, s2: *const u8, n: usize) -> i32 {
+    let mut i = 0;
+    while i < n {
+        let a = *s1.add(i);
+        let b = *s2.add(i);
+        if a != b {
+            return a as i32 - b as i32;
+        }
+        i += 1;
+    }
+    0
+}
+
 use aetherion_sdk::*;
 
 // ═══════════════════════════════════════════════════
@@ -480,27 +530,64 @@ pub extern "C" fn main() -> i64 {
     println("[J65] Drawing first prompt...");
     print_prompt(&mut term);
     println("[J65] First prompt drawn");
-    println("[J65] Terminal ready, entering test loop (no keyboard yet)");
+    println("[J65] Terminal ready, entering event loop");
 
-    // TEMPORARY: Simple test loop without blocking sys_read
-    let mut tick_count: u64 = 0;
+    // Persistent event loop: non-blocking sys_read(fd=0) + sys_yield()
+    // sys_read returns 0 immediately if no keystroke is buffered.
+    // sys_yield() does a real IRETQ context switch, allowing keyboard
+    // IRQs to fire and other processes to run.
+    let mut idle_count: u64 = 0;
+    let mut read_buf = [0u8; 16];
     loop {
-        sys_yield();
-        term.blink_tick();
-        tick_count += 1;
-        
-        if tick_count % 1000 == 0 {
-            println("[J65] Terminal alive, tick=");
-            print_u64(tick_count);
-            println("");
+        // 1. Try reading keyboard input (non-blocking)
+        let n = sys_read(0, &mut read_buf);
+        if n > 0 {
+            idle_count = 0;
+            let count = n as usize;
+            for i in 0..count {
+                let ch = read_buf[i];
+                match ch {
+                    0x08 => {
+                        // Backspace
+                        term.backspace();
+                    }
+                    b'\n' => {
+                        // Enter — execute command
+                        term.newline();
+                        process_command(&mut term);
+                        print_prompt(&mut term);
+                    }
+                    0x20..=0x7E => {
+                        // Printable ASCII — add to command buffer and display
+                        if term.cmd_len < CMD_BUF_SIZE {
+                            term.cmd_buf[term.cmd_len] = ch;
+                            term.cmd_len += 1;
+                        }
+                        term.put_char(ch, TEXT);
+                    }
+                    _ => {
+                        // Ignore non-printable / control characters
+                    }
+                }
+            }
+        } else {
+            idle_count += 1;
         }
-        
-        if tick_count >= 10000 {
-            println("[J65] Test complete, exiting");
+
+        // 2. Blink cursor animation
+        term.blink_tick();
+
+        // 3. Yield CPU to other processes (real IRETQ context switch)
+        sys_yield();
+
+        // 4. Safety valve for automated QEMU tests:
+        //    Exit after MAX_IDLE_LOOPS consecutive reads with no input.
+        if idle_count >= MAX_IDLE_LOOPS {
+            println("[J65] Safety valve: no input after max idle loops, exiting");
             break;
         }
     }
 
-    println("[J65-OK] Terminal test loop completed");
+    println("[J65-OK] Terminal event loop completed");
     0
 }
