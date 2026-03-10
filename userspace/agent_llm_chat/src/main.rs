@@ -1057,7 +1057,8 @@ pub extern "C" fn main() -> i64 {
 
     // Step 1: Try to open the GGUF model file
     print("[J67] Step 1: Scanning /disk/models/ for GGUF... ");
-    let paths: [&[u8]; 4] = [
+    let paths: [&[u8]; 5] = [
+        b"/disk/models/part1\0",
         b"/disk/models/TEST.GGU\0",
         b"/disk/models/MODEL.GGU\0",
         b"/disk/models/test.gguf\0",

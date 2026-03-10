@@ -246,16 +246,25 @@ fn kill_user_and_switch(current_pid: u64, addr_raw: u64) {
         crate::scheduler::set_current_pid(next_pid);
         let _ = crate::process::set_state(next_pid, crate::process::ProcessState::Running);
 
+        // CRITICAL: Only use preempt_state if it's valid (rip in userspace range 0x8000000000+).
+        // If saved_rip is 0 or invalid, use entry_point instead.
         let (rip, rsp, rfl, cr3) =
             if let Some((saved_rip, saved_rsp, saved_rfl, saved_pml4)) =
                 crate::process::get_preempt_state(next_pid)
             {
-                if saved_rip != 0 {
+                // Validate saved_rip is in userspace range (0x8000000000 - 0x9000000000)
+                if saved_rip >= 0x8000000000 && saved_rip < 0x9000000000 {
                     (saved_rip, saved_rsp, saved_rfl, saved_pml4)
                 } else {
+                    // Invalid saved_rip → start from entry_point
+                    crate::serial_println!(
+                        "[SIGSEGV] Invalid saved_rip=0x{:X} for PID {}, using entry_point",
+                        saved_rip, next_pid
+                    );
                     (entry, stack, 0x202u64, pml4)
                 }
             } else {
+                // No preempt_state saved → start from entry_point
                 (entry, stack, 0x202u64, pml4)
             };
 
