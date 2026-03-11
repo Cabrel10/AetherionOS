@@ -62,7 +62,7 @@ const INTENT_TERM_CMD: u64         = 0xB065;
 // MAX_IDLE_LOOPS is a safety valve for automated QEMU tests only.
 // In real interactive use the terminal never exits unless the user types 'exit'.
 // Each idle loop is one sys_yield() call (~10ms with timer IRQ), so 5000000 = ~13 hours.
-const MAX_IDLE_LOOPS: u64 = 5000000;
+const MAX_IDLE_LOOPS: u64 = u64::MAX;
 
 // ═══════════════════════════════════════════════════
 // Terminal State

@@ -386,68 +386,73 @@ extern "x86-interrupt" fn security_exception_handler(stack_frame: InterruptStack
 // ===== IRQ Handlers =====
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    // Jalon 55: Preemptive scheduler tick (context switch infrastructure ready,
-    // actual switching disabled until multi-process support is complete).
-    //
-    // tick_preemptive() updates scheduler counters and aging; the actual
-    // frame-modification path is guarded to only fire when at least 2
-    // Ring-3 processes are simultaneously ready with saved state.
-    let _ = crate::scheduler::tick_preemptive();
-
-    // Send EOI for timer IRQ (vector 32)
+    // Send EOI first so PIC can fire future interrupts
     unsafe {
         super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET);
     }
-}
 
-/// PS/2 Scancode Set 2 state: tracks if we're expecting a break code
-static mut EXPECTING_BREAK: bool = false;
+    // Try preemptive switch
+    if let Some((old_pid, new_pid, new_rip, new_rsp, new_rflags, new_pml4)) =
+        crate::scheduler::tick_preemptive()
+    {
+        // Save current process state using stack_frame RIP/RSP
+        let cur_rip = _stack_frame.instruction_pointer.as_u64();
+        let cur_rsp = _stack_frame.stack_pointer.as_u64();
+        let cur_rfl = _stack_frame.cpu_flags;
+        if old_pid != 0 {
+            // Sauvegarder seulement si le RIP est dans l'espace userspace
+            if cur_rip >= 0x8000000000 && cur_rip < 0x9000000000 {
+                crate::process::save_preempt_state(old_pid, cur_rip, cur_rsp, cur_rfl);
+            }
+        }
+
+        // Switch to new process
+        crate::scheduler::set_current_pid(new_pid);
+        let _ = crate::process::set_state(new_pid, crate::process::ProcessState::Running);
+
+        if new_rip != 0 && new_pml4 != 0 {
+            unsafe {
+                core::arch::asm!(
+                    "cli",
+                    "mov cr3, {cr3}",
+                    "push 0x1B",
+                    "push {rsp}",
+                    "push {rfl}",
+                    "push 0x23",
+                    "push {rip}",
+                    "iretq",
+                    cr3 = in(reg) new_pml4,
+                    rsp = in(reg) new_rsp,
+                    rfl = in(reg) new_rflags,
+                    rip = in(reg) new_rip,
+                    options(noreturn)
+                );
+            }
+        }
+    }
+}
 
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
     use x86_64::instructions::port::Port;
 
-    // Lire le scancode du port clavier 0x60
-    let mut port = Port::new(0x60);
-    // SAFETY: Port 0x60 is the PS/2 keyboard data port. Reading it inside
-    // the keyboard IRQ handler retrieves the pending scancode. No side effects
-    // beyond consuming the byte from the hardware buffer.
-    let scancode: u8 = unsafe { port.read() };
+    let scancode: u8 = unsafe { Port::new(0x60).read() };
 
-    // PS/2 Scancode Set 2 handling:
-    // 0xF0 = break code prefix (key release follows)
-    // Other = make code (key press)
-    if scancode == 0xF0 {
-        // Next scancode will be a break code — ignore it
-        unsafe { EXPECTING_BREAK = true; }
-    } else if unsafe { EXPECTING_BREAK } {
-        // This is a break code (key release) — ignore it
-        unsafe { EXPECTING_BREAK = false; }
-    } else {
-        // This is a make code (key press) — convert to ASCII
+    // Simplified PS/2 handler: ignore extended prefixes (0xE0) and release prefixes (0xF0)
+    // This avoids state machine desynchronization issues with Set 2 scancodes
+    if scancode != 0xF0 && scancode != 0xE0 {
         let ascii = scancode_to_ascii(scancode);
         if ascii != 0 {
             crate::process::kbd_push_byte(ascii);
-            // Echo to serial for debugging
-            if ascii == b'\n' {
-                crate::serial_write("\n");
-            } else {
-                let ch = [ascii];
-                if let Ok(s) = core::str::from_utf8(&ch) {
-                    crate::serial_write(s);
-                }
-            }
         }
     }
 
-    // Envoyer EOI au PIC
-    // SAFETY: Sends EOI for keyboard IRQ (vector 33). Must be called to
-    // acknowledge the interrupt and re-enable subsequent keyboard IRQs.
+    // Send EOI for keyboard IRQ
     unsafe {
         super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET + 1);
     }
 
     // Push keyboard event to HID ring buffer for J38
-    crate::drivers::mouse::push_key_event(scancode, scancode == 0xF0 || unsafe { EXPECTING_BREAK });
+    crate::drivers::mouse::push_key_event(scancode, false);
 }
 
 /// PS/2 Mouse IRQ 12 handler (Jalon 38)
