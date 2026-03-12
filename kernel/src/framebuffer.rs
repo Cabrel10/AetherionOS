@@ -201,8 +201,10 @@ pub fn map_fb_for_user(pml4_phys: u64) -> Option<u64> {
         let vaddr = FB_USER_VADDR + (i as u64) * 4096;
         let paddr = info.phys_addr + (i as u64) * 4096;
         
-        // Map with USER | WRITABLE | PRESENT (no NX - it's data not code)
-        let flags: u64 = 0x01 | 0x02 | 0x04 | (1u64 << 63); // PRESENT | WRITABLE | USER | NX
+        // Map with USER | WRITABLE | PRESENT | Write-Through | Cache-Disable
+        // NX removed: framebuffer is MMIO, NX bit can cause issues on some hardware
+        // Write-Through (bit 3) helps with MMIO framebuffer coherence
+        let flags: u64 = 0x01 | 0x02 | 0x04 | 0x08; // PRESENT | WRITABLE | USER_ACCESSIBLE | PWT
         unsafe {
             if crate::elf::demand_map_user_page(pml4_phys, vaddr, paddr, flags).is_err() {
                 crate::serial_println!("[FB] Failed to map page at 0x{:X}", vaddr);

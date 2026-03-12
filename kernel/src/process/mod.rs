@@ -17,7 +17,7 @@ use spin::Mutex;
 use lazy_static::lazy_static;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-pub use task::{AgentRole, Process, ProcessState, FdTable, FileDescriptor, MAX_FDS};
+pub use task::{AgentRole, Process, ProcessState, FdTable, FileDescriptor, MAX_FDS, VirtualMemoryArea};
 pub use crate::arch::x86_64::context::TaskContext;
 
 // ===== Keyboard Input Buffer =====
@@ -324,27 +324,35 @@ pub fn find_ready_child_thread(parent_pid: u64) -> Option<(u64, u64, u64, u64)> 
 }
 
 /// Find the next Ready userspace process (not a thread, not the given PID).
-/// Only returns processes that have been ACTIVELY RUNNING before (preempted),
-/// not just queued processes. A process that has saved_user_rip == entry_point
-/// has never been preempted and should not be switched to via kill_user_and_switch.
+///
+/// JALON 69 FIX: Two modes:
+///   1. For kill_user_and_switch (SIGSEGV recovery): only return processes that
+///      have been ACTUALLY PREEMPTED (saved_user_rip in valid userspace range
+///      0x8000000000..0x9000000000 and different from entry_point).
+///   2. For sys_yield context switch: also allow processes that have a valid
+///      saved state OR a valid entry_point for first-run.
+///
+/// Terminated processes are ALWAYS excluded.
+///
 /// Returns (pid, entry_point, stack_pointer, pml4_phys, name) or None.
 pub fn find_next_ready_userspace(exclude_pid: u64) -> Option<(u64, u64, u64, u64, String)> {
     let table = PROCESS_TABLE.lock();
+    
+    // First pass: look for processes that were actively running (have valid saved state)
     for (_, proc) in table.iter() {
-        // CRITICAL: Only return processes that have been actively running and preempted.
-        // saved_user_rip == entry_point means the process was never launched (just queued).
-        // saved_user_rip != entry_point means it was running and got preempted.
-        let was_actually_preempted = proc.saved_user_rip != 0 
+        if proc.pid == exclude_pid { continue; }
+        if proc.state != ProcessState::Ready { continue; }
+        if proc.state == ProcessState::Terminated { continue; }
+        if proc.is_thread { continue; }
+        if proc.entry_point == 0 || proc.pml4_phys == 0 { continue; }
+        if proc.role == AgentRole::KernelThread { continue; }
+        
+        // Only processes with saved_user_rip in valid userspace range
+        let has_valid_saved_state = proc.saved_user_rip >= 0x8000000000
+            && proc.saved_user_rip < 0x9000000000
             && proc.saved_user_rip != proc.entry_point;
         
-        if proc.pid != exclude_pid
-            && proc.state == ProcessState::Ready
-            && !proc.is_thread
-            && proc.entry_point != 0
-            && proc.pml4_phys != 0
-            && proc.role != AgentRole::KernelThread
-            && was_actually_preempted  // CRITICAL: Only processes that were running
-        {
+        if has_valid_saved_state {
             return Some((
                 proc.pid,
                 proc.entry_point,
@@ -354,6 +362,26 @@ pub fn find_next_ready_userspace(exclude_pid: u64) -> Option<(u64, u64, u64, u64
             ));
         }
     }
+    
+    // Second pass: look for any Ready process with a valid entry point (for first-run)
+    for (_, proc) in table.iter() {
+        if proc.pid == exclude_pid { continue; }
+        if proc.state != ProcessState::Ready { continue; }
+        if proc.state == ProcessState::Terminated { continue; }
+        if proc.is_thread { continue; }
+        if proc.entry_point == 0 || proc.pml4_phys == 0 { continue; }
+        if proc.role == AgentRole::KernelThread { continue; }
+        
+        // Any process with a valid entry point can be launched
+        return Some((
+            proc.pid,
+            proc.entry_point,
+            proc.stack_pointer,
+            proc.pml4_phys,
+            proc.name.clone(),
+        ));
+    }
+    
     None
 }
 
@@ -686,4 +714,28 @@ pub fn set_heap_break(pid: u64, new_break: u64) -> Option<u64> {
         p.heap_break = new_break;
         old
     })
+}
+
+// ===== VMA Management (Jalon 68: Zero-Copy Streaming) =====
+
+/// Add a file-backed VMA to a process
+pub fn add_vma(pid: u64, vma: VirtualMemoryArea) -> Option<()> {
+    with_process_mut(pid, |p| {
+        p.vmas.push(vma);
+    })
+}
+
+/// Find a VMA that contains the given virtual address
+/// Returns (file_path, file_offset_for_this_page, writable)
+pub fn find_vma(pid: u64, addr: u64) -> Option<(String, u64, bool)> {
+    with_process(pid, |p| {
+        for vma in &p.vmas {
+            if addr >= vma.vaddr_start && addr < vma.vaddr_end {
+                let page_offset = addr - vma.vaddr_start;
+                let file_offset = vma.file_offset + page_offset;
+                return Some((vma.file_path.clone(), file_offset, vma.writable));
+            }
+        }
+        None
+    }).flatten()
 }

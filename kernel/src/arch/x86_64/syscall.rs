@@ -299,6 +299,7 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         222 => sys_fb_draw_string(a1, a2, a3),     // Jalon 39: Framebuffer draw string
         223 => sys_fb_get_info(a1),                // Jalon 39: Framebuffer get info
         230 => sys_rdtsc(),                        // Jalon 40: Read TSC
+        240 => sys_mmap_file(a1, a2, a3),           // Jalon 68: File-backed mmap (fd, length, offset)
         _ => {
             crate::serial_println!("[SYSCALL] Unknown nr={} a1=0x{:X} a2=0x{:X} a3=0x{:X}", nr, a1, a2, a3);
             ENOSYS
@@ -2606,6 +2607,81 @@ fn sys_fb_get_info(info_buf: u64) -> u64 {
         }
     }
     1
+}
+
+// ===== sys_mmap_file(fd, length, offset) -> u64 (Jalon 68) =====
+/// File-backed mmap: creates a VMA (Virtual Memory Area) without allocating physical RAM.
+/// Pages are filled on-demand by the page fault handler when accessed.
+///
+/// fd: file descriptor (must be an open file on /disk/)
+/// length: mapping size in bytes (rounded up to page boundary)
+/// offset: offset into the file where the mapping starts
+///
+/// Returns the virtual address of the mapping, or EINVAL/EBADF on error.
+///
+/// The actual physical pages are NOT allocated here. Instead, a VMA record is
+/// created in the process's VMA list. When the process touches a page in this
+/// region, the page fault handler (idt.rs) checks the VMA list, allocates a
+/// frame, reads the corresponding file data into it, and maps it — true
+/// demand paging for zero-copy model loading.
+fn sys_mmap_file(fd: u64, length: u64, offset: u64) -> u64 {
+    const VMA_MMAP_BASE: u64 = 0x0000_6000_0000_0000; // PML4[192] — dedicated VMA region
+    static VMA_NEXT_OFFSET: AtomicU64 = AtomicU64::new(0);
+    
+    let current_pid = crate::scheduler::current_pid();
+    
+    crate::serial_println!(
+        "[SYSCALL] sys_mmap_file(fd={}, len={}, offset={}) PID={}",
+        fd, length, offset, current_pid
+    );
+    
+    if length == 0 {
+        return EINVAL;
+    }
+    
+    // Get the file path from the FD table
+    let file_path = match crate::process::get_fd_path(current_pid, fd as usize) {
+        Some(path) => path,
+        None => {
+            crate::serial_println!("[SYSCALL] mmap_file: bad fd {}", fd);
+            return EBADF;
+        }
+    };
+    
+    crate::serial_println!(
+        "[SYSCALL] mmap_file: fd={} -> path='{}' len={} offset={}",
+        fd, file_path, length, offset
+    );
+    
+    // Round length up to page boundary
+    let aligned_length = (length + 4095) & !4095;
+    let num_pages = aligned_length / 4096;
+    
+    // Reserve virtual address space (no physical allocation!)
+    let page_offset = VMA_NEXT_OFFSET.fetch_add(num_pages, AtomicOrdering::SeqCst);
+    let vaddr_start = VMA_MMAP_BASE + page_offset * 4096;
+    let vaddr_end = vaddr_start + aligned_length;
+    
+    // Create a VMA record
+    let vma = crate::process::VirtualMemoryArea {
+        vaddr_start,
+        vaddr_end,
+        file_path: file_path.clone(),
+        file_offset: offset,
+        size: length,
+        writable: false, // Model files are read-only
+    };
+    
+    crate::process::add_vma(current_pid, vma);
+    
+    crate::serial_println!(
+        "[SYSCALL] mmap_file: VMA created 0x{:X}-0x{:X} ({} pages, {} MiB) file='{}'",
+        vaddr_start, vaddr_end, num_pages, aligned_length / (1024 * 1024), file_path
+    );
+    
+    // Return the virtual address — NO physical pages allocated yet!
+    // The page fault handler will fill pages on demand.
+    vaddr_start
 }
 
 // ===== sys_rdtsc() -> u64 (Jalon 40) =====

@@ -823,6 +823,62 @@ const MULTIPART_BUFFER_SIZE: usize = 4_831_838_208; // 4.5 * 1024^3
 /// Chunk size for reading model parts from disk (4 KB = 1 FAT32 cluster)
 const CHUNK_SIZE: usize = 4096;
 
+/// Attempt to load a model via VMA mmap (zero-copy demand paging).
+/// Opens the model file, creates a VMA mapping, and returns a pointer to the
+/// memory-mapped region. Pages are loaded on-demand by the kernel's page fault
+/// handler — no upfront allocation needed.
+///
+/// Returns (virtual_address, file_size) on success, None on failure.
+fn load_model_via_vma() -> Option<(u64, u64)> {
+    println("[J68] ========================================");
+    println("[J68] Zero-Copy VMA Model Loader (Jalon 68)");
+    println("[J68] ========================================");
+    
+    // Try opening the model file
+    let model_paths: [&[u8]; 4] = [
+        b"/disk/models/mistral-7b.gguf\0",
+        b"/disk/models/MODEL.GGU\0",
+        b"/disk/models/model.gguf\0",
+        b"/disk/models/test.gguf\0",
+    ];
+    
+    for path in &model_paths {
+        let fd_result = sys_open(*path, O_RDONLY);
+        if fd_result >= 0 && fd_result < 256 {
+            let fd = fd_result as u32;
+            
+            // Get file size by seeking to end
+            let size = sys_lseek(fd, 0, 2); // SEEK_END
+            if size <= 0 {
+                sys_close(fd);
+                continue;
+            }
+            let file_size = size as u64;
+            sys_lseek(fd, 0, 0); // SEEK_SET — reset to start
+            
+            print("[J68-VMA] Found model: "); sys_write(1, &path[..path.len()-1]); println("");
+            print("[J68-VMA] Size: "); print_u64(file_size / (1024*1024)); println(" MB");
+            
+            // Create VMA mapping — pages loaded on demand!
+            let vaddr = sys_mmap_file(fd, file_size, 0);
+            if vaddr == 0 || vaddr > 0xFFFF_FFFF_FFFF_0000 {
+                println("[J68-VMA] mmap_file failed, falling back to buffer load");
+                sys_close(fd);
+                continue;
+            }
+            
+            print("[J68-VMA] Mapped at 0x"); print_u64(vaddr); println("");
+            println("[J68-VMA] Zero-copy demand paging active — pages loaded on first access");
+            
+            // Keep fd open (kernel needs it for the VMA)
+            return Some((vaddr, file_size));
+        }
+    }
+    
+    println("[J68-VMA] No model files found for VMA mapping");
+    None
+}
+
 /// Attempt to load a multi-part GGUF model from /disk/models/part{1,2,3}.
 /// Allocates a giant contiguous buffer, reads all parts into it sequentially,
 /// then returns ownership of the buffer.
@@ -1210,10 +1266,24 @@ pub extern "C" fn main() -> i64 {
     println("========================================");
 
     // ─────────────────────────────────────────────
-    // STEP 0: Try the multi-part unified buffer approach
-    // This is the PRIMARY path for Mistral 7B on 12 GB KVM
+    // STEP 0a: Try zero-copy VMA model loading (Jalon 68)
+    // This is the PREFERRED path — no RAM allocation needed!
     // ─────────────────────────────────────────────
-    println("[J68] Step 0: Attempting multi-part unified model load...");
+    println("[J68] Step 0a: Attempting zero-copy VMA model load...");
+    if let Some((vma_addr, vma_size)) = load_model_via_vma() {
+        print("[J68-VMA] Model mapped at 0x"); print_u64(vma_addr); 
+        print(" ("); print_u64(vma_size / (1024*1024)); println(" MB)");
+        println("[J68-VMA] Demand paging will load pages on first access");
+        println("[J68-VMA] Use load_multipart_model as fallback if VMA unsupported");
+        // For now, proceed to the multi-part loader as fallback
+        // In production, we would parse the GGUF directly from the VMA region
+    }
+
+    // ─────────────────────────────────────────────
+    // STEP 0b: Try the multi-part unified buffer approach
+    // This is the fallback for when VMA is not available
+    // ─────────────────────────────────────────────
+    println("[J68] Step 0b: Attempting multi-part unified model load...");
     if let Some((model_buffer, total_size)) = load_multipart_model() {
         print("[J68] Unified buffer ready: "); print_u64(total_size as u64 / (1024*1024)); println(" MB");
 

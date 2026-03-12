@@ -105,6 +105,7 @@ pub const SYS_EXIT:         u64 = 60;
 pub const SYS_WAIT:         u64 = 61;
 pub const SYS_BUS_PUBLISH:  u64 = 201;
 pub const SYS_VGA_WRITE:    u64 = 202;
+pub const SYS_MMAP_FILE:    u64 = 240;
 pub const SYS_NET_PING:     u64 = 210;
 pub const SYS_GETHOSTBYNAME:u64 = 211;
 pub const SYS_SOCKET:       u64 = 41;
@@ -523,6 +524,16 @@ pub fn sys_rdtsc() -> u64 {
 /// Returns the virtual address of the mapped region.
 pub fn sys_mmap(len: usize) -> u64 {
     syscall3(SYS_MMAP, 0, len as u64, 0x3) // PROT_READ|PROT_WRITE
+}
+
+/// File-backed mmap: creates a virtual memory mapping backed by a file.
+/// Pages are loaded on-demand by the kernel's page fault handler.
+/// fd: file descriptor (must be open on a /disk/ file)
+/// length: mapping size in bytes
+/// offset: starting offset into the file
+/// Returns the virtual address, or negative error code.
+pub fn sys_mmap_file(fd: u32, length: u64, offset: u64) -> u64 {
+    syscall3(SYS_MMAP_FILE, fd as u64, length, offset)
 }
 
 /// Seek a file descriptor to a given offset. Returns new offset.

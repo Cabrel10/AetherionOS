@@ -525,6 +525,7 @@ pub extern "C" fn main() -> i64 {
     sys_write(1, b"[DBG] checkpoint 19\n");
     sys_write(1, b"[J65] Entering main loop (non-blocking sys_read + sys_yield)\n");
     sys_write(1, b"[DBG] checkpoint 20 - entering loop\n");
+    sys_write(1, b"[J69] Terminal ready, entering input loop\n");
 
     loop {
         // 1. Try reading ONE byte from keyboard (non-blocking)

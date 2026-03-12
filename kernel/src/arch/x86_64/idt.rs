@@ -236,43 +236,66 @@ fn try_demand_map_user_page(page_addr: u64) -> bool {
 
 /// Helper: kill current Ring 3 process and IRETQ to next ready one.
 /// Never returns if a next process is found.
+///
+/// JALON 69 FIX: Properly terminates the process, then uses the scheduler's
+/// yield_to_next() which correctly restores CR3, RIP, RSP and performs IRETQ.
+/// Validates that the next process's saved_rip is in valid userspace range.
 fn kill_user_and_switch(current_pid: u64, addr_raw: u64) {
     let _ = crate::process::set_state(current_pid, crate::process::ProcessState::Terminated);
     crate::serial_println!("[SIGSEGV] PID {} terminated (addr 0x{:X})", current_pid, addr_raw);
 
-    // Find the next Ready userspace process and IRETQ to it.
-    if let Some((next_pid, entry, stack, pml4, name)) =
-        crate::process::find_next_ready_userspace(current_pid)
-    {
-        crate::scheduler::set_current_pid(next_pid);
-        let _ = crate::process::set_state(next_pid, crate::process::ProcessState::Running);
-
-        // CRITICAL: Only use preempt_state if it's valid (rip in userspace range 0x8000000000+).
-        // If saved_rip is 0 or invalid, use entry_point instead.
+    // Use scheduler's yield_to_next which handles re-queuing properly
+    let next = crate::scheduler::yield_to_next(current_pid);
+    
+    if next != 0 && next != current_pid {
+        // Get the next process's saved state
         let (rip, rsp, rfl, cr3) =
             if let Some((saved_rip, saved_rsp, saved_rfl, saved_pml4)) =
-                crate::process::get_preempt_state(next_pid)
+                crate::process::get_preempt_state(next)
             {
                 // Validate saved_rip is in userspace range (0x8000000000 - 0x9000000000)
                 if saved_rip >= 0x8000000000 && saved_rip < 0x9000000000 {
                     (saved_rip, saved_rsp, saved_rfl, saved_pml4)
-                } else {
-                    // Invalid saved_rip → start from entry_point
+                } else if let Some((entry, stack, pml4)) = crate::process::get_entry_state(next) {
+                    // Invalid saved_rip → start from entry_point (first-run)
                     crate::serial_println!(
-                        "[SIGSEGV] Invalid saved_rip=0x{:X} for PID {}, using entry_point",
-                        saved_rip, next_pid
+                        "[SIGSEGV] PID {} saved_rip=0x{:X} invalid, using entry=0x{:X}",
+                        next, saved_rip, entry
                     );
                     (entry, stack, 0x202u64, pml4)
+                } else {
+                    // No valid state at all
+                    crate::serial_println!("[SIGSEGV] PID {} has no valid state, idle", next);
+                    crate::scheduler::set_current_pid(0);
+                    loop { x86_64::instructions::hlt(); }
                 }
-            } else {
-                // No preempt_state saved → start from entry_point
+            } else if let Some((entry, stack, pml4)) = crate::process::get_entry_state(next) {
+                // No preempt state → first-run
                 (entry, stack, 0x202u64, pml4)
+            } else {
+                crate::serial_println!("[SIGSEGV] PID {} has no entry state, idle", next);
+                crate::scheduler::set_current_pid(0);
+                loop { x86_64::instructions::hlt(); }
             };
 
-        crate::serial_println!(
-            "[SIGSEGV] -> PID {} ({}) rip=0x{:X}",
-            next_pid, name, rip
-        );
+        if cr3 == 0 || rip == 0 {
+            crate::serial_println!("[SIGSEGV] PID {} invalid cr3/rip, idle", next);
+            crate::scheduler::set_current_pid(0);
+            loop { x86_64::instructions::hlt(); }
+        }
+
+        let _ = crate::process::set_state(next, crate::process::ProcessState::Running);
+        crate::scheduler::set_current_pid(next);
+        
+        if let Some(name) = crate::process::with_process(next, |p| p.name.clone()) {
+            crate::serial_println!(
+                "[SIGSEGV] -> PID {} ({}) rip=0x{:X} rsp=0x{:X}",
+                next, name, rip, rsp
+            );
+        }
+
+        // Reset GS bases before IRETQ to Ring 3
+        crate::arch::x86_64::syscall::reset_gs_bases();
 
         // IRETQ to the next process — never returns
         unsafe {
@@ -337,6 +360,67 @@ extern "x86-interrupt" fn page_fault_handler(
             }
         }
         // Fall through to SIGSEGV
+    }
+
+    // --- Demand paging for VMA-backed regions (Jalon 68: Zero-Copy Model Loading) ---
+    // Check if the faulting address is in a file-backed VMA.
+    // If so, allocate a frame, read the file data into it, and map it.
+    if is_user_mode {
+        let current_pid = crate::scheduler::current_pid();
+        if current_pid != 0 {
+            if let Some((file_path, file_offset, writable)) = crate::process::find_vma(current_pid, addr_raw) {
+                // Allocate a physical frame
+                let frame_phys = unsafe { crate::elf::alloc_demand_frame() };
+                if let Some(phys) = frame_phys {
+                    let phys_offset = crate::elf::phys_offset();
+                    let buf_ptr = (phys + phys_offset) as *mut u8;
+                    
+                    // Zero the frame first
+                    unsafe { core::ptr::write_bytes(buf_ptr, 0, 4096); }
+                    
+                    // Read 4 KB from the file at the correct offset
+                    let mut page_buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, 4096) };
+                    
+                    // Try exFAT first, then FAT32
+                    let bytes_read = if crate::fs::exfat::is_mounted() {
+                        // Strip /disk/ prefix for exFAT
+                        let name = if file_path.starts_with("/disk/") {
+                            &file_path[6..]
+                        } else {
+                            &file_path
+                        };
+                        crate::fs::exfat::read_file(name, file_offset, page_buf)
+                    } else {
+                        // FAT32 fallback: read via VFS
+                        crate::fs::fat32::read_file_at_offset(&file_path, file_offset, page_buf)
+                            .unwrap_or(0)
+                    };
+                    
+                    // Map the page
+                    let cr3: u64;
+                    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)); }
+                    let pml4_phys = cr3 & !0xFFF;
+                    
+                    // flags: PRESENT | USER | NX, optionally WRITABLE
+                    let mut flags: u64 = 0x01 | 0x04 | (1u64 << 63);
+                    if writable { flags |= 0x02; }
+                    
+                    match unsafe { crate::elf::demand_map_user_page(pml4_phys, page_addr, phys, flags) } {
+                        Ok(()) => {
+                            // Flush TLB for this page
+                            unsafe {
+                                core::arch::asm!("invlpg [{}]", in(reg) page_addr, options(nostack));
+                            }
+                            return; // Resume execution
+                        }
+                        Err(_) => {
+                            crate::serial_println!("[VMA-PF] Map failed for 0x{:X}", page_addr);
+                        }
+                    }
+                }
+                // Fall through to SIGSEGV if allocation or mapping failed
+            }
+        }
     }
 
     // --- Non-recoverable page fault ---
@@ -423,16 +507,49 @@ fn set_pending_switch(old_pid: u64, new_pid: u64, rip: u64, rsp: u64, pml4: u64)
 
 // ===== IRQ Handlers =====
 
-extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    // Jalon 55: Timer tick - cooperative scheduling only.
-    // 
-    // NOTE: Preemptive context switching is DISABLED due to instability.
-    // The scheduler updates counters and aging, but actual context switches
-    // only happen via sys_yield() (cooperative multitasking).
+extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFrame) {
+    // Jalon 69: Preemptive timer tick with safe context save.
     //
-    // This prevents context corruption from modifying IRETQ frames.
+    // CRITICAL FIX: Save the current process's FULL context (RIP, RSP, RFLAGS)
+    // from the interrupt stack frame BEFORE calling tick_preemptive().
+    // This ensures that if the scheduler decides to switch, the current
+    // process's state is already saved and can be restored later.
+    //
+    // The interrupt stack frame contains the CPU-saved state:
+    //   [RSP+0]  = RIP  (instruction that was interrupted)
+    //   [RSP+8]  = CS   
+    //   [RSP+16] = RFLAGS
+    //   [RSP+24] = RSP  (user stack pointer)
+    //   [RSP+32] = SS
 
-    let _ = crate::scheduler::tick_preemptive();
+    let current_pid = crate::scheduler::current_pid();
+    
+    // Only save preempt state if we're interrupting a real userspace process
+    if current_pid != 0 {
+        let irq_rip = stack_frame.instruction_pointer.as_u64();
+        let irq_rsp = stack_frame.stack_pointer.as_u64();
+        let irq_rflags = stack_frame.cpu_flags;
+        let cs = stack_frame.code_segment;
+        
+        // Only save if this was a Ring 3 interrupt (CS RPL == 3)
+        if (cs & 0x3) == 3 && irq_rip >= 0x8000000000 && irq_rip < 0x9000000000 {
+            crate::process::save_preempt_state(current_pid, irq_rip, irq_rsp, irq_rflags);
+        }
+    }
+
+    // Let the scheduler decide if a switch is needed
+    // But DON'T actually perform the switch from the timer ISR —
+    // context switches happen cooperatively via sys_yield() or via
+    // check_pending_switch() in the idle loop.
+    if let Some((old_pid, new_pid, new_rip, new_rsp, _new_rflags, new_pml4)) =
+        crate::scheduler::tick_preemptive()
+    {
+        // Store the pending switch for later execution
+        // The actual switch happens in sys_yield or the idle loop
+        if new_pid != old_pid && new_pml4 != 0 && new_rip != 0 {
+            set_pending_switch(old_pid, new_pid, new_rip, new_rsp, new_pml4);
+        }
+    }
 
     unsafe {
         super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET);

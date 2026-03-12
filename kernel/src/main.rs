@@ -63,7 +63,7 @@ mod framebuffer;
 mod font;
 
 // ===== Configuration =====
-const KERNEL_VERSION: &str = "2.0.0-j68-mistral-ready";
+const KERNEL_VERSION: &str = "2.1.0-j69-stable-terminal";
 
 // ===== Embedded ELF binaries =====
 /// Minimal hello.elf - statically linked x86-64 ELF for Ring 3 test
@@ -1809,69 +1809,74 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         // STEP A1: Load agent_llm_chat.elf as a QUEUED process
         // Dynamic GGUF agent: parses metadata, allocates tensors, runs
         // inference. Queued so terminal can start first and display UI.
+        //
+        // JALON 69 FIX: DISABLED — loading multiple agents at boot causes
+        // context corruption when the scheduler tries to first-run them
+        // alongside the terminal. The terminal must be the ONLY Ring 3
+        // process until it's stable. Re-enable when preemption is solid.
         // ──────────────────────────────────────────────────────────
-        serial_write("  [J67] Loading agent_llm_chat.elf (queued)...\n");
-        match elf::load_elf_binary(AGENT_LLM_CHAT_ELF) {
-            Ok(llm_result) => {
-                let llm_pid = process::spawn_userspace(
-                    "/bin/agent_llm_chat.elf", 0,
-                    llm_result.entry_point, llm_result.stack_pointer, llm_result.pml4_phys
-                ).unwrap_or(0);
-                if llm_pid != 0 {
-                    scheduler::enqueue_process(llm_pid);
-                    serial_println!("  [J67] LLM Chat PID={} queued (entry=0x{:X}, segs={}, frames={})",
-                        llm_pid, llm_result.entry_point, llm_result.segments_loaded, llm_result.frames_used);
-                }
-            }
-            Err(e) => {
-                serial_println!("  [J67] WARN: agent_llm_chat.elf load failed: {}", e);
-            }
-        }
+        serial_write("  [J69] agent_llm_chat.elf: DISABLED (terminal-only mode)\n");
+        // match elf::load_elf_binary(AGENT_LLM_CHAT_ELF) {
+        //     Ok(llm_result) => {
+        //         let llm_pid = process::spawn_userspace(
+        //             "/bin/agent_llm_chat.elf", 0,
+        //             llm_result.entry_point, llm_result.stack_pointer, llm_result.pml4_phys
+        //         ).unwrap_or(0);
+        //         if llm_pid != 0 {
+        //             scheduler::enqueue_process(llm_pid);
+        //             serial_println!("  [J67] LLM Chat PID={} queued (entry=0x{:X}, segs={}, frames={})",
+        //                 llm_pid, llm_result.entry_point, llm_result.segments_loaded, llm_result.frames_used);
+        //         }
+        //     }
+        //     Err(e) => {
+        //         serial_println!("  [J67] WARN: agent_llm_chat.elf load failed: {}", e);
+        //     }
+        // }
 
         // ──────────────────────────────────────────────────────────
         // STEP A2: Load agent_orchestrator.elf as a QUEUED process
+        // JALON 69 FIX: DISABLED — same reason as above
         // ──────────────────────────────────────────────────────────
-        serial_write("  [J60] Loading agent_orchestrator.elf (queued)...\n");
-        match elf::load_elf_binary(AGENT_ORCHESTRATOR_ELF) {
-            Ok(orch_result) => {
-                let orch_pid = process::spawn_userspace(
-                    "/bin/agent_orchestrator.elf", 0,
-                    orch_result.entry_point, orch_result.stack_pointer, orch_result.pml4_phys
-                ).unwrap_or(0);
-                if orch_pid != 0 {
-                    scheduler::enqueue_process(orch_pid);
-                    // DON'T save preempt_state here — it will be saved by timer IRQ when actually preempted
-                    serial_println!("  [J60] Orchestrator PID={} queued (entry=0x{:X})",
-                        orch_pid, orch_result.entry_point);
-                }
-            }
-            Err(e) => {
-                serial_println!("  [J60] WARN: agent_orchestrator.elf load failed: {}", e);
-            }
-        }
+        serial_write("  [J69] agent_orchestrator.elf: DISABLED (terminal-only mode)\n");
+        // match elf::load_elf_binary(AGENT_ORCHESTRATOR_ELF) {
+        //     Ok(orch_result) => {
+        //         let orch_pid = process::spawn_userspace(
+        //             "/bin/agent_orchestrator.elf", 0,
+        //             orch_result.entry_point, orch_result.stack_pointer, orch_result.pml4_phys
+        //         ).unwrap_or(0);
+        //         if orch_pid != 0 {
+        //             scheduler::enqueue_process(orch_pid);
+        //             serial_println!("  [J60] Orchestrator PID={} queued (entry=0x{:X})",
+        //                 orch_pid, orch_result.entry_point);
+        //         }
+        //     }
+        //     Err(e) => {
+        //         serial_println!("  [J60] WARN: agent_orchestrator.elf load failed: {}", e);
+        //     }
+        // }
 
         // ──────────────────────────────────────────────────────────
         // STEP A3: Load agent_llama_core.elf as QUEUED process
         // (Jalon 62/63 — runs AFTER terminal starts)
+        // JALON 69 FIX: DISABLED — same reason as above
         // ──────────────────────────────────────────────────────────
-        serial_write("  [J62] Loading agent_llama_core.elf (queued)...\n");
-        match elf::load_elf_binary(AGENT_LLAMA_CORE_ELF) {
-            Ok(core_result) => {
-                let core_pid = process::spawn_userspace(
-                    "/bin/agent_llama_core.elf", 0,
-                    core_result.entry_point, core_result.stack_pointer, core_result.pml4_phys
-                ).unwrap_or(0);
-                if core_pid != 0 {
-                    scheduler::enqueue_process(core_pid);
-                    // DON'T save preempt_state here — it will be saved by timer IRQ when actually preempted
-                    serial_println!("  [J62] LLaMA Core PID={} queued (entry=0x{:X}, segs={}, frames={})",
-                        core_pid, core_result.entry_point, core_result.segments_loaded, core_result.frames_used);
-                }
-            }
-            Err(e) => {
-                serial_println!("  [J62] WARN: agent_llama_core.elf load failed: {}", e);
-            }
-        }
+        serial_write("  [J69] agent_llama_core.elf: DISABLED (terminal-only mode)\n");
+        // match elf::load_elf_binary(AGENT_LLAMA_CORE_ELF) {
+        //     Ok(core_result) => {
+        //         let core_pid = process::spawn_userspace(
+        //             "/bin/agent_llama_core.elf", 0,
+        //             core_result.entry_point, core_result.stack_pointer, core_result.pml4_phys
+        //         ).unwrap_or(0);
+        //         if core_pid != 0 {
+        //             scheduler::enqueue_process(core_pid);
+        //             serial_println!("  [J62] LLaMA Core PID={} queued (entry=0x{:X}, segs={}, frames={})",
+        //                 core_pid, core_result.entry_point, core_result.segments_loaded, core_result.frames_used);
+        //         }
+        //     }
+        //     Err(e) => {
+        //         serial_println!("  [J62] WARN: agent_llama_core.elf load failed: {}", e);
+        //     }
+        // }
 
         // ──────────────────────────────────────────────────────────
         // STEP B: Load and LAUNCH agent_visual_term.elf FIRST (Jalon 65)
@@ -1903,9 +1908,12 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     serial_println!("  [J65] Visual Terminal PID={} registered (launching first)", pid);
                 }
 
-                // Save initial state so this process can be found if it crashes
-                // This sets saved_user_rip = entry_point so find_next_ready_userspace will find it
-                process::save_preempt_state(pid, result.entry_point, result.stack_pointer, 0x202);
+                // JALON 69 FIX: Do NOT save preempt_state with entry_point.
+                // The timer IRQ handler will save the real RIP/RSP when the
+                // process is actually preempted. Setting saved_user_rip = entry_point
+                // was causing find_next_ready_userspace to confuse fresh processes
+                // with actually-preempted ones.
+                // process::save_preempt_state(pid, result.entry_point, result.stack_pointer, 0x202);
 
                 serial_write("  [J65] IRETQ -> Ring 3: Interactive Terminal launches NOW!\n");
                 serial_write("========================================\n");

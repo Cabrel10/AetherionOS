@@ -1049,6 +1049,21 @@ pub fn file_exists(disk_path: &str) -> Option<u64> {
     }
 }
 
+/// Read bytes from a file at a given offset directly into a provided buffer.
+/// Returns the number of bytes actually read.
+/// Used by the VMA demand pager to fill pages from file-backed mappings.
+pub fn read_file_at_offset(disk_path: &str, offset: u64, buf: &mut [u8]) -> Result<usize, ()> {
+    let len = buf.len() as u64;
+    match read_file_path_chunk(disk_path, offset, len) {
+        Some(data) => {
+            let copy_len = core::cmp::min(data.len(), buf.len());
+            buf[..copy_len].copy_from_slice(&data[..copy_len]);
+            Ok(copy_len)
+        }
+        None => Err(()),
+    }
+}
+
 /// Find a directory entry by path (public API).
 pub fn find_directory_entry(path: &str) -> Option<Fat32DirEntry> {
     unsafe {

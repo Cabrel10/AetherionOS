@@ -232,6 +232,27 @@ pub struct Process {
     /// Userspace calls sys_brk to grow/shrink this.
     /// Base address: 0x0000_3000_0000_0000 (PML4[96])
     pub heap_break: u64,
+    /// Virtual Memory Areas for file-backed mmap (Jalon 68)
+    /// Each VMA describes a region of virtual memory backed by a file.
+    pub vmas: Vec<VirtualMemoryArea>,
+}
+
+/// Virtual Memory Area — describes a file-backed memory mapping
+/// Used for zero-copy model loading via demand paging
+#[derive(Debug, Clone)]
+pub struct VirtualMemoryArea {
+    /// Start virtual address (page-aligned)
+    pub vaddr_start: u64,
+    /// End virtual address (exclusive, page-aligned)
+    pub vaddr_end: u64,
+    /// File path in VFS (e.g., "/disk/models/mistral-7b.gguf")
+    pub file_path: String,
+    /// Offset into the file where this mapping starts
+    pub file_offset: u64,
+    /// Size of the mapping in bytes
+    pub size: u64,
+    /// Is this mapping writable? (false = read-only for model files)
+    pub writable: bool,
 }
 
 impl Process {
@@ -270,6 +291,7 @@ impl Process {
             fpu_state: fpu,
             is_forked: false,
             heap_break: 0x0000_3000_0000_0000, // Initial heap base (PML4[96])
+            vmas: Vec::new(),
         }
     }
 

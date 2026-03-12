@@ -12,3 +12,4 @@
 pub mod vfs;
 pub mod manifest;
 pub mod fat32;
+pub mod exfat;
