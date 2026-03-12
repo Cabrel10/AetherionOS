@@ -1,2 +1,6 @@
-[target.x86_64-aetherion-user]
-rustflags = ["-C", "link-arg=-Tlinker.ld"]
+# [target.x86_64-aetherion-user]
+# rustflags = ["-C", "link-arg=-Tlinker.ld"]
+# 
+# DISABLED: This custom linker script was discarding .rodata section,
+# causing all string literals to disappear from the binary.
+# The default LLD linker with x86_64-aetherion-user.json is sufficient.

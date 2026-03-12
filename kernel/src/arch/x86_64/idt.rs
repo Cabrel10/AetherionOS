@@ -669,8 +669,7 @@ extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFr
 
 /// Convert PS/2 Scancode Set 1 MAKE code to ASCII.
 ///
-/// Set 1 is what the 8042 delivers when Translation (Bit 6) is ON.
-/// These are the original XT-compatible scan codes.
+/// AZERTY French layout mapping for Set 1 scan codes.
 /// Reference: https://wiki.osdev.org/PS/2_Keyboard#Scan_Code_Set_1
 ///
 /// NOTE: This returns lowercase. Shift/Caps handling would require
@@ -684,58 +683,58 @@ fn scancode_set1_to_ascii(scancode: u8) -> u8 {
         0x0C => b'-', 0x0D => b'=',
         0x0E => 0x08, // Backspace
         0x0F => b'\t', // Tab
-        
-        // QWERTY row
-        0x10 => b'q', 0x11 => b'w', 0x12 => b'e', 0x13 => b'r',
+
+        // QWERTY row -> AZERTY mapping
+        0x10 => b'a', 0x11 => b'z', 0x12 => b'e', 0x13 => b'r',
         0x14 => b't', 0x15 => b'y', 0x16 => b'u', 0x17 => b'i',
         0x18 => b'o', 0x19 => b'p',
         0x1A => b'[', 0x1B => b']',
         0x1C => b'\n', // Enter (main)
-        
-        // ASDF row (home row)
-        0x1E => b'a', 0x1F => b's', 0x20 => b'd', 0x21 => b'f',
+
+        // ASDF row (home row) - AZERTY
+        0x1E => b'q', 0x1F => b's', 0x20 => b'd', 0x21 => b'f',
         0x22 => b'g', 0x23 => b'h', 0x24 => b'j', 0x25 => b'k',
         0x26 => b'l',
         0x27 => b';', 0x28 => b'\'',
         0x29 => b'`', // Backtick
         0x2B => b'\\', // Backslash
-        
-        // ZXCV row
-        0x2C => b'z', 0x2D => b'x', 0x2E => b'c', 0x2F => b'v',
+
+        // ZXCV row -> AZERTY bottom row
+        0x2C => b'w', 0x2D => b'x', 0x2E => b'c', 0x2F => b'v',
         0x30 => b'b', 0x31 => b'n', 0x32 => b'm',
         0x33 => b',', 0x34 => b'.', 0x35 => b'/',
-        
+
         // Right-side keys
         0x1D => 0, // Left Ctrl (modifier, ignore for now)
         0x2A => 0, // Left Shift (modifier)
         0x36 => 0, // Right Shift (modifier)
         0x38 => 0, // Left Alt (modifier)
         0x3A => 0, // Caps Lock (toggle)
-        
+
         // Space bar
         0x39 => b' ',
-        
+
         // Escape
         0x01 => 0x1B,
-        
+
         // Numpad (when NumLock is ON)
         0x47 => b'7', 0x48 => b'8', 0x49 => b'9',
         0x4B => b'4', 0x4C => b'5', 0x4D => b'6',
         0x4F => b'1', 0x50 => b'2', 0x51 => b'3',
         0x52 => b'0', 0x53 => b'.',
-        
+
         // Extended keys (arrows, etc) - handled separately via 0xE0 prefix
         // These are the non-extended codes that might slip through
         0x48 => 0, // Up arrow (without 0xE0 prefix - unlikely)
         0x50 => 0, // Down arrow
         0x4B => 0, // Left arrow
         0x4D => 0, // Right arrow
-        
+
         // Function keys F1-F12
         0x3B..=0x44 => 0, // F1-F10
         0x57 => 0, // F11
         0x58 => 0, // F12
-        
+
         // Everything else - ignore (modifiers, special keys)
         _ => 0,
     }

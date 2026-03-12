@@ -1974,3 +1974,4 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // Idle loop
     loop { x86_64::instructions::hlt(); }
 }
+// Force rebuild at jeu. 12 mars 2026 21:38:57 EET
