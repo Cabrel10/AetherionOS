@@ -148,7 +148,7 @@ fn saved_user_rsp() -> u64 {
 fn validate_user_ptr(addr: u64, len: u64) -> bool {
     // Accept both lower-half (<0x8000_0000_0000) and userspace ELF region (0x80_0000_0000+)
     if addr == 0 { return false; }
-    if len > 0x1000_0000 { return false; } // 256 MiB sanity
+    if len > 0x2_0000_0000 { return false; } // 8 GiB sanity (Jalon 68: was 256 MiB)
     // Standard user-space: below canonical hole
     if addr < USER_ADDR_LIMIT {
         return addr.checked_add(len).map_or(false, |end| end <= USER_ADDR_LIMIT);
@@ -2413,10 +2413,17 @@ fn sys_tcp_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
 ///   If `addr` < current break, the break is moved down (pages NOT freed for simplicity).
 ///   Returns the new (or current) program break on success, or the old break on failure.
 ///
-/// Heap region: 0x0000_3000_0000_0000 .. 0x0000_3000_1000_0000 (256 MiB max)
+/// Heap region: 0x0000_3000_0000_0000 .. 0x0000_3002_0000_0000 (8 GiB max)
+///
+/// Jalon 68: Expanded from 256 MiB to 8 GiB for Mistral 7B.
+/// The 3-part model (part1=2GB + part2=2GB + part3=171MB ≈ 4.2 GB) is loaded
+/// into a single contiguous userspace buffer via the global allocator (sys_brk).
+/// On the target 12 GB KVM machine, the kernel maps ~8 GiB of virtual heap
+/// using demand paging — pages are only allocated when actually touched.
+/// On sandbox (1 GB), this limit is harmless because pages aren't pre-allocated.
 fn sys_brk(new_break: u64) -> u64 {
     const HEAP_BASE: u64 = 0x0000_3000_0000_0000;  // PML4[96] user heap
-    const HEAP_MAX:  u64 = 0x0000_3000_1000_0000;  // 256 MiB limit
+    const HEAP_MAX:  u64 = 0x0000_3002_0000_0000;  // 8 GiB limit (was 256 MiB)
 
     let current = crate::scheduler::current_pid();
     if current == 0 {

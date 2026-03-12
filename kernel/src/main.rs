@@ -63,7 +63,7 @@ mod framebuffer;
 mod font;
 
 // ===== Configuration =====
-const KERNEL_VERSION: &str = "1.9.0-couche19-storage";
+const KERNEL_VERSION: &str = "2.0.0-j68-mistral-ready";
 
 // ===== Embedded ELF binaries =====
 /// Minimal hello.elf - statically linked x86-64 ELF for Ring 3 test
@@ -1164,10 +1164,16 @@ bootloader::entry_point!(kernel_main);
 
 fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // === Banner ===
-    serial_write("\n========================================\n");
-    serial_write("[AETHERION] Kernel v");
+    serial_write("\n╔══════════════════════════════════════════════════╗\n");
+    serial_write("║  AetherionOS Kernel Boot Sequence                ║\n");
+    serial_write("║  Version: ");
     serial_write(KERNEL_VERSION);
-    serial_write("\n========================================\n\n");
+    serial_write("\n");
+    serial_write("║  Jalon 68: PS/2 Fix + 8GB Heap + Mistral Loader  ║\n");
+    serial_write("╚══════════════════════════════════════════════════╝\n\n");
+
+    serial_write("[BOOT] Phase 1: Hardware Abstraction Layer\n");
+    serial_write("[BOOT] ──────────────────────────────────────\n");
 
     { let mut vga = VGA.lock(); vga.clear(); vga.write_str("[AETHERION] Couche 13 Multi-Process\n"); }
 
@@ -1197,15 +1203,19 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     arch::x86_64::interrupts::init();
     serial_write("       [OK] PIC remapped (32-47)\n");
 
-    // === Step 3.5: PS/2 Controller ===
-    serial_write("[3.5/12] Initializing PS/2 controller...\n");
+    // === Step 3.5: PS/2 Controller (JALON 68 FIX) ===
+    serial_write("[3.5/12] Initializing PS/2 controller (Jalon 68 Translation Fix)...\n");
     drivers::ps2::init();
-    serial_write("       [OK] PS/2 keyboard enabled (IRQ1)\n");
+    serial_write("       [OK] PS/2 keyboard: Translation=ON, IRQ1=ON, Set 1\n");
+    serial_write("       [FIX] Bit 6 now ENABLED (was disabled → keyboard dead)\n");
 
     // === Step 4: Security ===
     serial_write("[4/12] Security init...\n");
     security::init();
     serial_write("       [OK] TPM stub + PCR0 + stack protector\n");
+
+    serial_write("\n[BOOT] Phase 2: Memory & Filesystem\n");
+    serial_write("[BOOT] ──────────────────────────────────────\n");
 
     // === Step 5: Memory (Couche 2) ===
     serial_write("[5/12] Memory init (Couche 2)...\n");
@@ -1234,6 +1244,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     {
         serial_write("       [INFO] SMAP/SMEP not explicitly enabled to ensure compatibility\n");
     }
+
+    serial_write("\n[BOOT] Phase 3: IPC, VFS, Security\n");
+    serial_write("[BOOT] ──────────────────────────────────────\n");
 
     // === Step 6: Cognitive Bus (IPC) ===
     serial_write("\n[6/12] Cognitive Bus (IPC)...\n");
@@ -1280,9 +1293,14 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     gpu::init();
     run_gpu_tests();
 
+    serial_write("\n[BOOT] Phase 4: Syscall & Context Switch\n");
+    serial_write("[BOOT] ──────────────────────────────────────\n");
+
     // === Step 11: SYSCALL/SYSRET MSR Configuration (Couche 9) ===
     serial_write("\n[11/12] Syscall MSR configuration (Couche 9)...\n");
     arch::x86_64::syscall::init();
+    serial_write("       [J68] sys_brk HEAP_MAX = 8 GiB (0x0000_3002_0000_0000)\n");
+    serial_write("       [J68] Demand paging expanded to 8 GiB user heap\n");
     run_syscall_tests();
 
     // === Step 12: Context Switch (Couche 9) ===
@@ -1417,6 +1435,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // === Step 15: ELF Loader Tests ===
     serial_write("\n[15/15] ELF Loader Tests (Couche 11)...\n");
     elf::run_tests(HELLO_ELF);
+
+    serial_write("\n[BOOT] Phase 5: Drivers, Network, Storage\n");
+    serial_write("[BOOT] ──────────────────────────────────────\n");
 
     // ===================================================================
     // COUCHE 17: NETWORK STACK
@@ -1769,11 +1790,13 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // Launch llama_core (primary), visual terminal + orchestrator queued
     // Preemptive scheduling active (J55)
     // ===================================================================
-    serial_write("\n========================================\n");
-    serial_write("[J62] LLaMA Transformer Core Integration\n");
-    serial_write("[J63] Token Generation + Visual Terminal Streaming\n");
-    serial_write("[J60] Orchestrator + Preemption Active\n");
-    serial_write("========================================\n");
+    serial_write("\n[BOOT] Phase 6: Userspace Launch\n");
+    serial_write("[BOOT] ──────────────────────────────────────\n");
+    serial_write("\n╔══════════════════════════════════════════════════╗\n");
+    serial_write("║  Jalon 62/63/68: Ring 3 Agent Launch Sequence     ║\n");
+    serial_write("║  LLM Chat (8GB heap), Visual Terminal, Orchestr.  ║\n");
+    serial_write("║  PS/2 Translation FIX applied — keyboard ACTIVE   ║\n");
+    serial_write("╚══════════════════════════════════════════════════╝\n");
     {
         // Drain old messages from bus
         {

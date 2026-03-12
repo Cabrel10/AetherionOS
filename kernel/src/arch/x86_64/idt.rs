@@ -200,8 +200,9 @@ const USER_STACK_DEMAND_LOW: u64 = 0x7FFF_0000_0000;
 const USER_STACK_DEMAND_HIGH: u64 = 0x7FFF_FFFF_F000;
 /// User heap demand-paging lower bound (sys_brk region)
 const USER_HEAP_DEMAND_LOW: u64  = 0x0000_3000_0000_0000;
-/// User heap demand-paging upper bound (256 MiB)
-const USER_HEAP_DEMAND_HIGH: u64 = 0x0000_3000_1000_0000;
+/// User heap demand-paging upper bound (8 GiB — Jalon 68)
+/// Expanded from 256 MiB to 8 GiB to support Mistral 7B model loading.
+const USER_HEAP_DEMAND_HIGH: u64 = 0x0000_3002_0000_0000;
 
 /// Helper: try to demand-map a user page at `page_addr`.
 /// Returns true if the page was successfully mapped.
@@ -432,19 +433,59 @@ extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFr
     }
 }
 
+/// Keyboard IRQ1 handler — Scancode Set 1 (with 8042 translation ON)
+///
+/// JALON 68 FIX: The PS/2 controller now has Translation (Bit 6) enabled,
+/// which converts Set 2 → Set 1 in hardware. This means:
+///   - Make codes: 0x01-0x58 (key press)
+///   - Break codes: make | 0x80 (key release, bit 7 set)
+///   - Extended prefix: 0xE0 (multi-byte keys like arrows)
+///
+/// We ONLY process make codes (bit 7 = 0) and ignore releases (bit 7 = 1).
+/// This is the standard approach for PS/2 Set 1 on real hardware / KVM.
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
     use x86_64::instructions::port::Port;
 
     let scancode: u8 = unsafe { Port::new(0x60).read() };
 
-    // Simplified PS/2 handler: ignore extended prefixes (0xE0) and release prefixes (0xF0)
-    // This avoids state machine desynchronization issues with Set 2 scancodes
-    if scancode != 0xF0 && scancode != 0xE0 {
-        let ascii = scancode_to_ascii(scancode);
+    // Log every scancode for boot diagnostics (helps trace keyboard issues)
+    // Only log the first few to avoid flooding serial
+    {
+        static mut KBD_LOG_COUNT: u64 = 0;
+        unsafe {
+            KBD_LOG_COUNT += 1;
+            if KBD_LOG_COUNT <= 20 {
+                crate::serial_println!(
+                    "[KBD] IRQ1 scancode=0x{:02X} ({}), total={}",
+                    scancode,
+                    if scancode & 0x80 != 0 { "release" } else { "press" },
+                    KBD_LOG_COUNT
+                );
+            }
+        }
+    }
+
+    // Skip extended prefix (0xE0) — multi-byte sequences (arrows, etc.)
+    // We just ignore the prefix; the actual key code follows in next IRQ.
+    if scancode == 0xE0 {
+        // EOI and return — wait for the actual key code
+        unsafe { super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET + 1); }
+        crate::drivers::mouse::push_key_event(scancode, false);
+        return;
+    }
+
+    // Check if this is a KEY RELEASE (bit 7 set in Set 1)
+    let is_release = (scancode & 0x80) != 0;
+
+    if !is_release {
+        // KEY PRESS — convert make code to ASCII
+        let ascii = scancode_set1_to_ascii(scancode);
         if ascii != 0 {
             crate::process::kbd_push_byte(ascii);
         }
     }
+    // Key releases are intentionally ignored for text input.
+    // A future enhancement could track modifier state (Shift, Ctrl).
 
     // Send EOI for keyboard IRQ
     unsafe {
@@ -452,7 +493,7 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     }
 
     // Push keyboard event to HID ring buffer for J38
-    crate::drivers::mouse::push_key_event(scancode, false);
+    crate::drivers::mouse::push_key_event(scancode, is_release);
 }
 
 /// PS/2 Mouse IRQ 12 handler (Jalon 38)
@@ -465,29 +506,41 @@ extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFr
     }
 }
 
-/// Convert PS/2 scancode set 2 to ASCII
-fn scancode_to_ascii(scancode: u8) -> u8 {
-    // US QWERTY layout, PS/2 scancode set 2 (make codes only)
+/// Convert PS/2 Scancode Set 1 MAKE code to ASCII.
+///
+/// Set 1 is what the 8042 delivers when Translation (Bit 6) is ON.
+/// These are the original XT-compatible scan codes:
+///   0x02='1', 0x10='q', 0x1E='a', 0x2C='z', etc.
+///
+/// Reference: https://wiki.osdev.org/PS/2_Keyboard#Scan_Code_Set_1
+fn scancode_set1_to_ascii(scancode: u8) -> u8 {
     match scancode {
-        0x16 => b'1', 0x1E => b'2', 0x26 => b'3', 0x25 => b'4',
-        0x2E => b'5', 0x36 => b'6', 0x3D => b'7', 0x3E => b'8',
-        0x46 => b'9', 0x45 => b'0', 0x4E => b'-', 0x55 => b'=',
-        0x66 => 0x08, // Backspace
-        0x0D => b'\t', // Tab
-        0x15 => b'q', 0x1D => b'w', 0x24 => b'e', 0x2D => b'r',
-        0x2C => b't', 0x35 => b'y', 0x3C => b'u', 0x43 => b'i',
-        0x44 => b'o', 0x4D => b'p', 0x54 => b'[', 0x5B => b']',
-        0x5A => b'\n', // Enter
-        0x1C => b'a', 0x1B => b's', 0x23 => b'd', 0x2B => b'f',
-        0x34 => b'g', 0x33 => b'h', 0x3B => b'j', 0x42 => b'k',
-        0x4B => b'l', 0x4C => b';', 0x52 => b'\'',
-        0x0E => b'`',
-        0x5D => b'\\',
-        0x1A => b'z', 0x22 => b'x', 0x21 => b'c', 0x2A => b'v',
-        0x32 => b'b', 0x31 => b'n', 0x3A => b'm', 0x41 => b',',
-        0x49 => b'.', 0x4A => b'/',
-        0x29 => b' ', // Space
-        _ => 0, // Unknown scancode
+        // Number row
+        0x02 => b'1', 0x03 => b'2', 0x04 => b'3', 0x05 => b'4',
+        0x06 => b'5', 0x07 => b'6', 0x08 => b'7', 0x09 => b'8',
+        0x0A => b'9', 0x0B => b'0', 0x0C => b'-', 0x0D => b'=',
+        0x0E => 0x08, // Backspace
+        0x0F => b'\t', // Tab
+        // QWERTY row
+        0x10 => b'q', 0x11 => b'w', 0x12 => b'e', 0x13 => b'r',
+        0x14 => b't', 0x15 => b'y', 0x16 => b'u', 0x17 => b'i',
+        0x18 => b'o', 0x19 => b'p', 0x1A => b'[', 0x1B => b']',
+        0x1C => b'\n', // Enter
+        // ASDF row
+        0x1E => b'a', 0x1F => b's', 0x20 => b'd', 0x21 => b'f',
+        0x22 => b'g', 0x23 => b'h', 0x24 => b'j', 0x25 => b'k',
+        0x26 => b'l', 0x27 => b';', 0x28 => b'\'',
+        0x29 => b'`', // Backtick
+        0x2B => b'\\', // Backslash
+        // ZXCV row
+        0x2C => b'z', 0x2D => b'x', 0x2E => b'c', 0x2F => b'v',
+        0x30 => b'b', 0x31 => b'n', 0x32 => b'm', 0x33 => b',',
+        0x34 => b'.', 0x35 => b'/',
+        // Space
+        0x39 => b' ',
+        // Escape
+        0x01 => 0x1B,
+        _ => 0, // Unknown / modifier / function key
     }
 }
 
