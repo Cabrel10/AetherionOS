@@ -279,6 +279,8 @@ impl Process {
         proc.entry_point = entry;
         proc.stack_pointer = stack;
         proc.pml4_phys = pml4;
+        proc.saved_user_rip = entry;  // CRITICAL: Initialize so find_next_ready_userspace finds it
+        proc.saved_user_rsp = stack;
         proc
     }
 

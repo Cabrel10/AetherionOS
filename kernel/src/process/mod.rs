@@ -175,7 +175,10 @@ pub fn spawn_userspace(name: &str, ppid: u64, entry: u64, stack: u64, pml4: u64)
     if table.len() >= MAX_PROCESSES {
         return Err(ProcessError::LimitReached);
     }
-    let proc = Process::new_userspace(name, ppid, entry, stack, pml4);
+    let mut proc = Process::new_userspace(name, ppid, entry, stack, pml4);
+    // CRITICAL: Initialize saved state so find_next_ready_userspace can find this process
+    proc.saved_user_rip = entry;
+    proc.saved_user_rsp = stack;
     let pid = proc.pid;
     table.insert(pid, proc);
     // Add as child of parent if parent exists
@@ -207,6 +210,8 @@ pub fn fork_process(parent_pid: u64, child_pml4: u64, child_entry: u64, child_st
     child.pml4_phys = child_pml4;
     child.entry_point = child_entry;
     child.stack_pointer = child_stack;
+    child.saved_user_rip = child_entry;  // CRITICAL: Initialize so find_next_ready_userspace finds it
+    child.saved_user_rsp = child_stack;
     child.fd_table = parent_fd_table;
     child.state = ProcessState::Ready;
     let child_pid = child.pid;
@@ -241,6 +246,8 @@ pub fn clone_thread(parent_pid: u64, child_stack: u64, child_entry: u64) -> Resu
     child.pml4_phys = parent_pml4; // Key: share the address space
     child.entry_point = child_entry;
     child.stack_pointer = child_stack;
+    child.saved_user_rip = child_entry;  // CRITICAL: Initialize so find_next_ready_userspace finds it
+    child.saved_user_rsp = child_stack;
     child.fd_table = parent_fd_table;
     child.state = ProcessState::Ready;
     child.is_thread = true; // Mark as thread (shared memory)
@@ -317,16 +324,26 @@ pub fn find_ready_child_thread(parent_pid: u64) -> Option<(u64, u64, u64, u64)> 
 }
 
 /// Find the next Ready userspace process (not a thread, not the given PID).
+/// Only returns processes that have been ACTIVELY RUNNING before (preempted),
+/// not just queued processes. A process that has saved_user_rip == entry_point
+/// has never been preempted and should not be switched to via kill_user_and_switch.
 /// Returns (pid, entry_point, stack_pointer, pml4_phys, name) or None.
 pub fn find_next_ready_userspace(exclude_pid: u64) -> Option<(u64, u64, u64, u64, String)> {
     let table = PROCESS_TABLE.lock();
     for (_, proc) in table.iter() {
+        // CRITICAL: Only return processes that have been actively running and preempted.
+        // saved_user_rip == entry_point means the process was never launched (just queued).
+        // saved_user_rip != entry_point means it was running and got preempted.
+        let was_actually_preempted = proc.saved_user_rip != 0 
+            && proc.saved_user_rip != proc.entry_point;
+        
         if proc.pid != exclude_pid
             && proc.state == ProcessState::Ready
             && !proc.is_thread
             && proc.entry_point != 0
             && proc.pml4_phys != 0
             && proc.role != AgentRole::KernelThread
+            && was_actually_preempted  // CRITICAL: Only processes that were running
         {
             return Some((
                 proc.pid,

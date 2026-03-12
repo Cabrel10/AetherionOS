@@ -1903,6 +1903,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     serial_println!("  [J65] Visual Terminal PID={} registered (launching first)", pid);
                 }
 
+                // Save initial state so this process can be found if it crashes
+                // This sets saved_user_rip = entry_point so find_next_ready_userspace will find it
+                process::save_preempt_state(pid, result.entry_point, result.stack_pointer, 0x202);
+
                 serial_write("  [J65] IRETQ -> Ring 3: Interactive Terminal launches NOW!\n");
                 serial_write("========================================\n");
 

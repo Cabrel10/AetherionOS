@@ -384,53 +384,91 @@ extern "x86-interrupt" fn security_exception_handler(stack_frame: InterruptStack
     panic!("Security exception");
 }
 
+// ===== Preemptive Context Switch State =====
+// Global flag for pending context switch from timer interrupt
+// The timer handler sets this, and the kernel idle/process loop checks it
+
+use core::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+
+/// Pending context switch: (new_pid << 32) | old_pid, or 0 if none pending
+static PENDING_SWITCH: AtomicU64 = AtomicU64::new(0);
+/// Pending switch new RIP
+static PENDING_RIP: AtomicU64 = AtomicU64::new(0);
+/// Pending switch new RSP  
+static PENDING_RSP: AtomicU64 = AtomicU64::new(0);
+/// Pending switch new PML4
+static PENDING_PML4: AtomicU64 = AtomicU64::new(0);
+
+/// Check if there's a pending context switch and return the info if so
+pub fn take_pending_switch() -> Option<(u64, u64, u64, u64, u64)> {
+    let val = PENDING_SWITCH.swap(0, Ordering::SeqCst);
+    if val == 0 {
+        return None;
+    }
+    let old_pid = val & 0xFFFFFFFF;
+    let new_pid = val >> 32;
+    let rip = PENDING_RIP.load(Ordering::SeqCst);
+    let rsp = PENDING_RSP.load(Ordering::SeqCst);
+    let pml4 = PENDING_PML4.load(Ordering::SeqCst);
+    Some((old_pid, new_pid, rip, rsp, pml4))
+}
+
+/// Set a pending context switch from the timer handler
+fn set_pending_switch(old_pid: u64, new_pid: u64, rip: u64, rsp: u64, pml4: u64) {
+    PENDING_RIP.store(rip, Ordering::SeqCst);
+    PENDING_RSP.store(rsp, Ordering::SeqCst);
+    PENDING_PML4.store(pml4, Ordering::SeqCst);
+    PENDING_SWITCH.store((new_pid << 32) | old_pid, Ordering::SeqCst);
+}
+
 // ===== IRQ Handlers =====
 
 extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
-    // Send EOI first so PIC can fire future interrupts
+    // Jalon 55: Timer tick - cooperative scheduling only.
+    // 
+    // NOTE: Preemptive context switching is DISABLED due to instability.
+    // The scheduler updates counters and aging, but actual context switches
+    // only happen via sys_yield() (cooperative multitasking).
+    //
+    // This prevents context corruption from modifying IRETQ frames.
+
+    let _ = crate::scheduler::tick_preemptive();
+
     unsafe {
         super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET);
     }
+}
 
-    // Try preemptive switch
-    if let Some((old_pid, new_pid, new_rip, new_rsp, new_rflags, new_pml4)) =
-        crate::scheduler::tick_preemptive()
-    {
-        // Save current process state using stack_frame RIP/RSP
-        let cur_rip = _stack_frame.instruction_pointer.as_u64();
-        let cur_rsp = _stack_frame.stack_pointer.as_u64();
-        let cur_rfl = _stack_frame.cpu_flags;
-        if old_pid != 0 {
-            // Sauvegarder seulement si le RIP est dans l'espace userspace
-            if cur_rip >= 0x8000000000 && cur_rip < 0x9000000000 {
-                crate::process::save_preempt_state(old_pid, cur_rip, cur_rsp, cur_rfl);
-            }
-        }
-
-        // Switch to new process
-        crate::scheduler::set_current_pid(new_pid);
-        let _ = crate::process::set_state(new_pid, crate::process::ProcessState::Running);
-
-        if new_rip != 0 && new_pml4 != 0 {
+/// Check for and execute a pending context switch from timer interrupt.
+/// This should be called from syscall exit path or kernel idle loop.
+/// Returns true if a switch was performed (does not return to caller).
+/// 
+/// SAFETY: This function never returns if a switch is performed!
+#[inline(never)]
+pub fn check_pending_switch() -> bool {
+    if let Some((_old_pid, _new_pid, new_rip, new_rsp, new_pml4)) = take_pending_switch() {
+        if new_pml4 != 0 && new_rip != 0 {
+            // Perform the actual context switch via IRETQ
+            // This switches to the new process and never returns to caller
             unsafe {
                 core::arch::asm!(
                     "cli",
-                    "mov cr3, {cr3}",
-                    "push 0x1B",
-                    "push {rsp}",
-                    "push {rfl}",
-                    "push 0x23",
-                    "push {rip}",
-                    "iretq",
+                    "mov cr3, {cr3}",           // Switch page tables
+                    "push 0x1B",                // SS (Ring 3 data)
+                    "push {rsp}",               // RSP
+                    "push 0x202",               // RFLAGS (IF=1)
+                    "push 0x23",                // CS (Ring 3 code)
+                    "push {rip}",               // RIP
+                    "iretq",                    // IRETQ to new process
                     cr3 = in(reg) new_pml4,
                     rsp = in(reg) new_rsp,
-                    rfl = in(reg) new_rflags,
                     rip = in(reg) new_rip,
                     options(noreturn)
                 );
             }
         }
     }
+    false
 }
 
 /// Keyboard IRQ1 handler — Scancode Set 1 (with 8042 translation ON)
@@ -466,16 +504,26 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     }
 
     // Skip extended prefix (0xE0) — multi-byte sequences (arrows, etc.)
-    // We just ignore the prefix; the actual key code follows in next IRQ.
     if scancode == 0xE0 {
-        // EOI and return — wait for the actual key code
         unsafe { super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET + 1); }
-        crate::drivers::mouse::push_key_event(scancode, false);
+        return;
+    }
+    // Also skip 0xE1 (Pause key prefix)
+    if scancode == 0xE1 {
+        unsafe { super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET + 1); }
         return;
     }
 
     // Check if this is a KEY RELEASE (bit 7 set in Set 1)
     let is_release = (scancode & 0x80) != 0;
+    
+    // For releases, just send EOI and return (don't process)
+    if is_release {
+        unsafe {
+            super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET + 1);
+        }
+        return;
+    }
 
     if !is_release {
         // KEY PRESS — convert make code to ASCII
@@ -484,16 +532,12 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
             crate::process::kbd_push_byte(ascii);
         }
     }
-    // Key releases are intentionally ignored for text input.
-    // A future enhancement could track modifier state (Shift, Ctrl).
+    // Key releases already handled above
 
     // Send EOI for keyboard IRQ
     unsafe {
         super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET + 1);
     }
-
-    // Push keyboard event to HID ring buffer for J38
-    crate::drivers::mouse::push_key_event(scancode, is_release);
 }
 
 /// PS/2 Mouse IRQ 12 handler (Jalon 38)
@@ -509,38 +553,74 @@ extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFr
 /// Convert PS/2 Scancode Set 1 MAKE code to ASCII.
 ///
 /// Set 1 is what the 8042 delivers when Translation (Bit 6) is ON.
-/// These are the original XT-compatible scan codes:
-///   0x02='1', 0x10='q', 0x1E='a', 0x2C='z', etc.
-///
+/// These are the original XT-compatible scan codes.
 /// Reference: https://wiki.osdev.org/PS/2_Keyboard#Scan_Code_Set_1
+///
+/// NOTE: This returns lowercase. Shift/Caps handling would require
+/// tracking modifier state.
 fn scancode_set1_to_ascii(scancode: u8) -> u8 {
     match scancode {
-        // Number row
+        // Number row (top)
         0x02 => b'1', 0x03 => b'2', 0x04 => b'3', 0x05 => b'4',
         0x06 => b'5', 0x07 => b'6', 0x08 => b'7', 0x09 => b'8',
-        0x0A => b'9', 0x0B => b'0', 0x0C => b'-', 0x0D => b'=',
+        0x0A => b'9', 0x0B => b'0',
+        0x0C => b'-', 0x0D => b'=',
         0x0E => 0x08, // Backspace
         0x0F => b'\t', // Tab
+        
         // QWERTY row
         0x10 => b'q', 0x11 => b'w', 0x12 => b'e', 0x13 => b'r',
         0x14 => b't', 0x15 => b'y', 0x16 => b'u', 0x17 => b'i',
-        0x18 => b'o', 0x19 => b'p', 0x1A => b'[', 0x1B => b']',
-        0x1C => b'\n', // Enter
-        // ASDF row
+        0x18 => b'o', 0x19 => b'p',
+        0x1A => b'[', 0x1B => b']',
+        0x1C => b'\n', // Enter (main)
+        
+        // ASDF row (home row)
         0x1E => b'a', 0x1F => b's', 0x20 => b'd', 0x21 => b'f',
         0x22 => b'g', 0x23 => b'h', 0x24 => b'j', 0x25 => b'k',
-        0x26 => b'l', 0x27 => b';', 0x28 => b'\'',
+        0x26 => b'l',
+        0x27 => b';', 0x28 => b'\'',
         0x29 => b'`', // Backtick
         0x2B => b'\\', // Backslash
+        
         // ZXCV row
         0x2C => b'z', 0x2D => b'x', 0x2E => b'c', 0x2F => b'v',
-        0x30 => b'b', 0x31 => b'n', 0x32 => b'm', 0x33 => b',',
-        0x34 => b'.', 0x35 => b'/',
-        // Space
+        0x30 => b'b', 0x31 => b'n', 0x32 => b'm',
+        0x33 => b',', 0x34 => b'.', 0x35 => b'/',
+        
+        // Right-side keys
+        0x1D => 0, // Left Ctrl (modifier, ignore for now)
+        0x2A => 0, // Left Shift (modifier)
+        0x36 => 0, // Right Shift (modifier)
+        0x38 => 0, // Left Alt (modifier)
+        0x3A => 0, // Caps Lock (toggle)
+        
+        // Space bar
         0x39 => b' ',
+        
         // Escape
         0x01 => 0x1B,
-        _ => 0, // Unknown / modifier / function key
+        
+        // Numpad (when NumLock is ON)
+        0x47 => b'7', 0x48 => b'8', 0x49 => b'9',
+        0x4B => b'4', 0x4C => b'5', 0x4D => b'6',
+        0x4F => b'1', 0x50 => b'2', 0x51 => b'3',
+        0x52 => b'0', 0x53 => b'.',
+        
+        // Extended keys (arrows, etc) - handled separately via 0xE0 prefix
+        // These are the non-extended codes that might slip through
+        0x48 => 0, // Up arrow (without 0xE0 prefix - unlikely)
+        0x50 => 0, // Down arrow
+        0x4B => 0, // Left arrow
+        0x4D => 0, // Right arrow
+        
+        // Function keys F1-F12
+        0x3B..=0x44 => 0, // F1-F10
+        0x57 => 0, // F11
+        0x58 => 0, // F12
+        
+        // Everything else - ignore (modifiers, special keys)
+        _ => 0,
     }
 }
 

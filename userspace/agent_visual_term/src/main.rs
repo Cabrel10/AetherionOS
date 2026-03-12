@@ -114,8 +114,25 @@ impl Terminal {
     }
 
     fn scroll_up(&mut self) {
+        // Scroll the entire content area up by one row
+        // We can't easily read back from framebuffer, so we just clear the bottom row
+        // and let new content overwrite from top
+        let content_top = MARGIN_Y;
+        let content_height = SCR_H - MARGIN_Y - CHAR_H - 4; // Leave status bar
+        
+        // For a real scroll, we'd copy pixels. Since sys_fb doesn't have read,
+        // we clear the bottom row where new content will appear
         let last_row_y = self.px_y(ROWS - 1);
         sys_fb_fill_rect(0, last_row_y, SCR_W, CHAR_H, BG);
+    }
+    
+    fn clear_screen(&mut self) {
+        // Clear everything except title bar
+        sys_fb_fill_rect(0, TITLE_H, SCR_W, SCR_H - TITLE_H, BG);
+        self.cursor_x = 0;
+        self.cursor_y = 0;
+        self.input_len = 0;
+        self.draw_cursor();
     }
 
     fn put_char(&mut self, ch: u8, color: u32) {
@@ -131,10 +148,11 @@ impl Terminal {
         // Ensure we're still in bounds after potential newline
         if self.cursor_y >= ROWS {
             self.cursor_y = ROWS - 1;
+            // Clear the last row for scrolling effect
+            sys_fb_fill_rect(0, self.px_y(self.cursor_y), SCR_W, CHAR_H, BG);
         }
         sys_fb_draw_char(self.px_x(self.cursor_x), self.px_y(self.cursor_y), ch, color);
         self.cursor_x += 1;
-        self.input_len += 1;
         if self.cursor_x >= COLS { 
             self.newline(); 
         }
@@ -232,11 +250,7 @@ fn cmd_help(term: &mut Terminal) {
 }
 
 fn cmd_clear(term: &mut Terminal) {
-    // Redraw chrome, reset cursor
-    draw_chrome();
-    term.cursor_x = 0;
-    term.cursor_y = 0;
-    term.input_len = 0;
+    term.clear_screen();
 }
 
 fn cmd_status(term: &mut Terminal) {
