@@ -1809,29 +1809,24 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         // STEP A1: Load agent_llm_chat.elf as a QUEUED process
         // Dynamic GGUF agent: parses metadata, allocates tensors, runs
         // inference. Queued so terminal can start first and display UI.
-        //
-        // JALON 69 FIX: DISABLED — loading multiple agents at boot causes
-        // context corruption when the scheduler tries to first-run them
-        // alongside the terminal. The terminal must be the ONLY Ring 3
-        // process until it's stable. Re-enable when preemption is solid.
+        // JALON 71: RE-ENABLED for LLM integration via Cognitive Bus
         // ──────────────────────────────────────────────────────────
-        serial_write("  [J69] agent_llm_chat.elf: DISABLED (terminal-only mode)\n");
-        // match elf::load_elf_binary(AGENT_LLM_CHAT_ELF) {
-        //     Ok(llm_result) => {
-        //         let llm_pid = process::spawn_userspace(
-        //             "/bin/agent_llm_chat.elf", 0,
-        //             llm_result.entry_point, llm_result.stack_pointer, llm_result.pml4_phys
-        //         ).unwrap_or(0);
-        //         if llm_pid != 0 {
-        //             scheduler::enqueue_process(llm_pid);
-        //             serial_println!("  [J67] LLM Chat PID={} queued (entry=0x{:X}, segs={}, frames={})",
-        //                 llm_pid, llm_result.entry_point, llm_result.segments_loaded, llm_result.frames_used);
-        //         }
-        //     }
-        //     Err(e) => {
-        //         serial_println!("  [J67] WARN: agent_llm_chat.elf load failed: {}", e);
-        //     }
-        // }
+        serial_write("  [J71] agent_llm_chat.elf: ENABLED\n");
+        match elf::load_elf_binary(AGENT_LLM_CHAT_ELF) {
+            Ok(llm_result) => {
+                let llm_pid = process::spawn_userspace(
+                    "/bin/agent_llm_chat.elf", 0,
+                    llm_result.entry_point, llm_result.stack_pointer, llm_result.pml4_phys
+                ).unwrap_or(0);
+                if llm_pid != 0 {
+                    scheduler::enqueue_process(llm_pid);
+                    serial_println!("  [J71] LLM Chat PID={} queued", llm_pid);
+                }
+            }
+            Err(e) => {
+                serial_println!("  [J71] WARN: agent_llm_chat.elf load failed: {}", e);
+            }
+        }
 
         // ──────────────────────────────────────────────────────────
         // STEP A2: Load agent_orchestrator.elf as a QUEUED process

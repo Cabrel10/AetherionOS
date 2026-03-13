@@ -104,6 +104,7 @@ pub const SYS_CLONE:        u64 = 56;
 pub const SYS_EXIT:         u64 = 60;
 pub const SYS_WAIT:         u64 = 61;
 pub const SYS_BUS_PUBLISH:  u64 = 201;
+pub const SYS_BUS_CONSUME:  u64 = 203;
 pub const SYS_VGA_WRITE:    u64 = 202;
 pub const SYS_MMAP_FILE:    u64 = 240;
 pub const SYS_NET_PING:     u64 = 210;
@@ -264,6 +265,25 @@ pub fn sys_yield() {
 /// Returns 0 on success.
 pub fn sys_bus_publish(intent: u64, priority: u32, data: u64) -> i64 {
     syscall3(SYS_BUS_PUBLISH, intent, priority as u64, data) as i64
+}
+
+/// Consume a message from the Cognitive Bus (Jalon 71).
+/// msg_buf: pointer to a 48-byte buffer to receive the IntentMessage.
+/// 
+/// Buffer layout (C struct compatible):
+///   offset 0:  u32 source (ComponentId)
+///   offset 4:  u32 destination (ComponentId)
+///   offset 8:  u32 intent_id
+///   offset 12: u32 priority
+///   offset 16: u64 payload
+///   offset 24: u64 timestamp
+///
+/// Returns:
+///   0 on success (message copied to buffer)
+///   -EAGAIN (-11) if bus is empty
+///   -EFAULT (-14) if buffer address is invalid
+pub fn sys_bus_consume(msg_buf: &mut [u64; 6]) -> i64 {
+    syscall1(SYS_BUS_CONSUME, msg_buf.as_mut_ptr() as u64) as i64
 }
 
 /// Write a colored character to VGA text buffer.

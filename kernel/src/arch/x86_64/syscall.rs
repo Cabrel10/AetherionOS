@@ -290,6 +290,7 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         200 => sys_ps(),
         201 => sys_bus_publish(a1, a2 as u32, a3),
         202 => sys_vga_write(a1 as usize, a2 as usize, a3),
+        203 => sys_bus_consume(a1),                // Jalon 71: Consume message from Cognitive Bus
         210 => sys_net_ping(a1, a2 as u16),
         211 => sys_gethostbyname(a1),
         212 => sys_tcp_read(a1 as u32, a2, a3),
@@ -2239,6 +2240,63 @@ fn sys_bus_publish(intent: u64, priority: u32, data: u64) -> u64 {
         }
         Err(_) => {
             crate::serial_println!("[SYSCALL] bus_publish: queue full");
+            EAGAIN
+        }
+    }
+}
+
+// ===== sys_bus_consume(buf_addr) =====
+/// Consume a message from the Cognitive Bus (Jalon 71).
+/// buf_addr: pointer to user buffer (48 bytes) to receive IntentMessage.
+/// 
+/// Buffer layout (C struct compatible):
+///   offset 0:  u32 source (ComponentId)
+///   offset 4:  u32 destination (ComponentId)
+///   offset 8:  u32 intent_id
+///   offset 12: u32 priority
+///   offset 16: u64 payload
+///   offset 24: u64 timestamp
+///
+/// Returns:
+///   0 on success (message copied to buffer)
+///   -EAGAIN if bus is empty
+///   -EFAULT if buffer address is invalid
+fn sys_bus_consume(buf_addr: u64) -> u64 {
+    // Validate user buffer (48 bytes for IntentMessage)
+    if !validate_user_ptr(buf_addr, 48) {
+        return EFAULT;
+    }
+
+    // Try to consume a message from the bus
+    match crate::ipc::bus::consume() {
+        Ok(msg) => {
+            // Copy message to user buffer
+            unsafe {
+                let ptr = buf_addr as *mut u32;
+                // offset 0: source (u32)
+                core::ptr::write_volatile(ptr.add(0), msg.source as u32);
+                // offset 4: destination (u32)
+                core::ptr::write_volatile(ptr.add(1), msg.destination as u32);
+                // offset 8: intent_id (u32)
+                core::ptr::write_volatile(ptr.add(2), msg.intent_id);
+                // offset 12: priority (u32)
+                core::ptr::write_volatile(ptr.add(3), msg.priority as u32);
+                
+                let ptr64 = buf_addr as *mut u64;
+                // offset 16: payload (u64)
+                core::ptr::write_volatile(ptr64.add(2), msg.payload);
+                // offset 24: timestamp (u64)
+                core::ptr::write_volatile(ptr64.add(3), msg.timestamp);
+            }
+            
+            crate::serial_println!(
+                "[SYSCALL] bus_consume: intent=0x{:X}, payload=0x{:X}",
+                msg.intent_id, msg.payload
+            );
+            0
+        }
+        Err(_) => {
+            // Bus is empty - return EAGAIN (non-blocking)
             EAGAIN
         }
     }

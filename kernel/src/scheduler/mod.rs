@@ -388,7 +388,7 @@ pub fn tick_preemptive() -> Option<(u64, u64, u64, u64, u64, u64)> {
 
 /// Get current running PID
 pub fn current_pid() -> u64 {
-    SCHEDULER.lock().current_pid
+    SCHEDULER.try_lock().map(|s| s.current_pid).unwrap_or(0)
 }
 
 /// Set the current PID (used when directly launching a Ring 3 process via IRETQ)
@@ -398,7 +398,7 @@ pub fn set_current_pid(pid: u64) {
 
 /// Get the aging boost count
 pub fn aging_boosts() -> u64 {
-    SCHEDULER.lock().aging_boosts
+    SCHEDULER.try_lock().map(|s| s.aging_boosts).unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Copy)]

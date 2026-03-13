@@ -1302,9 +1302,10 @@ pub extern "C" fn main() -> i64 {
                     model_buffer[12], model_buffer[13], model_buffer[14], model_buffer[15]
                 ]);
                 let kv_count = u64::from_le_bytes([
-                    model_buffer[16], model_buffer[17], model_buffer[18], model_buffer[19]
+                    model_buffer[16], model_buffer[17], model_buffer[18], model_buffer[19],
+                    model_buffer[20], model_buffer[21], model_buffer[22], model_buffer[23]
                 ]);
-                cursor = 20;
+                cursor = 24;
 
                 print("[J68] GGUF v"); print_u64(version as u64);
                 print(", tensors="); print_u64(tensor_count);

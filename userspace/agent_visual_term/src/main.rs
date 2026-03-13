@@ -534,7 +534,7 @@ pub extern "C" fn main() -> i64 {
     let mut read_buf = [0u8; 1];
     
     loop {
-        // Read character from ring-buffer keyboard handler
+        // 1. Read character from ring-buffer keyboard handler
         let n = sys_read(0, &mut read_buf);
         if n > 0 {
             idle_count = 0;
@@ -547,17 +547,38 @@ pub extern "C" fn main() -> i64 {
                     print_prompt(&mut term);
                 }
                 0x20..=0x7E => {
-                    // Alphanumeric chars
+                    // Alphanumeric chars - ONLY printable ASCII (avoids weird cursor blocks)
                     if term.cmd_len < CMD_BUF_SIZE {
                         term.cmd_buf[term.cmd_len] = ch;
                         term.cmd_len += 1;
                     }
                     term.put_char(ch, TEXT);
                 }
-                _ => {}
+                _ => {} // Ignore all other characters (control codes, etc.)
             }
         } else {
             idle_count += 1;
+        }
+        
+        // 2. Listen to Cognitive Bus for LLM responses (Jalon 71)
+        let mut bus_msg = [0u64; 6];
+        if sys_bus_consume(&mut bus_msg) == 0 {
+            let intent = bus_msg[2] as u32; // intent_id at offset 8 (index 2 in u32 view)
+            let payload = bus_msg[4]; // payload at offset 16 (index 4 in u64 view)
+            
+            if intent == INTENT_TOKEN_GENERATED as u32 {
+                // LLM generated a token - display it in real-time
+                let token_char = (payload & 0xFF) as u8;
+                if token_char >= 0x20 && token_char <= 0x7E || token_char == b'\n' {
+                    term.put_char(token_char, LLM_COL);
+                }
+            } else if intent == INTENT_GENERATION_DONE as u32 {
+                // LLM finished generation
+                term.put_char(b'\n', TEXT);
+                term.put_str(b"[LLM] Generation complete\n", DIM);
+                term.llm_active = false;
+                print_prompt(&mut term);
+            }
         }
         
         term.blink_tick();

@@ -72,7 +72,9 @@ lazy_static! {
 
 /// Push a byte into the keyboard input buffer (called from keyboard IRQ handler)
 pub fn kbd_push_byte(byte: u8) {
-    KBD_BUFFER.lock().push(byte);
+    if let Some(mut kbd) = KBD_BUFFER.try_lock() {
+        kbd.push(byte);
+    }
 }
 
 /// Read up to `len` bytes from the keyboard buffer into a slice
