@@ -597,7 +597,6 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     
     // Lire le scancode
     let scancode: u8 = unsafe { Port::new(0x60).read() };
-    crate::serial_println!("[KBD] IRQ1 scancode=0x{:02X}", scancode);
 
     // Gérer Shift press (make codes)
     if scancode == 0x2A || scancode == 0x36 {

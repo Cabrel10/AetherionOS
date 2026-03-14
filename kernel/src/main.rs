@@ -1319,8 +1319,8 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         elf::set_phys_mem_offset(phys_offset);
 
         // Initialize ELF frame pool using frames from our allocator
-        // Jalon 72: Allocate 1.5M frames (6 GB) to support Mistral 7B model loading
-        let pool_frames = 1572864usize; // 6 GB for LLM inference
+        // Jalon 72: 1 GB pool — assez pour kernel + terminal + demand paging Mistral
+        let pool_frames = 262144usize; // 1 GB for LLM inference
         if let Some(first_frame) = memory_manager.frame_allocator.alloc_frame_kernel() {
             let base_phys = first_frame.start_address().as_u64();
             // Allocate remaining frames to ensure they're contiguous in the pool
