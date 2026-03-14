@@ -107,6 +107,7 @@ pub const SYS_BUS_PUBLISH:  u64 = 201;
 pub const SYS_BUS_CONSUME:  u64 = 203;
 pub const SYS_VGA_WRITE:    u64 = 202;
 pub const SYS_MMAP_FILE:    u64 = 240;
+pub const SYS_PREAD64:      u64 = 17;   // Jalon 73: pread64(fd, buf, offset) — no FD position change
 pub const SYS_NET_PING:     u64 = 210;
 pub const SYS_GETHOSTBYNAME:u64 = 211;
 pub const SYS_SOCKET:       u64 = 41;
@@ -560,6 +561,18 @@ pub fn sys_mmap_file(fd: u32, length: u64, offset: u64) -> u64 {
 /// whence: 0=SEEK_SET, 1=SEEK_CUR
 pub fn sys_lseek(fd: u32, offset: i64, whence: u32) -> i64 {
     syscall3(8, fd as u64, offset as u64, whence as u64) as i64
+}
+
+/// POSIX pread64: Read up to 4096 bytes from file at a given offset WITHOUT
+/// changing the file descriptor's position. Critical for streaming model loading.
+///
+/// fd: file descriptor (must be open)
+/// buf: destination buffer (must be at least 4096 bytes)
+/// offset: byte offset in the file to read from
+///
+/// Returns: number of bytes read (0 = EOF), or negative error code.
+pub fn sys_pread64(fd: u32, buf: &mut [u8], offset: u64) -> i64 {
+    syscall3(SYS_PREAD64, fd as u64, buf.as_mut_ptr() as u64, offset) as i64
 }
 
 /// Clone (create a lightweight thread sharing the parent's address space).

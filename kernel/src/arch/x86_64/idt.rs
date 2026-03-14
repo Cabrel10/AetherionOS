@@ -425,11 +425,14 @@ extern "x86-interrupt" fn page_fault_handler(
 
     // --- Non-recoverable page fault ---
     if is_user_mode {
-        crate::serial_println!(
-            "[SIGSEGV] PF addr=0x{:X} rip={:?} code={:?}",
-            addr_raw, stack_frame.instruction_pointer, error_code
-        );
         let current_pid = crate::scheduler::current_pid();
+        let is_write = error_code.contains(PageFaultErrorCode::CAUSED_BY_WRITE);
+        let is_present = error_code.contains(PageFaultErrorCode::PROTECTION_VIOLATION);
+        crate::serial_println!(
+            "[SIGSEGV] PID {} addr=0x{:X} rip={:?} write={} present={} code={:?}",
+            current_pid, addr_raw,
+            stack_frame.instruction_pointer, is_write, is_present, error_code
+        );
         if current_pid != 0 {
             kill_user_and_switch(current_pid, addr_raw);
             // kill_user_and_switch never returns if another process exists

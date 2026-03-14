@@ -342,10 +342,10 @@ pub fn find_next_ready_userspace(exclude_pid: u64) -> Option<(u64, u64, u64, u64
     let table = PROCESS_TABLE.lock();
     
     // First pass: look for processes that were actively running (have valid saved state)
+    // ONLY processes in Ready state are eligible — Running, Blocked, Terminated are skipped.
     for (_, proc) in table.iter() {
         if proc.pid == exclude_pid { continue; }
-        if proc.state != ProcessState::Ready { continue; }
-        if proc.state == ProcessState::Terminated { continue; }
+        if proc.state != ProcessState::Ready { continue; } // Only Ready (not Running/Blocked/Terminated)
         if proc.is_thread { continue; }
         if proc.entry_point == 0 || proc.pml4_phys == 0 { continue; }
         if proc.role == AgentRole::KernelThread { continue; }
@@ -369,8 +369,7 @@ pub fn find_next_ready_userspace(exclude_pid: u64) -> Option<(u64, u64, u64, u64
     // Second pass: look for any Ready process with a valid entry point (for first-run)
     for (_, proc) in table.iter() {
         if proc.pid == exclude_pid { continue; }
-        if proc.state != ProcessState::Ready { continue; }
-        if proc.state == ProcessState::Terminated { continue; }
+        if proc.state != ProcessState::Ready { continue; } // Only Ready (not Running/Blocked/Terminated)
         if proc.is_thread { continue; }
         if proc.entry_point == 0 || proc.pml4_phys == 0 { continue; }
         if proc.role == AgentRole::KernelThread { continue; }

@@ -301,6 +301,7 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         223 => sys_fb_get_info(a1),                // Jalon 39: Framebuffer get info
         230 => sys_rdtsc(),                        // Jalon 40: Read TSC
         240 => sys_mmap_file(a1, a2, a3),           // Jalon 68: File-backed mmap (fd, length, offset)
+        17 => sys_pread64(a1 as u32, a2, a3),       // Jalon 73: pread64(fd, buf|len_hi16, offset|count_lo48)
         _ => {
             crate::serial_println!("[SYSCALL] Unknown nr={} a1=0x{:X} a2=0x{:X} a3=0x{:X}", nr, a1, a2, a3);
             ENOSYS
@@ -2175,10 +2176,22 @@ fn sys_mmap_fb(info_buf: u64) -> u64 {
         }
     };
 
-    // Get current process PML4 from CR3
-    let cr3: u64;
-    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)); }
-    let pml4_phys = cr3 & !0xFFF;
+    // Get PML4 from process table (safer than reading CR3 which might be kernel PML4)
+    let current_pid = crate::scheduler::current_pid();
+    let pml4_phys = match crate::process::get_pml4_phys(current_pid) {
+        Some(pml4) if pml4 != 0 => pml4,
+        _ => {
+            // Fallback: read CR3 directly (process PML4 should still be loaded)
+            let cr3: u64;
+            unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)); }
+            cr3 & !0xFFF
+        }
+    };
+
+    crate::serial_println!(
+        "[SYSCALL] mmap_fb: PID={} PML4=0x{:X}",
+        current_pid, pml4_phys
+    );
 
     // Map framebuffer into user address space
     let fb_vaddr = match crate::framebuffer::map_fb_for_user(pml4_phys) {
@@ -2751,6 +2764,116 @@ fn sys_rdtsc() -> u64 {
         core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack));
     }
     ((hi as u64) << 32) | (lo as u64)
+}
+
+// ===== sys_pread64(fd, buf_addr, len, offset) -> ssize_t (Jalon 73) =====
+/// POSIX pread64: read from a file at a given offset WITHOUT changing the fd position.
+/// This is critical for streaming layer-by-layer model loading.
+///
+/// ABI packing (3 register limit):
+///   a1 = fd (u32)
+///   a2 = buf_addr (u64) — user buffer pointer
+///   a3 = packed: (count as u48) | (offset_hi as u16) — but we simplify:
+///        a3 = offset (u64)
+///
+/// Actually, we use a 4th implicit parameter by encoding:
+///   a2[63:48] = count (max 65535 pages = 256 MiB)
+///   a2[47:0]  = buf_addr (48-bit user VA is enough)
+///   a3 = offset
+///
+/// Simpler alternative: treat a2 as buf_addr, a3 high bits = count, a3 low = offset.
+/// Final design: use the FD's known path and simply:
+///   a1 = fd
+///   a2 = buf_addr
+///   a3 = offset
+///   Returns bytes read (reads up to 4096 bytes per call for safety).
+fn sys_pread64(fd: u32, buf_addr: u64, offset: u64) -> u64 {
+    const PREAD_MAX_CHUNK: usize = 4096; // Read one page at a time — safe for kernel stack
+
+    if !validate_user_ptr(buf_addr, PREAD_MAX_CHUNK as u64) {
+        return EFAULT;
+    }
+
+    let current_pid = crate::scheduler::current_pid();
+
+    // Get path from FD table (do NOT modify offset)
+    let file_path = match crate::process::get_fd_path(current_pid, fd as usize) {
+        Some(path) => path,
+        None => return EBADF,
+    };
+
+    // Route to the correct filesystem
+    let is_disk = file_path.starts_with("/disk/");
+    if is_disk {
+        let disk_path = &file_path[6..];
+
+        // Try exFAT first
+        if crate::fs::exfat::is_mounted() {
+            let mut temp = [0u8; PREAD_MAX_CHUNK];
+            let bytes = crate::fs::exfat::read_file(disk_path, offset, &mut temp);
+            if bytes > 0 {
+                unsafe {
+                    let dst = buf_addr as *mut u8;
+                    for i in 0..bytes {
+                        core::ptr::write_volatile(dst.add(i), temp[i]);
+                    }
+                }
+                return bytes as u64;
+            }
+        }
+
+        // FAT32 chunked read
+        match crate::fs::fat32::read_file_path_chunk(disk_path, offset, PREAD_MAX_CHUNK as u64) {
+            Some(chunk) => {
+                let to_copy = chunk.len();
+                if to_copy == 0 { return 0; } // EOF
+                unsafe {
+                    let dst = buf_addr as *mut u8;
+                    for i in 0..to_copy {
+                        core::ptr::write_volatile(dst.add(i), chunk[i]);
+                    }
+                }
+                return to_copy as u64;
+            }
+            None => {
+                // VFS fallback
+                match crate::fs::vfs::file_read(&file_path) {
+                    Ok(data) => {
+                        let start = offset as usize;
+                        if start >= data.len() { return 0; }
+                        let avail = data.len() - start;
+                        let to_copy = core::cmp::min(avail, PREAD_MAX_CHUNK);
+                        unsafe {
+                            let dst = buf_addr as *mut u8;
+                            for i in 0..to_copy {
+                                core::ptr::write_volatile(dst.add(i), data[start + i]);
+                            }
+                        }
+                        return to_copy as u64;
+                    }
+                    Err(_) => return ENOENT,
+                }
+            }
+        }
+    }
+
+    // Non-disk VFS path
+    match crate::fs::vfs::file_read(&file_path) {
+        Ok(data) => {
+            let start = offset as usize;
+            if start >= data.len() { return 0; }
+            let avail = data.len() - start;
+            let to_copy = core::cmp::min(avail, PREAD_MAX_CHUNK);
+            unsafe {
+                let dst = buf_addr as *mut u8;
+                for i in 0..to_copy {
+                    core::ptr::write_volatile(dst.add(i), data[start + i]);
+                }
+            }
+            to_copy as u64
+        }
+        Err(_) => ENOENT,
+    }
 }
 
 // ===== 8x16 bitmap font for framebuffer text rendering =====
