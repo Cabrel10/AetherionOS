@@ -474,6 +474,8 @@ extern "x86-interrupt" fn security_exception_handler(stack_frame: InterruptStack
 
 use core::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 
+static SHIFT_PRESSED: AtomicBool = AtomicBool::new(false);
+
 /// Pending context switch: (new_pid << 32) | old_pid, or 0 if none pending
 static PENDING_SWITCH: AtomicU64 = AtomicU64::new(0);
 /// Pending switch new RIP
@@ -589,72 +591,40 @@ pub fn check_pending_switch() -> bool {
 }
 
 /// Keyboard IRQ1 handler — Scancode Set 1 (with 8042 translation ON)
-///
-/// JALON 68 FIX: The PS/2 controller now has Translation (Bit 6) enabled,
-/// which converts Set 2 → Set 1 in hardware. This means:
-///   - Make codes: 0x01-0x58 (key press)
-///   - Break codes: make | 0x80 (key release, bit 7 set)
-///   - Extended prefix: 0xE0 (multi-byte keys like arrows)
-///
-/// We ONLY process make codes (bit 7 = 0) and ignore releases (bit 7 = 1).
-/// This is the standard approach for PS/2 Set 1 on real hardware / KVM.
+/// JALON 72: Ultra-robust handler without Shift (for now)
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
     use x86_64::instructions::port::Port;
-
-    let scancode: u8 = unsafe { Port::new(0x60).read() };
-
-    // Log every scancode for boot diagnostics (helps trace keyboard issues)
-    // Only log the first few to avoid flooding serial
-    {
-        static mut KBD_LOG_COUNT: u64 = 0;
-        unsafe {
-            KBD_LOG_COUNT += 1;
-            if KBD_LOG_COUNT <= 20 {
-                crate::serial_println!(
-                    "[KBD] IRQ1 scancode=0x{:02X} ({}), total={}",
-                    scancode,
-                    if scancode & 0x80 != 0 { "release" } else { "press" },
-                    KBD_LOG_COUNT
-                );
-            }
-        }
-    }
-
-    // Skip extended prefix (0xE0) — multi-byte sequences (arrows, etc.)
-    if scancode == 0xE0 {
-        unsafe { super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET + 1); }
-        return;
-    }
-    // Also skip 0xE1 (Pause key prefix)
-    if scancode == 0xE1 {
-        unsafe { super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET + 1); }
-        return;
-    }
-
-    // Check if this is a KEY RELEASE (bit 7 set in Set 1)
-    let is_release = (scancode & 0x80) != 0;
     
-    // For releases, just send EOI and return (don't process)
-    if is_release {
-        unsafe {
-            super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET + 1);
-        }
+    // Lire le scancode
+    let scancode: u8 = unsafe { Port::new(0x60).read() };
+    crate::serial_println!("[KBD] IRQ1 scancode=0x{:02X}", scancode);
+
+    // Gérer Shift press (make codes)
+    if scancode == 0x2A || scancode == 0x36 {
+        SHIFT_PRESSED.store(true, Ordering::Relaxed);
+        unsafe { super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET + 1); }
+        return;
+    }
+    // Gérer Shift release (break codes)
+    if scancode == 0xAA || scancode == 0xB6 {
+        SHIFT_PRESSED.store(false, Ordering::Relaxed);
+        unsafe { super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET + 1); }
+        return;
+    }
+    // Ignorer tous les autres release codes (bit 7 set) et 0xE0
+    if scancode & 0x80 != 0 || scancode == 0xE0 {
+        unsafe { super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET + 1); }
         return;
     }
 
-    if !is_release {
-        // KEY PRESS — convert make code to ASCII
-        let ascii = scancode_set1_to_ascii(scancode);
-        if ascii != 0 {
-            crate::process::kbd_push_byte(ascii);
-        }
+    // Make code normal — convertir en ASCII
+    let ascii = scancode_set1_to_ascii(scancode);
+    if ascii != 0 {
+        crate::process::kbd_push_byte(ascii);
     }
-    // Key releases already handled above
 
-    // Send EOI for keyboard IRQ
-    unsafe {
-        super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET + 1);
-    }
+    // EOI toujours envoyé
+    unsafe { super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET + 1); }
 }
 
 /// PS/2 Mouse IRQ 12 handler (Jalon 38)
@@ -667,75 +637,51 @@ extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFr
     }
 }
 
-/// Convert PS/2 Scancode Set 1 MAKE code to ASCII.
-///
-/// AZERTY French layout mapping for Set 1 scan codes.
-/// Reference: https://wiki.osdev.org/PS/2_Keyboard#Scan_Code_Set_1
-///
-/// NOTE: This returns lowercase. Shift/Caps handling would require
-/// tracking modifier state.
+/// Convert PS/2 Scancode Set 1 to ASCII (AZERTY layout, avec Shift)
 fn scancode_set1_to_ascii(scancode: u8) -> u8 {
-    match scancode {
-        // Number row (top)
-        0x02 => b'1', 0x03 => b'2', 0x04 => b'3', 0x05 => b'4',
-        0x06 => b'5', 0x07 => b'6', 0x08 => b'7', 0x09 => b'8',
-        0x0A => b'9', 0x0B => b'0',
-        0x0C => b'-', 0x0D => b'=',
-        0x0E => 0x08, // Backspace
-        0x0F => b'\t', // Tab
-
-        // QWERTY row -> AZERTY mapping
-        0x10 => b'a', 0x11 => b'z', 0x12 => b'e', 0x13 => b'r',
-        0x14 => b't', 0x15 => b'y', 0x16 => b'u', 0x17 => b'i',
-        0x18 => b'o', 0x19 => b'p',
-        0x1A => b'[', 0x1B => b']',
-        0x1C => b'\n', // Enter (main)
-
-        // ASDF row (home row) - AZERTY
-        0x1E => b'q', 0x1F => b's', 0x20 => b'd', 0x21 => b'f',
-        0x22 => b'g', 0x23 => b'h', 0x24 => b'j', 0x25 => b'k',
-        0x26 => b'l',
-        0x27 => b';', 0x28 => b'\'',
-        0x29 => b'`', // Backtick
-        0x2B => b'\\', // Backslash
-
-        // ZXCV row -> AZERTY bottom row
-        0x2C => b'w', 0x2D => b'x', 0x2E => b'c', 0x2F => b'v',
-        0x30 => b'b', 0x31 => b'n', 0x32 => b'm',
-        0x33 => b',', 0x34 => b'.', 0x35 => b'/',
-
-        // Right-side keys
-        0x1D => 0, // Left Ctrl (modifier, ignore for now)
-        0x2A => 0, // Left Shift (modifier)
-        0x36 => 0, // Right Shift (modifier)
-        0x38 => 0, // Left Alt (modifier)
-        0x3A => 0, // Caps Lock (toggle)
-
-        // Space bar
-        0x39 => b' ',
-
-        // Escape
-        0x01 => 0x1B,
-
-        // Numpad (when NumLock is ON)
-        0x47 => b'7', 0x48 => b'8', 0x49 => b'9',
-        0x4B => b'4', 0x4C => b'5', 0x4D => b'6',
-        0x4F => b'1', 0x50 => b'2', 0x51 => b'3',
-        0x52 => b'0', 0x53 => b'.',
-
-        // Extended keys (arrows, etc) - handled separately via 0xE0 prefix
-        // These are the non-extended codes that might slip through
-        0x48 => 0, // Up arrow (without 0xE0 prefix - unlikely)
-        0x50 => 0, // Down arrow
-        0x4B => 0, // Left arrow
-        0x4D => 0, // Right arrow
-
-        // Function keys F1-F12
-        0x3B..=0x44 => 0, // F1-F10
-        0x57 => 0, // F11
-        0x58 => 0, // F12
-
-        // Everything else - ignore (modifiers, special keys)
+    let shifted = SHIFT_PRESSED.load(Ordering::Relaxed);
+    match (scancode, shifted) {
+        (0x02, false) => b'1', (0x02, true) => b'!',
+        (0x03, false) => b'2', (0x03, true) => b'@',
+        (0x04, false) => b'3', (0x04, true) => b'#',
+        (0x05, false) => b'4', (0x05, true) => b'$',
+        (0x06, false) => b'5', (0x06, true) => b'%',
+        (0x07, false) => b'6', (0x07, true) => b'^',
+        (0x08, false) => b'7', (0x08, true) => b'&',
+        (0x09, false) => b'8', (0x09, true) => b'*',
+        (0x0A, false) => b'9', (0x0A, true) => b'(',
+        (0x0B, false) => b'0', (0x0B, true) => b')',
+        (0x0E, _) => 0x08, // Backspace
+        (0x0F, _) => b'\t',
+        (0x10, false) => b'a', (0x10, true) => b'A',
+        (0x11, false) => b'z', (0x11, true) => b'Z',
+        (0x12, false) => b'e', (0x12, true) => b'E',
+        (0x13, false) => b'r', (0x13, true) => b'R',
+        (0x14, false) => b't', (0x14, true) => b'T',
+        (0x15, false) => b'y', (0x15, true) => b'Y',
+        (0x16, false) => b'u', (0x16, true) => b'U',
+        (0x17, false) => b'i', (0x17, true) => b'I',
+        (0x18, false) => b'o', (0x18, true) => b'O',
+        (0x19, false) => b'p', (0x19, true) => b'P',
+        (0x1C, _) => b'\n',
+        (0x1E, false) => b'q', (0x1E, true) => b'Q',
+        (0x1F, false) => b's', (0x1F, true) => b'S',
+        (0x20, false) => b'd', (0x20, true) => b'D',
+        (0x21, false) => b'f', (0x21, true) => b'F',
+        (0x22, false) => b'g', (0x22, true) => b'G',
+        (0x23, false) => b'h', (0x23, true) => b'H',
+        (0x24, false) => b'j', (0x24, true) => b'J',
+        (0x25, false) => b'k', (0x25, true) => b'K',
+        (0x26, false) => b'l', (0x26, true) => b'L',
+        (0x27, false) => b'm', (0x27, true) => b'M',
+        (0x2C, false) => b'w', (0x2C, true) => b'W',
+        (0x2D, false) => b'x', (0x2D, true) => b'X',
+        (0x2E, false) => b'c', (0x2E, true) => b'C',
+        (0x2F, false) => b'v', (0x2F, true) => b'V',
+        (0x30, false) => b'b', (0x30, true) => b'B',
+        (0x31, false) => b'n', (0x31, true) => b'N',
+        (0x32, false) => b',', (0x32, true) => b'<',
+        (0x39, _) => b' ',
         _ => 0,
     }
 }

@@ -1319,8 +1319,8 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         elf::set_phys_mem_offset(phys_offset);
 
         // Initialize ELF frame pool using frames from our allocator
-        // Allocate 16384 frames (64 MiB) to support sys_fork deep page-table copy (Jalon 25)
-        let pool_frames = 16384usize;
+        // Jalon 72: Allocate 1.5M frames (6 GB) to support Mistral 7B model loading
+        let pool_frames = 1572864usize; // 6 GB for LLM inference
         if let Some(first_frame) = memory_manager.frame_allocator.alloc_frame_kernel() {
             let base_phys = first_frame.start_address().as_u64();
             // Allocate remaining frames to ensure they're contiguous in the pool
@@ -1328,7 +1328,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 let _ = memory_manager.frame_allocator.alloc_frame_kernel();
             }
             unsafe { elf::init_frame_pool(base_phys, pool_frames); }
-            serial_println!("       [OK] ELF frame pool: {} frames ({} KB)", pool_frames, pool_frames * 4);
+            serial_println!("       [OK] ELF frame pool: {} frames ({} GB)", pool_frames, pool_frames * 4 / 1024 / 1024);
         } else {
             serial_write("       [WARN] No frames for ELF pool\n");
         }

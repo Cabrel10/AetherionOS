@@ -21,75 +21,76 @@ pub use task::{AgentRole, Process, ProcessState, FdTable, FileDescriptor, MAX_FD
 pub use crate::arch::x86_64::context::TaskContext;
 
 // ===== Keyboard Input Buffer =====
-// Ring buffer for keyboard input, shared between IRQ handler and sys_read(0)
+// Lock-free ring buffer via atomic indices.
+// IRQ handler writes (push), sys_read reads (pop). No Mutex = no deadlock.
 
 const KBD_BUF_SIZE: usize = 256;
 
 struct KbdBuffer {
     buf: [u8; KBD_BUF_SIZE],
-    read_pos: usize,
-    write_pos: usize,
-    count: usize,
+    read_pos: core::sync::atomic::AtomicUsize,
+    write_pos: core::sync::atomic::AtomicUsize,
 }
 
 impl KbdBuffer {
     const fn new() -> Self {
         KbdBuffer {
-            buf: [0; KBD_BUF_SIZE],
-            read_pos: 0,
-            write_pos: 0,
-            count: 0,
+            buf: [0u8; KBD_BUF_SIZE],
+            read_pos: core::sync::atomic::AtomicUsize::new(0),
+            write_pos: core::sync::atomic::AtomicUsize::new(0),
         }
     }
 
-    fn push(&mut self, byte: u8) {
-        if self.count < KBD_BUF_SIZE {
-            self.buf[self.write_pos] = byte;
-            self.write_pos = (self.write_pos + 1) % KBD_BUF_SIZE;
-            self.count += 1;
+    // Called from IRQ — must never block
+    fn push(&self, byte: u8) {
+        use core::sync::atomic::Ordering;
+        let wp = self.write_pos.load(Ordering::Relaxed);
+        let next_wp = (wp + 1) % KBD_BUF_SIZE;
+        let rp = self.read_pos.load(Ordering::Acquire);
+        if next_wp != rp {
+            // SAFETY: single producer (IRQ handler), wp unique to this writer
+            unsafe {
+                core::ptr::write_volatile(self.buf.as_ptr().add(wp) as *mut u8, byte);
+            }
+            self.write_pos.store(next_wp, Ordering::Release);
         }
+        // Buffer full: byte dropped silently (correct behavior)
     }
 
-    fn pop(&mut self) -> Option<u8> {
-        if self.count > 0 {
-            let byte = self.buf[self.read_pos];
-            self.read_pos = (self.read_pos + 1) % KBD_BUF_SIZE;
-            self.count -= 1;
-            Some(byte)
-        } else {
-            None
-        }
-    }
-
-    fn available(&self) -> usize {
-        self.count
+    // Called from sys_read — non-blocking
+    fn pop(&self) -> Option<u8> {
+        use core::sync::atomic::Ordering;
+        let rp = self.read_pos.load(Ordering::Relaxed);
+        let wp = self.write_pos.load(Ordering::Acquire);
+        if rp == wp { return None; }
+        let byte = unsafe {
+            core::ptr::read_volatile(self.buf.as_ptr().add(rp))
+        };
+        self.read_pos.store((rp + 1) % KBD_BUF_SIZE, Ordering::Release);
+        Some(byte)
     }
 }
 
-lazy_static! {
-    static ref KBD_BUFFER: Mutex<KbdBuffer> = Mutex::new(KbdBuffer::new());
-}
+// SAFETY: Single producer (IRQ), single consumer (sys_read). Atomic indices guarantee safety.
+unsafe impl Sync for KbdBuffer {}
+unsafe impl Send for KbdBuffer {}
+
+static KBD_BUFFER: KbdBuffer = KbdBuffer::new();
 
 /// Push a byte into the keyboard input buffer (called from keyboard IRQ handler)
 pub fn kbd_push_byte(byte: u8) {
-    if let Some(mut kbd) = KBD_BUFFER.try_lock() {
-        kbd.push(byte);
-    }
+    KBD_BUFFER.push(byte);
 }
 
 /// Read up to `len` bytes from the keyboard buffer into a slice
 pub fn kbd_read(buf: &mut [u8], len: usize) -> usize {
-    let mut kbd = KBD_BUFFER.lock();
-    let mut read = 0;
     let max = core::cmp::min(len, buf.len());
+    let mut read = 0;
     while read < max {
-        if let Some(b) = kbd.pop() {
+        if let Some(b) = KBD_BUFFER.pop() {
             buf[read] = b;
             read += 1;
-            // Stop at newline for line-buffered input
-            if b == b'\n' {
-                break;
-            }
+            if b == b'\n' { break; }
         } else {
             break;
         }

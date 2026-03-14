@@ -56,7 +56,8 @@ const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
 
 /// ELF frame pool: dedicated frames for ELF loading
 /// Increased for sys_fork deep page-table copy (Jalon 25)
-const ELF_FRAME_POOL_SIZE: usize = 16384; // Up to 64 MiB of user pages
+/// Jalon 72: Expanded to 1.5M frames (6 GB) to support Mistral 7B model loading
+const ELF_FRAME_POOL_SIZE: usize = 1572864; // Up to 6 GiB for LLM models
 
 // ===== ELF64 Header (C-compatible, packed) =====
 
