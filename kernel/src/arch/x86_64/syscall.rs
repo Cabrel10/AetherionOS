@@ -302,6 +302,8 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         230 => sys_rdtsc(),                        // Jalon 40: Read TSC
         240 => sys_mmap_file(a1, a2, a3),           // Jalon 68: File-backed mmap (fd, length, offset)
         17 => sys_pread64(a1 as u32, a2, a3),       // Jalon 73: pread64(fd, buf|len_hi16, offset|count_lo48)
+        250 => sys_getprocs(a1, a2),                 // Jalon 73: list processes to user buffer
+        251 => sys_sysinfo(a1),                       // Jalon 73: system info to user buffer
         _ => {
             crate::serial_println!("[SYSCALL] Unknown nr={} a1=0x{:X} a2=0x{:X} a3=0x{:X}", nr, a1, a2, a3);
             ENOSYS
@@ -1955,12 +1957,64 @@ fn sys_getdents(fd: u32, buf_ptr: u64, buf_size: u64) -> u64 {
     
     crate::serial_println!("[SYSCALL] getdents: listing directory '{}'", dir_path);
     
-    // Get directory listing from VFS
+    // Handle /disk/ paths via FAT32 real directory listing
+    let is_disk = dir_path.starts_with("/disk/") || dir_path == "/disk";
+    if is_disk {
+        let fat_path = if dir_path == "/disk" || dir_path == "/disk/" {
+            ""
+        } else {
+            &dir_path[6..]
+        };
+        
+        let entries = crate::fs::fat32::list_directory_path(fat_path);
+        let mut output = alloc::string::String::new();
+        for (i, entry) in entries.iter().enumerate() {
+            if i > 0 { output.push('\n'); }
+            // Format: "d" or "-" flag, size, name
+            if entry.is_directory {
+                output.push('d');
+            } else {
+                output.push('-');
+            }
+            output.push(' ');
+            // Write size as decimal
+            let sz = entry.file_size;
+            let mut digits = [0u8; 12];
+            let mut n = sz;
+            let mut pos = 11;
+            if n == 0 {
+                digits[pos] = b'0';
+            } else {
+                while n > 0 && pos > 0 {
+                    digits[pos] = b'0' + (n % 10) as u8;
+                    n /= 10;
+                    pos -= 1;
+                }
+                pos += 1;
+            }
+            for b in &digits[pos..12] {
+                output.push(*b as char);
+            }
+            output.push(' ');
+            output.push_str(&entry.name);
+        }
+        
+        let bytes = output.as_bytes();
+        let to_copy = core::cmp::min(bytes.len(), buf_size as usize);
+        if to_copy > 0 {
+            unsafe {
+                core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_ptr as *mut u8, to_copy);
+            }
+        }
+        crate::serial_println!("[SYSCALL] getdents: returned {} bytes ({} FAT32 entries)", to_copy, entries.len());
+        return to_copy as u64;
+    }
+    
+    // VFS paths (legacy)
     let entries = {
         let root = crate::fs::vfs::lock_root();
         let mut result = alloc::vec::Vec::new();
         
-        // Parse path to find directory
         if dir_path == "/bin" || dir_path == "bin" {
             if let Some(crate::fs::vfs::VfsNode::Directory(ref bin_dir)) = root.get("bin") {
                 for key in bin_dir.keys() {
@@ -1975,7 +2029,6 @@ fn sys_getdents(fd: u32, buf_ptr: u64, buf_size: u64) -> u64 {
         result
     };
     
-    // Build output buffer: entries separated by newlines
     let mut output = alloc::string::String::new();
     for (i, entry) in entries.iter().enumerate() {
         if i > 0 { output.push('\n'); }
@@ -1986,9 +2039,8 @@ fn sys_getdents(fd: u32, buf_ptr: u64, buf_size: u64) -> u64 {
     let to_copy = core::cmp::min(bytes.len(), buf_size as usize);
     
     if to_copy > 0 {
-        let user_buf = buf_ptr as *mut u8;
         unsafe {
-            core::ptr::copy_nonoverlapping(bytes.as_ptr(), user_buf, to_copy);
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_ptr as *mut u8, to_copy);
         }
     }
     
@@ -2764,6 +2816,146 @@ fn sys_rdtsc() -> u64 {
         core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack));
     }
     ((hi as u64) << 32) | (lo as u64)
+}
+
+// ===== sys_getprocs(buf_addr, buf_size) -> u64 (Jalon 73) =====
+/// Write active process info to user buffer as newline-separated text.
+/// Format per line: "PID STATE ROLE NAME" (e.g. "3 READY W agent_visual_term")
+/// Returns number of bytes written.
+fn sys_getprocs(buf_addr: u64, buf_size: u64) -> u64 {
+    if buf_addr == 0 || buf_size == 0 || !validate_user_ptr(buf_addr, buf_size) {
+        return EINVAL;
+    }
+
+    let pids = crate::process::list_active_pids();
+    let mut output = alloc::string::String::new();
+
+    for (i, &pid) in pids.iter().enumerate() {
+        if i > 0 { output.push('\n'); }
+        if let Some((name, state, role)) = crate::process::with_process(pid, |p| {
+            (p.name.clone(), p.state, p.role)
+        }) {
+            let mut nbuf = [0u8; 12];
+            u64_to_dec_buf(pid, &mut nbuf);
+            for &b in &nbuf { if b != 0 { output.push(b as char); } }
+            output.push(' ');
+            let state_str = match state {
+                crate::process::ProcessState::Ready => "READY",
+                crate::process::ProcessState::Running => "RUN",
+                crate::process::ProcessState::Blocked => "BLOCK",
+                crate::process::ProcessState::Terminated => "TERM",
+            };
+            output.push_str(state_str);
+            output.push(' ');
+            let role_str = match role {
+                crate::process::task::AgentRole::Matriarch => "M",
+                crate::process::task::AgentRole::SubMatriarch => "S",
+                crate::process::task::AgentRole::Worker => "W",
+                crate::process::task::AgentRole::KernelThread => "K",
+            };
+            output.push_str(role_str);
+            output.push(' ');
+            output.push_str(&name);
+        }
+    }
+
+    let bytes = output.as_bytes();
+    let to_copy = core::cmp::min(bytes.len(), buf_size as usize);
+    if to_copy > 0 {
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_addr as *mut u8, to_copy); }
+    }
+    to_copy as u64
+}
+
+/// Helper: u64 to decimal bytes in a 12-byte buffer (left-aligned, zero-padded)
+fn u64_to_dec_buf(val: u64, buf: &mut [u8; 12]) {
+    for b in buf.iter_mut() { *b = 0; }
+    if val == 0 { buf[0] = b'0'; return; }
+    let mut v = val;
+    let mut i: usize = 11;
+    while v > 0 && i > 0 { buf[i] = b'0' + (v % 10) as u8; v /= 10; i -= 1; }
+    let start = i + 1;
+    let len = 12 - start;
+    for j in 0..len { buf[j] = buf[start + j]; }
+    for j in len..12 { buf[j] = 0; }
+}
+
+// ===== sys_sysinfo(buf_addr) -> u64 (Jalon 73) =====
+/// Write system information to user buffer as "key=value\n" pairs.
+/// Returns number of bytes written.
+fn sys_sysinfo(buf_addr: u64) -> u64 {
+    const SYSINFO_MAX: u64 = 512;
+    if buf_addr == 0 || !validate_user_ptr(buf_addr, SYSINFO_MAX) {
+        return EINVAL;
+    }
+
+    let mut out = alloc::string::String::with_capacity(256);
+    let mut nbuf = [0u8; 12];
+
+    // Process count
+    let pids = crate::process::list_active_pids();
+    out.push_str("procs=");
+    u64_to_dec_buf(pids.len() as u64, &mut nbuf);
+    for &b in &nbuf { if b != 0 { out.push(b as char); } }
+    out.push('\n');
+
+    // Frame pool
+    let (used, max) = crate::elf::pool_stats();
+    out.push_str("pool_used=");
+    u64_to_dec_buf(used as u64, &mut nbuf);
+    for &b in &nbuf { if b != 0 { out.push(b as char); } }
+    out.push('\n');
+
+    out.push_str("pool_max=");
+    u64_to_dec_buf(max as u64, &mut nbuf);
+    for &b in &nbuf { if b != 0 { out.push(b as char); } }
+    out.push('\n');
+
+    out.push_str("pool_used_mb=");
+    u64_to_dec_buf((used as u64 * 4096) / (1024 * 1024), &mut nbuf);
+    for &b in &nbuf { if b != 0 { out.push(b as char); } }
+    out.push('\n');
+
+    out.push_str("pool_max_mb=");
+    u64_to_dec_buf((max as u64 * 4096) / (1024 * 1024), &mut nbuf);
+    for &b in &nbuf { if b != 0 { out.push(b as char); } }
+    out.push('\n');
+
+    // TSC
+    let lo: u32;
+    let hi: u32;
+    unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack)); }
+    out.push_str("tsc=");
+    u64_to_dec_buf(((hi as u64) << 32) | (lo as u64), &mut nbuf);
+    for &b in &nbuf { if b != 0 { out.push(b as char); } }
+    out.push('\n');
+
+    // Scheduler
+    let sched = crate::scheduler::metrics();
+    out.push_str("ctx_sw=");
+    u64_to_dec_buf(sched.context_switches, &mut nbuf);
+    for &b in &nbuf { if b != 0 { out.push(b as char); } }
+    out.push('\n');
+
+    out.push_str("ticks=");
+    u64_to_dec_buf(sched.total_ticks, &mut nbuf);
+    for &b in &nbuf { if b != 0 { out.push(b as char); } }
+    out.push('\n');
+
+    // FS status
+    out.push_str("fat32=");
+    out.push_str(if crate::fs::fat32::is_mounted() { "1" } else { "0" });
+    out.push('\n');
+    out.push_str("exfat=");
+    out.push_str(if crate::fs::exfat::is_mounted() { "1" } else { "0" });
+    out.push('\n');
+
+    let bytes = out.as_bytes();
+    let to_copy = core::cmp::min(bytes.len(), SYSINFO_MAX as usize);
+    if to_copy > 0 {
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_addr as *mut u8, to_copy); }
+    }
+    to_copy as u64
 }
 
 // ===== sys_pread64(fd, buf_addr, len, offset) -> ssize_t (Jalon 73) =====

@@ -108,6 +108,10 @@ pub const SYS_BUS_CONSUME:  u64 = 203;
 pub const SYS_VGA_WRITE:    u64 = 202;
 pub const SYS_MMAP_FILE:    u64 = 240;
 pub const SYS_PREAD64:      u64 = 17;   // Jalon 73: pread64(fd, buf, offset) — no FD position change
+pub const SYS_GETDENTS:     u64 = 78;   // Jalon 73: getdents(fd, buf, len) — real directory listing
+pub const SYS_GETPROCS:     u64 = 250;  // Jalon 73: list processes to user buffer
+pub const SYS_SYSINFO:      u64 = 251;  // Jalon 73: system info to user buffer
+pub const SYS_SEEK:         u64 = 8;    // lseek(fd, offset, whence)
 pub const SYS_NET_PING:     u64 = 210;
 pub const SYS_GETHOSTBYNAME:u64 = 211;
 pub const SYS_SOCKET:       u64 = 41;
@@ -593,6 +597,26 @@ pub fn sys_wait(pid: u64) -> i64 {
 /// Yield the CPU to another ready process/thread.
 pub fn sys_yield_cpu() -> i64 {
     syscall0(SYS_YIELD) as i64
+}
+
+/// Read directory entries from an open directory fd into buf.
+/// Returns number of bytes written (entries separated by newlines).
+pub fn sys_getdents(fd: u32, buf: &mut [u8]) -> i64 {
+    syscall3(SYS_GETDENTS, fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64) as i64
+}
+
+/// List active processes into user buffer.
+/// Format: "PID STATE ROLE NAME\n..." per process.
+/// Returns bytes written.
+pub fn sys_getprocs(buf: &mut [u8]) -> i64 {
+    syscall2(SYS_GETPROCS, buf.as_mut_ptr() as u64, buf.len() as u64) as i64
+}
+
+/// Get system information into user buffer.
+/// Format: "key=value\n" pairs (procs, pool_used, pool_max, tsc, etc.)
+/// Returns bytes written.
+pub fn sys_sysinfo(buf: &mut [u8]) -> i64 {
+    syscall1(SYS_SYSINFO, buf.as_mut_ptr() as u64) as i64
 }
 
 // ============================================================
