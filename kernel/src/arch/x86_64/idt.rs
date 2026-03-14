@@ -640,18 +640,22 @@ extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFr
 fn scancode_set1_to_ascii(scancode: u8) -> u8 {
     let shifted = SHIFT_PRESSED.load(Ordering::Relaxed);
     match (scancode, shifted) {
-        (0x02, false) => b'1', (0x02, true) => b'!',
-        (0x03, false) => b'2', (0x03, true) => b'@',
-        (0x04, false) => b'3', (0x04, true) => b'#',
-        (0x05, false) => b'4', (0x05, true) => b'$',
-        (0x06, false) => b'5', (0x06, true) => b'%',
-        (0x07, false) => b'6', (0x07, true) => b'^',
-        (0x08, false) => b'7', (0x08, true) => b'&',
-        (0x09, false) => b'8', (0x09, true) => b'*',
-        (0x0A, false) => b'9', (0x0A, true) => b'(',
-        (0x0B, false) => b'0', (0x0B, true) => b')',
+        // Rangée chiffres AZERTY — sans Shift: symboles, avec Shift: chiffres
+        (0x02, false) => b'&',  (0x02, true) => b'1',
+        (0x03, false) => b'2',  (0x03, true) => b'2', // é → 2
+        (0x04, false) => b'"',  (0x04, true) => b'3',
+        (0x05, false) => b'\'', (0x05, true) => b'4',
+        (0x06, false) => b'(',  (0x06, true) => b'5',
+        (0x07, false) => b'-',  (0x07, true) => b'6',
+        (0x08, false) => b'7',  (0x08, true) => b'7', // è → 7
+        (0x09, false) => b'_',  (0x09, true) => b'8',
+        (0x0A, false) => b'9',  (0x0A, true) => b'9', // ç → 9
+        (0x0B, false) => b'0',  (0x0B, true) => b'0', // à → 0
+        (0x0C, false) => b')',  (0x0C, true) => b'-',
+        (0x0D, false) => b'=',  (0x0D, true) => b'+',
         (0x0E, _) => 0x08, // Backspace
         (0x0F, _) => b'\t',
+        // Rangée AZERTY: AZERTYUIOP
         (0x10, false) => b'a', (0x10, true) => b'A',
         (0x11, false) => b'z', (0x11, true) => b'Z',
         (0x12, false) => b'e', (0x12, true) => b'E',
@@ -662,7 +666,8 @@ fn scancode_set1_to_ascii(scancode: u8) -> u8 {
         (0x17, false) => b'i', (0x17, true) => b'I',
         (0x18, false) => b'o', (0x18, true) => b'O',
         (0x19, false) => b'p', (0x19, true) => b'P',
-        (0x1C, _) => b'\n',
+        (0x1C, _) => b'\n', // Entrée
+        // Rangée AZERTY: QSDFGHJKLM
         (0x1E, false) => b'q', (0x1E, true) => b'Q',
         (0x1F, false) => b's', (0x1F, true) => b'S',
         (0x20, false) => b'd', (0x20, true) => b'D',
@@ -673,14 +678,18 @@ fn scancode_set1_to_ascii(scancode: u8) -> u8 {
         (0x25, false) => b'k', (0x25, true) => b'K',
         (0x26, false) => b'l', (0x26, true) => b'L',
         (0x27, false) => b'm', (0x27, true) => b'M',
+        // Rangée AZERTY: WXCVBN
         (0x2C, false) => b'w', (0x2C, true) => b'W',
         (0x2D, false) => b'x', (0x2D, true) => b'X',
         (0x2E, false) => b'c', (0x2E, true) => b'C',
         (0x2F, false) => b'v', (0x2F, true) => b'V',
         (0x30, false) => b'b', (0x30, true) => b'B',
         (0x31, false) => b'n', (0x31, true) => b'N',
-        (0x32, false) => b',', (0x32, true) => b'<',
-        (0x39, _) => b' ',
+        (0x32, false) => b',', (0x32, true) => b'?',
+        (0x33, false) => b';', (0x33, true) => b'.',
+        (0x34, false) => b':', (0x34, true) => b'/',
+        (0x35, false) => b'!', (0x35, true) => b'!',
+        (0x39, _) => b' ', // Espace
         _ => 0,
     }
 }

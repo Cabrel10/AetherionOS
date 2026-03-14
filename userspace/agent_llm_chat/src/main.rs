@@ -817,8 +817,8 @@ fn read_f32_weights_from_reader(rd: &mut BufReader, buf: &mut [f32]) -> usize {
 // detects the allocation failure and falls back gracefully to the
 // single-file or synthetic path.
 
-/// Size of the contiguous reassembly buffer (4.5 GB)
-const MULTIPART_BUFFER_SIZE: usize = 4_831_838_208; // 4.5 * 1024^3
+/// Size of the contiguous reassembly buffer (128 MB for 256MB pool)
+const MULTIPART_BUFFER_SIZE: usize = 134_217_728; // 128 * 1024 * 1024
 
 /// Chunk size for reading model parts from disk (4 KB = 1 FAT32 cluster)
 const CHUNK_SIZE: usize = 4096;
