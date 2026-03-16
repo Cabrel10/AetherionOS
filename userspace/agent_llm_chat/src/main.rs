@@ -972,8 +972,8 @@ pub extern "C" fn main() -> i64 {
     0
 }
 
-/// Streaming inference: for each token, iterate over all layers,
-/// loading each layer's weights from disk via pread64.
+/// Streaming inference: wait for prompts on the bus, then generate tokens.
+/// Loops forever listening for INTENT_USER_PROMPT messages.
 fn run_streaming_inference(
     fd: u32,
     data_start: u64,
@@ -983,19 +983,40 @@ fn run_streaming_inference(
     scratch: &mut ScratchBuffers,
 ) {
     println("[LLM] ========================================");
-    println("[LLM] Streaming Inference — Layer-by-Layer");
+    println("[LLM] Ready — waiting for prompts on bus");
     println("[LLM] ========================================");
 
-    let prompt: &[u8] = b"Hello AetherionOS";
-    let plen = prompt.len();
     let temperature: f32 = 0.7;
 
-    let prompt_hash = {
-        let mut h: u64 = 5381;
-        for &b in prompt { h = h.wrapping_mul(33).wrapping_add(b as u64); }
-        h
-    };
-    sys_bus_publish(INTENT_USER_PROMPT, 2, prompt_hash);
+    // Main event loop: wait for INTENT_USER_PROMPT from terminal
+    loop {
+        let mut bus_msg = [0u64; 6];
+        if sys_bus_consume(&mut bus_msg) == 0 {
+            let intent = bus_msg[2] as u32;
+            if intent == INTENT_USER_PROMPT as u32 {
+                // The terminal sends a hash of the prompt — we use a fixed test prompt
+                // since we can't reconstruct the original text from a hash.
+                // In a real system, the full prompt would be in the bus payload.
+                let prompt: &[u8] = b"Bonjour";
+                generate_response(fd, data_start, cfg, gw, lw, scratch, prompt, temperature);
+            }
+        }
+        sys_yield();
+    }
+}
+
+/// Generate a response for a given prompt
+fn generate_response(
+    _fd: u32,
+    _data_start: u64,
+    cfg: &ModelConfig,
+    gw: &GlobalWeights,
+    lw: &mut LayerWeights,
+    scratch: &mut ScratchBuffers,
+    prompt: &[u8],
+    temperature: f32,
+) {
+    let plen = prompt.len();
 
     print("[LLM] Prompt: \""); sys_write(1, prompt);
     print("\" ("); print_u64(plen as u64); println(" bytes)");
@@ -1127,7 +1148,7 @@ fn run_synthetic() -> i64 {
     sys_bus_publish(INTENT_LLM_READY, 2, 0);
     sys_bus_publish(INTENT_LLM_CHAT_INIT, 3, 0);
 
-    // Run inference with synthetic weights (fd=0 not used since weights are preloaded)
+    // Same event loop as real model — wait for prompts
     run_streaming_inference(0, 0, &cfg, &gw, &mut lw, &mut scratch);
     0
 }

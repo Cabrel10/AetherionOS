@@ -248,38 +248,44 @@ fn kill_user_and_switch(current_pid: u64, addr_raw: u64) {
     let next = crate::scheduler::yield_to_next(current_pid);
     
     if next != 0 && next != current_pid {
-        // Get the next process's saved state
-        let (rip, rsp, rfl, cr3) =
-            if let Some((saved_rip, saved_rsp, saved_rfl, saved_pml4)) =
+        // Récupère l'état sauvegardé du prochain processus
+        let (rip, rsp, rfl, cr3, next_regs) =
+            if let Some((saved_rip, saved_rsp, saved_rfl, saved_pml4, regs)) =
                 crate::process::get_preempt_state(next)
             {
-                // Validate saved_rip is in userspace range (0x8000000000 - 0x9000000000)
+                crate::serial_println!(
+                    "[SIGSEGV] PID {} preempt_state: rip=0x{:X} rsp=0x{:X} rfl=0x{:X} cr3=0x{:X}",
+                    next, saved_rip, saved_rsp, saved_rfl, saved_pml4
+                );
+                // Valide que saved_rip est dans l'espace utilisateur (0x8000000000 - 0x9000000000)
                 if saved_rip >= 0x8000000000 && saved_rip < 0x9000000000 {
-                    (saved_rip, saved_rsp, saved_rfl, saved_pml4)
+                    // Force RFLAGS=0x202 (IF=1) si jamais initialisé (processus premier lancement)
+                    let rfl = if saved_rfl == 0 { 0x202u64 } else { saved_rfl };
+                    (saved_rip, saved_rsp, rfl, saved_pml4, regs)
                 } else if let Some((entry, stack, pml4)) = crate::process::get_entry_state(next) {
-                    // Invalid saved_rip → start from entry_point (first-run)
+                    // saved_rip invalide → démarrage depuis entry_point (premier lancement)
                     crate::serial_println!(
-                        "[SIGSEGV] PID {} saved_rip=0x{:X} invalid, using entry=0x{:X}",
+                        "[SIGSEGV] PID {} saved_rip=0x{:X} invalide, utilise entry=0x{:X}",
                         next, saved_rip, entry
                     );
-                    (entry, stack, 0x202u64, pml4)
+                    (entry, stack, 0x202u64, pml4, [0u64; 8])
                 } else {
-                    // No valid state at all
-                    crate::serial_println!("[SIGSEGV] PID {} has no valid state, idle", next);
+                    // Aucun état valide
+                    crate::serial_println!("[SIGSEGV] PID {} sans état valide, idle", next);
                     crate::scheduler::set_current_pid(0);
                     loop { x86_64::instructions::hlt(); }
                 }
             } else if let Some((entry, stack, pml4)) = crate::process::get_entry_state(next) {
-                // No preempt state → first-run
-                (entry, stack, 0x202u64, pml4)
+                // Pas d'état préempté → premier lancement
+                (entry, stack, 0x202u64, pml4, [0u64; 8])
             } else {
-                crate::serial_println!("[SIGSEGV] PID {} has no entry state, idle", next);
+                crate::serial_println!("[SIGSEGV] PID {} sans entry state, idle", next);
                 crate::scheduler::set_current_pid(0);
                 loop { x86_64::instructions::hlt(); }
             };
 
         if cr3 == 0 || rip == 0 {
-            crate::serial_println!("[SIGSEGV] PID {} invalid cr3/rip, idle", next);
+            crate::serial_println!("[SIGSEGV] PID {} cr3/rip invalide, idle", next);
             crate::scheduler::set_current_pid(0);
             loop { x86_64::instructions::hlt(); }
         }
@@ -294,24 +300,26 @@ fn kill_user_and_switch(current_pid: u64, addr_raw: u64) {
             );
         }
 
-        // Reset GS bases before IRETQ to Ring 3
+        // Réinitialise les bases GS avant l'IRETQ vers Ring 3
         crate::arch::x86_64::syscall::reset_gs_bases();
 
-        // IRETQ to the next process — never returns
+        // IRETQ simple — ne restaure pas les regs callee-saved depuis le stack noyau.
+        // En Rust Release, rbp est un registre général (valeur arbitraire sur le stack noyau).
+        // Le compilateur Rust gère la sauvegarde/restauration sur le stack utilisateur.
         unsafe {
             core::arch::asm!(
                 "cli",
-                "mov cr3, {cr3_val}",
-                "push 0x1B",           // SS (Ring 3 data)
-                "push {rsp_val}",      // RSP
-                "push {rfl_val}",      // RFLAGS
-                "push 0x23",           // CS (Ring 3 code)
-                "push {rip_val}",      // RIP
+                "mov cr3, rax",
+                "push 0x1B",
+                "push rdx",
+                "push rsi",
+                "push 0x23",
+                "push rcx",
                 "iretq",
-                cr3_val = in(reg) cr3,
-                rsp_val = in(reg) rsp,
-                rfl_val = in(reg) rfl,
-                rip_val = in(reg) rip,
+                in("rax") cr3,
+                in("rcx") rip,
+                in("rdx") rsp,
+                in("rsi") rfl,
                 options(noreturn),
             );
         }
@@ -644,16 +652,17 @@ fn scancode_set1_to_ascii(scancode: u8) -> u8 {
     let shifted = SHIFT_PRESSED.load(Ordering::Relaxed);
     match (scancode, shifted) {
         // Rangée chiffres AZERTY — sans Shift: symboles, avec Shift: chiffres
+        // &  1  |  é  2  |  "  3  |  '  4  |  (  5  |  -  6  |  è  7  |  _  8  |  ç  9  |  à  0  |  )  -  |  =  +
         (0x02, false) => b'&',  (0x02, true) => b'1',
-        (0x03, false) => b'2',  (0x03, true) => b'2', // é → 2
+        (0x03, false) => b'e',  (0x03, true) => b'2', // é (approx e car pas d'accents ASCII)
         (0x04, false) => b'"',  (0x04, true) => b'3',
         (0x05, false) => b'\'', (0x05, true) => b'4',
         (0x06, false) => b'(',  (0x06, true) => b'5',
         (0x07, false) => b'-',  (0x07, true) => b'6',
-        (0x08, false) => b'7',  (0x08, true) => b'7', // è → 7
+        (0x08, false) => b'e',  (0x08, true) => b'7', // è (approx e)
         (0x09, false) => b'_',  (0x09, true) => b'8',
-        (0x0A, false) => b'9',  (0x0A, true) => b'9', // ç → 9
-        (0x0B, false) => b'0',  (0x0B, true) => b'0', // à → 0
+        (0x0A, false) => b'c',  (0x0A, true) => b'9', // ç (approx c)
+        (0x0B, false) => b'a',  (0x0B, true) => b'0', // à (approx a)
         (0x0C, false) => b')',  (0x0C, true) => b'-',
         (0x0D, false) => b'=',  (0x0D, true) => b'+',
         (0x0E, _) => 0x08, // Backspace

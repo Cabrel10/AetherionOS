@@ -657,11 +657,13 @@ pub fn save_preempt_state(pid: u64, rip: u64, rsp: u64, rflags: u64) {
 }
 
 /// Jalon 55: Get user-mode state for restoring a preempted process.
-/// Returns (rip, rsp, rflags, pml4_phys).
-pub fn get_preempt_state(pid: u64) -> Option<(u64, u64, u64, u64)> {
+/// Retourne (rip, rsp, rflags, pml4_phys, saved_syscall_regs).
+/// Les regs contiennent les registres callee-saved (r15,r14,r13,r12,rbx,rbp,r11,rcx)
+/// tels qu'ils étaient sur le stack noyau au moment du yield.
+pub fn get_preempt_state(pid: u64) -> Option<(u64, u64, u64, u64, [u64; 8])> {
     let table = PROCESS_TABLE.lock();
     if let Some(p) = table.get(&pid) {
-        Some((p.saved_user_rip, p.saved_user_rsp, p.context.rflags, p.pml4_phys))
+        Some((p.saved_user_rip, p.saved_user_rsp, p.context.rflags, p.pml4_phys, p.saved_syscall_regs))
     } else {
         None
     }

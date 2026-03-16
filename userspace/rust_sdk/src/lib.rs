@@ -170,7 +170,7 @@ pub fn syscall1(nr: u64, a1: u64) -> u64 {
         core::arch::asm!(
             "syscall",
             inlateout("rax") nr => ret,
-            in("rdi") a1,
+            inlateout("rdi") a1 => _,
             out("rcx") _,
             out("r11") _,
             out("r8") _,
@@ -191,8 +191,8 @@ pub fn syscall2(nr: u64, a1: u64, a2: u64) -> u64 {
         core::arch::asm!(
             "syscall",
             inlateout("rax") nr => ret,
-            in("rdi") a1,
-            in("rsi") a2,
+            inlateout("rdi") a1 => _,
+            inlateout("rsi") a2 => _,
             out("rcx") _,
             out("r11") _,
             out("r8") _,
@@ -212,14 +212,35 @@ pub fn syscall3(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         core::arch::asm!(
             "syscall",
             inlateout("rax") nr => ret,
-            in("rdi") a1,
-            in("rsi") a2,
-            in("rdx") a3,
+            inlateout("rdi") a1 => _,
+            inlateout("rsi") a2 => _,
+            inlateout("rdx") a3 => _,
             out("rcx") _,
             out("r11") _,
             out("r8") _,
             out("r9") _,
             out("r10") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+#[inline(always)]
+pub fn syscall4(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+    let ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") nr => ret,
+            inlateout("rdi") a1 => _,
+            inlateout("rsi") a2 => _,
+            inlateout("rdx") a3 => _,
+            inlateout("r10") a4 => _,
+            out("rcx") _,
+            out("r11") _,
+            out("r8") _,
+            out("r9") _,
             options(nostack),
         );
     }
@@ -567,16 +588,16 @@ pub fn sys_lseek(fd: u32, offset: i64, whence: u32) -> i64 {
     syscall3(8, fd as u64, offset as u64, whence as u64) as i64
 }
 
-/// POSIX pread64: Read up to 4096 bytes from file at a given offset WITHOUT
+/// POSIX pread64: Read up to `buf.len()` bytes from file at a given offset WITHOUT
 /// changing the file descriptor's position. Critical for streaming model loading.
 ///
 /// fd: file descriptor (must be open)
-/// buf: destination buffer (must be at least 4096 bytes)
+/// buf: destination buffer
 /// offset: byte offset in the file to read from
 ///
 /// Returns: number of bytes read (0 = EOF), or negative error code.
 pub fn sys_pread64(fd: u32, buf: &mut [u8], offset: u64) -> i64 {
-    syscall3(SYS_PREAD64, fd as u64, buf.as_mut_ptr() as u64, offset) as i64
+    syscall4(SYS_PREAD64, fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64, offset) as i64
 }
 
 /// Clone (create a lightweight thread sharing the parent's address space).
