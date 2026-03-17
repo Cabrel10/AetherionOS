@@ -1809,24 +1809,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         // STEP A1: Load agent_llm_chat.elf as a QUEUED process
         // Dynamic GGUF agent: parses metadata, allocates tensors, runs
         // inference. Queued so terminal can start first and display UI.
-        // JALON 71: RE-ENABLED for LLM integration via Cognitive Bus
+        // JALON 71: DISABLED — LLM crashes at rip=0x0, blocks terminal keyboard
         // ──────────────────────────────────────────────────────────
-        serial_write("  [J71] agent_llm_chat.elf: ENABLED\n");
-        match elf::load_elf_binary(AGENT_LLM_CHAT_ELF) {
-            Ok(llm_result) => {
-                let llm_pid = process::spawn_userspace(
-                    "/bin/agent_llm_chat.elf", 0,
-                    llm_result.entry_point, llm_result.stack_pointer, llm_result.pml4_phys
-                ).unwrap_or(0);
-                if llm_pid != 0 {
-                    scheduler::enqueue_process(llm_pid);
-                    serial_println!("  [J71] LLM Chat PID={} queued", llm_pid);
-                }
-            }
-            Err(e) => {
-                serial_println!("  [J71] WARN: agent_llm_chat.elf load failed: {}", e);
-            }
-        }
+        serial_write("  [J71] agent_llm_chat.elf: DISABLED (terminal-only mode)\n");
 
         // ──────────────────────────────────────────────────────────
         // STEP A2: Load agent_orchestrator.elf as a QUEUED process

@@ -362,7 +362,7 @@ pub fn tick_preemptive() -> Option<(u64, u64, u64, u64, u64, u64)> {
         return None;
     }
 
-    // Récupère l'état sauvegardé du prochain processus (rip, rsp, rflags, cr3, regs callee-saved)
+    // Get the new process's saved user-mode state
     let (new_rip, new_rsp, new_rflags, new_pml4, _new_regs) =
         process::get_preempt_state(result.new_pid).unwrap_or((0, 0, 0x200, 0, [0; 8]));
 

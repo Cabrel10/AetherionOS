@@ -211,12 +211,19 @@ fn fnv1a(data: &[u8]) -> u64 {
 fn pread_exact(fd: u32, buf: &mut [u8], offset: u64, len: usize) -> usize {
     let mut total = 0usize;
     let max_chunk = 4096usize;
+    let mut calls = 0;
     while total < len {
         let remain = len - total;
         let chunk = if remain > max_chunk { max_chunk } else { remain };
         let n = sys_pread64(fd, &mut buf[total..total + chunk], offset + total as u64);
         if n <= 0 { break; }
         total += n as usize;
+        
+        // DISCIPLINE COOPÉRATIVE : On cède le processeur au terminal tous les 8 chunks (32 Ko)
+        calls += 1;
+        if calls % 8 == 0 {
+            sys_yield();
+        }
     }
     total
 }

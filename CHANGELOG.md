@@ -5,6 +5,27 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [v3.0-terminal-stable] -- 2026-03-17 -- Terminal-Only Stable State
+
+### Fixed
+- **Blink Tick Rate**: Fixed cursor blink from 30ms to 500ms interval in `agent_visual_term`
+  - File: `userspace/agent_visual_term/src/main.rs`
+  - Changed `tick_counter % 30` to `tick_counter % 500`
+
+### Changed
+- **LLM Agent Disabled**: `agent_llm_chat.elf` disabled at boot in `kernel/src/main.rs`
+  - Root cause: Crash at `rip=0x0` immediately after launch (entry 0x8000006510)
+  - Impact: Terminal (PID 11) is now sole Ring 3 process, eliminating scheduler conflicts
+  - Result: Keyboard input fully functional, no freezing
+
+### System State
+- **Reference Commit:** `d3da007f875164d5ce12a93f7f3a9eb579ea0732`
+- **Functional:** Visual terminal, keyboard AZERTY, framebuffer 1024x768, sys_yield()
+- **Disabled:** LLM inference, orchestrator, llama_core agents
+- **Architecture:** ACHA with Cognitive Bus, preemptive scheduling
+
+---
+
 ## [v2.1.0] -- 2026-03-05 -- Jalon 27+28: Dynamic Memory & Scheduler
 
 ### Critical Fix -- Syscall ABI Clobber List

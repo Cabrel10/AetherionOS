@@ -5,8 +5,27 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-nightly--2023--08--01-orange.svg)](https://www.rust-lang.org)
 [![Arch](https://img.shields.io/badge/arch-x86__64-green.svg)](https://en.wikipedia.org/wiki/X86-64)
-[![Version](https://img.shields.io/badge/version-v2.1.0--malloc--preempt-blue.svg)](#)
-[![Jalons](https://img.shields.io/badge/jalons-28%2F28-brightgreen.svg)](#development-milestones)
+[![Version](https://img.shields.io/badge/version-v3.0--terminal--stable-blue.svg)](#)
+[![Jalons](https://img.shields.io/badge/jalons-28%2F28%2B-brightgreen.svg)](#development-milestones)
+
+---
+
+## Current System State (v3.0-terminal-stable)
+
+**Reference Commit:** `d3da007f875164d5ce12a93f7f3a9eb579ea0732`
+
+| Component | Status |
+|-----------|--------|
+| Visual Terminal (PID 11) | ✅ Functional - Interactive shell with working keyboard |
+| Cursor Blink | ✅ Fixed - 500ms interval (was 30ms) |
+| Process Scheduling | ✅ Preemptive multi-tasking via sys_yield() |
+| LLM Agent (agent_llm_chat) | ⚠️ Disabled - Crash at rip=0x0 on startup |
+| Keyboard Input | ✅ Active - AZERTY layout, PS/2 translated |
+| Framebuffer | ✅ 1024x768x32bpp |
+
+**Known Issues:**
+- LLM agent crashes immediately on startup (entry point 0x8000006510, but jumps to rip=0x0)
+- Terminal is sole Ring 3 process (no other agents active)
 
 ---
 

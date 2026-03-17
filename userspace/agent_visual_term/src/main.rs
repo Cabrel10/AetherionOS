@@ -181,7 +181,7 @@ impl Terminal {
 
     fn blink_tick(&mut self) {
         self.tick += 1;
-        if self.tick % 30 == 0 {
+        if self.tick % 500 == 0 {
             self.cursor_visible = !self.cursor_visible;
             self.draw_cursor();
         }
@@ -758,15 +758,10 @@ fn cmd_llm(term: &mut Terminal, prompt_bytes: &[u8]) {
     term.llm_active = true;
     term.put_str(b"[LLM] Waiting for tokens...\n", DIM);
 
-    // Céder le CPU au LLM pour qu'il lise le message avant qu'on entre dans la boucle consume
-    sys_yield();
-    sys_yield();
-    sys_yield();
-
     // Listen for token stream with timeout (real bus messages)
     let mut token_count: u32 = 0;
     let mut idle_ticks: u32 = 0;
-    let max_idle = 500_000u32; // timeout massif — le LLM a besoin de temps pour charger ses poids
+    let max_idle = 500u32; // timeout after ~500 yield cycles with no tokens
 
     term.put_str(b"[LLM] ", LLM_COL);
     loop {

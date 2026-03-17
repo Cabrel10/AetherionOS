@@ -2,7 +2,31 @@
 
 **Master Plan -- From Bare Metal to AI-Native Desktop**
 
-Last updated: 2026-03-05 (post Jalon 28)
+Last updated: 2026-03-17 (v3.0-terminal-stable)
+
+---
+
+## Current System State
+
+**Reference:** `d3da007f875164d5ce12a93f7f3a9eb579ea0732`
+
+| Phase | Status | Notes |
+|-------|--------|-------|
+| Phase 1: Kernel Foundations | ✅ DONE | All jalons 1-9 complete |
+| Phase 2: POSIX Userspace | ✅ DONE | All jalons 11-28 complete |
+| Phase 3: Expansion | ⚠️ PARTIAL | Visual terminal functional, LLM disabled |
+
+**Active Components:**
+- Visual Terminal (`agent_visual_term.elf`) - Interactive shell with keyboard
+- Framebuffer 1024x768x32bpp
+- PS/2 Keyboard (AZERTY layout, translated scancodes)
+- Preemptive scheduler via `sys_yield()`
+- FAT32 filesystem read-only
+
+**Disabled Components:**
+- LLM Chat Agent (`agent_llm_chat.elf`) - Crash at rip=0x0
+- Orchestrator Agent - Disabled to prevent interference
+- Llama Core Agent - Disabled to prevent interference
 
 ---
 

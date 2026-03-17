@@ -203,30 +203,21 @@ unsafe extern "C" fn syscall_entry() {
         // Uses GS-relative access (gs:[24]) to avoid R_X86_64_32S relocations.
         "mov gs:[24], rsp",
 
-        // 3c. Save r10 (user's 4th arg) to stack before we overwrite registers
-        "push r10",
-
         // 4. Prepare arguments for Rust handler
-        //    syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64)
-        //    System V calling convention: rdi, rsi, rdx, rcx, r8
-        //    From SYSCALL: rax=nr, rdi=a1, rsi=a2, rdx=a3, r10=a4
-        "mov r8, [rsp]",     // 5th arg = a4 (r10 saved on stack)
-        "mov rcx, rdx",      // 4th arg = a3
-        "mov rdx, rsi",      // 3rd arg = a2
-        "mov rsi, rdi",      // 2nd arg = a1
-        "mov rdi, rax",      // 1st arg = syscall number
+        //    syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64)
+        //    System V calling convention: rdi, rsi, rdx, rcx
+        //    From SYSCALL: rax=nr, rdi=a1, rsi=a2, rdx=a3
+        "mov rcx, rdx",    // 4th arg = a3 (rdx from user)
+        "mov rdx, rsi",    // 3rd arg = a2
+        "mov rsi, rdi",    // 2nd arg = a1
+        "mov rdi, rax",    // 1st arg = syscall number
 
         // Align RSP to 16 bytes before calling Rust (ABI requirement)
-        // CRITICAL: do NOT use r15 to save RSP — r15 is callee-saved and
-        // will be clobbered by the Rust handler's prologue/epilogue.
-        // Instead, push a dummy alignment word so RSP is 16-byte aligned.
-        "sub rsp, 8",            // align RSP to 16 bytes (r10 push may have misaligned)
+        "mov r15, rsp",          // save current RSP in r15 (already pushed)
+        "and rsp, -16",          // align to 16-byte boundary
         // Call the Rust dispatcher
         "call {handler}",
-        "add rsp, 8",            // undo alignment
-
-        // Pop the saved r10 value
-        "add rsp, 8",
+        "mov rsp, r15",          // restore RSP (r15 will be popped next)
 
         // RAX = return value (set by Rust handler)
 
@@ -263,12 +254,12 @@ unsafe extern "C" fn syscall_entry() {
 /// touches XMM/YMM registers.  User FPU state therefore survives every
 /// syscall automatically — no fxsave/fxrstor needed in the fast path.
 #[no_mangle]
-extern "C" fn syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
-    syscall_dispatch(nr, a1, a2, a3, a4)
+extern "C" fn syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    syscall_dispatch(nr, a1, a2, a3)
 }
 
 /// Internal syscall dispatch (separated for FPU save/restore wrapper).
-fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     match nr {
         0  => sys_read(a1 as u32, a2, a3),
         1  => sys_write(a1, a2, a3),
@@ -310,11 +301,11 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
         223 => sys_fb_get_info(a1),                // Jalon 39: Framebuffer get info
         230 => sys_rdtsc(),                        // Jalon 40: Read TSC
         240 => sys_mmap_file(a1, a2, a3),           // Jalon 68: File-backed mmap (fd, length, offset)
-        17 => sys_pread64(a1 as u32, a2, a3, a4),       // Jalon 73: pread64(fd, buf, len, offset)
+        17 => sys_pread64(a1 as u32, a2, a3),       // Jalon 73: pread64(fd, buf|len_hi16, offset|count_lo48)
         250 => sys_getprocs(a1, a2),                 // Jalon 73: list processes to user buffer
         251 => sys_sysinfo(a1),                       // Jalon 73: system info to user buffer
         _ => {
-            crate::serial_println!("[SYSCALL] Unknown nr={} a1=0x{:X} a2=0x{:X} a3=0x{:X} a4=0x{:X}", nr, a1, a2, a3, a4);
+            crate::serial_println!("[SYSCALL] Unknown nr={} a1=0x{:X} a2=0x{:X} a3=0x{:X}", nr, a1, a2, a3);
             ENOSYS
         }
     }
@@ -596,21 +587,6 @@ fn sys_open(path_addr: u64, flags: u32) -> u64 {
     // Hot-path: logging disabled
     // crate::serial_println!("[SYSCALL] sys_open(\"{}\", flags=0x{:X}) from PID {}", path, flags, current_pid);
 
-    // Branche spéciale : /disk et /disk/ sont des répertoires FAT32 valides.
-    // sys_open ne doit pas vérifier vfs::file_read pour eux — allouer le FD directement.
-    if path == "/disk" || path == "/disk/" {
-        crate::serial_println!("[SYSCALL] sys_open: répertoire racine FAT32 '{}'", path);
-        match crate::process::with_fd_table_mut(current_pid, |fd_table| {
-            fd_table.alloc_fd(&path, flags)
-        }) {
-            Some(Some(fd)) => {
-                crate::serial_println!("[SYSCALL] sys_open(\"{}\") = FD {} (répertoire FAT32)", path, fd);
-                return fd as u64;
-            }
-            _ => return EMFILE,
-        }
-    }
-
     // For /disk/ paths with O_CREAT, we allow creating files that don't exist yet
     if path.starts_with("/disk/") && (flags & O_CREAT) != 0 {
         // FIX #17: Use file_exists() instead of read_file_path() to avoid OOM
@@ -831,51 +807,44 @@ fn sys_yield() -> u64 {
     let current = crate::scheduler::current_pid();
     if current == 0 { return 0; }
 
-    // Sauvegarde l'état complet du processus courant.
-    // Le stack noyau contient tous les registres utilisateur sauvegardés par syscall_entry.
-    // Layout depuis saved_kernel_rsp : [r15, r14, r13, r12, rbx, rbp, r11(rflags), rcx(rip)]
-    let parent_kernel_rsp = unsafe { PER_CPU.saved_kernel_rsp };
-    let saved_regs: [u64; 8] = if parent_kernel_rsp != 0 {
-        let ptr = parent_kernel_rsp as *const u64;
-        unsafe {[
-            core::ptr::read_volatile(ptr),        // r15
-            core::ptr::read_volatile(ptr.add(1)), // r14
-            core::ptr::read_volatile(ptr.add(2)), // r13
-            core::ptr::read_volatile(ptr.add(3)), // r12
-            core::ptr::read_volatile(ptr.add(4)), // rbx
-            core::ptr::read_volatile(ptr.add(5)), // rbp
-            core::ptr::read_volatile(ptr.add(6)), // r11 (RFLAGS utilisateur)
-            core::ptr::read_volatile(ptr.add(7)), // rcx (RIP utilisateur)
-        ]}
-    } else {
-        [0; 8]
-    };
+    // Save current process's user-mode state so it can be resumed later.
+    let user_rip = saved_user_rip();
+    let user_rsp = saved_user_rsp();
+    crate::process::save_preempt_state(current, user_rip, user_rsp, 0x202);
 
-    // Sauvegarde dans la structure du processus
-    crate::process::with_process_mut(current, |p| {
-        p.saved_user_rip = saved_regs[7]; // rcx = RIP de retour syscall
-        p.saved_user_rsp = saved_user_rsp();
-        p.saved_syscall_regs = saved_regs;
-        p.context.rflags = 0x202;
-    });
+    // Use yield_to_next which does a blocking lock + tick + returns result
+    // Loop to skip stale/test processes that have no valid address space
+    let mut next = 0u64;
+    for _ in 0..16 {
+        let candidate = crate::scheduler::yield_to_next(current);
+        if candidate == 0 || candidate == current {
+            next = current;
+            break;
+        }
+        // Verify the candidate has a valid PML4 (real userspace process)
+        if let Some((_e, _s, pml4)) = crate::process::get_entry_state(candidate) {
+            if pml4 != 0 {
+                next = candidate;
+                break;
+            }
+        }
+        // Invalid process: re-enqueue current and try again
+        // The invalid candidate was already dequeued and lost, which is fine
+    }
 
-    // FIX: appel UNIQUE à yield_to_next — la boucle for _ in 0..16 était le bug principal.
-    // Chaque appel supplémentaire re-enqueue current et dequeue next une fois de plus,
-    // corrompant l'état du scheduler et mélangeant les regs entre processus.
-    let next = crate::scheduler::yield_to_next(current);
-
-    // Aucun autre processus prêt → retour immédiat
+    // If scheduler picked the same process (or none), just return
     if next == 0 || next == current {
         return 0;
     }
 
-    // Récupère l'état sauvegardé du prochain processus (ou état initial si premier lancement)
+    // Get the next process's saved state (or entry state for first-run)
     let (new_rip, new_rsp, new_rflags, new_pml4) =
         if let Some((rip, rsp, rfl, pml4, _regs)) = crate::process::get_preempt_state(next) {
             if rip != 0 {
-                let rfl = if rfl == 0 { 0x202u64 } else { rfl };
                 (rip, rsp, rfl, pml4)
             } else if let Some((entry, stack, pml4)) = crate::process::get_entry_state(next) {
+                // First-run process: use entry_point and stack_pointer
+                // crate::serial_println!("[YIELD] First-run PID {} entry=0x{:X}", next, entry);
                 (entry, stack, 0x202u64, pml4)
             } else {
                 return 0;
@@ -888,38 +857,30 @@ fn sys_yield() -> u64 {
         return 0;
     }
 
-    crate::serial_println!(
-        "[YIELD] PID {} -> PID {}: rip=0x{:X} rsp=0x{:X}",
-        current, next, new_rip, new_rsp
-    );
-
-    // Marque l'ancien processus comme Ready, le nouveau comme Running
+    // Mark the old process as Ready, new as Running
     let _ = crate::process::set_state(current, crate::process::ProcessState::Ready);
     let _ = crate::process::set_state(next, crate::process::ProcessState::Running);
     crate::scheduler::set_current_pid(next);
 
-    // IRETQ vers le prochain processus.
-    // On ne restaure PAS les regs callee-saved (rbx, rbp, r12-r15) depuis le stack noyau.
-    // Raison : en Rust Release, rbp est un registre général (pas frame pointer).
-    // Sa valeur sur le stack noyau est arbitraire et corromprait RSP si restaurée.
-    // Le compilateur Rust sauvegarde/restaure ces regs sur le stack UTILISATEUR
-    // via les prologues/épilogues de fonctions — le noyau ne doit pas interférer.
+    // crate::serial_println!("[YIELD] PID {} -> PID {} rip=0x{:X} rsp=0x{:X} cr3=0x{:X}",
+    //     current, next, new_rip, new_rsp, new_pml4);
+
+    // Context switch: load new CR3 and IRETQ to new process
     unsafe {
         asm!(
             "cli",
-            "mov cr3, rax",        // rax = new_pml4
+            "mov cr3, {cr3_val}",
             "push 0x1B",           // SS (Ring 3 data)
-            "push rdx",            // RSP utilisateur
-            "push rsi",            // RFLAGS utilisateur
+            "push {rsp_val}",      // RSP
+            "push {rfl_val}",      // RFLAGS
             "push 0x23",           // CS (Ring 3 code)
-            "push rcx",            // RIP utilisateur
-            "xor eax, eax",        // Valeur de retour = 0 (sys_yield retourne 0 au processus)
-            "swapgs",              // Repasse au GS utilisateur
+            "push {rip_val}",      // RIP
+            "swapgs",              // Switch back to user GS
             "iretq",
-            in("rax") new_pml4,
-            in("rcx") new_rip,
-            in("rdx") new_rsp,
-            in("rsi") new_rflags,
+            cr3_val = in(reg) new_pml4,
+            rsp_val = in(reg) new_rsp,
+            rfl_val = in(reg) new_rflags,
+            rip_val = in(reg) new_rip,
             options(noreturn),
         );
     }
@@ -1307,20 +1268,27 @@ fn sys_exit(code: u64) -> u64 {
 
                     unsafe {
                         core::arch::asm!(
-                            "mov rbx, r8",          // r8 = rbx (LLVM interdit rbx direct)
-                            "mov rbp, r9",          // r9 = rbp (LLVM interdit rbp direct)
+                            "mov r15, {v_r15}",
+                            "mov r14, {v_r14}",
+                            "mov r13, {v_r13}",
+                            "mov r12, {v_r12}",
+                            "mov rbx, {v_rbx}",
+                            "mov rbp, {v_rbp}",
+                            "mov r11, {v_r11}",
+                            "mov rcx, {v_rcx}",
+                            "mov rax, {result}",
                             "mov rsp, gs:[8]",      // Restore user RSP
                             "swapgs",               // Swap back to user GS
                             "sysretq",              // Return to Ring 3
-                            in("r15") r15,
-                            in("r14") r14,
-                            in("r13") r13,
-                            in("r12") r12,
-                            in("r8")  rbx,          // rbx passé via r8
-                            in("r9")  rbp,          // rbp passé via r9
-                            in("r11") r11,
-                            in("rcx") rcx,
-                            in("rax") wait_result,
+                            v_r15 = in(reg) r15,
+                            v_r14 = in(reg) r14,
+                            v_r13 = in(reg) r13,
+                            v_r12 = in(reg) r12,
+                            v_rbx = in(reg) rbx,
+                            v_rbp = in(reg) rbp,
+                            v_r11 = in(reg) r11,
+                            v_rcx = in(reg) rcx,
+                            result = in(reg) wait_result,
                             options(noreturn),
                         );
                     }
@@ -1427,20 +1395,27 @@ fn sys_exit(code: u64) -> u64 {
                         unsafe {
                             core::arch::asm!("mov cr3, {}", in(reg) pml4, options(nostack));
                             core::arch::asm!(
-                                "mov rbx, r8",      // r8 = rbx (LLVM interdit rbx direct)
-                                "mov rbp, r9",      // r9 = rbp (LLVM interdit rbp direct)
+                                "mov r15, {v_r15}",
+                                "mov r14, {v_r14}",
+                                "mov r13, {v_r13}",
+                                "mov r12, {v_r12}",
+                                "mov rbx, {v_rbx}",
+                                "mov rbp, {v_rbp}",
+                                "mov r11, {v_r11}",
+                                "mov rcx, {v_rcx}",
+                                "mov rax, {result}",
                                 "mov rsp, gs:[8]",
                                 "swapgs",
                                 "sysretq",
-                                in("r15") r15,
-                                in("r14") r14,
-                                in("r13") r13,
-                                in("r12") r12,
-                                in("r8")  rbx,      // rbx passé via r8
-                                in("r9")  rbp,      // rbp passé via r9
-                                in("r11") r11,
-                                in("rcx") rcx,
-                                in("rax") wait_result,
+                                v_r15 = in(reg) r15,
+                                v_r14 = in(reg) r14,
+                                v_r13 = in(reg) r13,
+                                v_r12 = in(reg) r12,
+                                v_rbx = in(reg) rbx,
+                                v_rbp = in(reg) rbp,
+                                v_r11 = in(reg) r11,
+                                v_rcx = in(reg) rcx,
+                                result = in(reg) wait_result,
                                 options(noreturn),
                             );
                         }
@@ -1537,20 +1512,26 @@ fn launch_next_userspace_process(exclude_pid: u64) {
                 unsafe {
                     core::arch::asm!("mov cr3, {}", in(reg) pml4, options(nostack));
                     core::arch::asm!(
-                        "mov rbx, r8",          // r8 = rbx (LLVM interdit rbx direct)
-                        "mov rbp, r9",          // r9 = rbp (LLVM interdit rbp direct)
+                        "mov r15, {v_r15}",
+                        "mov r14, {v_r14}",
+                        "mov r13, {v_r13}",
+                        "mov r12, {v_r12}",
+                        "mov rbx, {v_rbx}",
+                        "mov rbp, {v_rbp}",
+                        "mov r11, {v_r11}",
+                        "mov rcx, {v_rcx}",
                         "xor eax, eax",         // RAX = 0 (fork return for child!)
                         "mov rsp, gs:[8]",      // Restore user RSP
                         "swapgs",               // Swap back to user GS
                         "sysretq",              // Return to Ring 3
-                        in("r15") r15,
-                        in("r14") r14,
-                        in("r13") r13,
-                        in("r12") r12,
-                        in("r8")  rbx,          // rbx passé via r8
-                        in("r9")  rbp,          // rbp passé via r9
-                        in("r11") r11,
-                        in("rcx") rcx,
+                        v_r15 = in(reg) r15,
+                        v_r14 = in(reg) r14,
+                        v_r13 = in(reg) r13,
+                        v_r12 = in(reg) r12,
+                        v_rbx = in(reg) rbx,
+                        v_rbp = in(reg) rbp,
+                        v_r11 = in(reg) r11,
+                        v_rcx = in(reg) rcx,
                         options(noreturn),
                     );
                 }
@@ -1701,20 +1682,26 @@ fn sys_wait(pid: u64) -> u64 {
         unsafe {
             core::arch::asm!("mov cr3, {}", in(reg) child_pml4, options(nostack));
             core::arch::asm!(
-                "mov rbx, r8",          // r8 = rbx (LLVM interdit rbx direct)
-                "mov rbp, r9",          // r9 = rbp (LLVM interdit rbp direct)
+                "mov r15, {v_r15}",
+                "mov r14, {v_r14}",
+                "mov r13, {v_r13}",
+                "mov r12, {v_r12}",
+                "mov rbx, {v_rbx}",
+                "mov rbp, {v_rbp}",
+                "mov r11, {v_r11}",
+                "mov rcx, {v_rcx}",
                 "xor eax, eax",         // RAX = 0 (fork return for child!)
                 "mov rsp, gs:[8]",
                 "swapgs",
                 "sysretq",
-                in("r15") r15,
-                in("r14") r14,
-                in("r13") r13,
-                in("r12") r12,
-                in("r8")  rbx,          // rbx passé via r8
-                in("r9")  rbp,          // rbp passé via r9
-                in("r11") r11,
-                in("rcx") rcx,
+                v_r15 = in(reg) r15,
+                v_r14 = in(reg) r14,
+                v_r13 = in(reg) r13,
+                v_r12 = in(reg) r12,
+                v_rbx = in(reg) rbx,
+                v_rbp = in(reg) rbp,
+                v_r11 = in(reg) r11,
+                v_rcx = in(reg) rcx,
                 options(noreturn),
             );
         }
@@ -2990,17 +2977,12 @@ fn sys_sysinfo(buf_addr: u64) -> u64 {
 /// Final design: use the FD's known path and simply:
 ///   a1 = fd
 ///   a2 = buf_addr
-///   a3 = len (max 4096)
-///   a4 = offset
-///   Returns bytes read.
-fn sys_pread64(fd: u32, buf_addr: u64, len: u64, offset: u64) -> u64 {
-    const PREAD_MAX_CHUNK: usize = 4096;
+///   a3 = offset
+///   Returns bytes read (reads up to 4096 bytes per call for safety).
+fn sys_pread64(fd: u32, buf_addr: u64, offset: u64) -> u64 {
+    const PREAD_MAX_CHUNK: usize = 4096; // Read one page at a time — safe for kernel stack
 
-    // Clamp len to max chunk size
-    let len = core::cmp::min(len as usize, PREAD_MAX_CHUNK);
-    if len == 0 { return 0; }
-
-    if !validate_user_ptr(buf_addr, len as u64) {
+    if !validate_user_ptr(buf_addr, PREAD_MAX_CHUNK as u64) {
         return EFAULT;
     }
 
@@ -3020,7 +3002,7 @@ fn sys_pread64(fd: u32, buf_addr: u64, len: u64, offset: u64) -> u64 {
         // Try exFAT first
         if crate::fs::exfat::is_mounted() {
             let mut temp = [0u8; PREAD_MAX_CHUNK];
-            let bytes = crate::fs::exfat::read_file(disk_path, offset, &mut temp[..len]);
+            let bytes = crate::fs::exfat::read_file(disk_path, offset, &mut temp);
             if bytes > 0 {
                 unsafe {
                     let dst = buf_addr as *mut u8;
@@ -3033,7 +3015,7 @@ fn sys_pread64(fd: u32, buf_addr: u64, len: u64, offset: u64) -> u64 {
         }
 
         // FAT32 chunked read
-        match crate::fs::fat32::read_file_path_chunk(disk_path, offset, len as u64) {
+        match crate::fs::fat32::read_file_path_chunk(disk_path, offset, PREAD_MAX_CHUNK as u64) {
             Some(chunk) => {
                 let to_copy = chunk.len();
                 if to_copy == 0 { return 0; } // EOF
@@ -3052,7 +3034,7 @@ fn sys_pread64(fd: u32, buf_addr: u64, len: u64, offset: u64) -> u64 {
                         let start = offset as usize;
                         if start >= data.len() { return 0; }
                         let avail = data.len() - start;
-                        let to_copy = core::cmp::min(avail, len);
+                        let to_copy = core::cmp::min(avail, PREAD_MAX_CHUNK);
                         unsafe {
                             let dst = buf_addr as *mut u8;
                             for i in 0..to_copy {
@@ -3073,7 +3055,7 @@ fn sys_pread64(fd: u32, buf_addr: u64, len: u64, offset: u64) -> u64 {
             let start = offset as usize;
             if start >= data.len() { return 0; }
             let avail = data.len() - start;
-            let to_copy = core::cmp::min(avail, len);
+            let to_copy = core::cmp::min(avail, PREAD_MAX_CHUNK);
             unsafe {
                 let dst = buf_addr as *mut u8;
                 for i in 0..to_copy {
