@@ -63,7 +63,7 @@ mod framebuffer;
 mod font;
 
 // ===== Configuration =====
-const KERNEL_VERSION: &str = "2.2.0-j77-tcp-xhci";
+const KERNEL_VERSION: &str = "2.3.0-j76-mmap-tiled-matmul";
 
 // ===== Embedded ELF binaries =====
 /// Minimal hello.elf - statically linked x86-64 ELF for Ring 3 test

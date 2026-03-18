@@ -484,6 +484,38 @@ pub fn file_read(path: &str) -> Result<Vec<u8>, VfsError> {
     Ok(data)
 }
 
+/// Read a range of bytes from a VFS file at a given offset.
+/// Used by the page fault handler for demand-paging mmap of VFS-resident files.
+/// Copies up to `buf.len()` bytes starting at `offset` into `buf`.
+/// Returns the number of bytes actually copied.
+pub fn file_read_at_offset(path: &str, offset: u64, buf: &mut [u8]) -> usize {
+    let components = path_components(path);
+    if components.is_empty() {
+        return 0;
+    }
+
+    let root = VFS_ROOT.lock();
+    let node = match find_node(&root, &components) {
+        Some(n) => n,
+        None => return 0,
+    };
+
+    let file_data = match node {
+        VfsNode::File(ref data) => data,
+        VfsNode::Device { data: ref device_data, .. } => device_data,
+        _ => return 0,
+    };
+
+    let off = offset as usize;
+    if off >= file_data.len() {
+        return 0;
+    }
+    let available = file_data.len() - off;
+    let to_copy = core::cmp::min(available, buf.len());
+    buf[..to_copy].copy_from_slice(&file_data[off..off + to_copy]);
+    to_copy
+}
+
 /// List entries at a given path (directory listing)
 pub fn list_path(path: &str) -> Result<Vec<String>, VfsError> {
     VFS_METRICS.operations_count.fetch_add(1, Ordering::Relaxed);

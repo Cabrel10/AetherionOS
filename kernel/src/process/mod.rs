@@ -731,12 +731,15 @@ pub fn add_vma(pid: u64, vma: VirtualMemoryArea) -> Option<()> {
 
 /// Find a VMA that contains the given virtual address
 /// Returns (file_path, file_offset_for_this_page, writable)
+/// NOTE: The returned file_offset is page-aligned so the page fault handler
+/// reads exactly 4 KiB starting at the correct file page boundary.
 pub fn find_vma(pid: u64, addr: u64) -> Option<(String, u64, bool)> {
     with_process(pid, |p| {
         for vma in &p.vmas {
             if addr >= vma.vaddr_start && addr < vma.vaddr_end {
-                let page_offset = addr - vma.vaddr_start;
-                let file_offset = vma.file_offset + page_offset;
+                // Page-align: compute offset from start of VMA, rounded down to 4K
+                let offset_in_vma = (addr - vma.vaddr_start) & !0xFFF;
+                let file_offset = vma.file_offset + offset_in_vma;
                 return Some((vma.file_path.clone(), file_offset, vma.writable));
             }
         }

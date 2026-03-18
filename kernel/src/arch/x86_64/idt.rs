@@ -362,9 +362,10 @@ extern "x86-interrupt" fn page_fault_handler(
         // Fall through to SIGSEGV
     }
 
-    // --- Demand paging for VMA-backed regions (Jalon 68: Zero-Copy Model Loading) ---
+    // --- Demand paging for VMA-backed regions (Jalon 68/76: Zero-Copy Model Loading) ---
     // Check if the faulting address is in a file-backed VMA.
     // If so, allocate a frame, read the file data into it, and map it.
+    // Supports: in-memory VFS files (/sys/*, /bin/*), exFAT, and FAT32 on /disk/.
     if is_user_mode {
         let current_pid = crate::scheduler::current_pid();
         if current_pid != 0 {
@@ -379,24 +380,26 @@ extern "x86-interrupt" fn page_fault_handler(
                     unsafe { core::ptr::write_bytes(buf_ptr, 0, 4096); }
                     
                     // Read 4 KB from the file at the correct offset
-                    let mut page_buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, 4096) };
+                    let page_buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, 4096) };
                     
-                    // Try exFAT first, then FAT32
-                    let bytes_read = if crate::fs::exfat::is_mounted() {
-                        // Strip /disk/ prefix for exFAT
-                        let name = if file_path.starts_with("/disk/") {
-                            &file_path[6..]
-                        } else {
-                            &file_path
-                        };
-                        crate::fs::exfat::read_file(name, file_offset, page_buf)
-                    } else {
-                        // FAT32 fallback: read via VFS
-                        crate::fs::fat32::read_file_at_offset(&file_path, file_offset, page_buf)
-                            .unwrap_or(0)
-                    };
+                    // Priority 1: Try in-memory VFS (for /sys/*, /bin/*, etc.)
+                    let mut bytes_read = crate::fs::vfs::file_read_at_offset(&file_path, file_offset, page_buf);
                     
-                    // Map the page
+                    // Priority 2: Try exFAT (for /disk/ paths)
+                    if bytes_read == 0 && file_path.starts_with("/disk/") {
+                        if crate::fs::exfat::is_mounted() {
+                            let name = &file_path[6..];
+                            bytes_read = crate::fs::exfat::read_file(name, file_offset, page_buf);
+                        }
+                    }
+                    
+                    // Priority 3: FAT32 fallback
+                    if bytes_read == 0 {
+                        bytes_read = crate::fs::fat32::read_file_at_offset(&file_path, file_offset, page_buf)
+                            .unwrap_or(0);
+                    }
+                    
+                    // Map the page (even if bytes_read < 4096, rest is zeroed)
                     let cr3: u64;
                     unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)); }
                     let pml4_phys = cr3 & !0xFFF;
