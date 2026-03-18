@@ -1095,6 +1095,8 @@ fn generate_response(
         // Process all layers
         for layer in 0..cfg.n_layers {
             transformer_forward_layer(layer, pos, cfg, lw, scratch);
+            // Jalon 75: Yield between layers to avoid starving terminal
+            if layer % 2 == 0 { sys_yield(); }
         }
 
         // Final RMSNorm + logits

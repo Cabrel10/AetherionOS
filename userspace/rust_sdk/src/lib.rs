@@ -846,9 +846,20 @@ unsafe impl GlobalAlloc for AetherionAllocator {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
+    // Jalon 75: Use a STATIC buffer to avoid heap allocation during panic.
+    // If panic occurs before heap init (or during alloc), we must never allocate.
+    static mut PANIC_BUF: [u8; 256] = [0u8; 256];
     sys_write(2, b"\n[PANIC] Rust agent panic: ");
     if let Some(loc) = info.location() {
-        sys_write(2, loc.file().as_bytes());
+        // Safe: single-threaded userspace, only one panic handler at a time
+        let file_bytes = loc.file().as_bytes();
+        let copy_len = if file_bytes.len() > 200 { 200 } else { file_bytes.len() };
+        unsafe {
+            for i in 0..copy_len {
+                PANIC_BUF[i] = file_bytes[i];
+            }
+            sys_write(2, &PANIC_BUF[..copy_len]);
+        }
         sys_write(2, b":");
         print_u64_to_fd(2, loc.line() as u64);
     }
@@ -901,6 +912,13 @@ extern "C" {
 /// Raw assembly _start: call main, then syscall exit with return value.
 /// Ensures no compiler-generated stack realignment that would break
 /// the 16-byte alignment invariant required by SSE movaps instructions.
+/// Jalon 75: Explicit allocator init before main().
+/// This ensures the heap is ready even if main() allocates immediately.
+#[no_mangle]
+pub extern "C" fn _aetherion_runtime_init() {
+    ALLOCATOR.ensure_init();
+}
+
 #[naked]
 #[no_mangle]
 pub unsafe extern "C" fn _start() -> ! {
@@ -908,6 +926,10 @@ pub unsafe extern "C" fn _start() -> ! {
         // RSP is 16-byte aligned here (from IRETQ).
         // CALL pushes 8-byte return address -> RSP becomes 8 mod 16.
         // This is exactly what the x86_64 SysV ABI expects on function entry.
+        //
+        // Jalon 75: Initialize allocator BEFORE main() to prevent
+        // panic in alloc_error_handler before heap is set up.
+        "call _aetherion_runtime_init",
         "call main",
         // main() returned in RAX. Use it as exit code.
         "mov rdi, rax",      // exit code = main() return value

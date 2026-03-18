@@ -310,9 +310,11 @@ pub extern "C" fn main() -> i64 {
         return 1;
     }
 
-    // Print tensor name
-    let name_print = if name_len > 40 { 40 } else { name_len };
-    sys_write(1, &header[offset..offset + name_print]);
+    // Print tensor name (bounded to prevent OOB)
+    let name_print = core::cmp::min(name_len, core::cmp::min(40, (n as usize).saturating_sub(offset)));
+    if name_print > 0 {
+        sys_write(1, &header[offset..offset + name_print]);
+    }
     offset = name_end;
 
     let n_dims = read_u32(header, offset) as usize;

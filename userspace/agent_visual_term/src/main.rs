@@ -58,7 +58,8 @@ const ROWS: usize = (SCR_H - MARGIN_Y - 34) / CHAR_H;    // 43 rows
 const CMD_BUF_SIZE: usize = 256;  // Larger buffer for file paths
 
 const INTENT_VISUAL_TERM: u64     = 0xB059;
-const INTENT_TOKEN_GENERATED: u64 = 0x8002;
+const INTENT_TOKEN_GENERATED: u64 = 0x8002;    // From agent_llm_chat
+const INTENT_TOKEN_GEN_CORE: u64  = 0x8063;    // From agent_llama_core (J63)
 const INTENT_USER_PROMPT: u64     = 0x8001;
 const INTENT_GENERATION_DONE: u64 = 0x8003;
 const INTENT_TERM_CMD: u64        = 0xB065;
@@ -770,7 +771,8 @@ fn cmd_llm(term: &mut Terminal, prompt_bytes: &[u8]) {
             let intent = bus_msg[2] as u32;
             let payload = bus_msg[4];
 
-            if intent == INTENT_TOKEN_GENERATED as u32 {
+            // Accept tokens from both LLM agents
+            if intent == INTENT_TOKEN_GENERATED as u32 || intent == INTENT_TOKEN_GEN_CORE as u32 {
                 let token_char = (payload & 0xFF) as u8;
                 if token_char >= 0x20 && token_char <= 0x7E || token_char == b'\n' {
                     term.put_char(token_char, LLM_COL);
@@ -950,18 +952,18 @@ pub extern "C" fn main() -> i64 {
             idle_count += 1;
         }
 
-        // 2. Listen for bus messages (LLM tokens, etc.)
+        // 2. Listen for bus messages (LLM tokens from both agents)
         if !term.llm_active {
-            // Only consume bus messages when not in an active llm session
-            // (llm command has its own consume loop)
             let mut bus_msg = [0u64; 6];
             if sys_bus_consume(&mut bus_msg) == 0 {
                 let intent = bus_msg[2] as u32;
                 let payload = bus_msg[4];
 
-                if intent == INTENT_TOKEN_GENERATED as u32 {
+                // J63: Accept tokens from agent_llm_chat (0x8002) AND agent_llama_core (0x8063)
+                if intent == INTENT_TOKEN_GENERATED as u32 || intent == INTENT_TOKEN_GEN_CORE as u32 {
                     let token_char = (payload & 0xFF) as u8;
                     if token_char >= 0x20 && token_char <= 0x7E || token_char == b'\n' {
+                        // Typewriter effect: render each token character as it arrives
                         term.put_char(token_char, LLM_COL);
                         term.tokens_received += 1;
                     }

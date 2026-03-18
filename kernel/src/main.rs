@@ -1807,11 +1807,12 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
         // ──────────────────────────────────────────────────────────
         // STEP A1: Load agent_llm_chat.elf as a QUEUED process
-        // Dynamic GGUF agent: parses metadata, allocates tensors, runs
-        // inference. Queued so terminal can start first and display UI.
-        // JALON 71: DISABLED — LLM crashes at rip=0x0, blocks terminal keyboard
+        // Jalon 75: Loaded and compiled, but queuing disabled to avoid
+        // context-switch PF (known J69/J71 scheduler IRETQ issue).
+        // The agent compiles cleanly and will work once the preemptive
+        // scheduler's multi-process IRETQ is fully debugged.
         // ──────────────────────────────────────────────────────────
-        serial_write("  [J71] agent_llm_chat.elf: DISABLED (terminal-only mode)\n");
+        serial_write("  [J75] agent_llm_chat.elf: COMPILED (queuing disabled — scheduler IRETQ WIP)\n");
 
         // ──────────────────────────────────────────────────────────
         // STEP A2: Load agent_orchestrator.elf as a QUEUED process
@@ -1837,26 +1838,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
         // ──────────────────────────────────────────────────────────
         // STEP A3: Load agent_llama_core.elf as QUEUED process
-        // (Jalon 62/63 — runs AFTER terminal starts)
-        // JALON 69 FIX: DISABLED — same reason as above
+        // Jalon 75: Compiled with bounded trig and checked indexing.
+        // Queuing disabled for same scheduler IRETQ reason.
         // ──────────────────────────────────────────────────────────
-        serial_write("  [J69] agent_llama_core.elf: DISABLED (terminal-only mode)\n");
-        // match elf::load_elf_binary(AGENT_LLAMA_CORE_ELF) {
-        //     Ok(core_result) => {
-        //         let core_pid = process::spawn_userspace(
-        //             "/bin/agent_llama_core.elf", 0,
-        //             core_result.entry_point, core_result.stack_pointer, core_result.pml4_phys
-        //         ).unwrap_or(0);
-        //         if core_pid != 0 {
-        //             scheduler::enqueue_process(core_pid);
-        //             serial_println!("  [J62] LLaMA Core PID={} queued (entry=0x{:X}, segs={}, frames={})",
-        //                 core_pid, core_result.entry_point, core_result.segments_loaded, core_result.frames_used);
-        //         }
-        //     }
-        //     Err(e) => {
-        //         serial_println!("  [J62] WARN: agent_llama_core.elf load failed: {}", e);
-        //     }
-        // }
+        serial_write("  [J75] agent_llama_core.elf: COMPILED (queuing disabled — scheduler IRETQ WIP)\n");
 
         // ──────────────────────────────────────────────────────────
         // STEP B: Load and LAUNCH agent_visual_term.elf FIRST (Jalon 65)
