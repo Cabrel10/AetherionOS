@@ -368,6 +368,84 @@ pub fn sys_gethostbyname(name_addr: u64) -> u64 {
     }
 }
 
+/// Close a socket and clean up resources
+pub fn sys_socket_close(fd: u32) -> u64 {
+    // If TCP and connected, do TCP shutdown first
+    {
+        let table = SOCKET_TABLE.lock();
+        if let Some(s) = table.get(&fd) {
+            if s.tcp_connected {
+                let (lp, rip, rp) = (s.tcp_local_port, s.tcp_remote_ip, s.tcp_remote_port);
+                drop(table);
+                let _ = super::tcp::tcp_close(lp, rip, rp);
+            }
+        }
+    }
+    // Remove from socket table
+    let mut table = SOCKET_TABLE.lock();
+    match table.remove(&fd) {
+        Some(_) => {
+            crate::serial_println!("[SOCKET] fd={} closed", fd);
+            0
+        }
+        None => (-9i64) as u64, // EBADF
+    }
+}
+
+/// TCP receive with blocking poll (timeout ~500ms worth of iterations)
+/// Polls the network repeatedly to wait for incoming data before returning 0
+pub fn sys_tcp_recv_blocking(fd: u32, buf_addr: u64, len: u64) -> u64 {
+    let (local_port, remote_ip, remote_port, connected) = {
+        let table = SOCKET_TABLE.lock();
+        match table.get(&fd) {
+            Some(s) if s.tcp_connected => (s.tcp_local_port, s.tcp_remote_ip, s.tcp_remote_port, true),
+            _ => return (-9i64) as u64,
+        }
+    };
+
+    if !connected {
+        return (-107i64) as u64; // ENOTCONN
+    }
+
+    // Try up to 500,000 poll iterations (~500ms at typical instruction speed)
+    for attempt in 0..500_000u32 {
+        super::poll();
+
+        let mut temp_buf = alloc::vec![0u8; len as usize];
+        match super::tcp::tcp_recv(local_port, remote_ip, remote_port, &mut temp_buf) {
+            Ok(bytes_read) if bytes_read > 0 => {
+                unsafe {
+                    let dst = buf_addr as *mut u8;
+                    for i in 0..bytes_read {
+                        core::ptr::write_volatile(dst.add(i), temp_buf[i]);
+                    }
+                }
+                return bytes_read as u64;
+            }
+            Ok(0) => {
+                // Check if connection closed
+                let state = super::tcp::get_state(local_port, remote_ip, remote_port);
+                if state == super::tcp::TcpState::CloseWait || state == super::tcp::TcpState::Closed {
+                    return 0; // EOF
+                }
+            }
+            Err(e) => return e as u64,
+            _ => {}
+        }
+
+        if attempt % 50_000 == 0 && attempt > 0 {
+            // Periodic poll burst
+            for _ in 0..100 {
+                super::poll();
+                unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
+            }
+        }
+        unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
+    }
+
+    0 // No data after timeout (non-blocking return)
+}
+
 /// Deliver an incoming UDP packet to the appropriate socket
 pub fn deliver_udp(src_ip: Ipv4Addr, src_port: u16, dst_port: u16, data: &[u8]) {
     let mut table = SOCKET_TABLE.lock();

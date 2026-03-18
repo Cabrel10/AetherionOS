@@ -304,6 +304,9 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         17 => sys_pread64(a1 as u32, a2, a3),       // Jalon 73: pread64(fd, buf|len_hi16, offset|count_lo48)
         250 => sys_getprocs(a1, a2),                 // Jalon 73: list processes to user buffer
         251 => sys_sysinfo(a1),                       // Jalon 73: system info to user buffer
+        213 => sys_tcp_recv_blocking(a1 as u32, a2, a3), // Jalon 76: TCP recv with poll timeout
+        214 => sys_socket_close(a1 as u32),              // Jalon 76: close socket fd
+        260 => sys_xhci_info(a1),                        // Jalon 77: xHCI controller info
         _ => {
             crate::serial_println!("[SYSCALL] Unknown nr={} a1=0x{:X} a2=0x{:X} a3=0x{:X}", nr, a1, a2, a3);
             ENOSYS
@@ -2526,6 +2529,40 @@ fn sys_tcp_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
         return EFAULT;
     }
     crate::net::socket::sys_tcp_recv(fd, buf_addr, len)
+}
+
+/// sys_tcp_recv_blocking(fd, buf_addr, len) -> bytes read (polls network with timeout)
+fn sys_tcp_recv_blocking(fd: u32, buf_addr: u64, len: u64) -> u64 {
+    if !validate_user_ptr(buf_addr, len) {
+        return EFAULT;
+    }
+    crate::serial_println!("[SYSCALL] sys_tcp_recv_blocking(fd={}, len={})", fd, len);
+    crate::net::socket::sys_tcp_recv_blocking(fd, buf_addr, len)
+}
+
+/// sys_socket_close(fd) -> 0 or error
+fn sys_socket_close(fd: u32) -> u64 {
+    crate::serial_println!("[SYSCALL] sys_socket_close(fd={})", fd);
+    crate::net::socket::sys_socket_close(fd)
+}
+
+/// sys_xhci_info(buf_addr) -> 0 or error
+/// Writes xHCI controller info to user buffer (if available)
+fn sys_xhci_info(buf_addr: u64) -> u64 {
+    if !validate_user_ptr(buf_addr, 64) {
+        return EFAULT;
+    }
+    let info = crate::drivers::usb::xhci::get_info_string();
+    let bytes = info.as_bytes();
+    let copy_len = core::cmp::min(bytes.len(), 63);
+    unsafe {
+        let dst = buf_addr as *mut u8;
+        for i in 0..copy_len {
+            core::ptr::write_volatile(dst.add(i), bytes[i]);
+        }
+        core::ptr::write_volatile(dst.add(copy_len), 0); // null terminate
+    }
+    copy_len as u64
 }
 
 // ===== sys_brk(new_break) - Jalon 27 =====

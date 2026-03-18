@@ -63,7 +63,7 @@ mod framebuffer;
 mod font;
 
 // ===== Configuration =====
-const KERNEL_VERSION: &str = "2.1.0-j69-stable-terminal";
+const KERNEL_VERSION: &str = "2.2.0-j77-tcp-xhci";
 
 // ===== Embedded ELF binaries =====
 /// Minimal hello.elf - statically linked x86-64 ELF for Ring 3 test
@@ -176,6 +176,9 @@ static AGENT_Q4_DEQUANT_ELF: &[u8] = include_bytes!("../../userspace/agent_q4_de
 
 /// agent_llama_core - Jalon 62/63 LLaMA Transformer Core (Ring 3)
 static AGENT_LLAMA_CORE_ELF: &[u8] = include_bytes!("../../userspace/agent_llama_core/target/x86_64-aetherion-user/release/agent_llama_core");
+
+/// wget_real - Jalon 78 TCP Socket Validation (Ring 3 C app)
+static WGET_REAL_ELF: &[u8] = include_bytes!("../../userspace/c_apps/wget_real.elf");
 
 // VGA text buffer
 const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
@@ -1169,7 +1172,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_write("║  Version: ");
     serial_write(KERNEL_VERSION);
     serial_write("\n");
-    serial_write("║  Jalon 68: PS/2 Fix + 8GB Heap + Mistral Loader  ║\n");
+    serial_write("║  Jalon 77: TCP/IP Sockets + USB 3.0 xHCI Driver  ║\n");
     serial_write("╚══════════════════════════════════════════════════╝\n\n");
 
     serial_write("[BOOT] Phase 1: Hardware Abstraction Layer\n");
@@ -1460,6 +1463,13 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     drivers::mouse::init();
     drivers::mouse::run_tests();
 
+    // ===================================================================
+    // JALON 77: USB 3.0 xHCI CONTROLLER DETECTION
+    // ===================================================================
+    serial_write("\n[17c/19] USB 3.0 xHCI Controller (Jalon 77)...\n");
+    drivers::usb::xhci::init();
+    drivers::usb::xhci::run_tests();
+
     serial_write("\n[18/19] FAT32 Filesystem (Couche 19)...\n");
     fs::fat32::init();
     fs::fat32::run_tests();
@@ -1730,6 +1740,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     alloc::string::String::from("agent_llama_core.elf"),
                     fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_LLAMA_CORE_ELF)),
                 );
+                bin_dir.insert(
+                    alloc::string::String::from("wget_real.elf"),
+                    fs::vfs::VfsNode::File(alloc::vec::Vec::from(WGET_REAL_ELF)),
+                );
                 serial_println!("       [OK] /bin/ls.elf ({} bytes)", LS_ELF.len());
                 serial_println!("       [OK] /bin/cat.elf ({} bytes)", CAT_ELF.len());
                 serial_println!("       [OK] /bin/j19_test.elf ({} bytes)", J19_TEST_ELF.len());
@@ -1766,6 +1780,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 serial_println!("       [OK] /bin/agent_visual_term.elf ({} bytes)", AGENT_VISUAL_TERM_ELF.len());
                 serial_println!("       [OK] /bin/agent_q4_dequant.elf ({} bytes)", AGENT_Q4_DEQUANT_ELF.len());
                 serial_println!("       [OK] /bin/agent_llama_core.elf ({} bytes)", AGENT_LLAMA_CORE_ELF.len());
+                serial_println!("       [OK] /bin/wget_real.elf ({} bytes)", WGET_REAL_ELF.len());
             }
         }
     }
@@ -1793,8 +1808,8 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_write("\n[BOOT] Phase 6: Userspace Launch\n");
     serial_write("[BOOT] ──────────────────────────────────────\n");
     serial_write("\n╔══════════════════════════════════════════════════╗\n");
-    serial_write("║  Jalon 62/63/68: Ring 3 Agent Launch Sequence     ║\n");
-    serial_write("║  LLM Chat (8GB heap), Visual Terminal, Orchestr.  ║\n");
+    serial_write("║  Jalon 76/77/78: Ring 3 Agent Launch Sequence     ║\n");
+    serial_write("║  TCP Sockets + xHCI + Visual Terminal + wget_real ║\n");
     serial_write("║  PS/2 Translation FIX applied — keyboard ACTIVE   ║\n");
     serial_write("╚══════════════════════════════════════════════════╝\n");
     {
@@ -1855,16 +1870,23 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         let load_result = elf::load_elf_binary(elf_binary);
         match load_result {
             Ok(result) => {
+                // CRITICAL: Extract values to local vars BEFORE any serial_println!
+                // The macro uses ArrayString<256> on stack which can corrupt `result`.
+                let entry = result.entry_point;
+                let stack = result.stack_pointer;
+                let pml4 = result.pml4_phys;
+                let segs = result.segments_loaded;
+                let frames = result.frames_used;
+
                 serial_println!(
                     "  [OK] entry=0x{:X}, stack=0x{:X}, PML4=0x{:X}, segs={}, frames={}",
-                    result.entry_point, result.stack_pointer, result.pml4_phys,
-                    result.segments_loaded, result.frames_used
+                    entry, stack, pml4, segs, frames
                 );
 
                 // Create a process record
                 let pid = process::spawn_userspace(
                     elf_name, 0,
-                    result.entry_point, result.stack_pointer, result.pml4_phys
+                    entry, stack, pml4
                 ).unwrap_or(0);
                 if pid != 0 {
                     scheduler::enqueue_process(pid);
@@ -1895,9 +1917,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                         "push 0x23",
                         "push {rip_val}",
                         "iretq",
-                        cr3_val = in(reg) result.pml4_phys,
-                        rsp_val = in(reg) result.stack_pointer,
-                        rip_val = in(reg) result.entry_point,
+                        cr3_val = in(reg) pml4,
+                        rsp_val = in(reg) stack,
+                        rip_val = in(reg) entry,
                         options(noreturn),
                     );
                 }

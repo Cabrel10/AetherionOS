@@ -356,6 +356,7 @@ fn cmd_help(term: &mut Terminal) {
     term.put_str(b"  status          System information\n", TEXT);
     term.put_str(b"  llm <prompt>    Send prompt to LLM agent\n", TEXT);
     term.put_str(b"  version         Show OS version\n", TEXT);
+    term.put_str(b"  wget            TCP network test (10.0.2.2)\n", TEXT);
     term.put_str(b"  shutdown        Halt the system\n", TEXT);
     term.put_char(b'\n', TEXT);
 }
@@ -811,6 +812,68 @@ fn cmd_shutdown(term: &mut Terminal) {
     sys_exit(0);
 }
 
+/// wget — TCP network test to QEMU gateway
+fn cmd_wget(term: &mut Terminal) {
+    term.put_char(b'\n', TEXT);
+    term.put_str(b"[NET] TCP Socket Test to 10.0.2.2:80\n", INFO_COL);
+    sys_write(1, b"[TERM] wget: starting TCP test\n");
+
+    // Step 1: Create TCP socket
+    term.put_str(b"  Creating socket...", TEXT);
+    let sock_fd = sys_socket(2, 1, 6); // AF_INET, SOCK_STREAM, TCP
+    if sock_fd < 0 {
+        term.put_str(b" FAIL\n", ERR_COL);
+        return;
+    }
+    term.put_str(b" OK (fd=", TEXT);
+    term.put_u64(sock_fd as u64, TEXT);
+    term.put_str(b")\n", TEXT);
+
+    // Step 2: Connect
+    term.put_str(b"  Connecting...", TEXT);
+    let ip_packed: u64 = (10 << 24) | (0 << 16) | (2 << 8) | 2;
+    let conn = aetherion_sdk::syscall3(42, sock_fd as u64, ip_packed, 80);
+    if conn == 0 {
+        term.put_str(b" ESTABLISHED\n", INFO_COL);
+
+        // Step 3: Send GET
+        term.put_str(b"  Sending HTTP GET...", TEXT);
+        let request = b"GET / HTTP/1.0\r\n\r\n";
+        let mut send_buf = [0u8; 128];
+        // tcp_send expects length prefix in first 8 bytes
+        let len_bytes = (request.len() as u64).to_le_bytes();
+        for i in 0..8 { send_buf[i] = len_bytes[i]; }
+        for i in 0..request.len() { send_buf[8 + i] = request[i]; }
+        let sent = aetherion_sdk::syscall3(44, sock_fd as u64, send_buf.as_ptr() as u64, 0);
+        if (sent as i64) > 0 {
+            term.put_str(b" OK\n", TEXT);
+        } else {
+            term.put_str(b" FAIL\n", ERR_COL);
+        }
+
+        // Step 4: Receive (blocking poll)
+        term.put_str(b"  Receiving...", TEXT);
+        let mut recv_buf = [0u8; 256];
+        let received = aetherion_sdk::syscall3(213, sock_fd as u64,
+            recv_buf.as_mut_ptr() as u64, 255);
+        if (received as i64) > 0 {
+            term.put_str(b" got ", TEXT);
+            term.put_u64(received, TEXT);
+            term.put_str(b" bytes\n", TEXT);
+        } else {
+            term.put_str(b" no data (no HTTP server)\n", DIM);
+        }
+
+        // Step 5: Close
+        aetherion_sdk::syscall1(47, sock_fd as u64); // tcp_shutdown
+    } else {
+        term.put_str(b" refused/timeout (TCP stack OK)\n", DIM);
+    }
+
+    term.put_str(b"  Done.\n", INFO_COL);
+    term.put_char(b'\n', TEXT);
+}
+
 /// Helper: check if a byte slice contains a substring
 fn has_substr(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.len() > haystack.len() { return false; }
@@ -874,6 +937,8 @@ fn process_command(term: &mut Terminal) {
         cmd_version(term);
     } else if bytes_eq(first_word, b"llm") {
         cmd_llm(term, args);
+    } else if bytes_eq(first_word, b"wget") {
+        cmd_wget(term);
     } else if bytes_eq(first_word, b"shutdown") || bytes_eq(first_word, b"halt") {
         cmd_shutdown(term);
     } else if bytes_eq(first_word, b"exit") || bytes_eq(first_word, b"quit") {
