@@ -4,3 +4,7 @@
 # DISABLED: This custom linker script was discarding .rodata section,
 # causing all string literals to disappear from the binary.
 # The default LLD linker with x86_64-aetherion-user.json is sufficient.
+
+[unstable]
+build-std = ["core", "compiler_builtins", "alloc"]
+build-std-features = ["compiler-builtins-mem"]

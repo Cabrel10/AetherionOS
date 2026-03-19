@@ -10,10 +10,24 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use core::fmt;
 
-// ===== File Descriptor Table =====
+// ===== File Descriptor Table (Jalon 79: Unified FD with FdType) =====
 
 /// Maximum number of file descriptors per process
-pub const MAX_FDS: usize = 16;
+pub const MAX_FDS: usize = 32;
+
+/// FD type discriminator — dispatches read/write/close to the correct subsystem.
+/// Jalon 79: Unified FD table for POSIX compatibility (musl requirement).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FdType {
+    /// Regular file backed by VFS or FAT32 (default)
+    File,
+    /// Network socket (TCP/UDP) — dispatches to net::socket
+    Socket,
+    /// Kernel pipe (pipe2 / pipe)
+    Pipe,
+    /// Terminal (stdin/stdout/stderr)
+    Tty,
+}
 
 /// A file descriptor entry
 #[derive(Debug, Clone)]
@@ -26,6 +40,10 @@ pub struct FileDescriptor {
     pub flags: u32,
     /// Is this FD active?
     pub active: bool,
+    /// Type discriminator for unified dispatch (Jalon 79)
+    pub fd_type: FdType,
+    /// Socket ID (only valid when fd_type == Socket)
+    pub socket_id: u32,
 }
 
 impl FileDescriptor {
@@ -35,6 +53,30 @@ impl FileDescriptor {
             offset: 0,
             flags,
             active: true,
+            fd_type: FdType::File,
+            socket_id: 0,
+        }
+    }
+
+    pub fn new_typed(path: &str, flags: u32, fd_type: FdType) -> Self {
+        FileDescriptor {
+            path: String::from(path),
+            offset: 0,
+            flags,
+            active: true,
+            fd_type,
+            socket_id: 0,
+        }
+    }
+
+    pub fn new_socket(socket_id: u32) -> Self {
+        FileDescriptor {
+            path: String::from("socket"),
+            offset: 0,
+            flags: 2, // O_RDWR
+            active: true,
+            fd_type: FdType::Socket,
+            socket_id,
         }
     }
 
@@ -44,6 +86,8 @@ impl FileDescriptor {
             offset: 0,
             flags: 0,
             active: false,
+            fd_type: FdType::File,
+            socket_id: 0,
         }
     }
 }
@@ -56,11 +100,12 @@ pub struct FdTable {
 
 impl FdTable {
     /// Create a new FD table with stdin(0), stdout(1), stderr(2)
+    /// Jalon 79: These are now typed as Tty for unified dispatch.
     pub fn new_with_stdio() -> Self {
         let mut entries = Vec::with_capacity(MAX_FDS);
-        entries.push(FileDescriptor::new("stdin", 0));   // FD 0 = stdin
-        entries.push(FileDescriptor::new("stdout", 1));  // FD 1 = stdout
-        entries.push(FileDescriptor::new("stderr", 1));  // FD 2 = stderr
+        entries.push(FileDescriptor::new_typed("stdin", 0, FdType::Tty));   // FD 0 = stdin
+        entries.push(FileDescriptor::new_typed("stdout", 1, FdType::Tty));  // FD 1 = stdout
+        entries.push(FileDescriptor::new_typed("stderr", 1, FdType::Tty));  // FD 2 = stderr
         FdTable { entries }
     }
 
@@ -71,17 +116,39 @@ impl FdTable {
 
     /// Allocate a new FD, returns the FD number or None
     pub fn alloc_fd(&mut self, path: &str, flags: u32) -> Option<usize> {
+        self.alloc_fd_typed(path, flags, FdType::File)
+    }
+
+    /// Allocate a new FD with explicit type (Jalon 79: unified FD)
+    pub fn alloc_fd_typed(&mut self, path: &str, flags: u32, fd_type: FdType) -> Option<usize> {
         // Try to reuse a closed FD slot
         for (i, entry) in self.entries.iter_mut().enumerate() {
             if !entry.active {
-                *entry = FileDescriptor::new(path, flags);
+                *entry = FileDescriptor::new_typed(path, flags, fd_type);
                 return Some(i);
             }
         }
         // Allocate new slot
         if self.entries.len() < MAX_FDS {
             let fd = self.entries.len();
-            self.entries.push(FileDescriptor::new(path, flags));
+            self.entries.push(FileDescriptor::new_typed(path, flags, fd_type));
+            Some(fd)
+        } else {
+            None
+        }
+    }
+
+    /// Allocate a socket FD (Jalon 79)
+    pub fn alloc_socket_fd(&mut self, socket_id: u32) -> Option<usize> {
+        for (i, entry) in self.entries.iter_mut().enumerate() {
+            if !entry.active {
+                *entry = FileDescriptor::new_socket(socket_id);
+                return Some(i);
+            }
+        }
+        if self.entries.len() < MAX_FDS {
+            let fd = self.entries.len();
+            self.entries.push(FileDescriptor::new_socket(socket_id));
             Some(fd)
         } else {
             None

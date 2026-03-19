@@ -443,7 +443,57 @@ extern "x86-interrupt" fn page_fault_handler(
     }
 
     // Kernel-mode page fault — fatal
-    crate::serial_println!("[EXCEPTION] #PF at {:?} addr=0x{:X}", stack_frame.instruction_pointer, addr_raw);
+    // Use raw serial writes to avoid formatting issues when the stack frame is corrupted
+    crate::serial_write("[PF-FATAL] user_mode=");
+    if is_user_mode { crate::serial_write("YES"); } else { crate::serial_write("NO"); }
+    crate::serial_write(" CR2=0x");
+    {
+        let mut buf = [b'0'; 16];
+        let mut v = addr_raw;
+        for i in (0..16).rev() {
+            let d = (v & 0xF) as u8;
+            buf[i] = if d < 10 { b'0' + d } else { b'A' + d - 10 };
+            v >>= 4;
+        }
+        unsafe { crate::serial_write(core::str::from_utf8_unchecked(&buf)); }
+    }
+    crate::serial_write(" RIP=0x");
+    {
+        let rip_val = stack_frame.instruction_pointer.as_u64();
+        let mut buf = [b'0'; 16];
+        let mut v = rip_val;
+        for i in (0..16).rev() {
+            let d = (v & 0xF) as u8;
+            buf[i] = if d < 10 { b'0' + d } else { b'A' + d - 10 };
+            v >>= 4;
+        }
+        unsafe { crate::serial_write(core::str::from_utf8_unchecked(&buf)); }
+    }
+    crate::serial_write(" CS=0x");
+    {
+        let cs_val = stack_frame.code_segment;
+        let mut buf = [b'0'; 4];
+        let mut v = cs_val as u64;
+        for i in (0..4).rev() {
+            let d = (v & 0xF) as u8;
+            buf[i] = if d < 10 { b'0' + d } else { b'A' + d - 10 };
+            v >>= 4;
+        }
+        unsafe { crate::serial_write(core::str::from_utf8_unchecked(&buf)); }
+    }
+    crate::serial_write(" ERR=0x");
+    {
+        let err = error_code.bits();
+        let mut buf = [b'0'; 4];
+        let mut v = err;
+        for i in (0..4).rev() {
+            let d = (v & 0xF) as u8;
+            buf[i] = if d < 10 { b'0' + d } else { b'A' + d - 10 };
+            v >>= 4;
+        }
+        unsafe { crate::serial_write(core::str::from_utf8_unchecked(&buf)); }
+    }
+    crate::serial_write("\n");
     panic!("Kernel page fault at 0x{:X}", addr_raw);
 }
 

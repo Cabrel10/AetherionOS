@@ -68,6 +68,8 @@ const ENOENT: u64 = (-2i64) as u64;
 const EMFILE: u64 = (-24i64) as u64;
 const ENOSPC: u64 = (-28i64) as u64;
 const EEXIST: u64 = (-17i64) as u64;
+const EPERM:  u64 = (-1i64) as u64;
+const ENOTTY: u64 = (-25i64) as u64;
 
 // POSIX open flags
 const O_RDONLY: u32 = 0;
@@ -247,6 +249,44 @@ unsafe extern "C" fn syscall_entry() {
 
 // ===== Rust syscall dispatcher =====
 
+/// Print a u64 as decimal to serial using raw writes (no ArrayString alloc).
+/// Safe to use in ISR/fault contexts.
+fn print_u64_raw(val: u64) {
+    if val == 0 {
+        crate::serial_write("0");
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut v = val;
+    let mut pos = 20usize;
+    while v > 0 && pos > 0 {
+        pos -= 1;
+        buf[pos] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    let s = unsafe { core::str::from_utf8_unchecked(&buf[pos..20]) };
+    crate::serial_write(s);
+}
+
+/// Print a u64 value in hexadecimal (no 0x prefix) via serial
+fn print_hex_raw(val: u64) {
+    if val == 0 {
+        crate::serial_write("0");
+        return;
+    }
+    let hex = b"0123456789ABCDEF";
+    let mut buf = [0u8; 16];
+    let mut v = val;
+    let mut pos = 16usize;
+    while v > 0 && pos > 0 {
+        pos -= 1;
+        buf[pos] = hex[(v & 0xF) as usize];
+        v >>= 4;
+    }
+    let s = unsafe { core::str::from_utf8_unchecked(&buf[pos..16]) };
+    crate::serial_write(s);
+}
+
 /// Route syscall by number (Linux x86_64 ABI).
 /// Returns result in RAX.
 ///
@@ -259,59 +299,371 @@ extern "C" fn syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 }
 
 /// Internal syscall dispatch (separated for FPU save/restore wrapper).
+/// Jalon 79: Linux x86_64 ABI numbers with musl-libc stubs.
+/// Syscall numbers match Linux x86_64 ABI for POSIX compatibility.
 fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     match nr {
-        0  => sys_read(a1 as u32, a2, a3),
-        1  => sys_write(a1, a2, a3),
-        2  => sys_open(a1, a2 as u32),
-        3  => sys_close(a1 as u32),
-        8  => sys_seek(a1 as u32, a2 as i64, a3 as u32),
-        9  => sys_mmap(a1, a2, a3),
-        10 => sys_mmap_fb(a1),
-        12 => sys_brk(a1),             // Jalon 27: brk(new_break) for userspace malloc
-        20 => sys_getpid(),
-        24 => sys_yield(),
-        39 => sys_getppid(),
-        41 => sys_socket(a1 as u32, a2 as u32, a3 as u32),
-        42 => sys_tcp_connect(a1 as u32, a2, a3),
-        44 => sys_sendto(a1 as u32, a2, a3),
-        45 => sys_recvfrom(a1 as u32, a2, a3),
-        47 => sys_tcp_shutdown_syscall(a1 as u32),
-        49 => sys_bind(a1 as u32, a2 as u16),
-        56 => sys_clone(a1),
-        57 => sys_fork(),
-        59 => sys_exec(a1),
-        60 => sys_exit(a1),
-        61 => sys_wait(a1),
-        62 => sys_kill(a1, a2 as u32),
-        22 => sys_pipe(a1),             // Jalon 24: pipe(int pipefd[2])
-        33 => sys_dup2(a1 as u32, a2 as u32), // Jalon 24: dup2(oldfd, newfd)
-        78 => sys_getdents(a1 as u32, a2, a3), // Jalon 24: getdents(fd, buf, len)
+        // ── Core POSIX file I/O (Linux ABI) ──
+        0  => sys_read(a1 as u32, a2, a3),          // read(fd, buf, count)
+        1  => sys_write(a1, a2, a3),                 // write(fd, buf, count)
+        2  => sys_open(a1, a2 as u32),               // open(path, flags, mode)
+        3  => sys_close(a1 as u32),                  // close(fd)
+        4  => sys_stub_stat(a1, a2),                 // stat(path, buf)    [stub for musl]
+        5  => sys_stub_fstat(a1 as u32, a2),         // fstat(fd, buf)     [stub for musl]
+        7  => sys_stub_poll(a1, a2, a3),             // poll(fds, nfds, timeout) [stub]
+        8  => sys_seek(a1 as u32, a2 as i64, a3 as u32), // lseek(fd, off, whence)
+        9  => sys_mmap(a1, a2, a3),                  // mmap(addr, len, prot)
+        10 => sys_stub_mprotect(a1, a2, a3),         // mprotect [stub for musl]
+        11 => sys_poll_hid(),                        // AetherionOS: HID event polling
+        12 => sys_brk(a1),                           // brk(new_break)
+        16 => sys_stub_ioctl(a1 as u32, a2, a3),    // ioctl(fd, cmd, arg)  [stub for musl]
+        17 => sys_pread64(a1 as u32, a2, a3),        // pread64
+        19 => sys_stub_readv(a1 as u32, a2, a3),     // readv [stub for musl]
+        20 => sys_getpid(),                          // getpid()
+        22 => sys_pipe(a1),                          // pipe(pipefd[2])
+        24 => sys_yield(),                           // sched_yield()
+        33 => sys_dup2(a1 as u32, a2 as u32),        // dup2(oldfd, newfd)
+        35 => sys_stub_nanosleep(a1, a2),            // nanosleep [stub - yield]
+        39 => sys_getppid(),                         // getppid()
+        41 => sys_socket(a1 as u32, a2 as u32, a3 as u32), // socket(domain, type, proto)
+        42 => sys_tcp_connect(a1 as u32, a2, a3),    // connect(fd, addr, len)
+        43 => sys_stub_accept(a1 as u32, a2, a3),    // accept [stub for musl]
+        44 => sys_sendto(a1 as u32, a2, a3),         // sendto
+        45 => sys_recvfrom(a1 as u32, a2, a3),       // recvfrom
+        47 => sys_tcp_shutdown_syscall(a1 as u32),   // shutdown(fd, how) - reused
+        49 => sys_bind(a1 as u32, a2 as u16),        // bind(fd, addr, len)
+        50 => sys_stub_listen(a1 as u32, a2),        // listen [stub for musl]
+        56 => sys_clone(a1),                         // clone(flags)
+        57 => sys_fork(),                            // fork()
+        59 => sys_exec(a1),                          // execve(path, argv, envp)
+        60 => sys_exit(a1),                          // exit(code)
+        61 => sys_wait(a1),                          // wait4(pid)
+        62 => sys_kill(a1, a2 as u32),               // kill(pid, sig)
+        63 => sys_stub_uname(a1),                    // uname(buf) [stub for musl]
+        72 => sys_stub_fcntl(a1 as u32, a2, a3),     // fcntl [stub for musl]
+        78 => sys_getdents(a1 as u32, a2, a3),       // getdents(fd, buf, len)
+        79 => sys_stub_getcwd(a1, a2),               // getcwd [stub for musl]
+        96 => sys_stub_gettimeofday(a1, a2),         // gettimeofday [stub]
+        97 => sys_stub_getrlimit(a1, a2),            // getrlimit [stub for musl]
+        102 => sys_stub_getuid(),                     // getuid [stub]
+        104 => sys_stub_getgid(),                     // getgid [stub]
+        107 => sys_stub_geteuid(),                    // geteuid [stub]
+        108 => sys_stub_getegid(),                    // getegid [stub]
+        110 => sys_stub_getppid_compat(),             // getpgrp [stub]
+        131 => sys_stub_sigaltstack(a1, a2),          // sigaltstack [stub for musl]
+        158 => sys_stub_arch_prctl(a1, a2),           // arch_prctl [stub for musl]
+        186 => sys_stub_gettid(),                     // gettid [stub]
+        201 => sys_stub_time(a1),                     // time [stub]
+        218 => sys_stub_set_tid_address(a1),          // set_tid_address [stub for musl]
+        228 => sys_stub_clock_gettime(a1, a2),        // clock_gettime [stub for musl]
+        231 => sys_stub_exit_group(a1),               // exit_group = exit
+        257 => sys_stub_openat(a1, a2, a3),           // openat [routed to sys_open]
+        262 => sys_stub_newfstatat(a1, a2, a3),       // newfstatat [stub for musl]
+        302 => sys_stub_prlimit64(a1, a2, a3),        // prlimit64 [stub for musl]
+        318 => sys_stub_getrandom(a1, a2, a3),        // getrandom [stub for musl]
+
+        // ── AetherionOS custom syscalls (200-299) ──
         200 => sys_ps(),
-        201 => sys_bus_publish(a1, a2 as u32, a3),
+        // 201 => used by Linux time() stub above
         202 => sys_vga_write(a1 as usize, a2 as usize, a3),
-        203 => sys_bus_consume(a1),                // Jalon 71: Consume message from Cognitive Bus
+        203 => sys_bus_consume(a1),
         210 => sys_net_ping(a1, a2 as u16),
         211 => sys_gethostbyname(a1),
         212 => sys_tcp_read(a1 as u32, a2, a3),
-        11 => sys_poll_hid(),                     // Jalon 38: HID event polling
-        220 => sys_fb_fill_rect(a1, a2, a3),      // Jalon 39: Framebuffer fill rect
-        221 => sys_fb_draw_char(a1, a2),           // Jalon 39: Framebuffer draw char
-        222 => sys_fb_draw_string(a1, a2, a3),     // Jalon 39: Framebuffer draw string
-        223 => sys_fb_get_info(a1),                // Jalon 39: Framebuffer get info
-        230 => sys_rdtsc(),                        // Jalon 40: Read TSC
-        240 => sys_mmap_file(a1, a2, a3),           // Jalon 68: File-backed mmap (fd, length, offset)
-        17 => sys_pread64(a1 as u32, a2, a3),       // Jalon 73: pread64(fd, buf|len_hi16, offset|count_lo48)
-        250 => sys_getprocs(a1, a2),                 // Jalon 73: list processes to user buffer
-        251 => sys_sysinfo(a1),                       // Jalon 73: system info to user buffer
-        213 => sys_tcp_recv_blocking(a1 as u32, a2, a3), // Jalon 76: TCP recv with poll timeout
-        214 => sys_socket_close(a1 as u32),              // Jalon 76: close socket fd
-        260 => sys_xhci_info(a1),                        // Jalon 77: xHCI controller info
+        213 => sys_tcp_recv_blocking(a1 as u32, a2, a3),
+        214 => sys_socket_close(a1 as u32),
+        220 => sys_fb_fill_rect(a1, a2, a3),
+        221 => sys_fb_draw_char(a1, a2),
+        222 => sys_fb_draw_string(a1, a2, a3),
+        223 => sys_fb_get_info(a1),
+        230 => sys_rdtsc(),
+        240 => sys_mmap_file(a1, a2, a3),
+        250 => sys_getprocs(a1, a2),
+        251 => sys_sysinfo(a1),
+        260 => sys_xhci_info(a1),
+
+        // ── AetherionOS custom IPC (remap bus_publish to avoid conflict with Linux 201) ──
+        270 => sys_bus_publish(a1, a2 as u32, a3),
+
         _ => {
-            crate::serial_println!("[SYSCALL] Unknown nr={} a1=0x{:X} a2=0x{:X} a3=0x{:X}", nr, a1, a2, a3);
+            // Only log truly unknown syscalls (not common musl probes)
+            if nr < 400 {
+                crate::serial_write("[SYSCALL] Unknown nr=");
+                print_u64_raw(nr);
+                crate::serial_write("\n");
+            }
             ENOSYS
         }
     }
+}
+
+// ===== Musl-libc Stub Syscalls (Jalon 79: POSIX Compatibility) =====
+// These return sensible defaults so musl-linked binaries don't crash.
+
+/// stat(path, buf) -> 0 (fills minimal stat struct)
+fn sys_stub_stat(_path_addr: u64, buf_addr: u64) -> u64 {
+    if !validate_user_ptr(buf_addr, 144) { return EFAULT; }
+    // Zero the struct (144 bytes = sizeof(struct stat) on x86_64)
+    unsafe {
+        let dst = buf_addr as *mut u8;
+        for i in 0..144 { core::ptr::write_volatile(dst.add(i), 0); }
+        // st_mode at offset 24: S_IFREG | 0644 = 0o100644 = 33188
+        let mode_ptr = (buf_addr + 24) as *mut u32;
+        core::ptr::write_volatile(mode_ptr, 0o100644);
+        // st_blksize at offset 56: 4096
+        let blk_ptr = (buf_addr + 56) as *mut u64;
+        core::ptr::write_volatile(blk_ptr, 4096);
+    }
+    0
+}
+
+/// fstat(fd, buf) -> 0
+fn sys_stub_fstat(fd: u32, buf_addr: u64) -> u64 {
+    if !validate_user_ptr(buf_addr, 144) { return EFAULT; }
+    unsafe {
+        let dst = buf_addr as *mut u8;
+        for i in 0..144 { core::ptr::write_volatile(dst.add(i), 0); }
+        let mode_ptr = (buf_addr + 24) as *mut u32;
+        if fd <= 2 {
+            // TTY: S_IFCHR | 0620 = 0o20620 = 8592
+            core::ptr::write_volatile(mode_ptr, 0o20620);
+        } else {
+            core::ptr::write_volatile(mode_ptr, 0o100644);
+        }
+        let blk_ptr = (buf_addr + 56) as *mut u64;
+        core::ptr::write_volatile(blk_ptr, 4096);
+    }
+    0
+}
+
+/// poll(fds, nfds, timeout) -> 0 (no events)
+fn sys_stub_poll(_fds: u64, _nfds: u64, _timeout: u64) -> u64 { 0 }
+
+/// mprotect(addr, len, prot) -> 0 (no-op)
+fn sys_stub_mprotect(_addr: u64, _len: u64, _prot: u64) -> u64 { 0 }
+
+/// ioctl(fd, cmd, arg) -> -ENOTTY for TTY queries, 0 otherwise
+fn sys_stub_ioctl(fd: u32, cmd: u64, _arg: u64) -> u64 {
+    // TIOCGWINSZ = 0x5413 -> return terminal size (80x25)
+    if cmd == 0x5413 {
+        if validate_user_ptr(_arg, 8) {
+            unsafe {
+                let ws = _arg as *mut u16;
+                core::ptr::write_volatile(ws, 25);       // ws_row
+                core::ptr::write_volatile(ws.add(1), 80); // ws_col
+                core::ptr::write_volatile(ws.add(2), 0);  // ws_xpixel
+                core::ptr::write_volatile(ws.add(3), 0);  // ws_ypixel
+            }
+            return 0;
+        }
+    }
+    // TCGETS = 0x5401 -> not a real TTY
+    if cmd == 0x5401 && fd <= 2 { return ENOTTY; }
+    0
+}
+
+/// readv(fd, iov, iovcnt) -> simulate with sequential reads
+fn sys_stub_readv(fd: u32, iov_addr: u64, iovcnt: u64) -> u64 {
+    if iovcnt == 0 { return 0; }
+    if !validate_user_ptr(iov_addr, iovcnt * 16) { return EFAULT; }
+    let mut total: u64 = 0;
+    for i in 0..core::cmp::min(iovcnt, 16) as usize {
+        let base_ptr = (iov_addr + (i * 16) as u64) as *const u64;
+        let len_ptr = (iov_addr + (i * 16 + 8) as u64) as *const u64;
+        let base = unsafe { core::ptr::read_volatile(base_ptr) };
+        let len = unsafe { core::ptr::read_volatile(len_ptr) };
+        if len > 0 && validate_user_ptr(base, len) {
+            let n = sys_read(fd, base, len);
+            if (n as i64) < 0 { return n; }
+            total += n;
+            if n < len { break; } // short read
+        }
+    }
+    total
+}
+
+/// nanosleep -> yield and return 0
+fn sys_stub_nanosleep(_req: u64, _rem: u64) -> u64 {
+    sys_yield();
+    0
+}
+
+/// accept(fd, addr, addrlen) -> -ENOSYS (not yet implemented)
+fn sys_stub_accept(_fd: u32, _addr: u64, _addrlen: u64) -> u64 { ENOSYS }
+
+/// listen(fd, backlog) -> 0 (stub)
+fn sys_stub_listen(_fd: u32, _backlog: u64) -> u64 { 0 }
+
+/// uname(buf) -> fills with AetherionOS info
+fn sys_stub_uname(buf_addr: u64) -> u64 {
+    // struct utsname: 5 fields of 65 bytes each = 325 bytes
+    if !validate_user_ptr(buf_addr, 325) { return EFAULT; }
+    unsafe {
+        let dst = buf_addr as *mut u8;
+        // Zero first
+        for i in 0..325 { core::ptr::write_volatile(dst.add(i), 0); }
+        // sysname
+        let sysname = b"AetherionOS";
+        for (i, &b) in sysname.iter().enumerate() { core::ptr::write_volatile(dst.add(i), b); }
+        // nodename (offset 65)
+        let node = b"aetherion";
+        for (i, &b) in node.iter().enumerate() { core::ptr::write_volatile(dst.add(65 + i), b); }
+        // release (offset 130)
+        let rel = b"2.3.0-j79";
+        for (i, &b) in rel.iter().enumerate() { core::ptr::write_volatile(dst.add(130 + i), b); }
+        // version (offset 195)
+        let ver = b"#1 SMP";
+        for (i, &b) in ver.iter().enumerate() { core::ptr::write_volatile(dst.add(195 + i), b); }
+        // machine (offset 260)
+        let mach = b"x86_64";
+        for (i, &b) in mach.iter().enumerate() { core::ptr::write_volatile(dst.add(260 + i), b); }
+    }
+    0
+}
+
+/// fcntl(fd, cmd, arg) -> 0 or flags
+fn sys_stub_fcntl(fd: u32, cmd: u64, _arg: u64) -> u64 {
+    match cmd {
+        1 => 0,    // F_GETFD -> 0 (no CLOEXEC)
+        2 => 0,    // F_SETFD -> success
+        3 => 2,    // F_GETFL -> O_RDWR
+        4 => 0,    // F_SETFL -> success
+        _ => EINVAL,
+    }
+}
+
+/// getcwd(buf, size) -> writes "/" and returns buf
+fn sys_stub_getcwd(buf_addr: u64, size: u64) -> u64 {
+    if size < 2 || !validate_user_ptr(buf_addr, size) { return EFAULT; }
+    unsafe {
+        let dst = buf_addr as *mut u8;
+        core::ptr::write_volatile(dst, b'/');
+        core::ptr::write_volatile(dst.add(1), 0);
+    }
+    buf_addr
+}
+
+/// gettimeofday(tv, tz) -> 0 (returns TSC-based approximation)
+fn sys_stub_gettimeofday(tv_addr: u64, _tz: u64) -> u64 {
+    if tv_addr != 0 && validate_user_ptr(tv_addr, 16) {
+        let tsc: u64;
+        unsafe { asm!("rdtsc", "shl rdx, 32", "or rax, rdx", out("rax") tsc, out("rdx") _); }
+        let approx_secs = tsc / 2_000_000_000; // ~2 GHz approximation
+        let approx_usec = (tsc / 2_000) % 1_000_000;
+        unsafe {
+            core::ptr::write_volatile(tv_addr as *mut u64, approx_secs);
+            core::ptr::write_volatile((tv_addr + 8) as *mut u64, approx_usec);
+        }
+    }
+    0
+}
+
+/// getrlimit(resource, rlim) -> 0 with generous limits
+fn sys_stub_getrlimit(_resource: u64, rlim_addr: u64) -> u64 {
+    if !validate_user_ptr(rlim_addr, 16) { return EFAULT; }
+    unsafe {
+        // rlim_cur = rlim_max = 8 MiB (stack) or RLIM_INFINITY
+        let infinity: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+        core::ptr::write_volatile(rlim_addr as *mut u64, infinity);
+        core::ptr::write_volatile((rlim_addr + 8) as *mut u64, infinity);
+    }
+    0
+}
+
+/// getuid -> 1000
+fn sys_stub_getuid() -> u64 { 1000 }
+/// getgid -> 1000
+fn sys_stub_getgid() -> u64 { 1000 }
+/// geteuid -> 1000
+fn sys_stub_geteuid() -> u64 { 1000 }
+/// getegid -> 1000
+fn sys_stub_getegid() -> u64 { 1000 }
+/// getpgrp -> getpid
+fn sys_stub_getppid_compat() -> u64 { crate::scheduler::current_pid() }
+
+/// sigaltstack -> 0 (no-op)
+fn sys_stub_sigaltstack(_ss: u64, _old_ss: u64) -> u64 { 0 }
+
+/// arch_prctl(code, addr) -> handle ARCH_SET_FS (0x1002)
+fn sys_stub_arch_prctl(code: u64, addr: u64) -> u64 {
+    match code {
+        0x1002 => { // ARCH_SET_FS
+            // Would need to set FS base MSR for TLS, but kernel doesn't use it
+            // For now, accept silently
+            0
+        }
+        0x1001 => { // ARCH_GET_FS
+            if validate_user_ptr(addr, 8) {
+                unsafe { core::ptr::write_volatile(addr as *mut u64, 0); }
+            }
+            0
+        }
+        _ => EINVAL,
+    }
+}
+
+/// gettid -> getpid (single-threaded processes)
+fn sys_stub_gettid() -> u64 { crate::scheduler::current_pid() }
+
+/// time(tloc) -> seconds since epoch (approximate)
+fn sys_stub_time(tloc: u64) -> u64 {
+    let tsc: u64;
+    unsafe { asm!("rdtsc", "shl rdx, 32", "or rax, rdx", out("rax") tsc, out("rdx") _); }
+    let approx_secs = tsc / 2_000_000_000;
+    if tloc != 0 && validate_user_ptr(tloc, 8) {
+        unsafe { core::ptr::write_volatile(tloc as *mut u64, approx_secs); }
+    }
+    approx_secs
+}
+
+/// set_tid_address -> getpid (stub for musl thread init)
+fn sys_stub_set_tid_address(_tidptr: u64) -> u64 { crate::scheduler::current_pid() }
+
+/// clock_gettime(clk_id, tp) -> 0
+fn sys_stub_clock_gettime(_clk_id: u64, tp_addr: u64) -> u64 {
+    if tp_addr != 0 && validate_user_ptr(tp_addr, 16) {
+        let tsc: u64;
+        unsafe { asm!("rdtsc", "shl rdx, 32", "or rax, rdx", out("rax") tsc, out("rdx") _); }
+        let secs = tsc / 2_000_000_000;
+        let nsecs = ((tsc / 2) % 1_000_000_000) as u64;
+        unsafe {
+            core::ptr::write_volatile(tp_addr as *mut u64, secs);
+            core::ptr::write_volatile((tp_addr + 8) as *mut u64, nsecs);
+        }
+    }
+    0
+}
+
+/// exit_group(code) -> same as exit
+fn sys_stub_exit_group(code: u64) -> u64 { sys_exit(code) }
+
+/// openat(dirfd, path, flags) -> route to sys_open (ignoring dirfd)
+fn sys_stub_openat(_dirfd: u64, path_addr: u64, flags: u64) -> u64 {
+    sys_open(path_addr, flags as u32)
+}
+
+/// newfstatat(dirfd, path, buf, flags) -> route to stat stub
+fn sys_stub_newfstatat(_dirfd: u64, path_addr: u64, buf_addr: u64) -> u64 {
+    sys_stub_stat(path_addr, buf_addr)
+}
+
+/// prlimit64(pid, resource, new, old) -> 0 with generous limits
+fn sys_stub_prlimit64(_pid: u64, _resource: u64, _new_rlim: u64) -> u64 { 0 }
+
+/// getrandom(buf, buflen, flags) -> fill with TSC-based pseudo-random
+fn sys_stub_getrandom(buf_addr: u64, buflen: u64, _flags: u64) -> u64 {
+    if buflen == 0 { return 0; }
+    if !validate_user_ptr(buf_addr, buflen) { return EFAULT; }
+    let mut state: u64;
+    unsafe { asm!("rdtsc", "shl rdx, 32", "or rax, rdx", out("rax") state, out("rdx") _); }
+    unsafe {
+        let dst = buf_addr as *mut u8;
+        for i in 0..buflen as usize {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            core::ptr::write_volatile(dst.add(i), (state >> 33) as u8);
+        }
+    }
+    buflen
 }
 
 // ===== sys_write(fd, buf, len) =====
@@ -803,20 +1155,56 @@ fn sys_clone(child_stack: u64) -> u64 {
 
 // ===== sys_yield() =====
 
+/// Global yield counter for QEMU validation (Jalon 79)
+static YIELD_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Read the 8 callee-saved registers from the kernel syscall stack.
+/// gs:[24] points to the stack frame: [r15, r14, r13, r12, rbx, rbp, r11, rcx]
+/// (pushed by syscall_entry, growing downward)
+fn read_syscall_regs() -> [u64; 8] {
+    let ksp = unsafe { PER_CPU.saved_kernel_rsp };
+    if ksp == 0 { return [0; 8]; }
+    let ptr = ksp as *const u64;
+    unsafe {
+        [
+            core::ptr::read_volatile(ptr),           // r15
+            core::ptr::read_volatile(ptr.add(1)),    // r14
+            core::ptr::read_volatile(ptr.add(2)),    // r13
+            core::ptr::read_volatile(ptr.add(3)),    // r12
+            core::ptr::read_volatile(ptr.add(4)),    // rbx
+            core::ptr::read_volatile(ptr.add(5)),    // rbp
+            core::ptr::read_volatile(ptr.add(6)),    // r11 (RFLAGS from SYSCALL)
+            core::ptr::read_volatile(ptr.add(7)),    // rcx (RIP from SYSCALL)
+        ]
+    }
+}
+
 /// Voluntarily yield the CPU to another ready process.
-/// Performs a REAL context switch: saves current state, picks next process,
-/// and IRETQ's to it. If no other process is ready, returns immediately.
+/// Jalon 79: CRITICAL FIX - saves and restores callee-saved registers
+/// (rbx, rbp, r12-r15) via sysretq to prevent register corruption
+/// on context switch. Uses the kernel syscall stack frame for save/restore.
 fn sys_yield() -> u64 {
     let current = crate::scheduler::current_pid();
     if current == 0 { return 0; }
 
-    // Save current process's user-mode state so it can be resumed later.
+    // Debug: log entry with real PID
+    let ysc_entry = YIELD_COUNT.load(AtomicOrdering::Relaxed);
+    if ysc_entry < 3 {
+        crate::serial_write("[YIELD-ENTRY] cur=");
+        print_u64_raw(current);
+        crate::serial_write("\n");
+    }
+
+    // Save current process's user-mode state
     let user_rip = saved_user_rip();
     let user_rsp = saved_user_rsp();
     crate::process::save_preempt_state(current, user_rip, user_rsp, 0x202);
 
-    // Use yield_to_next which does a blocking lock + tick + returns result
-    // Loop to skip stale/test processes that have no valid address space
+    // Jalon 79: Save callee-saved registers from kernel syscall stack
+    let regs = read_syscall_regs();
+    crate::process::save_syscall_regs(current, regs);
+
+    // Find next valid userspace process
     let mut next = 0u64;
     for _ in 0..16 {
         let candidate = crate::scheduler::yield_to_next(current);
@@ -824,31 +1212,36 @@ fn sys_yield() -> u64 {
             next = current;
             break;
         }
-        // Verify the candidate has a valid PML4 (real userspace process)
         if let Some((_e, _s, pml4)) = crate::process::get_entry_state(candidate) {
             if pml4 != 0 {
                 next = candidate;
                 break;
             }
         }
-        // Invalid process: re-enqueue current and try again
-        // The invalid candidate was already dequeued and lost, which is fine
     }
 
-    // If scheduler picked the same process (or none), just return
+    // If scheduler picked the same process (or none), just return normally
+    // (sysretq in syscall_entry will restore our registers)
     if next == 0 || next == current {
+        // Debug: log yield-to-self
+        let ysc = YIELD_COUNT.load(AtomicOrdering::Relaxed);
+        if ysc < 5 {
+            crate::serial_write("[YIELD-SELF] pid=");
+            print_u64_raw(current);
+            crate::serial_write(" next=");
+            print_u64_raw(next);
+            crate::serial_write("\n");
+        }
         return 0;
     }
 
-    // Get the next process's saved state (or entry state for first-run)
-    let (new_rip, new_rsp, new_rflags, new_pml4) =
-        if let Some((rip, rsp, rfl, pml4, _regs)) = crate::process::get_preempt_state(next) {
+    // Get the next process's saved state
+    let (new_rip, new_rsp, new_rflags, new_pml4, new_regs) =
+        if let Some((rip, rsp, rfl, pml4, regs)) = crate::process::get_preempt_state(next) {
             if rip != 0 {
-                (rip, rsp, rfl, pml4)
+                (rip, rsp, rfl, pml4, regs)
             } else if let Some((entry, stack, pml4)) = crate::process::get_entry_state(next) {
-                // First-run process: use entry_point and stack_pointer
-                // crate::serial_println!("[YIELD] First-run PID {} entry=0x{:X}", next, entry);
-                (entry, stack, 0x202u64, pml4)
+                (entry, stack, 0x202u64, pml4, [0u64; 8])
             } else {
                 return 0;
             }
@@ -857,33 +1250,129 @@ fn sys_yield() -> u64 {
         };
 
     if new_pml4 == 0 || new_rip == 0 {
+        crate::serial_write("[YIELD] ABORT: pml4=0 or rip=0\n");
         return 0;
     }
 
-    // Mark the old process as Ready, new as Running
+    // Debug: log context switch details for first few yields
+    let ysc_dbg = YIELD_COUNT.load(AtomicOrdering::Relaxed);
+    if ysc_dbg < 10 {
+        crate::serial_write("[YIELD-CTX] next=");
+        print_u64_raw(next);
+        crate::serial_write(" rip=0x");
+        print_hex_raw(new_rip);
+        crate::serial_write(" rsp=0x");
+        print_hex_raw(new_rsp);
+        crate::serial_write(" rfl=0x");
+        print_hex_raw(new_rflags);
+        crate::serial_write(" pml4=0x");
+        print_hex_raw(new_pml4);
+        crate::serial_write("\n");
+    }
+
+    // Mark old process as Ready, new as Running
     let _ = crate::process::set_state(current, crate::process::ProcessState::Ready);
     let _ = crate::process::set_state(next, crate::process::ProcessState::Running);
     crate::scheduler::set_current_pid(next);
 
-    // crate::serial_println!("[YIELD] PID {} -> PID {} rip=0x{:X} rsp=0x{:X} cr3=0x{:X}",
-    //     current, next, new_rip, new_rsp, new_pml4);
+    // Yield counter + periodic logging
+    let yc = YIELD_COUNT.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+    if yc <= 20 || yc % 100 == 0 {
+        crate::serial_write("[YIELD] ");
+        print_u64_raw(current); crate::serial_write("->"); print_u64_raw(next);
+        crate::serial_write(" #"); print_u64_raw(yc);
+        crate::serial_write("\n");
+    }
 
-    // Context switch: load new CR3 and IRETQ to new process
+    // Jalon 79: Context switch with FULL callee-saved register restoration.
+    // 
+    // Two paths:
+    // 1) First-run process (new_regs all zeroes): Use IRETQ (proven reliable).
+    // 2) Previously-preempted process: Use sysretq with saved registers.
+    
+    let is_first_run = new_regs.iter().all(|&r| r == 0);
+    
     unsafe {
+        // Update PER_CPU with new process's user state
+        PER_CPU.user_rsp = new_rsp;
+        PER_CPU.user_rip = new_rip;
+
+        if is_first_run {
+            // First-run: use IRETQ which is proven to work for launching processes.
+            // IRETQ pops: RIP, CS, RFLAGS, RSP, SS from the stack.
+            asm!(
+                "cli",
+                // Switch address space FIRST
+                "mov cr3, {cr3}",
+                // Build IRETQ frame on the kernel stack
+                "push 0x1B",    // SS (Ring 3 data, GDT entry 3 | RPL=3)
+                "push {rsp}",   // RSP (user stack)
+                "push 0x202",   // RFLAGS (IF=1, reserved bit 1)
+                "push 0x23",    // CS (Ring 3 code, GDT entry 4 | RPL=3)
+                "push {rip}",   // RIP (entry point)
+                "swapgs",
+                "iretq",
+                cr3 = in(reg) new_pml4,
+                rsp = in(reg) new_rsp,
+                rip = in(reg) new_rip,
+                options(noreturn),
+            );
+        }
+
+        // Resumed process: restore callee-saved registers and return via sysretq.
+
+        let r15 = new_regs[0];
+        let r14 = new_regs[1];
+        let r13 = new_regs[2];
+        let r12 = new_regs[3];
+        let rbx = new_regs[4];
+        let rbp = new_regs[5];
+        // new_regs[6] = r11 (user RFLAGS) — goes into R11 for sysretq
+        // new_regs[7] = rcx (user RIP)   — goes into RCX for sysretq
+
+        // CRITICAL: Use explicit register constraints to prevent clobbering.
+        // Step 1: Load rip, rflags, rsp, cr3 into fixed scratch registers.
+        // Step 2: Restore callee-saved registers from generic in(reg) operands.
+        //         The compiler allocates these 6 operands to any available GPRs,
+        //         but since rax/rdi/rsi/rdx are already consumed in step 1,
+        //         the compiler won't allocate them to those registers.
+        // Step 3: Use the fixed scratch regs to set up sysretq.
+        let rip_v: u64 = new_rip;
+        let rfl_v: u64 = new_rflags;
+        let rsp_v: u64 = new_rsp;
+        let cr3_v: u64 = new_pml4;
         asm!(
             "cli",
-            "mov cr3, {cr3_val}",
-            "push 0x1B",           // SS (Ring 3 data)
-            "push {rsp_val}",      // RSP
-            "push {rfl_val}",      // RFLAGS
-            "push 0x23",           // CS (Ring 3 code)
-            "push {rip_val}",      // RIP
-            "swapgs",              // Switch back to user GS
-            "iretq",
-            cr3_val = in(reg) new_pml4,
-            rsp_val = in(reg) new_rsp,
-            rfl_val = in(reg) new_rflags,
-            rip_val = in(reg) new_rip,
+            // Step 1: Restore callee-saved regs FIRST (they come from in(reg),
+            // which the compiler guarantees won't conflict with explicit regs below)
+            "mov r15, {r15}",
+            "mov r14, {r14}",
+            "mov r13, {r13}",
+            "mov r12, {r12}",
+            "mov rbx, {rbx}",
+            "mov rbp, {rbp}",
+            // Step 2: Switch address space (rdx is explicitly bound to cr3_v)
+            "mov cr3, rdx",
+            // Step 3: Set up for sysretq (rax=rip, rdi=rfl, rsi=rsp_v are explicit)
+            "mov rcx, rax",           // RCX = user RIP
+            "mov r11, rdi",           // R11 = user RFLAGS
+            "mov rsp, rsi",           // RSP = user stack
+            // Step 4: Switch back to user GS
+            "swapgs",
+            // Step 5: Return to user space — sysretq sets RIP=RCX, RFLAGS=R11
+            "sysretq",
+            // Explicit register bindings (compiler CANNOT reassign these)
+            in("rax") rip_v,
+            in("rdi") rfl_v,
+            in("rsi") rsp_v,
+            in("rdx") cr3_v,
+            // Generic register bindings for callee-saved values
+            r15 = in(reg) r15,
+            r14 = in(reg) r14,
+            r13 = in(reg) r13,
+            r12 = in(reg) r12,
+            rbx = in(reg) rbx,
+            rbp = in(reg) rbp,
             options(noreturn),
         );
     }

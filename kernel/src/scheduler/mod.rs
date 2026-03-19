@@ -362,22 +362,23 @@ pub fn tick_preemptive() -> Option<(u64, u64, u64, u64, u64, u64)> {
         return None;
     }
 
+    // CRITICAL FIX (Jalon 79): Don't change current_pid here.
+    // The actual context switch is DEFERRED (pending). The timer ISR
+    // only records a pending switch; the actual switch happens in
+    // check_pending_switch() or sys_yield(). Until then, the old process
+    // is still running on the CPU, so current_pid must remain the old PID.
+    sched.current_pid = result.old_pid;
+
     // Get the new process's saved user-mode state
     let (new_rip, new_rsp, new_rflags, new_pml4, _new_regs) =
-        process::get_preempt_state(result.new_pid).unwrap_or((0, 0, 0x200, 0, [0; 8]));
+        process::get_preempt_state(result.new_pid).unwrap_or((0, 0, 0x202, 0, [0; 8]));
 
     if new_rip == 0 {
         // Process hasn't been preempted before — it's a fresh process.
         // Use its entry_point and stack_pointer for first launch.
-        // This enables the preemptive scheduler to start queued processes
-        // that were never launched via the sequential launch_next path.
         if let Some((entry, stack, pml4)) = process::get_entry_state(result.new_pid) {
-            if entry != 0 && new_pml4 != 0 {
-                // crate::serial_println!(
-                //     "[SCHEDULER] First-run launch PID {} entry=0x{:X}",
-                //     result.new_pid, entry
-                // );
-                return Some((result.old_pid, result.new_pid, entry, stack, 0x200, new_pml4));
+            if entry != 0 && pml4 != 0 {
+                return Some((result.old_pid, result.new_pid, entry, stack, 0x202, pml4));
             }
         }
         return None;

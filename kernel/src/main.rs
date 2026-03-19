@@ -63,7 +63,7 @@ mod framebuffer;
 mod font;
 
 // ===== Configuration =====
-const KERNEL_VERSION: &str = "2.3.0-j76-mmap-tiled-matmul";
+const KERNEL_VERSION: &str = "2.4.0-j79-unified-fd-posix";
 
 // ===== Embedded ELF binaries =====
 /// Minimal hello.elf - statically linked x86-64 ELF for Ring 3 test
@@ -1808,8 +1808,8 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_write("\n[BOOT] Phase 6: Userspace Launch\n");
     serial_write("[BOOT] ──────────────────────────────────────\n");
     serial_write("\n╔══════════════════════════════════════════════════╗\n");
-    serial_write("║  Jalon 76/77/78: Ring 3 Agent Launch Sequence     ║\n");
-    serial_write("║  TCP Sockets + xHCI + Visual Terminal + wget_real ║\n");
+    serial_write("║  Jalon 79: RTOS Core - Unified FD + POSIX ABI     ║\n");
+    serial_write("║  IRETQ FIX + Multi-Agent Scheduling + musl stubs  ║\n");
     serial_write("║  PS/2 Translation FIX applied — keyboard ACTIVE   ║\n");
     serial_write("╚══════════════════════════════════════════════════╝\n");
     {
@@ -1822,18 +1822,15 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
         // ──────────────────────────────────────────────────────────
         // STEP A1: Load agent_llm_chat.elf as a QUEUED process
-        // Jalon 75: Loaded and compiled, but queuing disabled to avoid
-        // context-switch PF (known J69/J71 scheduler IRETQ issue).
-        // The agent compiles cleanly and will work once the preemptive
-        // scheduler's multi-process IRETQ is fully debugged.
+        // Jalon 79: IRETQ bug fixed (serial_println stack corruption).
+        // LLM chat agent loaded but queuing still disabled - uses llama_core instead.
         // ──────────────────────────────────────────────────────────
-        serial_write("  [J75] agent_llm_chat.elf: COMPILED (queuing disabled — scheduler IRETQ WIP)\n");
+        serial_write("  [J79] agent_llm_chat.elf: DISABLED (replaced by agent_llama_core)\n");
 
         // ──────────────────────────────────────────────────────────
         // STEP A2: Load agent_orchestrator.elf as a QUEUED process
-        // JALON 69 FIX: DISABLED — same reason as above
         // ──────────────────────────────────────────────────────────
-        serial_write("  [J69] agent_orchestrator.elf: DISABLED (terminal-only mode)\n");
+        serial_write("  [J79] agent_orchestrator.elf: DISABLED (terminal-only mode)\n");
         // match elf::load_elf_binary(AGENT_ORCHESTRATOR_ELF) {
         //     Ok(orch_result) => {
         //         let orch_pid = process::spawn_userspace(
@@ -1853,10 +1850,27 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
         // ──────────────────────────────────────────────────────────
         // STEP A3: Load agent_llama_core.elf as QUEUED process
-        // Jalon 75: Compiled with bounded trig and checked indexing.
-        // Queuing disabled for same scheduler IRETQ reason.
+        // Jalon 79: IRETQ bug fixed! Enable multi-agent scheduling.
+        // agent_llama_core runs alongside visual_term with cooperative yield.
         // ──────────────────────────────────────────────────────────
-        serial_write("  [J75] agent_llama_core.elf: COMPILED (queuing disabled — scheduler IRETQ WIP)\n");
+        match elf::load_elf_binary(AGENT_LLAMA_CORE_ELF) {
+            Ok(llama_result) => {
+                let llama_entry = llama_result.entry_point;
+                let llama_stack = llama_result.stack_pointer;
+                let llama_pml4 = llama_result.pml4_phys;
+                let llama_pid = process::spawn_userspace(
+                    "/bin/agent_llama_core.elf", 0,
+                    llama_entry, llama_stack, llama_pml4
+                ).unwrap_or(0);
+                if llama_pid != 0 {
+                    scheduler::enqueue_process(llama_pid);
+                    serial_write("  [J79] agent_llama_core.elf: QUEUED (multi-agent scheduling ENABLED)\n");
+                }
+            }
+            Err(_e) => {
+                serial_write("  [J79] WARN: agent_llama_core.elf load failed\n");
+            }
+        }
 
         // ──────────────────────────────────────────────────────────
         // STEP B: Load and LAUNCH agent_visual_term.elf FIRST (Jalon 65)

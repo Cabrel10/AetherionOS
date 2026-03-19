@@ -182,6 +182,7 @@ pub fn spawn_userspace(name: &str, ppid: u64, entry: u64, stack: u64, pml4: u64)
     // CRITICAL: Initialize saved state so find_next_ready_userspace can find this process
     proc.saved_user_rip = entry;
     proc.saved_user_rsp = stack;
+    proc.context.rflags = 0x202; // IF=1 + reserved bit 1
     let pid = proc.pid;
     table.insert(pid, proc);
     // Add as child of parent if parent exists
@@ -215,6 +216,7 @@ pub fn fork_process(parent_pid: u64, child_pml4: u64, child_entry: u64, child_st
     child.stack_pointer = child_stack;
     child.saved_user_rip = child_entry;  // CRITICAL: Initialize so find_next_ready_userspace finds it
     child.saved_user_rsp = child_stack;
+    child.context.rflags = 0x202; // IF=1 + reserved bit 1
     child.fd_table = parent_fd_table;
     child.state = ProcessState::Ready;
     let child_pid = child.pid;
@@ -251,6 +253,7 @@ pub fn clone_thread(parent_pid: u64, child_stack: u64, child_entry: u64) -> Resu
     child.stack_pointer = child_stack;
     child.saved_user_rip = child_entry;  // CRITICAL: Initialize so find_next_ready_userspace finds it
     child.saved_user_rsp = child_stack;
+    child.context.rflags = 0x202; // IF=1 + reserved bit 1
     child.fd_table = parent_fd_table;
     child.state = ProcessState::Ready;
     child.is_thread = true; // Mark as thread (shared memory)
@@ -433,12 +436,7 @@ pub fn set_fd(pid: u64, fd: usize, path: &str, flags: u32) {
     with_fd_table_mut(pid, |fdt| {
         // Ensure enough capacity
         while fdt.entries.len() <= fd {
-            fdt.entries.push(task::FileDescriptor {
-                path: alloc::string::String::new(),
-                flags: 0,
-                offset: 0,
-                active: false,
-            });
+            fdt.entries.push(task::FileDescriptor::empty());
         }
         fdt.entries[fd] = task::FileDescriptor::new(path, flags);
     });
@@ -645,14 +643,26 @@ pub fn set_wait_ticks(pid: u64, ticks: u64) {
     }
 }
 
-/// Jalon 55: Save user-mode state for preemptive context switch.
-/// Called from timer interrupt handler when preempting a Ring 3 process.
+/// Jalon 55/79: Save user-mode state for preemptive context switch.
+/// Called from timer interrupt handler or sys_yield when preempting a Ring 3 process.
+/// Also saves callee-saved registers (r15,r14,r13,r12,rbx,rbp,r11,rcx) from
+/// the kernel syscall stack so they can be restored on resume.
 pub fn save_preempt_state(pid: u64, rip: u64, rsp: u64, rflags: u64) {
     let mut table = PROCESS_TABLE.lock();
     if let Some(p) = table.get_mut(&pid) {
         p.saved_user_rip = rip;
         p.saved_user_rsp = rsp;
         p.context.rflags = rflags;
+    }
+}
+
+/// Jalon 79: Save callee-saved registers from kernel syscall stack.
+/// The kernel_rsp points to: [r15, r14, r13, r12, rbx, rbp, r11, rcx]
+/// These must be saved per-process to restore on context switch.
+pub fn save_syscall_regs(pid: u64, regs: [u64; 8]) {
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(p) = table.get_mut(&pid) {
+        p.saved_syscall_regs = regs;
     }
 }
 

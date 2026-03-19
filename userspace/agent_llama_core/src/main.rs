@@ -825,7 +825,8 @@ pub extern "C" fn main() -> i64 {
     for pos in 0..plen {
         if pos >= MAX_SEQ_LEN { break; }
         unsafe { transformer_forward(prompt[pos] as usize, pos); }
-        if pos % 4 == 0 { sys_yield(); }
+        // Jalon 79: yield every 2 tokens (~10ms cooperating window)
+        if pos % 2 == 0 { sys_yield(); }
     }
     let next_token = unsafe { argmax(&LOGITS, VOCAB_SIZE) };
     print("OK ("); print_u64(plen as u64); println(" tokens prefilled)");
@@ -857,7 +858,8 @@ pub extern "C" fn main() -> i64 {
             cur_token = sample_temperature(&mut LOGITS, VOCAB_SIZE, temperature, &mut sample_rng);
         }
 
-        if g % 4 == 0 { sys_yield(); }
+        // Jalon 79: yield every 2 tokens for cooperative multi-agent scheduling
+        if g % 2 == 0 { sys_yield(); }
     }
 
     let t_total = sys_rdtsc() - t_gen;
