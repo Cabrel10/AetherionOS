@@ -58,6 +58,7 @@ cd "$PROJECT_DIR"
 timeout "$TIMEOUT" qemu-system-x86_64 \
     -drive format=raw,file="$BOOTIMAGE" \
     -m 256M -serial stdio -display none \
+    -cpu Haswell \
     -device virtio-net-pci,netdev=net0 -netdev user,id=net0 \
     -device qemu-xhci \
     2>/dev/null > "$LOG_FILE" || true
@@ -179,6 +180,17 @@ echo "=== Security ==="
 check "Path traversal blocked" "traversal.*(blocked|OK)"
 check "Stack protector active" "(stack protector|TPM)"
 check "Verifier default-deny rule" "default-deny"
+
+echo ""
+echo "=== Level 3: VFS & Commands ==="
+check "All agent binaries mounted" "additional agent binaries mounted"
+check "/var/state.bin created" "state\\.bin created"
+check_not "No break-code keyboard logs" "\\[KBD\\] break|scancode release"
+
+echo ""
+echo "=== Level 4: Keyboard ==="
+check "PS/2 keyboard initialized" "PS/2 keyboard"
+check_not "No spurious break-code events" "\\[KBD\\].*release|\\[KBD\\].*break"
 
 # Cleanup
 rm -f "$STRINGS_FILE"
