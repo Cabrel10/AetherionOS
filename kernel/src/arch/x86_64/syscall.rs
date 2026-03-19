@@ -996,8 +996,39 @@ fn sys_open(path_addr: u64, flags: u32) -> u64 {
         }
     }
 
-    // Standard open: check the file exists in VFS
-    if crate::fs::vfs::file_read(&path).is_err() {
+    // Standard open: check the file/directory exists in VFS
+    // Allow opening directories for getdents (ls)
+    let node_found = {
+        let root = crate::fs::vfs::lock_root();
+        let components: alloc::vec::Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        let mut current = &*root;
+        let mut found = false;
+        if components.is_empty() {
+            found = true; // root "/"
+        } else {
+            for (i, comp) in components.iter().enumerate() {
+                match current.get(*comp) {
+                    Some(crate::fs::vfs::VfsNode::Directory(ref children)) => {
+                        if i == components.len() - 1 {
+                            found = true; // target is a directory
+                        } else {
+                            current = children;
+                        }
+                    }
+                    Some(crate::fs::vfs::VfsNode::File(_)) | Some(crate::fs::vfs::VfsNode::Device { .. }) => {
+                        if i == components.len() - 1 {
+                            found = true; // target is a file
+                        }
+                        break;
+                    }
+                    None => break,
+                }
+            }
+        }
+        found
+    };
+
+    if !node_found && crate::fs::vfs::file_read(&path).is_err() {
         // Try with /bin prefix
         let bin_path = alloc::format!("/bin/{}", path);
         if crate::fs::vfs::file_read(&bin_path).is_err() {
@@ -2502,20 +2533,44 @@ fn sys_getdents(fd: u32, buf_ptr: u64, buf_size: u64) -> u64 {
         return to_copy as u64;
     }
     
-    // VFS paths (legacy)
+    // VFS paths — generic directory traversal for any VFS-mounted path
     let entries = {
         let root = crate::fs::vfs::lock_root();
         let mut result = alloc::vec::Vec::new();
         
-        if dir_path == "/bin" || dir_path == "bin" {
-            if let Some(crate::fs::vfs::VfsNode::Directory(ref bin_dir)) = root.get("bin") {
-                for key in bin_dir.keys() {
-                    result.push(key.clone());
+        let components: alloc::vec::Vec<&str> = dir_path.split('/').filter(|s| !s.is_empty()).collect();
+        
+        if components.is_empty() {
+            // Root directory "/"
+            for key in root.keys() {
+                result.push(alloc::format!("d 0 {}", key));
+            }
+        } else {
+            // Navigate to the target directory
+            let mut current: &alloc::collections::BTreeMap<alloc::string::String, crate::fs::vfs::VfsNode> = &root;
+            let mut found = true;
+            for comp in &components {
+                match current.get(*comp) {
+                    Some(crate::fs::vfs::VfsNode::Directory(ref children)) => {
+                        current = children;
+                    }
+                    _ => { found = false; break; }
                 }
             }
-        } else if dir_path == "/" || dir_path == "." {
-            for key in root.keys() {
-                result.push(key.clone());
+            if found {
+                for (name, node) in current.iter() {
+                    match node {
+                        crate::fs::vfs::VfsNode::Directory(_) => {
+                            result.push(alloc::format!("d 0 {}", name));
+                        }
+                        crate::fs::vfs::VfsNode::File(ref data) => {
+                            result.push(alloc::format!("- {} {}", data.len(), name));
+                        }
+                        crate::fs::vfs::VfsNode::Device { ref manifest, .. } => {
+                            result.push(alloc::format!("- {} {}", manifest.capacity, name));
+                        }
+                    }
+                }
             }
         }
         result
@@ -2536,7 +2591,7 @@ fn sys_getdents(fd: u32, buf_ptr: u64, buf_size: u64) -> u64 {
         }
     }
     
-    crate::serial_println!("[SYSCALL] getdents: returned {} bytes ({} entries)", to_copy, entries.len());
+    crate::serial_println!("[SYSCALL] getdents: returned {} bytes ({} VFS entries)", to_copy, entries.len());
     to_copy as u64
 }
 

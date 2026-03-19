@@ -349,11 +349,12 @@ fn cmd_help(term: &mut Terminal) {
     term.put_str(b"AetherionOS v3.0 Shell Commands:\n", INFO_COL);
     term.put_str(b"  help            Show this help\n", TEXT);
     term.put_str(b"  clear           Clear terminal\n", TEXT);
-    term.put_str(b"  ls [path]       List directory (real FAT32/exFAT)\n", TEXT);
+    term.put_str(b"  ls [path]       List directory (real FAT32/VFS)\n", TEXT);
     term.put_str(b"  cat <file>      Display file contents\n", TEXT);
     term.put_str(b"  ps              List running processes\n", TEXT);
     term.put_str(b"  mem             Show memory usage\n", TEXT);
     term.put_str(b"  status          System information\n", TEXT);
+    term.put_str(b"  run <agent>     Launch agent binary (fork+exec)\n", TEXT);
     term.put_str(b"  llm <prompt>    Send prompt to LLM agent\n", TEXT);
     term.put_str(b"  version         Show OS version\n", TEXT);
     term.put_str(b"  wget            TCP network test (10.0.2.2)\n", TEXT);
@@ -365,14 +366,19 @@ fn cmd_help(term: &mut Terminal) {
 fn cmd_ls(term: &mut Terminal, args: &[u8]) {
     term.put_char(b'\n', TEXT);
 
-    // Default path is /disk/ if no argument
+    // Default path is /bin if no argument (shows all binaries)
     let mut path_buf = [0u8; 260];
     let path_len;
-    if args.is_empty() || bytes_eq(args, b"/") {
-        // List root /disk/
-        let p = b"/disk/\0";
+    if args.is_empty() {
+        // List /bin (always available)
+        let p = b"/bin\0";
         for i in 0..p.len() { path_buf[i] = p[i]; }
-        path_len = p.len() - 1; // exclude null for display
+        path_len = p.len() - 1;
+    } else if bytes_eq(args, b"/") {
+        // List root
+        let p = b"/\0";
+        for i in 0..p.len() { path_buf[i] = p[i]; }
+        path_len = p.len() - 1;
     } else {
         // User-specified path
         let mut off = 0;
@@ -812,6 +818,54 @@ fn cmd_shutdown(term: &mut Terminal) {
     sys_exit(0);
 }
 
+/// run <agent_name> — fork + exec an agent binary from /bin
+fn cmd_run(term: &mut Terminal, args: &[u8]) {
+    term.put_char(b'\n', TEXT);
+    if args.is_empty() {
+        term.put_str(b"Usage: run <binary>\n", ERR_COL);
+        term.put_str(b"Example: run agent_bench\n", DIM);
+        term.put_char(b'\n', TEXT);
+        return;
+    }
+    // Build path: /bin/<name>.elf\0
+    let mut path_buf = [0u8; 128];
+    let prefix = b"/bin/";
+    let mut off = 0usize;
+    for b in prefix { path_buf[off] = *b; off += 1; }
+    for i in 0..args.len() {
+        if off >= 120 { break; }
+        path_buf[off] = args[i];
+        off += 1;
+    }
+    // Append .elf if not already present
+    if off < 4 || &path_buf[off-4..off] != b".elf" {
+        let suffix = b".elf";
+        for b in suffix { if off < 126 { path_buf[off] = *b; off += 1; } }
+    }
+    path_buf[off] = 0; // null-terminate
+
+    term.put_str(b"Launching: ", TEXT);
+    term.put_str(&path_buf[..off], INFO_COL);
+    term.put_char(b'\n', TEXT);
+
+    // Fork and exec
+    let pid = sys_fork();
+    if pid == 0 {
+        // Child: exec the binary
+        sys_exec(&path_buf[..off + 1]);
+        // If exec returns, it failed
+        sys_exit(1);
+    } else if pid > 0 {
+        term.put_str(b"  Started PID ", TEXT);
+        term.put_u64(pid as u64, INFO_COL);
+        term.put_char(b'\n', TEXT);
+        sys_write(1, b"[TERM] run: forked child\n");
+    } else {
+        term.put_str(b"  Fork failed\n", ERR_COL);
+    }
+    term.put_char(b'\n', TEXT);
+}
+
 /// wget — TCP network test to QEMU gateway
 fn cmd_wget(term: &mut Terminal) {
     term.put_char(b'\n', TEXT);
@@ -939,6 +993,8 @@ fn process_command(term: &mut Terminal) {
         cmd_llm(term, args);
     } else if bytes_eq(first_word, b"wget") {
         cmd_wget(term);
+    } else if bytes_eq(first_word, b"run") {
+        cmd_run(term, args);
     } else if bytes_eq(first_word, b"shutdown") || bytes_eq(first_word, b"halt") {
         cmd_shutdown(term);
     } else if bytes_eq(first_word, b"exit") || bytes_eq(first_word, b"quit") {

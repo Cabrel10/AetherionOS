@@ -1507,6 +1507,80 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             }
         }
 
+        // Mount ALL remaining agent ELFs into /bin for real `ls /bin` support
+        {
+            let all_elfs: &[(&str, &[u8])] = &[
+                ("ls.elf", LS_ELF),
+                ("cat.elf", CAT_ELF),
+                ("sh.elf", SH_ELF),
+                ("j19_test.elf", J19_TEST_ELF),
+                ("threads.elf", THREADS_ELF),
+                ("ui.elf", UI_ELF),
+                ("test_malloc.elf", TEST_MALLOC_ELF),
+                ("test_preempt.elf", TEST_PREEMPT_ELF),
+                ("wget_real.elf", WGET_REAL_ELF),
+                ("agent_ai.elf", AGENT_AI_ELF),
+                ("agent_rag.elf", AGENT_RAG_ELF),
+                ("agent_rust.elf", AGENT_RUST_ELF),
+                ("agent_saga.elf", AGENT_SAGA_ELF),
+                ("agent_sse.elf", AGENT_SSE_ELF),
+                ("agent_ai_native.elf", AGENT_AI_NATIVE_ELF),
+                ("agent_gguf.elf", AGENT_GGUF_ELF),
+                ("agent_net.elf", AGENT_NET_ELF),
+                ("agent_input.elf", AGENT_INPUT_ELF),
+                ("agent_gui_test.elf", AGENT_GUI_TEST_ELF),
+                ("agent_sysinfo.elf", AGENT_SYSINFO_ELF),
+                ("agent_wm.elf", AGENT_WM_ELF),
+                ("agent_terminal.elf", AGENT_TERMINAL_ELF),
+                ("agent_multipart.elf", AGENT_MULTIPART_ELF),
+                ("agent_bench.elf", AGENT_BENCH_ELF),
+                ("agent_tokenizer.elf", AGENT_TOKENIZER_ELF),
+                ("agent_inference.elf", AGENT_INFERENCE_ELF),
+                ("agent_llama.elf", AGENT_LLAMA_ELF),
+                ("agent_llm_chat.elf", AGENT_LLM_CHAT_ELF),
+                ("agent_mt_matmul.elf", AGENT_MT_MATMUL_ELF),
+                ("agent_chunk_reader.elf", AGENT_CHUNK_READER_ELF),
+                ("agent_weight_loader.elf", AGENT_WEIGHT_LOADER_ELF),
+                ("agent_orchestrator.elf", AGENT_ORCHESTRATOR_ELF),
+                ("agent_state.elf", AGENT_STATE_ELF),
+                ("agent_http.elf", AGENT_HTTP_ELF),
+                ("agent_visual_term.elf", AGENT_VISUAL_TERM_ELF),
+                ("agent_q4_dequant.elf", AGENT_Q4_DEQUANT_ELF),
+                ("agent_llama_core.elf", AGENT_LLAMA_CORE_ELF),
+            ];
+            let mut mounted = 0u32;
+            let mut root = crate::fs::vfs::lock_root();
+            if let Some(fs::vfs::VfsNode::Directory(ref mut bin_dir)) = root.get_mut("bin") {
+                for &(name, data) in all_elfs {
+                    bin_dir.insert(
+                        alloc::string::String::from(name),
+                        fs::vfs::VfsNode::File(alloc::vec::Vec::from(data)),
+                    );
+                    mounted += 1;
+                }
+            }
+            drop(root);
+            serial_println!("       [OK] {} additional agent binaries mounted in /bin", mounted);
+        }
+
+        // Create /var directory with state.bin for `cat /var/state.bin`
+        {
+            let mut root = crate::fs::vfs::lock_root();
+            root.insert(
+                alloc::string::String::from("var"),
+                fs::vfs::VfsNode::Directory(alloc::collections::BTreeMap::new()),
+            );
+            if let Some(fs::vfs::VfsNode::Directory(ref mut var_dir)) = root.get_mut("var") {
+                // Boot counter state (4 bytes LE)
+                let state = alloc::vec![0x01, 0x00, 0x00, 0x00]; // boot #1
+                var_dir.insert(
+                    alloc::string::String::from("state.bin"),
+                    fs::vfs::VfsNode::File(state),
+                );
+            }
+            serial_write("       [OK] /var/state.bin created\n");
+        }
+
         // Create /sys/version file
         {
             let version_str = alloc::format!("AetherionOS v{}\n", KERNEL_VERSION);

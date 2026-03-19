@@ -127,6 +127,8 @@ pub const SYS_FB_DRAW_CHAR: u64 = 221;
 pub const SYS_FB_DRAW_STR:  u64 = 222;
 pub const SYS_FB_GET_INFO:  u64 = 223;
 pub const SYS_RDTSC:        u64 = 230;
+pub const SYS_EXEC:         u64 = 59;   // execve(path, argv, envp)
+pub const SYS_FORK:         u64 = 57;   // fork()
 
 // POSIX open flags
 pub const O_RDONLY: u32 = 0;
@@ -638,6 +640,17 @@ pub fn sys_getprocs(buf: &mut [u8]) -> i64 {
 /// Returns bytes written.
 pub fn sys_sysinfo(buf: &mut [u8]) -> i64 {
     syscall1(SYS_SYSINFO, buf.as_mut_ptr() as u64) as i64
+}
+
+/// Execute a new binary, replacing current process.
+/// path should be null-terminated, e.g., b"/bin/agent_bench.elf\0"
+pub fn sys_exec(path: &[u8]) -> i64 {
+    syscall1(SYS_EXEC, path.as_ptr() as u64) as i64
+}
+
+/// Fork the current process. Returns child PID to parent, 0 to child.
+pub fn sys_fork() -> i64 {
+    syscall0(SYS_FORK) as i64
 }
 
 // ============================================================
