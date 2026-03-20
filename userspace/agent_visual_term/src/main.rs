@@ -56,6 +56,9 @@ const COLS: usize = (SCR_W - MARGIN_X * 2) / CHAR_W;     // 126 cols
 const ROWS: usize = (SCR_H - MARGIN_Y - 34) / CHAR_H;    // 43 rows
 
 const CMD_BUF_SIZE: usize = 256;  // Larger buffer for file paths
+const HISTORY_SIZE: usize = 16;   // Number of history entries
+const KNOWN_CMDS: &[&[u8]] = &[b"help", b"clear", b"ls", b"cat", b"ps", b"mem", b"status",
+    b"run", b"llm", b"version", b"wget", b"shutdown", b"exit"];
 
 const INTENT_VISUAL_TERM: u64     = 0xB059;
 const INTENT_TOKEN_GENERATED: u64 = 0x8002;    // From agent_llm_chat
@@ -95,6 +98,12 @@ struct Terminal {
     commands_run: u32,
     tokens_received: u32,
     llm_active: bool,
+    // Command history — Heap-allocated to avoid Ring 3 stack overflow (4KB+)
+    history: Vec<[u8; CMD_BUF_SIZE]>,
+    history_lens: Vec<usize>,
+    history_count: usize,
+    history_pos: usize,
+    history_browsing: bool,
 }
 
 impl Terminal {
@@ -114,6 +123,11 @@ impl Terminal {
             commands_run: 0,
             tokens_received: 0,
             llm_active: false,
+            history: alloc::vec![[0u8; CMD_BUF_SIZE]; HISTORY_SIZE],
+            history_lens: alloc::vec![0usize; HISTORY_SIZE],
+            history_count: 0,
+            history_pos: 0,
+            history_browsing: false,
         }
     }
 
@@ -268,7 +282,112 @@ impl Terminal {
         }
     }
 
-    fn clear_cmd_buf(&mut self) { self.cmd_len = 0; }
+    fn clear_cmd_buf(&mut self) { self.cmd_len = 0; self.history_browsing = false; }
+
+    /// Save current command to history ring buffer (heap-allocated Vec)
+    fn push_history(&mut self) {
+        if self.cmd_len == 0 { return; }
+        // Don't duplicate the last entry
+        if self.history_count > 0 {
+            let prev = (self.history_count - 1) % HISTORY_SIZE;
+            if self.history_lens[prev] == self.cmd_len {
+                let mut same = true;
+                for i in 0..self.cmd_len {
+                    if self.history[prev][i] != self.cmd_buf[i] { same = false; break; }
+                }
+                if same { return; }
+            }
+        }
+        let idx = self.history_count % HISTORY_SIZE;
+        self.history[idx] = [0u8; CMD_BUF_SIZE];
+        for i in 0..self.cmd_len { self.history[idx][i] = self.cmd_buf[i]; }
+        self.history_lens[idx] = self.cmd_len;
+        self.history_count += 1;
+        self.history_browsing = false;
+    }
+
+    /// Navigate history: up = true (older), false (newer)
+    fn nav_history(&mut self, up: bool) {
+        let total = core::cmp::min(self.history_count, HISTORY_SIZE);
+        if total == 0 { return; }
+        if !self.history_browsing {
+            self.history_pos = self.history_count;
+            self.history_browsing = true;
+        }
+        if up {
+            if self.history_pos > 0 && self.history_pos > self.history_count.saturating_sub(total) {
+                self.history_pos -= 1;
+            }
+        } else {
+            if self.history_pos < self.history_count {
+                self.history_pos += 1;
+            }
+        }
+        // Erase current line visually
+        while self.cmd_len > 0 { self.backspace(); }
+        // Load history entry
+        if self.history_pos < self.history_count {
+            let idx = self.history_pos % HISTORY_SIZE;
+            let len = self.history_lens[idx];
+            for i in 0..len {
+                let ch = self.history[idx][i];
+                self.put_char(ch, TEXT);
+                self.cmd_buf[i] = ch;
+            }
+            self.cmd_len = len;
+        }
+    }
+
+    /// Tab auto-completion from KNOWN_CMDS
+    fn tab_complete(&mut self) {
+        if self.cmd_len == 0 { return; }
+        // Copy prefix to local buffer to avoid borrow conflict
+        let plen = self.cmd_len;
+        let mut prefix_buf = [0u8; CMD_BUF_SIZE];
+        for i in 0..plen { prefix_buf[i] = self.cmd_buf[i]; }
+        let mut match_count = 0u32;
+        let mut match_idx: usize = 0;
+        for (idx, cmd) in KNOWN_CMDS.iter().enumerate() {
+            if cmd.len() >= plen {
+                let mut ok = true;
+                for i in 0..plen {
+                    if cmd[i] != prefix_buf[i] { ok = false; break; }
+                }
+                if ok { match_count += 1; match_idx = idx; }
+            }
+        }
+        if match_count == 1 {
+            // Single match: auto-complete + trailing space
+            let matched = KNOWN_CMDS[match_idx];
+            for i in plen..matched.len() {
+                let ch = matched[i];
+                self.put_char(ch, TEXT);
+                if self.cmd_len < CMD_BUF_SIZE {
+                    self.cmd_buf[self.cmd_len] = ch;
+                    self.cmd_len += 1;
+                }
+            }
+            if self.cmd_len < CMD_BUF_SIZE {
+                self.put_char(b' ', TEXT);
+                self.cmd_buf[self.cmd_len] = b' ';
+                self.cmd_len += 1;
+            }
+        } else if match_count > 1 {
+            // Show all matches
+            self.put_char(b'\n', TEXT);
+            for cmd in KNOWN_CMDS {
+                if cmd.len() >= plen {
+                    let mut ok = true;
+                    for i in 0..plen { if cmd[i] != prefix_buf[i] { ok = false; break; } }
+                    if ok {
+                        self.put_str(b"  ", TEXT);
+                        self.put_str(cmd, INFO_COL);
+                        self.put_char(b'\n', TEXT);
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════
@@ -335,8 +454,13 @@ fn draw_chrome() {
 }
 
 fn print_prompt(term: &mut Terminal) {
-    term.put_str(b"aetherion", PROMPT);
-    term.put_str(b":~$ ", TEXT);
+    // Custom prompt: [Ψ AetherionOS]> with color
+    term.put_char(b'[', DIM);
+    // Ψ = Greek Psi, not in ASCII — use closest visual: PSI symbol
+    term.put_str(b"PSI", PROMPT);
+    term.put_char(b' ', DIM);
+    term.put_str(b"AetherionOS", PROMPT);
+    term.put_str(b"]> ", DIM);
     term.clear_cmd_buf();
 }
 
@@ -1056,10 +1180,14 @@ pub extern "C" fn main() -> i64 {
             match ch {
                 0x08 | 0x7F => { term.backspace(); }
                 b'\n' | b'\r' => {
+                    term.push_history();
                     term.newline();
                     process_command(&mut term);
                     print_prompt(&mut term);
                 }
+                0x01 => { term.nav_history(true);  }  // Up arrow → older history
+                0x02 => { term.nav_history(false); }  // Down arrow → newer history
+                0x09 => { term.tab_complete(); }       // Tab → auto-complete
                 0x20..=0x7E => {
                     if term.cmd_len < CMD_BUF_SIZE {
                         term.cmd_buf[term.cmd_len] = ch;
@@ -1067,7 +1195,7 @@ pub extern "C" fn main() -> i64 {
                     }
                     term.put_char(ch, TEXT);
                 }
-                _ => {} // Ignore control codes
+                _ => {} // Ignore other control codes
             }
         } else {
             idle_count += 1;

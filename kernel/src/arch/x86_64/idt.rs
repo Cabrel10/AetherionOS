@@ -531,6 +531,7 @@ extern "x86-interrupt" fn security_exception_handler(stack_frame: InterruptStack
 use core::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 
 static SHIFT_PRESSED: AtomicBool = AtomicBool::new(false);
+static E0_PREFIX: AtomicBool = AtomicBool::new(false);
 
 /// Pending context switch: (new_pid << 32) | old_pid, or 0 if none pending
 static PENDING_SWITCH: AtomicU64 = AtomicU64::new(0);
@@ -651,34 +652,62 @@ pub fn check_pending_switch() -> bool {
 extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
     use x86_64::instructions::port::Port;
     
-    // Lire le scancode
+    // Read the scancode
     let scancode: u8 = unsafe { Port::new(0x60).read() };
 
-    // Gérer Shift press (make codes)
+    // Handle E0 prefix (extended keys: arrows, etc.)
+    if scancode == 0xE0 {
+        E0_PREFIX.store(true, Ordering::Relaxed);
+        unsafe { super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET + 1); }
+        return;
+    }
+
+    let is_e0 = E0_PREFIX.load(Ordering::Relaxed);
+    if is_e0 {
+        E0_PREFIX.store(false, Ordering::Relaxed);
+        // E0 extended key — only handle make codes (bit 7 clear)
+        if scancode & 0x80 == 0 {
+            let special = match scancode {
+                0x48 => 0x01u8, // Up arrow    → SOH
+                0x50 => 0x02u8, // Down arrow  → STX
+                0x4B => 0x03u8, // Left arrow  → ETX
+                0x4D => 0x04u8, // Right arrow → EOT
+                _ => 0u8,
+            };
+            if special != 0 {
+                crate::process::kbd_push_byte(special);
+            }
+        }
+        // E0 release codes are silently dropped
+        unsafe { super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET + 1); }
+        return;
+    }
+
+    // Handle Shift press (make codes)
     if scancode == 0x2A || scancode == 0x36 {
         SHIFT_PRESSED.store(true, Ordering::Relaxed);
         unsafe { super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET + 1); }
         return;
     }
-    // Gérer Shift release (break codes)
+    // Handle Shift release (break codes)
     if scancode == 0xAA || scancode == 0xB6 {
         SHIFT_PRESSED.store(false, Ordering::Relaxed);
         unsafe { super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET + 1); }
         return;
     }
-    // Ignorer tous les autres release codes (bit 7 set) et 0xE0
-    if scancode & 0x80 != 0 || scancode == 0xE0 {
+    // Ignore all other release codes (bit 7 set) — no logging
+    if scancode & 0x80 != 0 {
         unsafe { super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET + 1); }
         return;
     }
 
-    // Make code normal — convertir en ASCII
+    // Normal make code — convert to ASCII
     let ascii = scancode_set1_to_ascii(scancode);
     if ascii != 0 {
         crate::process::kbd_push_byte(ascii);
     }
 
-    // EOI toujours envoyé
+    // EOI always sent
     unsafe { super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET + 1); }
 }
 
