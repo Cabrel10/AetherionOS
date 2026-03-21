@@ -55,6 +55,10 @@ fi
 echo ""
 
 # ── Step 2: Run QEMU headless with -cpu Haswell ──
+# Kill any lingering QEMU instances from previous runs
+pkill -9 -f "qemu-system-x86_64.*bootimage-aetherion" 2>/dev/null || true
+sleep 0.5
+
 echo "[QEMU] Launching headless QEMU (timeout=${TIMEOUT}s, cpu=Haswell, ram=256M)..."
 cd "$PROJECT_DIR"
 timeout "$TIMEOUT" qemu-system-x86_64 \
@@ -66,6 +70,14 @@ timeout "$TIMEOUT" qemu-system-x86_64 \
     2>/dev/null > "$LOG_FILE" || true
 
 BYTE_COUNT=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
+
+# Guard: if QEMU produced zero output, it failed to start
+if [ "$BYTE_COUNT" -lt 100 ]; then
+    echo "[FAIL] QEMU produced no output ($BYTE_COUNT bytes) — launch failure!"
+    echo "  Hint: A previous QEMU instance may still be running."
+    rm -f "$LOG_FILE" "${LOG_FILE}.clean"
+    exit 3
+fi
 
 # Extract printable strings from binary serial output (min length 4)
 strings -n 4 "$LOG_FILE" > "$CLEAN_LOG" 2>/dev/null
@@ -319,6 +331,67 @@ check "T64 sys_yield syscall active" "YIELD-ENTRY|YIELD-CTX|YIELD-SELF"
 check "T65 SYSCALL init complete" "SYSCALL.*Initializing|SYSCALL.*LSTAR"
 
 # =============================================
+# Test Category 15: GGUF & Model Loading (4 tests)
+# =============================================
+echo ""
+echo "=== [Cat 15] GGUF & Model Loading ==="
+check "T66 GGUF agent binary present" "agent_gguf.elf"
+check "T67 test.gguf model created" "test\.gguf created|test\.gguf"
+check "T68 GGUF v3 format" "GGUF v3"
+check "T69 sys_pread64 for GGUF" "sys_pread64|pread"
+
+# =============================================
+# Test Category 16: Terminal Features (5 tests)
+# =============================================
+echo ""
+echo "=== [Cat 16] Terminal Features ==="
+check "T70 Terminal ready message" "Terminal ready"
+check "T71 Visual terminal ELF loaded" "agent_visual_term.elf"
+check "T72 Visual terminal PID registered" "Visual Terminal PID"
+check "T73 Terminal-only mode active" "terminal-only mode"
+check "T74 POSIX ABI layer" "POSIX|unified-fd-posix"
+
+# =============================================
+# Test Category 17: Memory Management (4 tests)
+# =============================================
+echo ""
+echo "=== [Cat 17] Memory Management ==="
+check "T75 ELF frame pool initialized" "Frame pool initialized"
+check "T76 Demand paging configured" "Demand paging|demand.*paging"
+check "T77 Page table manager init" "Page table manager|page.*table.*init"
+check "T78 User heap (8 GiB brk range)" "8 GiB|HEAP_MAX"
+
+# =============================================
+# Test Category 18: Cognitive Bus Protocol (4 tests)
+# =============================================
+echo ""
+echo "=== [Cat 18] Cognitive Bus Protocol ==="
+check "T79 Bus drained at startup" "Drained.*old messages"
+check "T80 Token #50 milestone" "data=0x3D2E.*#50|#50"
+check "T81 Token #100 milestone" "data=0x6F2E.*#100|#100"
+check_val "T82 Token events >= 100" "$TOKEN_EV" "-ge" "100"
+
+# =============================================
+# Test Category 19: Process & Syscall Advanced (4 tests)
+# =============================================
+echo ""
+echo "=== [Cat 19] Process & Syscall Advanced ==="
+check "T83 Forked child exit handled" "Forked child exit"
+check "T84 RFLAGS 0x202 enforced" "rflags=0x202 enforced"
+check "T85 TaskContext zeroed" "all GPRs=0"
+check "T86 IDT with demand paging" "IDT.*Loaded|exception handlers.*demand"
+
+# =============================================
+# Test Category 20: Multi-Agent Stress Extended (4 tests)
+# =============================================
+echo ""
+echo "=== [Cat 20] Multi-Agent Stress Extended ==="
+check_val "T87 YIELD count >= 50" "$YIELD_RAW" "-ge" "50"
+check_val "T88 Token events >= 50" "$TOKEN_EV" "-ge" "50"
+check_val "T89 Bus publish >= 20" "$BUS_PUB" "-ge" "20"
+check_val "T90 Bus consume >= 50" "$BUS_CONSUME" "-ge" "50"
+
+# =============================================
 # Cleanup and Summary
 # =============================================
 rm -f "$CLEAN_LOG"
@@ -327,7 +400,7 @@ echo ""
 echo "=============================================="
 echo "  RESULTS: $PASSED/$TOTAL passed, $FAILED failed"
 echo "  YIELD exchanges: $YIELD_RAW"
-echo "  Bus events: $BUS_PUB (tokens: $TOKEN_EV)"
+echo "  Bus events: $BUS_PUB (tokens: $TOKEN_EV) consume: $BUS_CONSUME"
 echo "  Log: $LOG_FILE"
 echo "=============================================="
 
