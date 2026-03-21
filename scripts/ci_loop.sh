@@ -1,6 +1,6 @@
 #!/bin/bash
-# AetherionOS — Continuous Integration Loop
-# Rebuilds kernel, runs regression tests every 5 minutes.
+# AetherionOS — Continuous Integration Loop v2.0
+# Rebuilds kernel, runs regression tests (v3.0, 90 tests) every 5 minutes.
 # Detects regressions and alerts immediately.
 # Usage: ./scripts/ci_loop.sh [--interval SECONDS]
 #
