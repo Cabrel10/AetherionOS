@@ -180,7 +180,7 @@ pub unsafe fn init_frame_pool(base_phys: u64, num_frames: usize) {
 }
 
 /// Allocate a physical frame from the ELF pool
-unsafe fn alloc_elf_frame() -> Option<u64> {
+pub unsafe fn alloc_elf_frame() -> Option<u64> {
     if !ELF_POOL_INITIALIZED.load(Ordering::SeqCst) {
         return None;
     }

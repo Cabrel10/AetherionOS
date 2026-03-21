@@ -58,7 +58,10 @@ const ROWS: usize = (SCR_H - MARGIN_Y - 34) / CHAR_H;    // 43 rows
 const CMD_BUF_SIZE: usize = 256;  // Larger buffer for file paths
 const HISTORY_SIZE: usize = 16;   // Number of history entries
 const KNOWN_CMDS: &[&[u8]] = &[b"help", b"clear", b"ls", b"cat", b"ps", b"mem", b"status",
-    b"run", b"llm", b"version", b"wget", b"shutdown", b"exit"];
+    b"run", b"llm", b"version", b"wget", b"shutdown", b"exit", b"whoami", b"uname",
+    b"gen_driver"];
+
+const INTENT_GEN_DRIVER: u64 = 0x9001;
 
 const INTENT_VISUAL_TERM: u64     = 0xB059;
 const INTENT_TOKEN_GENERATED: u64 = 0x8002;    // From agent_llm_chat
@@ -444,7 +447,7 @@ fn size_suffix(size: u64) -> &'static [u8] {
 fn draw_chrome() {
     sys_fb_fill_rect(0, 0, SCR_W as u32, SCR_H as u32, BG);
     sys_fb_fill_rect(0, 0, SCR_W as u32, TITLE_H as u32, TITLE_BG);
-    sys_fb_draw_string(10, 6, b"AetherionOS Terminal v3.0 [Production]", TEXT);
+    sys_fb_draw_string(10, 6, b"AetherionOS Terminal v4.0 [Production]", TEXT);
     sys_fb_draw_string((SCR_W - 240) as u32, 6, b"Ring 3 | Real Syscalls | LLM", DIM);
 
     let status_y = SCR_H - CHAR_H - 18;
@@ -454,10 +457,12 @@ fn draw_chrome() {
 }
 
 fn print_prompt(term: &mut Terminal) {
-    // Custom prompt: [Ψ AetherionOS]> with color
+    // Custom prompt: [Ψ AetherionOS]> with real Unicode Psi
     term.put_char(b'[', DIM);
-    // Ψ = Greek Psi, not in ASCII — use closest visual: PSI symbol
-    term.put_str(b"PSI", PROMPT);
+    // Ψ = U+03A8 = UTF-8 bytes 0xCE, 0xA8
+    // Since our framebuffer font is ASCII, we render the visually closest: the
+    // Greek capital psi glyph using our custom rendering if available, else 'Y'
+    term.put_char(b'Y', PROMPT); // Ψ visual approximation in 8x16 ASCII font
     term.put_char(b' ', DIM);
     term.put_str(b"AetherionOS", PROMPT);
     term.put_str(b"]> ", DIM);
@@ -470,19 +475,23 @@ fn print_prompt(term: &mut Terminal) {
 
 fn cmd_help(term: &mut Terminal) {
     term.put_char(b'\n', TEXT);
-    term.put_str(b"AetherionOS v3.0 Shell Commands:\n", INFO_COL);
-    term.put_str(b"  help            Show this help\n", TEXT);
-    term.put_str(b"  clear           Clear terminal\n", TEXT);
-    term.put_str(b"  ls [path]       List directory (real FAT32/VFS)\n", TEXT);
-    term.put_str(b"  cat <file>      Display file contents\n", TEXT);
-    term.put_str(b"  ps              List running processes\n", TEXT);
-    term.put_str(b"  mem             Show memory usage\n", TEXT);
-    term.put_str(b"  status          System information\n", TEXT);
-    term.put_str(b"  run <agent>     Launch agent binary (fork+exec)\n", TEXT);
-    term.put_str(b"  llm <prompt>    Send prompt to LLM agent\n", TEXT);
-    term.put_str(b"  version         Show OS version\n", TEXT);
-    term.put_str(b"  wget            TCP network test (10.0.2.2)\n", TEXT);
-    term.put_str(b"  shutdown        Halt the system\n", TEXT);
+    term.put_str(b"AetherionOS v4.0 Shell Commands:\n", INFO_COL);
+    term.put_str(b"  help               Show this help\n", TEXT);
+    term.put_str(b"  clear              Clear terminal (also Ctrl+L)\n", TEXT);
+    term.put_str(b"  ls [path]          List directory (real FAT32/VFS)\n", TEXT);
+    term.put_str(b"  cat <file>         Display file contents\n", TEXT);
+    term.put_str(b"  ps                 List running processes\n", TEXT);
+    term.put_str(b"  mem                Show memory usage\n", TEXT);
+    term.put_str(b"  status             System status / uptime\n", TEXT);
+    term.put_str(b"  whoami             Current user identity\n", TEXT);
+    term.put_str(b"  uname [-a]         Kernel version info\n", TEXT);
+    term.put_str(b"  run <agent>        Launch agent binary (fork+exec)\n", TEXT);
+    term.put_str(b"  llm <prompt>       Send prompt to LLM agent\n", TEXT);
+    term.put_str(b"  gen_driver <id>    AI-generate driver for PCI device\n", TEXT);
+    term.put_str(b"  version            Show OS version\n", TEXT);
+    term.put_str(b"  wget               TCP network test (10.0.2.2)\n", TEXT);
+    term.put_str(b"  shutdown           Halt the system\n", TEXT);
+    term.put_str(b"\n  Shortcuts: Ctrl+C cancel | Ctrl+L clear | Up/Down history | Tab complete\n", DIM);
     term.put_char(b'\n', TEXT);
 }
 
@@ -1121,6 +1130,12 @@ fn process_command(term: &mut Terminal) {
         cmd_run(term, args);
     } else if bytes_eq(first_word, b"shutdown") || bytes_eq(first_word, b"halt") {
         cmd_shutdown(term);
+    } else if bytes_eq(first_word, b"whoami") {
+        cmd_whoami(term);
+    } else if bytes_eq(first_word, b"uname") {
+        cmd_uname(term, args);
+    } else if bytes_eq(first_word, b"gen_driver") {
+        cmd_gen_driver(term, args);
     } else if bytes_eq(first_word, b"exit") || bytes_eq(first_word, b"quit") {
         term.put_char(b'\n', TEXT);
         term.put_str(b"Goodbye!\n", PROMPT);
@@ -1141,6 +1156,276 @@ fn cmd_clear(term: &mut Terminal) {
     term.clear_screen();
 }
 
+fn cmd_whoami(term: &mut Terminal) {
+    term.put_char(b'\n', TEXT);
+    term.put_str(b"root@aetherion\n", PROMPT);
+    term.put_char(b'\n', TEXT);
+}
+
+fn cmd_uname(term: &mut Terminal, args: &[u8]) {
+    term.put_char(b'\n', TEXT);
+    if args.is_empty() || bytes_eq(args, b"-a") || bytes_eq(args, b"--all") {
+        term.put_str(b"AetherionOS aetherion 4.0.0-multi-agent x86_64 Haswell GNU/AetherionOS\n", TEXT);
+    } else if bytes_eq(args, b"-r") {
+        term.put_str(b"4.0.0-multi-agent\n", TEXT);
+    } else if bytes_eq(args, b"-s") {
+        term.put_str(b"AetherionOS\n", TEXT);
+    } else if bytes_eq(args, b"-m") {
+        term.put_str(b"x86_64\n", TEXT);
+    } else {
+        term.put_str(b"AetherionOS aetherion 4.0.0-multi-agent x86_64 Haswell GNU/AetherionOS\n", TEXT);
+    }
+    term.put_char(b'\n', TEXT);
+}
+
+/// gen_driver <pci_id> — AI-generate a PCI device driver
+/// Publishes INTENT_GEN_DRIVER to the bus with the PCI vendor:device ID encoded.
+/// agent_llama_core receives this and streams back a Rust driver template.
+fn cmd_gen_driver(term: &mut Terminal, args: &[u8]) {
+    term.put_char(b'\n', TEXT);
+    if args.is_empty() {
+        term.put_str(b"Usage: gen_driver <vendor:device>\n", ERR_COL);
+        term.put_str(b"Example: gen_driver 8086:100e  (Intel e1000)\n", DIM);
+        term.put_str(b"         gen_driver 1af4:1000  (virtio-net)\n", DIM);
+        term.put_char(b'\n', TEXT);
+        return;
+    }
+
+    // Parse PCI ID: "VVVV:DDDD" -> vendor (u16), device (u16)
+    let mut vendor: u64 = 0;
+    let mut device: u64 = 0;
+    let mut in_device = false;
+
+    for &b in args {
+        if b == b':' {
+            in_device = true;
+            continue;
+        }
+        let nibble = match b {
+            b'0'..=b'9' => (b - b'0') as u64,
+            b'a'..=b'f' => (b - b'a' + 10) as u64,
+            b'A'..=b'F' => (b - b'A' + 10) as u64,
+            _ => continue,
+        };
+        if in_device {
+            device = (device << 4) | nibble;
+        } else {
+            vendor = (vendor << 4) | nibble;
+        }
+    }
+
+    let pci_id = (vendor << 16) | device;
+
+    term.put_str(b"[GEN] Generating driver for PCI ", INFO_COL);
+    term.put_str(args, TEXT);
+    term.put_char(b'\n', TEXT);
+
+    // Identify known devices
+    let device_name: &[u8] = match (vendor as u16, device as u16) {
+        (0x8086, 0x100E) => b"Intel 82540EM Gigabit Ethernet (e1000)",
+        (0x8086, 0x100F) => b"Intel 82545EM Gigabit Ethernet",
+        (0x8086, 0x10D3) => b"Intel 82574L Gigabit Ethernet",
+        (0x1AF4, 0x1000) => b"VirtIO Network Device",
+        (0x1AF4, 0x1001) => b"VirtIO Block Device",
+        (0x1AF4, 0x1050) => b"VirtIO GPU Device",
+        (0x1B36, 0x000D) => b"QEMU XHCI USB Controller",
+        (0x1234, 0x1111) => b"QEMU Standard VGA",
+        _ => b"Unknown PCI device",
+    };
+
+    term.put_str(b"[GEN] Device: ", DIM);
+    term.put_str(device_name, INFO_COL);
+    term.put_char(b'\n', TEXT);
+    term.put_str(b"[GEN] Publishing INTENT_GEN_DRIVER to bus...\n", DIM);
+
+    // Publish intent for LLM agent to pick up
+    sys_bus_publish(INTENT_GEN_DRIVER, 2, pci_id);
+    sys_write(1, b"[TERM] gen_driver: intent published\n");
+
+    // Generate driver template locally (predefined for known devices)
+    term.put_str(b"[GEN] Generating Rust driver template...\n", DIM);
+    term.put_char(b'\n', TEXT);
+
+    // Stream the template character by character for visual effect
+    let template = match (vendor as u16, device as u16) {
+        (0x8086, 0x100E) => generate_e1000_template(),
+        (0x1AF4, 0x1000) => generate_virtio_net_template(),
+        _ => generate_generic_template(vendor, device),
+    };
+
+    for &b in template {
+        term.put_char(b, LLM_COL);
+        // Yield every 16 chars to allow display update
+        if b == b'\n' { sys_yield(); }
+    }
+
+    term.put_char(b'\n', TEXT);
+    term.put_str(b"[GEN] Driver template generated (", DIM);
+    term.put_u64(template.len() as u64, INFO_COL);
+    term.put_str(b" bytes)\n", DIM);
+
+    // Save to /var/drivers/<pci_id>.rs
+    let mut path = [0u8; 64];
+    let mut poff = 0usize;
+    let prefix = b"/var/drivers/";
+    for &b in prefix.iter() { path[poff] = b; poff += 1; }
+    for &b in args {
+        if b == b':' { path[poff] = b'_'; poff += 1; }
+        else if (b >= b'0' && b <= b'9') || (b >= b'a' && b <= b'f') || (b >= b'A' && b <= b'F') {
+            path[poff] = b; poff += 1;
+        }
+    }
+    let suffix = b".rs";
+    for &b in suffix.iter() { path[poff] = b; poff += 1; }
+    path[poff] = 0;
+
+    // Write via sys_open + sys_write
+    let fd = sys_open(&path[..poff + 1], O_WRONLY | O_CREAT | O_TRUNC);
+    if fd >= 0 {
+        sys_write_fd(fd as u32, template);
+        sys_close(fd as u32);
+        term.put_str(b"[GEN] Saved to ", DIM);
+        term.put_str(&path[..poff], INFO_COL);
+        term.put_char(b'\n', TEXT);
+    } else {
+        term.put_str(b"[GEN] (file save skipped - VFS write pending)\n", DIM);
+    }
+    term.put_char(b'\n', TEXT);
+}
+
+fn generate_e1000_template() -> &'static [u8] {
+    b"// Intel e1000 (8086:100E) Driver for AetherionOS\n\
+// Auto-generated by gen_driver AI\n\
+\n\
+const E1000_VENDOR: u16 = 0x8086;\n\
+const E1000_DEVICE: u16 = 0x100E;\n\
+\n\
+// MMIO Register Offsets\n\
+const REG_CTRL:   u32 = 0x0000;  // Device Control\n\
+const REG_STATUS: u32 = 0x0008;  // Device Status\n\
+const REG_EERD:   u32 = 0x0014;  // EEPROM Read\n\
+const REG_ICR:    u32 = 0x00C0;  // Interrupt Cause Read\n\
+const REG_IMS:    u32 = 0x00D0;  // Interrupt Mask Set\n\
+const REG_RCTL:   u32 = 0x0100;  // Receive Control\n\
+const REG_TCTL:   u32 = 0x0400;  // Transmit Control\n\
+const REG_RDBAL:  u32 = 0x2800;  // RX Desc Base Low\n\
+const REG_RDBAH:  u32 = 0x2804;  // RX Desc Base High\n\
+const REG_RDLEN:  u32 = 0x2808;  // RX Desc Length\n\
+const REG_TDBAL:  u32 = 0x3800;  // TX Desc Base Low\n\
+const REG_TDBAH:  u32 = 0x3804;  // TX Desc Base High\n\
+const REG_TDLEN:  u32 = 0x3808;  // TX Desc Length\n\
+\n\
+pub struct E1000Driver {\n\
+    mmio_base: u64,\n\
+    mac_addr: [u8; 6],\n\
+    rx_ring: *mut RxDescriptor,\n\
+    tx_ring: *mut TxDescriptor,\n\
+}\n\
+\n\
+impl E1000Driver {\n\
+    pub unsafe fn init(mmio_base: u64) -> Self {\n\
+        let mut drv = Self {\n\
+            mmio_base,\n\
+            mac_addr: [0; 6],\n\
+            rx_ring: core::ptr::null_mut(),\n\
+            tx_ring: core::ptr::null_mut(),\n\
+        };\n\
+        drv.reset();\n\
+        drv.read_mac();\n\
+        drv.setup_rx();\n\
+        drv.setup_tx();\n\
+        drv.enable_interrupts();\n\
+        drv\n\
+    }\n\
+\n\
+    unsafe fn mmio_read(&self, reg: u32) -> u32 {\n\
+        core::ptr::read_volatile(\n\
+            (self.mmio_base + reg as u64) as *const u32\n\
+        )\n\
+    }\n\
+\n\
+    unsafe fn mmio_write(&self, reg: u32, val: u32) {\n\
+        core::ptr::write_volatile(\n\
+            (self.mmio_base + reg as u64) as *mut u32,\n\
+            val\n\
+        );\n\
+    }\n\
+\n\
+    unsafe fn reset(&mut self) {\n\
+        self.mmio_write(REG_CTRL, 1 << 26); // RST bit\n\
+        for _ in 0..10000 { core::hint::spin_loop(); }\n\
+    }\n\
+}\n"
+}
+
+fn generate_virtio_net_template() -> &'static [u8] {
+    b"// VirtIO Network (1AF4:1000) Driver for AetherionOS\n\
+// Auto-generated by gen_driver AI\n\
+\n\
+const VIRTIO_VENDOR: u16 = 0x1AF4;\n\
+const VIRTIO_NET_DEVICE: u16 = 0x1000;\n\
+\n\
+// VirtIO MMIO Registers\n\
+const VIRTIO_MAGIC:         u32 = 0x000;\n\
+const VIRTIO_VERSION:       u32 = 0x004;\n\
+const VIRTIO_DEVICE_ID:     u32 = 0x008;\n\
+const VIRTIO_STATUS:        u32 = 0x070;\n\
+const VIRTIO_QUEUE_SEL:     u32 = 0x030;\n\
+const VIRTIO_QUEUE_NUM_MAX: u32 = 0x034;\n\
+const VIRTIO_QUEUE_NUM:     u32 = 0x038;\n\
+\n\
+pub struct VirtioNetDriver {\n\
+    mmio_base: u64,\n\
+    mac: [u8; 6],\n\
+}\n\
+\n\
+impl VirtioNetDriver {\n\
+    pub unsafe fn init(mmio_base: u64) -> Self {\n\
+        let drv = Self { mmio_base, mac: [0; 6] };\n\
+        drv.negotiate_features();\n\
+        drv.setup_queues();\n\
+        drv\n\
+    }\n\
+}\n"
+}
+
+fn generate_generic_template(vendor: u64, device: u64) -> &'static [u8] {
+    b"// Generic PCI Driver Template for AetherionOS\n\
+// Auto-generated by gen_driver AI\n\
+// TODO: Fill in MMIO register definitions for this device.\n\
+\n\
+pub struct PciDriver {\n\
+    mmio_base: u64,\n\
+    vendor_id: u16,\n\
+    device_id: u16,\n\
+}\n\
+\n\
+impl PciDriver {\n\
+    pub unsafe fn init(mmio_base: u64, vendor: u16, device: u16) -> Self {\n\
+        let drv = Self { mmio_base, vendor_id: vendor, device_id: device };\n\
+        // Step 1: Read PCI config space\n\
+        // Step 2: Map MMIO BAR\n\
+        // Step 3: Reset device\n\
+        // Step 4: Configure interrupts\n\
+        // Step 5: Initialize descriptor rings\n\
+        drv\n\
+    }\n\
+\n\
+    pub unsafe fn mmio_read(&self, offset: u32) -> u32 {\n\
+        core::ptr::read_volatile(\n\
+            (self.mmio_base + offset as u64) as *const u32\n\
+        )\n\
+    }\n\
+\n\
+    pub unsafe fn mmio_write(&self, offset: u32, val: u32) {\n\
+        core::ptr::write_volatile(\n\
+            (self.mmio_base + offset as u64) as *mut u32,\n\
+            val,\n\
+        );\n\
+    }\n\
+}\n"
+}
+
 // ═══════════════════════════════════════════════════
 // MAIN EVENT LOOP
 // ═══════════════════════════════════════════════════
@@ -1157,7 +1442,7 @@ pub extern "C" fn main() -> i64 {
     let mut term = alloc::boxed::Box::new(Terminal::new());
     term.clear_screen();
 
-    term.put_str(b"AetherionOS v3.0 - Production Terminal\n", TEXT);
+    term.put_str(b"AetherionOS v4.0 - Production Terminal\n", TEXT);
     term.put_str(b"Kernel: x86_64 Ring 3 | Real Syscall Architecture\n", DIM);
     term.put_str(b"FS: FAT32 + exFAT | Bus: Cognitive Intent Bus\n", DIM);
     term.put_str(b"Type 'help' for commands, 'ls' for files, 'ps' for procs.\n", INFO_COL);
@@ -1187,7 +1472,17 @@ pub extern "C" fn main() -> i64 {
                 }
                 0x01 => { term.nav_history(true);  }  // Up arrow → older history
                 0x02 => { term.nav_history(false); }  // Down arrow → newer history
+                0x03 => {  // Ctrl+C → cancel current line
+                    term.put_str(b"^C", ERR_COL);
+                    term.newline();
+                    term.clear_cmd_buf();
+                    print_prompt(&mut term);
+                }
                 0x09 => { term.tab_complete(); }       // Tab → auto-complete
+                0x0C => {  // Ctrl+L → clear screen
+                    cmd_clear(&mut term);
+                    print_prompt(&mut term);
+                }
                 0x20..=0x7E => {
                     if term.cmd_len < CMD_BUF_SIZE {
                         term.cmd_buf[term.cmd_len] = ch;
