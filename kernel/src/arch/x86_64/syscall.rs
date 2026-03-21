@@ -155,9 +155,14 @@ fn validate_user_ptr(addr: u64, len: u64) -> bool {
     if addr < USER_ADDR_LIMIT {
         return addr.checked_add(len).map_or(false, |end| end <= USER_ADDR_LIMIT);
     }
-    // User ELF region: 0x80_0000_0000 .. 0x80_1000_0000 (4 GiB window)
+    // User ELF region: 0x80_0000_0000 .. 0x80_1000_0000 (4 GiB window at 32 GiB)
     if addr >= 0x80_0000_0000 && addr < 0x80_1000_0000 {
         return addr.checked_add(len).map_or(false, |end| end <= 0x80_1000_0000);
+    }
+    // User ELF region: 0x8000_0000_0000 .. 0x8001_0000_0000 (4 GiB window at 512 GiB)
+    // This is where the linker places binaries with --image-base=0x8000000000
+    if addr >= 0x8000_0000_0000 && addr < 0x8001_0000_0000 {
+        return addr.checked_add(len).map_or(false, |end| end <= 0x8001_0000_0000);
     }
     false
 }
@@ -673,43 +678,46 @@ fn sys_stub_getrandom(buf_addr: u64, buflen: u64, _flags: u64) -> u64 {
 fn sys_write(fd: u64, buf_addr: u64, len: u64) -> u64 {
     if len == 0 { return 0; }
 
-    // SECURITY: validate user pointer
-    if !validate_user_ptr(buf_addr, len) {
-        // For serial output (fd 1/2), try to write with clamped length
-        if (fd == 1 || fd == 2) && validate_user_ptr(buf_addr, 1) {
-            // Clamp len to a safe maximum and write what we can
-            let safe_len = core::cmp::min(len, 4096) as usize;
-            let ptr = buf_addr as *const u8;
-            for i in 0..safe_len {
-                if !validate_user_ptr(buf_addr + i as u64, 1) { break; }
-                let byte = unsafe { core::ptr::read_volatile(ptr.add(i)) };
-                if byte == 0 { break; }
-                unsafe {
-                    while (x86_64::instructions::port::Port::<u8>::new(0x3FD).read() & 0x20) == 0 {}
-                    x86_64::instructions::port::Port::<u8>::new(0x3F8).write(byte);
-                }
-            }
-            return safe_len as u64;
-        }
-        return EFAULT;
-    }
-
-    // stdout/stderr -> serial output
+    // stdout/stderr -> serial output (atomic: no preemption during write)
     if fd == 1 || fd == 2 {
-        unsafe {
-            let buf = buf_addr as *const u8;
-            for i in 0..len as usize {
-                let byte = core::ptr::read_volatile(buf.add(i));
-                // Wait for THR empty (LSR bit 5)
-                loop {
-                    let lsr: u8;
-                    asm!("in al, dx", out("al") lsr, in("dx") 0x3FDu16,
+        let n = len as usize;
+        if n > 0 && n <= 8192 && validate_user_ptr(buf_addr, len) {
+            unsafe {
+                asm!("cli", options(nomem, nostack));
+                let buf = buf_addr as *const u8;
+                for i in 0..n {
+                    let byte = core::ptr::read_volatile(buf.add(i));
+                    loop {
+                        let lsr: u8;
+                        asm!("in al, dx", out("al") lsr, in("dx") 0x3FDu16,
+                             options(nomem, nostack));
+                        if lsr & 0x20 != 0 { break; }
+                    }
+                    asm!("out dx, al", in("al") byte, in("dx") 0x3F8u16,
                          options(nomem, nostack));
-                    if lsr & 0x20 != 0 { break; }
                 }
-                // Send byte
-                asm!("out dx, al", in("al") byte, in("dx") 0x3F8u16,
-                     options(nomem, nostack));
+                asm!("sti", options(nomem, nostack));
+            }
+        } else if n > 0 && validate_user_ptr(buf_addr, 1) {
+            // Fallback: write byte-by-byte with per-byte validation
+            let safe_len = core::cmp::min(n, 4096);
+            let ptr = buf_addr as *const u8;
+            unsafe {
+                asm!("cli", options(nomem, nostack));
+                for i in 0..safe_len {
+                    if !validate_user_ptr(buf_addr + i as u64, 1) { break; }
+                    let byte = core::ptr::read_volatile(ptr.add(i));
+                    if byte == 0 { break; }
+                    loop {
+                        let lsr: u8;
+                        asm!("in al, dx", out("al") lsr, in("dx") 0x3FDu16,
+                             options(nomem, nostack));
+                        if lsr & 0x20 != 0 { break; }
+                    }
+                    asm!("out dx, al", in("al") byte, in("dx") 0x3F8u16,
+                         options(nomem, nostack));
+                }
+                asm!("sti", options(nomem, nostack));
             }
         }
         return len;
@@ -1188,6 +1196,8 @@ fn sys_clone(child_stack: u64) -> u64 {
 
 /// Global yield counter for QEMU validation (Jalon 79)
 static YIELD_COUNT: AtomicU64 = AtomicU64::new(0);
+static BUS_PUB_COUNT: AtomicU64 = AtomicU64::new(0);
+static BUS_CON_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Read the 8 callee-saved registers from the kernel syscall stack.
 /// gs:[24] points to the stack frame: [r15, r14, r13, r12, rbx, rbp, r11, rcx]
@@ -1306,9 +1316,9 @@ fn sys_yield() -> u64 {
     let _ = crate::process::set_state(next, crate::process::ProcessState::Running);
     crate::scheduler::set_current_pid(next);
 
-    // Yield counter + periodic logging
+    // Yield counter + periodic logging (sparse to avoid serial flood)
     let yc = YIELD_COUNT.fetch_add(1, AtomicOrdering::Relaxed) + 1;
-    if yc <= 20 || yc % 100 == 0 {
+    if yc <= 20 || (yc <= 1000 && yc % 100 == 0) || yc % 100000 == 0 {
         crate::serial_write("[YIELD] ");
         print_u64_raw(current); crate::serial_write("->"); print_u64_raw(next);
         crate::serial_write(" #"); print_u64_raw(yc);
@@ -2689,6 +2699,15 @@ pub fn init() {
     crate::serial_println!("[OK] SYSCALL/SYSRET fully configured (16 syscalls registered)");
 }
 
+/// Get the top of the kernel syscall stack.
+/// Used by kernel_main to switch to a fresh stack before the initial IRETQ,
+/// since the boot stack may be nearly exhausted after the long init sequence.
+pub fn get_kernel_stack_top() -> u64 {
+    unsafe {
+        (&SYSCALL_STACK.0 as *const u8 as u64) + KERNEL_SYSCALL_STACK_SIZE as u64
+    }
+}
+
 /// Ensure GS_BASE = 0 (user) and KERNEL_GS_BASE = PER_CPU (kernel).
 /// Call this right before the initial IRETQ to Ring 3 to guarantee
 /// that syscall_entry's first swapgs will work correctly.
@@ -2863,10 +2882,13 @@ fn sys_bus_publish(intent: u64, priority: u32, data: u64) -> u64 {
 
     match crate::ipc::bus::publish(msg) {
         Ok(()) => {
-            crate::serial_println!(
-                "[SYSCALL] bus_publish: intent=0x{:X}, prio={}, data=0x{:X}",
-                intent, priority, data
-            );
+            let pc = BUS_PUB_COUNT.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+            if pc <= 20 || (pc <= 500 && pc % 50 == 0) || pc % 10000 == 0 {
+                crate::serial_println!(
+                    "[SYSCALL] bus_publish: intent=0x{:X}, prio={}, data=0x{:X} (#{pc})",
+                    intent, priority, data
+                );
+            }
             0
         }
         Err(_) => {
@@ -2924,6 +2946,7 @@ fn sys_bus_consume(buf_addr: u64) -> u64 {
                 "[SYSCALL] bus_consume: intent=0x{:X}, payload=0x{:X}",
                 msg.intent_id, msg.payload
             );
+            let _cc = BUS_CON_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
             0
         }
         Err(_) => {

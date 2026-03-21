@@ -1946,6 +1946,74 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     }
 
     // ===================================================================
+    // Create /models directory with a mini GGUF test file for Level 2
+    // GGUF v3 header: magic(4) + version(4) + tensor_count(8) + kv_count(8)
+    // Plus one KV pair with model architecture = "test"
+    // ===================================================================
+    {
+        use alloc::vec::Vec;
+        let mut gguf_data: Vec<u8> = Vec::with_capacity(256);
+        // Magic: "GGUF" = 0x46554747 little-endian
+        gguf_data.extend_from_slice(&0x46554747u32.to_le_bytes());
+        // Version: 3
+        gguf_data.extend_from_slice(&3u32.to_le_bytes());
+        // Tensor count: 2
+        gguf_data.extend_from_slice(&2u64.to_le_bytes());
+        // KV count: 1
+        gguf_data.extend_from_slice(&1u64.to_le_bytes());
+        // KV pair 0: key = "general.architecture", type = STRING(8), value = "test"
+        let key = b"general.architecture";
+        gguf_data.extend_from_slice(&(key.len() as u64).to_le_bytes()); // key length
+        gguf_data.extend_from_slice(key);                                // key data
+        gguf_data.extend_from_slice(&8u32.to_le_bytes());               // value type = STRING
+        let val = b"test";
+        gguf_data.extend_from_slice(&(val.len() as u64).to_le_bytes()); // string length
+        gguf_data.extend_from_slice(val);                                // string data
+        // Tensor info 0: name="token_embd.weight", ndims=2, dims=[32,64], type=F32(0), offset=0
+        let t0_name = b"token_embd.weight";
+        gguf_data.extend_from_slice(&(t0_name.len() as u64).to_le_bytes());
+        gguf_data.extend_from_slice(t0_name);
+        gguf_data.extend_from_slice(&2u32.to_le_bytes()); // ndims
+        gguf_data.extend_from_slice(&32u64.to_le_bytes()); // dim[0]
+        gguf_data.extend_from_slice(&64u64.to_le_bytes()); // dim[1]
+        gguf_data.extend_from_slice(&0u32.to_le_bytes());  // type = F32
+        gguf_data.extend_from_slice(&0u64.to_le_bytes());  // offset
+        // Tensor info 1: name="output.weight", ndims=2, dims=[32,64], type=F32(0), offset=8192
+        let t1_name = b"output.weight";
+        gguf_data.extend_from_slice(&(t1_name.len() as u64).to_le_bytes());
+        gguf_data.extend_from_slice(t1_name);
+        gguf_data.extend_from_slice(&2u32.to_le_bytes()); // ndims
+        gguf_data.extend_from_slice(&32u64.to_le_bytes()); // dim[0]
+        gguf_data.extend_from_slice(&64u64.to_le_bytes()); // dim[1]
+        gguf_data.extend_from_slice(&0u32.to_le_bytes());  // type = F32
+        gguf_data.extend_from_slice(&8192u64.to_le_bytes()); // offset
+        // Pad to 256 bytes alignment + add some dummy weight data
+        while gguf_data.len() < 256 { gguf_data.push(0); }
+        // Add 16KB of synthetic f32 weight data (4096 floats)
+        for i in 0..4096u32 {
+            let f = (i as f32) * 0.001;
+            gguf_data.extend_from_slice(&f.to_le_bytes());
+        }
+        
+        let gguf_len = gguf_data.len();
+        
+        {
+            let mut root = fs::vfs::lock_root();
+            // Create /models directory
+            let mut models_dir = alloc::collections::BTreeMap::new();
+            models_dir.insert(
+                alloc::string::String::from("test.gguf"),
+                fs::vfs::VfsNode::File(gguf_data),
+            );
+            root.insert(
+                alloc::string::String::from("models"),
+                fs::vfs::VfsNode::Directory(models_dir),
+            );
+            serial_println!("       [OK] /models/test.gguf created ({} bytes, GGUF v3)", gguf_len);
+        }
+    }
+
+    // ===================================================================
     // COUCHE 21: FRAMEBUFFER INITIALIZATION
     // Bochs VGA Extension: switch to 1024x768x32bpp linear framebuffer
     // ===================================================================
@@ -1982,10 +2050,24 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
         // ──────────────────────────────────────────────────────────
         // STEP A1: Load agent_llm_chat.elf as a QUEUED process
-        // Jalon 79: IRETQ bug fixed (serial_println stack corruption).
-        // LLM chat agent loaded but queuing still disabled - uses llama_core instead.
+        // Level 2: Re-enabled to verify GGUF header parsing via sys_pread64
+        // Opens /models/test.gguf from VFS and parses GGUF v3 header
         // ──────────────────────────────────────────────────────────
-        serial_write("  [J79] agent_llm_chat.elf: DISABLED (replaced by agent_llama_core)\n");
+        match elf::load_elf_binary(AGENT_LLM_CHAT_ELF) {
+            Ok(chat_result) => {
+                let chat_pid = process::spawn_userspace(
+                    "/bin/agent_llm_chat.elf", 0,
+                    chat_result.entry_point, chat_result.stack_pointer, chat_result.pml4_phys
+                ).unwrap_or(0);
+                if chat_pid != 0 {
+                    scheduler::enqueue_process(chat_pid);
+                    serial_write("  [J79] agent_llm_chat.elf: QUEUED (GGUF verification via sys_pread64)\n");
+                }
+            }
+            Err(_e) => {
+                serial_write("  [J79] WARN: agent_llm_chat.elf load failed\n");
+            }
+        }
 
         // ──────────────────────────────────────────────────────────
         // STEP A2: Load agent_orchestrator.elf as a QUEUED process
@@ -2081,16 +2163,28 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
                 arch::x86_64::syscall::reset_gs_bases();
 
+                // CRITICAL: Switch to the syscall kernel stack before IRETQ.
+                // The boot stack is nearly exhausted after kernel_main's deep
+                // call chains (ELF loading, VFS, serial I/O). The push instructions
+                // in the IRETQ frame need a valid stack. We use the syscall stack
+                // (1 MiB) which is fresh and properly sized.
+                let kernel_stack_top = arch::x86_64::syscall::get_kernel_stack_top();
+
                 unsafe {
                     core::arch::asm!(
                         "cli",
+                        // Switch to syscall kernel stack (boot stack is exhausted)
+                        "mov rsp, {kstack}",
+                        // Switch address space to the user process
                         "mov cr3, {cr3_val}",
-                        "push 0x1B",
-                        "push {rsp_val}",
-                        "push 0x202",
-                        "push 0x23",
-                        "push {rip_val}",
+                        // Build IRETQ stack frame
+                        "push 0x1B",          // SS (User Data, RPL=3)
+                        "push {rsp_val}",     // RSP (user stack)
+                        "push 0x202",         // RFLAGS (IF=1)
+                        "push 0x23",          // CS (User Code, RPL=3)
+                        "push {rip_val}",     // RIP (entry point)
                         "iretq",
+                        kstack = in(reg) kernel_stack_top,
                         cr3_val = in(reg) pml4,
                         rsp_val = in(reg) stack,
                         rip_val = in(reg) entry,

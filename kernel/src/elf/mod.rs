@@ -351,16 +351,20 @@ unsafe fn create_user_pml4() -> Result<u64, ElfError> {
     // Zero the entire new PML4
     core::ptr::write_bytes(new_pml4_virt, 0, 512);
 
-    // Copy ALL present kernel entries from current PML4 (indices 0-511).
-    // This includes entries needed for kernel code (PML4[0], PML4[1], etc.)
-    // and upper-half entries (PML4[256+]) for physical memory mapping.
+    // Copy ALL kernel PML4 entries EXCEPT PML4[1] (user ELF region).
     //
-    // IMPORTANT: map_user_page() uses deep-copy for intermediate tables when
-    // it encounters existing entries in the user address range (PML4[1]).
-    // This prevents modifications to user page tables from corrupting the
-    // shared kernel page tables — fixing the multi-ELF loader state leak.
+    // PML4[0]: kernel identity mapping (code, GDT, IDT, kernel stacks)
+    // PML4[1]: user ELF region (0x8000000000) — MUST NOT copy, built per-process
+    // PML4[2-135]: various bootloader/kernel mappings
+    // PML4[136+]: physical memory offset mapping (bootloader 0.9.x)
+    // PML4[256-511]: kernel upper half (physical memory, kernel heap)
+    //
+    // Ring 3 code cannot access PML4[0] or PML4[256+] because those entries
+    // don't have the USER_ACCESSIBLE bit set — KPTI-lite protection.
+    // PML4[1] is created fresh for each process by map_user_page().
     let mut copied = 0usize;
     for i in 0..512usize {
+        if i == 1 { continue; } // Skip user ELF region — built per-process
         let entry = core::ptr::read_volatile(current_pml4_virt.add(i));
         if entry & 0x01 != 0 {
             core::ptr::write_volatile(new_pml4_virt.add(i), entry);
@@ -369,7 +373,7 @@ unsafe fn create_user_pml4() -> Result<u64, ElfError> {
     }
 
     crate::serial_println!(
-        "[ELF] User PML4 created: phys=0x{:X} ({} kernel entries cloned, user isolated)",
+        "[ELF] User PML4 created: phys=0x{:X} ({} kernel entries cloned, PML4[1] isolated)",
         new_pml4_phys, copied
     );
 
@@ -396,6 +400,26 @@ unsafe fn map_user_page(
         ((vaddr >> 12) & 0x1FF) as usize, // PT index
     ];
 
+    // Track which tables we allocated in THIS load operation.
+    // We use the current PML4's own address as a marker: if a table was
+    // allocated in this call chain, its parent entry was written by us.
+    // To avoid cross-process contamination, we check against pml4_phys.
+    //
+    // CRITICAL: Need enough slots for all intermediate page tables:
+    //   - ELF segments: up to 3 levels (PDPT, PD, PT) per distinct PML4 index
+    //   - User stack: 3 more levels at PML4[255]
+    //   - Total: typically 6-12 tables per process load
+    static mut CURRENT_LOAD_PML4: u64 = 0;
+    static mut OWNED_TABLES: [u64; 32] = [0; 32];
+    static mut OWNED_COUNT: usize = 0;
+
+    // When PML4 changes (new process), reset owned tables
+    if CURRENT_LOAD_PML4 != pml4_phys {
+        CURRENT_LOAD_PML4 = pml4_phys;
+        OWNED_COUNT = 0;
+        for t in OWNED_TABLES.iter_mut() { *t = 0; }
+    }
+
     let mut table_phys = pml4_phys;
 
     // Walk PML4 -> PDPT -> PD, creating or deep-copying entries as needed
@@ -411,26 +435,59 @@ unsafe fn map_user_page(
                 table_virt.add(indices[level]),
                 new_table | 0x07, // P | W | U
             );
+            // Track this table as owned by current load
+            if OWNED_COUNT < OWNED_TABLES.len() {
+                OWNED_TABLES[OWNED_COUNT] = new_table;
+                OWNED_COUNT += 1;
+            }
             table_phys = new_table;
         } else {
             let existing_phys = entry & !0xFFF;
-            // Check if this table was allocated from the ELF pool.
-            // If not, it's a kernel table that must be deep-copied to
-            // prevent user mappings from corrupting kernel page tables.
-            let pool_base = ELF_POOL.base_frame;
-            let pool_end = pool_base + (ELF_POOL.max_frames as u64) * PAGE_SIZE;
-            if existing_phys < pool_base || existing_phys >= pool_end {
-                // Kernel table - deep copy it
+            // Check if this table was allocated by THIS load operation.
+            // If not, it's either a kernel table or a table from a PREVIOUS
+            // process load — both must be deep-copied to prevent cross-process
+            // page table corruption (the multi-ELF state leak bug).
+            let mut owned = false;
+            for i in 0..OWNED_COUNT {
+                if OWNED_TABLES[i] == existing_phys {
+                    owned = true;
+                    break;
+                }
+            }
+            if !owned {
+                // NOT owned by this load — deep copy to isolate
                 let new_table = alloc_elf_frame().ok_or(ElfError::OutOfMemory)?;
-                let src = phys_to_virt(existing_phys) as *const u8;
-                let dst = phys_to_virt(new_table) as *mut u8;
-                core::ptr::copy_nonoverlapping(src, dst, PAGE_SIZE as usize);
-                // Replace the entry with the copy, preserving flags but adding U
-                let new_entry = new_table | (entry & 0xFFF) | 0x07; // add P|W|U
+                // CRITICAL: Zero the new table first, then selectively
+                // copy only non-user entries (kernel entries).
+                // User entries from previous processes must NOT be copied.
+                let src_virt = phys_to_virt(existing_phys) as *const u64;
+                let dst_virt = phys_to_virt(new_table) as *mut u64;
+                // Zero the whole table
+                core::ptr::write_bytes(dst_virt as *mut u8, 0, PAGE_SIZE as usize);
+                // Only copy kernel-owned entries (those NOT from ELF pool)
+                let pool_base = ELF_POOL.base_frame;
+                let pool_end = pool_base + (ELF_POOL.max_frames as u64) * PAGE_SIZE;
+                for idx in 0..512usize {
+                    let e = core::ptr::read_volatile(src_virt.add(idx));
+                    if e & 0x01 != 0 {
+                        let phys = e & !0xFFF;
+                        // Only copy if it points OUTSIDE the ELF pool (kernel-owned)
+                        if phys < pool_base || phys >= pool_end {
+                            core::ptr::write_volatile(dst_virt.add(idx), e);
+                        }
+                        // ELF pool entries from previous loads are DROPPED
+                        // — they will be recreated for this process
+                    }
+                }
+                let new_entry = new_table | (entry & 0xFFF) | 0x07; // P|W|U
                 core::ptr::write_volatile(table_virt.add(indices[level]), new_entry);
+                if OWNED_COUNT < OWNED_TABLES.len() {
+                    OWNED_TABLES[OWNED_COUNT] = new_table;
+                    OWNED_COUNT += 1;
+                }
                 table_phys = new_table;
             } else {
-                // ELF-allocated table - reuse it
+                // Owned by this load — reuse safely
                 table_phys = existing_phys;
             }
         }

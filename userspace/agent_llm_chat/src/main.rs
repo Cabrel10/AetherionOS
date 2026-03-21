@@ -866,13 +866,15 @@ pub extern "C" fn main() -> i64 {
     // ──────────────────────────────────────────────
     // Step 1: Open GGUF model file
     // ──────────────────────────────────────────────
-    let model_paths: [&[u8]; 6] = [
+    let model_paths: [&[u8]; 8] = [
         b"/disk/models/mistral-7b-instruct-v0.3.Q4_K_M.gguf\0",
         b"/disk/models/mistral-7b.gguf\0",
         b"/disk/models/MODEL.GGU\0",
         b"/disk/models/model.gguf\0",
         b"/disk/models/test.gguf\0",
         b"/disk/models/part1\0",
+        b"/models/test.gguf\0",    // VFS-embedded mini GGUF test file
+        b"/models/model.gguf\0",   // VFS fallback
     ];
 
     let mut model_fd: i64 = -1;

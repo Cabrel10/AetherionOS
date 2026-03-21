@@ -560,6 +560,113 @@ fn test_mmap_f32_alignment() -> bool {
 }
 
 // ═══════════════════════════════════════════════════
+// Level 2: GGUF Header Verification via sys_pread64
+// ═══════════════════════════════════════════════════
+const GGUF_MAGIC: u32 = 0x46554747; // "GGUF" little-endian
+
+/// Open a GGUF file and verify its header using sys_pread64.
+/// Returns true if GGUF magic, version, tensor count, and KV count
+/// are all successfully parsed.
+fn test_gguf_pread64() -> bool {
+    println("[GGUF] Testing GGUF header parsing via sys_pread64...");
+
+    // Try to open the VFS-embedded test GGUF file
+    let fd = sys_open(b"/models/test.gguf\0", 0);
+    if fd < 0 {
+        println("[GGUF]   Cannot open /models/test.gguf — skipping");
+        return false;
+    }
+    let fd_u = fd as u32;
+    print("[GGUF]   Opened /models/test.gguf (fd=");
+    print_u64(fd as u64);
+    println(")");
+
+    // Read GGUF magic (4 bytes at offset 0)
+    let mut buf4 = [0u8; 4];
+    let n = sys_pread64(fd_u, &mut buf4, 0);
+    if n != 4 {
+        print("[GGUF]   pread64 magic: expected 4, got ");
+        print_u64(n as u64);
+        println("");
+        sys_close(fd_u);
+        return false;
+    }
+    let magic = u32::from_le_bytes(buf4);
+    if magic != GGUF_MAGIC {
+        print("[GGUF]   Bad GGUF magic: 0x");
+        print_u64(magic as u64);
+        println(" (expected 0x46554747)");
+        sys_close(fd_u);
+        return false;
+    }
+    println("[GGUF]   Magic: GGUF (0x46554747) — OK");
+
+    // Read version (4 bytes at offset 4)
+    let n = sys_pread64(fd_u, &mut buf4, 4);
+    if n != 4 {
+        println("[GGUF]   pread64 version failed");
+        sys_close(fd_u);
+        return false;
+    }
+    let version = u32::from_le_bytes(buf4);
+    print("[GGUF]   Version: ");
+    print_u64(version as u64);
+    println("");
+
+    // Read tensor count (8 bytes at offset 8)
+    let mut buf8 = [0u8; 8];
+    let n = sys_pread64(fd_u, &mut buf8, 8);
+    if n != 8 {
+        println("[GGUF]   pread64 tensor_count failed");
+        sys_close(fd_u);
+        return false;
+    }
+    let tensor_count = u64::from_le_bytes(buf8);
+    print("[GGUF]   Tensors: ");
+    print_u64(tensor_count);
+    println("");
+
+    // Read KV count (8 bytes at offset 16)
+    let n = sys_pread64(fd_u, &mut buf8, 16);
+    if n != 8 {
+        println("[GGUF]   pread64 kv_count failed");
+        sys_close(fd_u);
+        return false;
+    }
+    let kv_count = u64::from_le_bytes(buf8);
+    print("[GGUF]   KV pairs: ");
+    print_u64(kv_count);
+    println("");
+
+    // Read first KV key length (8 bytes at offset 24)
+    let n = sys_pread64(fd_u, &mut buf8, 24);
+    if n == 8 {
+        let key_len = u64::from_le_bytes(buf8);
+        if key_len > 0 && key_len < 256 {
+            // Read key string
+            let mut key_buf = [0u8; 64];
+            let to_read = if key_len > 64 { 64 } else { key_len as usize };
+            let rn = sys_pread64(fd_u, &mut key_buf[..to_read], 32);
+            if rn > 0 {
+                sys_write(1, b"[GGUF]   First KV key: \"");
+                sys_write(1, &key_buf[..rn as usize]);
+                println("\"");
+            }
+        }
+    }
+
+    sys_close(fd_u);
+
+    let ok = version >= 2 && tensor_count > 0 && kv_count > 0;
+    if ok {
+        println("[GGUF]   GGUF header verified — sys_pread64 pipeline OK");
+    } else {
+        println("[GGUF]   GGUF header verification FAILED");
+    }
+    ok
+}
+
+// ═══════════════════════════════════════════════════
 // L1-Cache Tiling Benchmark
 // ═══════════════════════════════════════════════════
 
@@ -777,6 +884,7 @@ pub extern "C" fn main() -> i64 {
     let mmap_ok = test_mmap_basic();
     let elf_ok = test_mmap_elf();
     let align_ok = test_mmap_f32_alignment();
+    let gguf_ok = test_gguf_pread64();
 
     unsafe { MMAP_OPERATIONAL = mmap_ok; }
 
