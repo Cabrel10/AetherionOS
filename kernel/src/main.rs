@@ -1251,6 +1251,8 @@ fn exec_command(path: &str) {
 // ===== Entry Point =====
 bootloader::entry_point!(kernel_main);
 
+// verify_elf_rodata_pages removed — diagnostic served, reduces kernel_main stack pressure
+
 fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // === Banner ===
     serial_write("\n╔══════════════════════════════════════════════════╗\n");
