@@ -269,6 +269,56 @@ check "T47 PS/2 keyboard handler active" "PS/2 keyboard|keyboard.*init|KBD"
 check_not "T48 No spurious break-code floods" "\[KBD\].*release.*release.*release"
 
 # =============================================
+# Test Category 11: LLM Pipeline Deep (6 tests)
+# =============================================
+echo ""
+echo "=== [Cat 11] LLM Pipeline Deep ==="
+check "T49 GGUF model file created" "test\.gguf created|GGUF v3"
+check "T50 Model found signal (0xD067)" "0xD067"
+check "T51 LLM ready signal (0x8004)" "0x8004"
+check "T52 LLM chat init (0xD064)" "0xD064"
+check "T53 Llama core init (0xD062)" "0xD062"
+
+BUS_CONSUME=$(grep -c 'bus_consume' "$CLEAN_LOG" 2>/dev/null || true)
+BUS_CONSUME=$(echo "$BUS_CONSUME" | tr -d '[:space:]')
+BUS_CONSUME=${BUS_CONSUME:-0}
+check_val "T54 Bus consume events >= 5" "$BUS_CONSUME" "-ge" "5"
+
+# =============================================
+# Test Category 12: Process Lifecycle (4 tests)
+# =============================================
+echo ""
+echo "=== [Cat 12] Process Lifecycle ==="
+check "T55 PID 12 runs and exits cleanly" "PID 12 terminated.*exit 0|Process 12 terminating"
+check "T56 Ring 3 process success" "Ring 3 process.*exited"
+check "T57 Terminal announced (0xB059)" "0xB059"
+check "T58 Heap growth via sys_brk" "heap.*grow|brk.*0x3000"
+
+# =============================================
+# Test Category 13: Multi-Agent Stress (4 tests)
+# =============================================
+echo ""
+echo "=== [Cat 13] Multi-Agent Stress ==="
+
+YIELD_HIGH=$(grep -c 'YIELD.*#' "$CLEAN_LOG" 2>/dev/null || true)
+YIELD_HIGH=$(echo "$YIELD_HIGH" | tr -d '[:space:]')
+YIELD_HIGH=${YIELD_HIGH:-0}
+check_val "T59 YIELD count >= 20" "$YIELD_HIGH" "-ge" "20"
+
+check_val "T60 Token events >= 10" "$TOKEN_EV" "-ge" "10"
+check_val "T61 Bus publish >= 5 events" "$BUS_PUB" "-ge" "5"
+check_not "T62 No process crash (SIGSEGV/GPF)" "SIGSEGV|General protection fault"
+
+# =============================================
+# Test Category 14: Syscall Coverage (3 tests)
+# =============================================
+echo ""
+echo "=== [Cat 14] Syscall Coverage ==="
+check "T63 sys_mmap_file handled" "mmap_file|VMA created"
+check "T64 sys_yield syscall active" "YIELD-ENTRY|YIELD-CTX|YIELD-SELF"
+check "T65 SYSCALL init complete" "SYSCALL.*Initializing|SYSCALL.*LSTAR"
+
+# =============================================
 # Cleanup and Summary
 # =============================================
 rm -f "$CLEAN_LOG"
