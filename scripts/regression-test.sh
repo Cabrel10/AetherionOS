@@ -442,6 +442,46 @@ check "T109 GGUF layer structure" "embedding.*Attn.*FFN|Layers.*RMSNorm"
 check "T110 GGUF architecture validated" "GGUF-OK"
 
 # =============================================
+echo "=== [Cat 22] Network Stack (VirtIO-Net) ==="
+# =============================================
+check "T111 VirtIO-Net PCI detection" "VirtIO-Net device detected"
+check "T112 VirtIO-Net MAC address" "MAC.*52:54:00"
+check "T113 VirtIO-Net queues initialized" "Queue 0 size.*256"
+check "T114 VirtIO-Net driver active" "DRIVER_OK"
+check "T115 IP stack configured" "IP.*10.0.2.15"
+check "T116 ARP resolution works" "ARP reply.*10.0.2.2"
+check "T117 ICMP echo reply" "ICMP Echo Reply"
+check "T118 Network 8/8 tests" "NET TESTS.*8/8"
+
+# =============================================
+echo "=== [Cat 23] TCP/DNS Stack ==="
+# =============================================
+check "T119 TCP segment parse" "TCP TEST.*Segment build"
+check "T120 TCP checksum computation" "TCP TEST.*Checksum"
+check "T121 DNS tests passed" "DNS.*TESTS|TCP/DNS"
+
+# =============================================
+echo "=== [Cat 24] Stack Alignment & ABI ==="
+# =============================================
+check "T122 User stack RSP aligned" "stack_rsp=0x7FFFFFFFEFF0"
+check "T123 No GP fault" "stack_rsp.*EFF0"
+check_not "T124 No stack overflow crash" "page fault at 0x7FFFFFFFF000"
+
+# =============================================
+echo "=== [Cat 25] Filesystem Operations ==="
+# =============================================
+check "T125 VFS init complete" "VFS.*Initializing|VFS.*Created.*dev"
+check "T126 Models directory" "models/test.gguf"
+check "T127 Binary mounting" "/bin/agent_visual_term.elf"
+check "T128 FAT32 driver present" "FAT32 Filesystem"
+
+# =============================================
+echo "=== [Cat 26] Framebuffer & Display ==="
+# =============================================
+check "T129 Bochs VGA detected" "Bochs VGA adapter"
+check "T130 Framebuffer mode set" "1024x768"
+
+# =============================================
 # Cleanup and Summary
 # =============================================
 rm -f "$CLEAN_LOG"

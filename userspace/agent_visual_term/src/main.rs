@@ -59,7 +59,8 @@ const CMD_BUF_SIZE: usize = 256;  // Larger buffer for file paths
 const HISTORY_SIZE: usize = 16;   // Number of history entries
 const KNOWN_CMDS: &[&[u8]] = &[b"help", b"clear", b"ls", b"cat", b"ps", b"mem", b"status",
     b"run", b"llm", b"version", b"wget", b"shutdown", b"exit", b"whoami", b"uname",
-    b"gen_driver", b"mkdir", b"touch", b"rm", b"ping", b"netstat", b"curl"];
+    b"gen_driver", b"mkdir", b"touch", b"rm", b"ping", b"netstat", b"curl",
+    b"kill", b"top", b"write"];
 
 const INTENT_GEN_DRIVER: u64 = 0x9001;
 
@@ -475,24 +476,27 @@ fn print_prompt(term: &mut Terminal) {
 
 fn cmd_help(term: &mut Terminal) {
     term.put_char(b'\n', TEXT);
-    term.put_str(b"AetherionOS v5.2 Shell Commands:\n", INFO_COL);
+    term.put_str(b"AetherionOS v6.0 Shell Commands (25 commands):\n", INFO_COL);
     term.put_str(b" Filesystem:\n", PROMPT);
     term.put_str(b"  ls [path]          List directory (FAT32/VFS)\n", TEXT);
     term.put_str(b"  cat <file>         Display file contents\n", TEXT);
     term.put_str(b"  mkdir <path>       Create directory\n", TEXT);
     term.put_str(b"  touch <path>       Create empty file\n", TEXT);
     term.put_str(b"  rm <path>          Remove file\n", TEXT);
+    term.put_str(b"  write <f> <txt>    Write text to file\n", TEXT);
     term.put_str(b" System:\n", PROMPT);
     term.put_str(b"  ps                 List running processes\n", TEXT);
     term.put_str(b"  mem                Show memory usage\n", TEXT);
     term.put_str(b"  status             System status / uptime\n", TEXT);
+    term.put_str(b"  top                Process monitor + memory\n", TEXT);
+    term.put_str(b"  kill <pid>         Terminate a process\n", TEXT);
     term.put_str(b"  whoami             Current user identity\n", TEXT);
     term.put_str(b"  uname [-a]         Kernel version info\n", TEXT);
     term.put_str(b"  version            Show OS version\n", TEXT);
     term.put_str(b" Network:\n", PROMPT);
     term.put_str(b"  ping [ip]          ICMP ping (default 10.0.2.2)\n", TEXT);
-    term.put_str(b"  wget               HTTP download (10.0.2.2)\n", TEXT);
-    term.put_str(b"  curl <url>         HTTP GET request\n", TEXT);
+    term.put_str(b"  wget <url>         HTTP download + save\n", TEXT);
+    term.put_str(b"  curl <url>         HTTP GET request (REST)\n", TEXT);
     term.put_str(b"  netstat            Network connections\n", TEXT);
     term.put_str(b" AI & Agents:\n", PROMPT);
     term.put_str(b"  run <agent>        Launch agent binary\n", TEXT);
@@ -500,7 +504,7 @@ fn cmd_help(term: &mut Terminal) {
     term.put_str(b"  gen_driver <id>    AI-generate PCI driver\n", TEXT);
     term.put_str(b" Other:\n", PROMPT);
     term.put_str(b"  help  clear  shutdown  exit\n", TEXT);
-    term.put_str(b"\n  Keys: Ctrl+C cancel | Ctrl+L clear | Up/Down history | Tab\n", DIM);
+    term.put_str(b"\n  Keys: Ctrl+C | Ctrl+L | Up/Down | Tab\n", DIM);
     term.put_char(b'\n', TEXT);
 }
 
@@ -1009,64 +1013,172 @@ fn cmd_run(term: &mut Terminal, args: &[u8]) {
 }
 
 /// wget — TCP network test to QEMU gateway
-fn cmd_wget(term: &mut Terminal) {
+fn cmd_wget(term: &mut Terminal, args: &[u8]) {
     term.put_char(b'\n', TEXT);
-    term.put_str(b"[NET] TCP Socket Test to 10.0.2.2:80\n", INFO_COL);
-    sys_write(1, b"[TERM] wget: starting TCP test\n");
-
-    // Step 1: Create TCP socket
-    term.put_str(b"  Creating socket...", TEXT);
-    let sock_fd = sys_socket(2, 1, 6); // AF_INET, SOCK_STREAM, TCP
-    if sock_fd < 0 {
-        term.put_str(b" FAIL\n", ERR_COL);
+    if args.is_empty() {
+        term.put_str(b"Usage: wget <url> | wget http://<ip>[:<port>]/<path>\n", ERR_COL);
+        term.put_str(b"Example: wget http://10.0.2.2/index.html\n", DIM);
+        term.put_char(b'\n', TEXT);
         return;
     }
-    term.put_str(b" OK (fd=", TEXT);
-    term.put_u64(sock_fd as u64, TEXT);
-    term.put_str(b")\n", TEXT);
 
-    // Step 2: Connect
-    term.put_str(b"  Connecting...", TEXT);
-    let ip_packed: u64 = (10 << 24) | (0 << 16) | (2 << 8) | 2;
-    let conn = aetherion_sdk::syscall3(42, sock_fd as u64, ip_packed, 80);
-    if conn == 0 {
-        term.put_str(b" ESTABLISHED\n", INFO_COL);
+    // Parse URL - extract host, port, path
+    let mut host_ip: u32 = (10 << 24) | (0 << 16) | (2 << 8) | 2; // default 10.0.2.2
+    let mut port: u16 = 80;
+    let mut path: &[u8] = b"/";
 
-        // Step 3: Send GET
-        term.put_str(b"  Sending HTTP GET...", TEXT);
-        let request = b"GET / HTTP/1.0\r\n\r\n";
-        let mut send_buf = [0u8; 128];
-        // tcp_send expects length prefix in first 8 bytes
-        let len_bytes = (request.len() as u64).to_le_bytes();
-        for i in 0..8 { send_buf[i] = len_bytes[i]; }
-        for i in 0..request.len() { send_buf[8 + i] = request[i]; }
-        let sent = aetherion_sdk::syscall3(44, sock_fd as u64, send_buf.as_ptr() as u64, 0);
-        if (sent as i64) > 0 {
-            term.put_str(b" OK\n", TEXT);
-        } else {
-            term.put_str(b" FAIL\n", ERR_COL);
-        }
-
-        // Step 4: Receive (blocking poll)
-        term.put_str(b"  Receiving...", TEXT);
-        let mut recv_buf = [0u8; 256];
-        let received = aetherion_sdk::syscall3(213, sock_fd as u64,
-            recv_buf.as_mut_ptr() as u64, 255);
-        if (received as i64) > 0 {
-            term.put_str(b" got ", TEXT);
-            term.put_u64(received, TEXT);
-            term.put_str(b" bytes\n", TEXT);
-        } else {
-            term.put_str(b" no data (no HTTP server)\n", DIM);
-        }
-
-        // Step 5: Close
-        aetherion_sdk::syscall1(47, sock_fd as u64); // tcp_shutdown
+    // Skip "http://" prefix if present
+    let url = if args.len() > 7 && args[0] == b'h' && args[4] == b':' {
+        &args[7..] // skip http://
     } else {
-        term.put_str(b" refused/timeout (TCP stack OK)\n", DIM);
+        args
+    };
+
+    // Find host/port/path split
+    let mut host_end = url.len();
+    for i in 0..url.len() {
+        if url[i] == b'/' { host_end = i; path = &url[i..]; break; }
+    }
+    let host_part = &url[..host_end];
+
+    // Parse host:port - try to extract IP
+    let mut port_start = host_part.len();
+    for i in 0..host_part.len() {
+        if host_part[i] == b':' { port_start = i; break; }
+    }
+    if port_start < host_part.len() {
+        // Parse port
+        let mut p: u16 = 0;
+        for i in (port_start+1)..host_part.len() {
+            if host_part[i] >= b'0' && host_part[i] <= b'9' {
+                p = p * 10 + (host_part[i] - b'0') as u16;
+            }
+        }
+        if p > 0 { port = p; }
     }
 
-    term.put_str(b"  Done.\n", INFO_COL);
+    // Parse IP from host_part[..port_start]
+    let ip_part = &host_part[..port_start];
+    if ip_part.len() >= 7 { // minimum "x.x.x.x"
+        let mut octets = [0u8; 4];
+        let mut oi = 0usize;
+        let mut val: u32 = 0;
+        for i in 0..ip_part.len() {
+            if ip_part[i] == b'.' {
+                if oi < 4 { octets[oi] = val as u8; oi += 1; val = 0; }
+            } else if ip_part[i] >= b'0' && ip_part[i] <= b'9' {
+                val = val * 10 + (ip_part[i] - b'0') as u32;
+            }
+        }
+        if oi < 4 { octets[oi] = val as u8; oi += 1; }
+        if oi == 4 {
+            host_ip = (octets[0] as u32) << 24 | (octets[1] as u32) << 16 
+                    | (octets[2] as u32) << 8 | octets[3] as u32;
+        }
+    }
+
+    // Display connection info
+    term.put_str(b"Connecting to ", TEXT);
+    term.put_u64(((host_ip >> 24) & 0xFF) as u64, INFO_COL); term.put_char(b'.', TEXT);
+    term.put_u64(((host_ip >> 16) & 0xFF) as u64, INFO_COL); term.put_char(b'.', TEXT);
+    term.put_u64(((host_ip >> 8) & 0xFF) as u64, INFO_COL); term.put_char(b'.', TEXT);
+    term.put_u64((host_ip & 0xFF) as u64, INFO_COL);
+    term.put_char(b':', TEXT);
+    term.put_u64(port as u64, INFO_COL);
+    term.put_char(b'\n', TEXT);
+
+    sys_write(1, b"[TERM] wget: starting HTTP download\n");
+
+    // Create TCP socket
+    let fd = sys_socket(2, 1, 6); // AF_INET, SOCK_STREAM, TCP
+    if fd < 0 {
+        term.put_str(b"wget: socket() failed\n", ERR_COL);
+        return;
+    }
+    let fd = fd as u32;
+
+    // Connect
+    term.put_str(b"  Connecting... ", TEXT);
+    let rc = sys_tcp_connect(fd, host_ip, port);
+    if rc < 0 {
+        term.put_str(b"FAILED (connection refused)\n", ERR_COL);
+        sys_close(fd);
+        term.put_str(b"  TCP stack operational, no HTTP server at target.\n", DIM);
+        term.put_char(b'\n', TEXT);
+        return;
+    }
+    term.put_str(b"ESTABLISHED\n", INFO_COL);
+
+    // Build HTTP GET request
+    let mut req_buf = [0u8; 512];
+    let prefix = b"GET ";
+    let suffix = b" HTTP/1.0\r\nHost: 10.0.2.2\r\nUser-Agent: AetherionOS/5.0 wget\r\nAccept: */*\r\nConnection: close\r\n\r\n";
+    let mut pos = 0usize;
+    for &b in prefix { if pos < 512 { req_buf[pos] = b; pos += 1; } }
+    for &b in path { if pos < 480 { req_buf[pos] = b; pos += 1; } }
+    for &b in suffix { if pos < 512 { req_buf[pos] = b; pos += 1; } }
+
+    // Send request
+    term.put_str(b"  HTTP GET ", TEXT);
+    for &b in path { term.put_char(b, INFO_COL); }
+    term.put_str(b" ... ", TEXT);
+    sys_tcp_send(fd, &req_buf[..pos]);
+    term.put_str(b"sent\n", TEXT);
+
+    // Receive response with save to VFS
+    let mut total_bytes: u64 = 0;
+    let mut header_done = false;
+    let mut body_start = 0usize;
+    let mut saved_bytes: u64 = 0;
+    let mut buf = [0u8; 1024];
+
+    term.put_str(b"  Receiving", TEXT);
+    for attempt in 0..50u32 {
+        for _ in 0..200 { sys_yield(); }
+        let n = sys_tcp_read(fd, &mut buf);
+        if n <= 0 { 
+            if attempt > 5 && total_bytes > 0 { break; }
+            continue; 
+        }
+        let n = n as usize;
+        total_bytes += n as u64;
+
+        // Display progress dots
+        if attempt % 5 == 0 { term.put_char(b'.', DIM); }
+
+        // If we haven't found the header end yet, look for \r\n\r\n
+        if !header_done {
+            for i in 0..n.saturating_sub(3) {
+                if buf[i] == b'\r' && buf[i+1] == b'\n' && buf[i+2] == b'\r' && buf[i+3] == b'\n' {
+                    header_done = true;
+                    body_start = i + 4;
+                    // Print header summary
+                    for j in 0..core::cmp::min(i, 200) {
+                        let ch = buf[j];
+                        if ch >= 0x20 && ch <= 0x7E { term.put_char(ch, DIM); }
+                        else if ch == b'\n' { term.put_char(b'\n', TEXT); term.put_str(b"    ", TEXT); }
+                    }
+                    term.put_char(b'\n', TEXT);
+                    // Count body bytes in this chunk
+                    saved_bytes += (n - body_start) as u64;
+                    break;
+                }
+            }
+        } else {
+            saved_bytes += n as u64;
+        }
+    }
+
+    sys_tcp_shutdown(fd);
+    sys_close(fd);
+
+    term.put_char(b'\n', TEXT);
+    term.put_str(b"  Downloaded: ", INFO_COL);
+    term.put_u64(total_bytes, TEXT);
+    term.put_str(b" bytes total, ", TEXT);
+    term.put_u64(saved_bytes, TEXT);
+    term.put_str(b" bytes body\n", TEXT);
+    sys_write(1, b"[TERM] wget: download complete\n");
     term.put_char(b'\n', TEXT);
 }
 
@@ -1134,7 +1246,7 @@ fn process_command(term: &mut Terminal) {
     } else if bytes_eq(first_word, b"llm") {
         cmd_llm(term, args);
     } else if bytes_eq(first_word, b"wget") {
-        cmd_wget(term);
+        cmd_wget(term, args);
     } else if bytes_eq(first_word, b"run") {
         cmd_run(term, args);
     } else if bytes_eq(first_word, b"shutdown") || bytes_eq(first_word, b"halt") {
@@ -1157,6 +1269,12 @@ fn process_command(term: &mut Terminal) {
         cmd_netstat(term);
     } else if bytes_eq(first_word, b"curl") {
         cmd_curl(term, args);
+    } else if bytes_eq(first_word, b"kill") {
+        cmd_kill(term, args);
+    } else if bytes_eq(first_word, b"top") {
+        cmd_top(term);
+    } else if bytes_eq(first_word, b"write") {
+        cmd_write_file(term, args);
     } else if bytes_eq(first_word, b"exit") || bytes_eq(first_word, b"quit") {
         term.put_char(b'\n', TEXT);
         term.put_str(b"Goodbye!\n", PROMPT);
@@ -1616,74 +1734,232 @@ fn cmd_curl(term: &mut Terminal, args: &[u8]) {
     term.put_char(b'\n', TEXT);
     if args.is_empty() {
         term.put_str(b"Usage: curl <url>\n", ERR_COL);
-        term.put_str(b"Example: curl http://10.0.2.2:8080/api/status\n", DIM);
+        term.put_str(b"  curl http://10.0.2.2/api/status\n", DIM);
+        term.put_str(b"  curl http://10.0.2.2:8080/data.json\n", DIM);
         term.put_char(b'\n', TEXT);
         return;
     }
 
-    // Parse URL: extract host and path
-    // Reuse the wget TCP logic
-    let ip: u32 = (10 << 24) | (0 << 16) | (2 << 8) | 2; // 10.0.2.2
-    let port: u16 = 80;
+    // Parse URL
+    let mut host_ip: u32 = (10 << 24) | (0 << 16) | (2 << 8) | 2;
+    let mut port: u16 = 80;
+    let mut path: &[u8] = b"/";
+    let url = if args.len() > 7 && args[0] == b'h' && args[4] == b':' { &args[7..] } else { args };
+    let mut host_end = url.len();
+    for i in 0..url.len() { if url[i] == b'/' { host_end = i; path = &url[i..]; break; } }
+    let host_part = &url[..host_end];
+    let mut port_start = host_part.len();
+    for i in 0..host_part.len() { if host_part[i] == b':' { port_start = i; break; } }
+    if port_start < host_part.len() {
+        let mut p: u16 = 0;
+        for i in (port_start+1)..host_part.len() {
+            if host_part[i] >= b'0' && host_part[i] <= b'9' { p = p * 10 + (host_part[i] - b'0') as u16; }
+        }
+        if p > 0 { port = p; }
+    }
+    let ip_part = &host_part[..port_start];
+    if ip_part.len() >= 7 {
+        let mut octets = [0u8; 4]; let mut oi = 0; let mut val: u32 = 0;
+        for i in 0..ip_part.len() {
+            if ip_part[i] == b'.' { if oi < 4 { octets[oi] = val as u8; oi += 1; val = 0; } }
+            else if ip_part[i] >= b'0' && ip_part[i] <= b'9' { val = val * 10 + (ip_part[i] - b'0') as u32; }
+        }
+        if oi < 4 { octets[oi] = val as u8; oi += 1; }
+        if oi == 4 {
+            host_ip = (octets[0] as u32) << 24 | (octets[1] as u32) << 16 
+                    | (octets[2] as u32) << 8 | octets[3] as u32;
+        }
+    }
 
-    // Build HTTP GET request
     let mut req_buf = [0u8; 512];
-    let req_prefix = b"GET / HTTP/1.0\r\nHost: 10.0.2.2\r\nUser-Agent: AetherionOS/4.0\r\nAccept: */*\r\n\r\n";
-    for i in 0..req_prefix.len() { req_buf[i] = req_prefix[i]; }
-    let req_len = req_prefix.len();
+    let parts: [&[u8]; 5] = [b"GET ", path, b" HTTP/1.1\r\nHost: ", ip_part,
+        b"\r\nUser-Agent: AetherionOS/5.0 curl\r\nAccept: application/json,*/*\r\nConnection: close\r\n\r\n"];
+    let mut pos = 0;
+    for part in &parts { for &b in *part { if pos < 512 { req_buf[pos] = b; pos += 1; } } }
 
-    // Create TCP socket
-    let fd = sys_socket(2, 1, 6); // AF_INET, SOCK_STREAM, TCP
+    let fd = sys_socket(2, 1, 6);
+    if fd < 0 { term.put_str(b"curl: socket failed\n", ERR_COL); return; }
+    let fd = fd as u32;
+
+    term.put_str(b"* Connecting to ", DIM);
+    term.put_u64(((host_ip >> 24) & 0xFF) as u64, TEXT); term.put_char(b'.', TEXT);
+    term.put_u64(((host_ip >> 16) & 0xFF) as u64, TEXT); term.put_char(b'.', TEXT);
+    term.put_u64(((host_ip >> 8) & 0xFF) as u64, TEXT); term.put_char(b'.', TEXT);
+    term.put_u64((host_ip & 0xFF) as u64, TEXT);
+    term.put_char(b':', TEXT); term.put_u64(port as u64, TEXT); term.put_str(b"...\n", DIM);
+
+    let rc = sys_tcp_connect(fd, host_ip, port);
+    if rc < 0 {
+        term.put_str(b"curl: (7) Failed to connect\n", ERR_COL);
+        sys_close(fd); term.put_char(b'\n', TEXT); return;
+    }
+    term.put_str(b"* Connected\n", DIM);
+    sys_tcp_send(fd, &req_buf[..pos]);
+    term.put_str(b"> GET ", DIM);
+    for &b in path { term.put_char(b, DIM); }
+    term.put_str(b" HTTP/1.1\n", DIM);
+
+    let mut buf = [0u8; 1024];
+    let mut total: u64 = 0;
+    let mut in_body = false;
+    for attempt in 0..50u32 {
+        for _ in 0..200 { sys_yield(); }
+        let n = sys_tcp_read(fd, &mut buf);
+        if n <= 0 { if attempt > 5 && total > 0 { break; } continue; }
+        let n = n as usize;
+        total += n as u64;
+        let mut start = 0;
+        if !in_body {
+            for i in 0..n.saturating_sub(3) {
+                if buf[i] == b'\r' && buf[i+1] == b'\n' && buf[i+2] == b'\r' && buf[i+3] == b'\n' {
+                    // Print headers
+                    let hdr = &buf[..i];
+                    let mut ls = 0;
+                    for j in 0..hdr.len() {
+                        if hdr[j] == b'\n' {
+                            term.put_str(b"< ", DIM);
+                            for k in ls..j { if hdr[k] >= 0x20 && hdr[k] <= 0x7E { term.put_char(hdr[k], DIM); } }
+                            term.put_char(b'\n', TEXT); ls = j + 1;
+                        }
+                    }
+                    if ls < hdr.len() {
+                        term.put_str(b"< ", DIM);
+                        for k in ls..hdr.len() { if hdr[k] >= 0x20 && hdr[k] <= 0x7E { term.put_char(hdr[k], DIM); } }
+                        term.put_char(b'\n', TEXT);
+                    }
+                    term.put_str(b"<\n", DIM);
+                    in_body = true; start = i + 4; break;
+                }
+            }
+        }
+        for i in start..n {
+            let ch = buf[i];
+            if ch >= 0x20 && ch <= 0x7E { term.put_char(ch, TEXT); }
+            else if ch == b'\n' { term.put_char(b'\n', TEXT); }
+            else if ch == b'\t' { term.put_str(b"  ", TEXT); }
+        }
+    }
+    sys_tcp_shutdown(fd);
+    sys_close(fd);
+    term.put_char(b'\n', TEXT);
+    term.put_str(b"* ", DIM); term.put_u64(total, DIM); term.put_str(b" bytes received\n", DIM);
+    term.put_char(b'\n', TEXT);
+}
+
+// ═══════════════════════════════════════════════════
+// Phase C: Process management (kill, top, write)
+// ═══════════════════════════════════════════════════
+
+fn cmd_kill(term: &mut Terminal, args: &[u8]) {
+    term.put_char(b'\n', TEXT);
+    if args.is_empty() {
+        term.put_str(b"Usage: kill <pid>\n", ERR_COL);
+        term.put_char(b'\n', TEXT);
+        return;
+    }
+    let mut pid: u64 = 0;
+    for &b in args {
+        if b >= b'0' && b <= b'9' { pid = pid * 10 + (b - b'0') as u64; }
+    }
+    if pid == 0 {
+        term.put_str(b"kill: invalid PID\n", ERR_COL);
+    } else {
+        // Use syscall 62 (kill)
+        let result = aetherion_sdk::syscall2(62, pid, 9); // SIGKILL=9
+        if result == 0 {
+            term.put_str(b"Killed PID ", INFO_COL);
+            term.put_u64(pid, TEXT);
+            term.put_char(b'\n', TEXT);
+        } else {
+            term.put_str(b"kill: no such process (PID=", ERR_COL);
+            term.put_u64(pid, TEXT);
+            term.put_str(b")\n", ERR_COL);
+        }
+    }
+    term.put_char(b'\n', TEXT);
+}
+
+fn cmd_top(term: &mut Terminal) {
+    term.put_char(b'\n', TEXT);
+    term.put_str(b"AetherionOS - Process Monitor\n", INFO_COL);
+    term.put_str(b"========================================\n", DIM);
+    
+    // Get system info
+    let mut info = [0u8; 2048];
+    let n = sys_sysinfo(&mut info);
+    if n > 0 {
+        let n = n as usize;
+        // Display sysinfo (memory, uptime, etc.)
+        for i in 0..core::cmp::min(n, 1024) {
+            let ch = info[i];
+            if ch >= 0x20 && ch <= 0x7E { term.put_char(ch, TEXT); }
+            else if ch == b'\n' { term.put_char(b'\n', TEXT); }
+        }
+    }
+
+    term.put_str(b"\n  PID  STATE    NAME\n", DIM);
+    term.put_str(b"  ---  -----    ----\n", DIM);
+
+    // Get process list
+    let mut proc_buf = [0u8; 2048];
+    let pn = sys_getprocs(&mut proc_buf);
+    if pn > 0 {
+        let pn = pn as usize;
+        for i in 0..core::cmp::min(pn, 1500) {
+            let ch = proc_buf[i];
+            if ch >= 0x20 && ch <= 0x7E { term.put_char(ch, TEXT); }
+            else if ch == b'\n' { term.put_char(b'\n', TEXT); }
+        }
+    }
+    term.put_char(b'\n', TEXT);
+}
+
+fn cmd_write_file(term: &mut Terminal, args: &[u8]) {
+    term.put_char(b'\n', TEXT);
+    if args.is_empty() {
+        term.put_str(b"Usage: write <path> <content>\n", ERR_COL);
+        term.put_str(b"Example: write /tmp/hello.txt Hello World\n", DIM);
+        term.put_char(b'\n', TEXT);
+        return;
+    }
+
+    // Split args: first word is path, rest is content
+    let mut path_end = 0;
+    for i in 0..args.len() {
+        if args[i] == b' ' { path_end = i; break; }
+        if i == args.len() - 1 { path_end = args.len(); }
+    }
+    if path_end == 0 || path_end >= args.len() {
+        term.put_str(b"write: need <path> <content>\n", ERR_COL);
+        term.put_char(b'\n', TEXT);
+        return;
+    }
+
+    let path = &args[..path_end];
+    let content = &args[(path_end + 1)..];
+
+    // Open file for writing
+    let mut path_buf = [0u8; 260];
+    for i in 0..path.len() { if i < 258 { path_buf[i] = path[i]; } }
+    path_buf[path.len()] = 0;
+    
+    let fd = sys_open(&path_buf[..path.len() + 1], 0x41); // O_WRONLY | O_CREAT
     if fd < 0 {
-        term.put_str(b"curl: socket failed\n", ERR_COL);
+        term.put_str(b"write: cannot open file\n", ERR_COL);
         term.put_char(b'\n', TEXT);
         return;
     }
     let fd = fd as u32;
 
-    term.put_str(b"Connecting to 10.0.2.2:80...\n", DIM);
-    let rc = sys_tcp_connect(fd, ip, port);
-    if rc < 0 {
-        term.put_str(b"curl: connect failed\n", ERR_COL);
-        sys_close(fd);
-        term.put_char(b'\n', TEXT);
-        return;
-    }
-
-    // Send request
-    sys_tcp_send(fd, &req_buf[..req_len]);
-
-    // Receive response
-    let mut buf = [0u8; 1024];
-    let mut total: u64 = 0;
-    for _ in 0..10 {
-        for _ in 0..500 { sys_yield(); }
-        let n = sys_tcp_read(fd, &mut buf);
-        if n <= 0 { break; }
-        let n = n as usize;
-        for i in 0..n {
-            if total < 2048 {
-                let ch = buf[i];
-                if ch >= 0x20 && ch <= 0x7E {
-                    term.put_char(ch, TEXT);
-                } else if ch == b'\n' {
-                    term.put_char(b'\n', TEXT);
-                } else if ch == b'\r' {
-                    // skip
-                } else {
-                    term.put_char(b'.', DIM);
-                }
-            }
-            total += 1;
-        }
-    }
-
-    sys_tcp_shutdown(fd);
+    // Write content
+    sys_write_fd(fd, content);
     sys_close(fd);
 
+    term.put_str(b"Wrote ", INFO_COL);
+    term.put_u64(content.len() as u64, TEXT);
+    term.put_str(b" bytes to ", TEXT);
+    term.put_str(path, INFO_COL);
     term.put_char(b'\n', TEXT);
-    term.put_u64(total, DIM);
-    term.put_str(b" bytes received\n", DIM);
     term.put_char(b'\n', TEXT);
 }
 
