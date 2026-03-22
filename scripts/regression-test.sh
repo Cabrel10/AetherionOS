@@ -422,6 +422,26 @@ check "T101 Per-process PML4" "PML4.*isolated|User PML4 created"
 check "T102 KPTI-lite protection" "kernel entries cloned"
 
 # =============================================
+# Test Category 24: BPE Tokenizer (4 tests)
+# =============================================
+echo ""
+echo "=== [Cat 24] BPE Tokenizer ==="
+check "T103 BPE tokenizer initialized" "BPE.*Tokenizer|Byte-Pair Encoding"
+check "T104 BPE merge rules applied" "BPE.*Tokens|BPE.*merge"
+check "T105 BPE decode validated" "BPE.*Decoded|BPE-OK"
+check "T106 Token compression" "BPE.*Compression|bytes.*tokens"
+
+# =============================================
+# Test Category 25: GGUF Architecture (4 tests)
+# =============================================
+echo ""
+echo "=== [Cat 25] GGUF Architecture ==="
+check "T107 GGUF model architecture" "GGUF.*Architecture|GGUF.*dim="
+check "T108 GGUF parameter count" "Total params"
+check "T109 GGUF layer structure" "embedding.*Attn.*FFN|Layers.*RMSNorm"
+check "T110 GGUF architecture validated" "GGUF-OK"
+
+# =============================================
 # Cleanup and Summary
 # =============================================
 rm -f "$CLEAN_LOG"

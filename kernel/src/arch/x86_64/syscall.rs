@@ -88,13 +88,15 @@ static mut SYSCALL_STACK: AlignedStack = AlignedStack([0; KERNEL_SYSCALL_STACK_S
 
 /// Per-CPU data structure accessed via GS base after swapgs.
 /// Layout is ABI-critical: offset 0 = kernel_rsp, offset 8 = user_rsp, offset 16 = user_rip,
-/// offset 24 = saved_kernel_rsp (for sys_wait parent resume).
+/// offset 24 = saved_kernel_rsp (for sys_wait parent resume),
+/// offset 32 = user_r10 (4th syscall argument for pread64, sendto, etc.).
 #[repr(C)]
 struct PerCpuData {
     kernel_rsp: u64,        // offset 0: kernel RSP loaded on SYSCALL entry
     user_rsp: u64,          // offset 8: user RSP saved during SYSCALL
     user_rip: u64,          // offset 16: user RIP saved on SYSCALL entry (from RCX)
     saved_kernel_rsp: u64,  // offset 24: snapshot of kernel RSP after pushes (for sys_wait)
+    user_r10: u64,          // offset 32: 4th syscall arg (r10 in Linux syscall ABI)
 }
 
 static mut PER_CPU: PerCpuData = PerCpuData {
@@ -102,6 +104,7 @@ static mut PER_CPU: PerCpuData = PerCpuData {
     user_rsp: 0,
     user_rip: 0,
     saved_kernel_rsp: 0,
+    user_r10: 0,
 };
 
 // ===== MSR helpers =====
@@ -141,6 +144,13 @@ fn saved_user_rip() -> u64 {
 #[inline]
 fn saved_user_rsp() -> u64 {
     unsafe { PER_CPU.user_rsp }
+}
+
+/// Return the 4th syscall argument (R10 in Linux syscall ABI).
+/// Used by pread64, sendto, recvfrom, and other 4+ arg syscalls.
+#[inline]
+fn saved_user_r10() -> u64 {
+    unsafe { PER_CPU.user_r10 }
 }
 
 // ===== User pointer validation =====
@@ -189,9 +199,10 @@ unsafe extern "C" fn syscall_entry() {
         // 1. Switch to kernel GS
         "swapgs",
 
-        // 2. Save user RSP and RIP, load kernel RSP
+        // 2. Save user RSP, RIP, and R10 (4th syscall arg), load kernel RSP
         "mov gs:[8], rsp",
         "mov gs:[16], rcx",   // save user RIP (RCX holds return addr from SYSCALL)
+        "mov gs:[32], r10",   // save R10 = 4th syscall argument (pread64 offset, etc.)
         "mov rsp, gs:[0]",
 
         // 3. Build a stack frame with all user state
@@ -322,7 +333,7 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         11 => sys_poll_hid(),                        // AetherionOS: HID event polling
         12 => sys_brk(a1),                           // brk(new_break)
         16 => sys_stub_ioctl(a1 as u32, a2, a3),    // ioctl(fd, cmd, arg)  [stub for musl]
-        17 => sys_pread64(a1 as u32, a2, a3),        // pread64
+        17 => sys_pread64(a1 as u32, a2, a3, saved_user_r10()),  // pread64(fd, buf, count, offset)
         19 => sys_stub_readv(a1 as u32, a2, a3),     // readv [stub for musl]
         20 => sys_getpid(),                          // getpid()
         22 => sys_pipe(a1),                          // pipe(pipefd[2])
@@ -3781,31 +3792,24 @@ fn sys_sysinfo(buf_addr: u64) -> u64 {
     to_copy as u64
 }
 
-// ===== sys_pread64(fd, buf_addr, len, offset) -> ssize_t (Jalon 73) =====
+// ===== sys_pread64(fd, buf_addr, count, offset) -> ssize_t (Jalon 73) =====
 /// POSIX pread64: read from a file at a given offset WITHOUT changing the fd position.
 /// This is critical for streaming layer-by-layer model loading.
 ///
-/// ABI packing (3 register limit):
+/// Full 4-argument syscall (uses R10 for 4th arg per Linux ABI):
 ///   a1 = fd (u32)
 ///   a2 = buf_addr (u64) — user buffer pointer
-///   a3 = packed: (count as u48) | (offset_hi as u16) — but we simplify:
-///        a3 = offset (u64)
+///   a3 = count (u64) — bytes to read
+///   a4 = offset (u64) — file offset (from R10, retrieved via saved_user_r10())
 ///
-/// Actually, we use a 4th implicit parameter by encoding:
-///   a2[63:48] = count (max 65535 pages = 256 MiB)
-///   a2[47:0]  = buf_addr (48-bit user VA is enough)
-///   a3 = offset
-///
-/// Simpler alternative: treat a2 as buf_addr, a3 high bits = count, a3 low = offset.
-/// Final design: use the FD's known path and simply:
-///   a1 = fd
-///   a2 = buf_addr
-///   a3 = offset
-///   Returns bytes read (reads up to 4096 bytes per call for safety).
-fn sys_pread64(fd: u32, buf_addr: u64, offset: u64) -> u64 {
+///   Returns bytes read, capped at PREAD_MAX_CHUNK for kernel stack safety.
+fn sys_pread64(fd: u32, buf_addr: u64, count: u64, offset: u64) -> u64 {
     const PREAD_MAX_CHUNK: usize = 4096; // Read one page at a time — safe for kernel stack
 
-    if !validate_user_ptr(buf_addr, PREAD_MAX_CHUNK as u64) {
+    let actual_count = core::cmp::min(count as usize, PREAD_MAX_CHUNK);
+    if actual_count == 0 { return 0; }
+
+    if !validate_user_ptr(buf_addr, actual_count as u64) {
         return EFAULT;
     }
 
@@ -3857,7 +3861,7 @@ fn sys_pread64(fd: u32, buf_addr: u64, offset: u64) -> u64 {
                         let start = offset as usize;
                         if start >= data.len() { return 0; }
                         let avail = data.len() - start;
-                        let to_copy = core::cmp::min(avail, PREAD_MAX_CHUNK);
+                        let to_copy = core::cmp::min(core::cmp::min(avail, actual_count), PREAD_MAX_CHUNK);
                         unsafe {
                             let dst = buf_addr as *mut u8;
                             for i in 0..to_copy {
@@ -3878,7 +3882,7 @@ fn sys_pread64(fd: u32, buf_addr: u64, offset: u64) -> u64 {
             let start = offset as usize;
             if start >= data.len() { return 0; }
             let avail = data.len() - start;
-            let to_copy = core::cmp::min(avail, PREAD_MAX_CHUNK);
+            let to_copy = core::cmp::min(core::cmp::min(avail, actual_count), PREAD_MAX_CHUNK);
             unsafe {
                 let dst = buf_addr as *mut u8;
                 for i in 0..to_copy {

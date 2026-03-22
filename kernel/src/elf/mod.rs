@@ -46,7 +46,18 @@ const PAGE_SIZE: u64 = 4096;
 
 /// User stack top virtual address (grows down from here)
 /// Stack occupies: 0x7FFF_FFFF_F000 - stack_size to 0x7FFF_FFFF_F000
+/// IMPORTANT: The last mapped byte is at 0x7FFF_FFFF_EFFF.
+/// Initial RSP must be INSIDE the mapped range and ABI-aligned.
 const USER_STACK_TOP: u64 = 0x7FFF_FFFF_F000;
+
+/// ABI-correct initial stack pointer for IRETQ entry:
+/// - Must be inside the last mapped page (0x7FFF_FFFF_E000 .. 0x7FFF_FFFF_EFFF)
+/// - _start is a #[naked] function entered via IRETQ (not via CALL)
+/// - _start convention: RSP % 16 == 0 on IRETQ entry
+/// - _start does `call main` which pushes 8 bytes -> main sees RSP % 16 == 8 (correct ABI)
+/// - 0x7FFF_FFFF_EFF0 % 16 == 0 => perfect alignment for IRETQ entry
+/// - Safe: 16 bytes below unmapped boundary at 0x7FFF_FFFF_F000
+const USER_STACK_INITIAL_RSP: u64 = USER_STACK_TOP - 16;
 /// User stack size: 8 MiB virtual range reserved.
 /// 256 pages (1 MiB) initially mapped — sufficient for TCP, DNS, FAT32 ops.
 const USER_STACK_PAGES: u64 = 256; // 1 MiB initial mapping
@@ -672,16 +683,16 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
     let frames_after = unsafe { ELF_POOL.frames_used };
 
     crate::serial_println!(
-        "[ELF] Load complete: entry=0x{:X}, stack=0x{:X}, segments={}, frames={}",
+        "[ELF] Load complete: entry=0x{:X}, stack_rsp=0x{:X}, segments={}, frames={}",
         entry,
-        USER_STACK_TOP,
+        USER_STACK_INITIAL_RSP,
         segments_loaded,
         frames_after - frames_before
     );
 
     Ok(ElfLoadResult {
         entry_point: entry,
-        stack_pointer: USER_STACK_TOP,
+        stack_pointer: USER_STACK_INITIAL_RSP,
         pml4_phys,
         segments_loaded,
         frames_used: frames_after - frames_before,
