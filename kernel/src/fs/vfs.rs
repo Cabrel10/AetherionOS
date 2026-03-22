@@ -537,6 +537,133 @@ pub fn list_path(path: &str) -> Result<Vec<String>, VfsError> {
     }
 }
 
+/// Create a directory at the given path
+pub fn mkdir(path: &str) -> Result<(), VfsError> {
+    VFS_METRICS.operations_count.fetch_add(1, Ordering::Relaxed);
+    validate_path(path)?;
+
+    let components = path_components(path);
+    if components.is_empty() {
+        return Err(VfsError::InvalidPath);
+    }
+
+    let mut root = VFS_ROOT.lock();
+
+    // Navigate to parent
+    let (parent_comps, new_name) = components.split_at(components.len() - 1);
+
+    let parent = if parent_comps.is_empty() {
+        &mut *root
+    } else {
+        let mut current = &mut *root;
+        for comp in parent_comps {
+            let node = current.get_mut(*comp).ok_or(VfsError::NotFound)?;
+            match node {
+                VfsNode::Directory(ref mut children) => current = children,
+                _ => return Err(VfsError::NotFound),
+            }
+        }
+        current
+    };
+
+    // Check if already exists
+    if parent.contains_key(new_name[0]) {
+        return Ok(()); // mkdir -p behavior: no error if exists
+    }
+
+    parent.insert(
+        String::from(new_name[0]),
+        VfsNode::Directory(BTreeMap::new()),
+    );
+
+    crate::serial_println!("[VFS] mkdir: created {}", path);
+    Ok(())
+}
+
+/// Remove a file (unlink) at the given path
+pub fn unlink(path: &str) -> Result<(), VfsError> {
+    VFS_METRICS.operations_count.fetch_add(1, Ordering::Relaxed);
+    validate_path(path)?;
+
+    let components = path_components(path);
+    if components.is_empty() {
+        return Err(VfsError::InvalidPath);
+    }
+
+    let mut root = VFS_ROOT.lock();
+
+    let (parent_comps, target_name) = components.split_at(components.len() - 1);
+
+    let parent = if parent_comps.is_empty() {
+        &mut *root
+    } else {
+        let mut current = &mut *root;
+        for comp in parent_comps {
+            let node = current.get_mut(*comp).ok_or(VfsError::NotFound)?;
+            match node {
+                VfsNode::Directory(ref mut children) => current = children,
+                _ => return Err(VfsError::NotFound),
+            }
+        }
+        current
+    };
+
+    match parent.get(target_name[0]) {
+        Some(VfsNode::File(_)) => {
+            parent.remove(target_name[0]);
+            crate::serial_println!("[VFS] unlink: removed {}", path);
+            Ok(())
+        }
+        Some(VfsNode::Directory(children)) => {
+            if children.is_empty() {
+                parent.remove(target_name[0]);
+                crate::serial_println!("[VFS] rmdir: removed {}", path);
+                Ok(())
+            } else {
+                Err(VfsError::PermissionDenied) // Directory not empty
+            }
+        }
+        _ => Err(VfsError::NotFound),
+    }
+}
+
+/// Create an empty file (touch) — creates if not exists, no-op if exists
+pub fn file_create_empty(path: &str) -> Result<(), VfsError> {
+    VFS_METRICS.operations_count.fetch_add(1, Ordering::Relaxed);
+    validate_path(path)?;
+
+    let components = path_components(path);
+    if components.is_empty() {
+        return Err(VfsError::InvalidPath);
+    }
+
+    let mut root = VFS_ROOT.lock();
+
+    let (parent_comps, new_name) = components.split_at(components.len() - 1);
+
+    let parent = if parent_comps.is_empty() {
+        &mut *root
+    } else {
+        let mut current = &mut *root;
+        for comp in parent_comps {
+            let node = current.get_mut(*comp).ok_or(VfsError::NotFound)?;
+            match node {
+                VfsNode::Directory(ref mut children) => current = children,
+                _ => return Err(VfsError::NotFound),
+            }
+        }
+        current
+    };
+
+    if parent.contains_key(new_name[0]) {
+        return Ok(()); // touch behavior: no error if exists
+    }
+
+    parent.insert(String::from(new_name[0]), VfsNode::File(Vec::new()));
+    crate::serial_println!("[VFS] touch: created {}", path);
+    Ok(())
+}
+
 // ===== Internal Helpers =====
 
 /// Navigate the BTreeMap tree to find a node (immutable)

@@ -654,6 +654,35 @@ pub fn sys_fork() -> i64 {
 }
 
 // ============================================================
+// POSIX Filesystem Operations (mkdir, rmdir, creat, unlink)
+// ============================================================
+
+const SYS_MKDIR: u64 = 83;
+const SYS_RMDIR: u64 = 84;
+const SYS_CREAT: u64 = 85;
+const SYS_UNLINK: u64 = 87;
+
+/// mkdir(path, mode) - Create a directory
+pub fn sys_mkdir(path: &[u8], mode: u32) -> i64 {
+    syscall2(SYS_MKDIR, path.as_ptr() as u64, mode as u64) as i64
+}
+
+/// rmdir(path) - Remove an empty directory
+pub fn sys_rmdir(path: &[u8]) -> i64 {
+    syscall1(SYS_RMDIR, path.as_ptr() as u64) as i64
+}
+
+/// creat(path, mode) - Create an empty file (touch)
+pub fn sys_creat(path: &[u8], mode: u32) -> i64 {
+    syscall2(SYS_CREAT, path.as_ptr() as u64, mode as u64) as i64
+}
+
+/// unlink(path) - Remove a file
+pub fn sys_unlink(path: &[u8]) -> i64 {
+    syscall1(SYS_UNLINK, path.as_ptr() as u64) as i64
+}
+
+// ============================================================
 // Print Utilities
 // ============================================================
 

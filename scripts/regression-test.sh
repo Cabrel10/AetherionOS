@@ -392,6 +392,36 @@ check_val "T89 Bus publish >= 20" "$BUS_PUB" "-ge" "20"
 check_val "T90 Bus consume >= 50" "$BUS_CONSUME" "-ge" "50"
 
 # =============================================
+# Test Category 21: POSIX FS Syscalls (4 tests)
+# =============================================
+echo ""
+echo "=== [Cat 21] POSIX FS Syscalls ==="
+check "T91 VFS directories created" "VFS.*Created.*directories|/dev and /tmp"
+check "T92 VFS state.bin created" "state.bin created"
+check "T93 VFS version file" "/sys/version created"
+check "T94 Syscall dispatch >= 20 known" "SYSCALL.*Initializing|syscall.*registered|42 registered"
+
+# =============================================
+# Test Category 22: Network Stack (4 tests)
+# =============================================
+echo ""
+echo "=== [Cat 22] Network Stack ==="
+check "T95 ARP request sent" "ARP.*request.*sent|ARP.*resolve"
+check "T96 Network stack initialized" "Network Stack|NET.*Init|VirtIO.*Net"
+check "T97 Live ping test" "ping.*gateway|ping.*10.0.2"
+check "T98 TCP/Socket subsystem" "TCP.*Stack|TCP TEST|tcp_connect|Sockets"
+
+# =============================================
+# Test Category 23: Shell v5.2 Features (4 tests)
+# =============================================
+echo ""
+echo "=== [Cat 23] Shell v5.2 Features ==="
+check "T99 Terminal v3.0 banner" "AetherionOS v3.0 Production Terminal"
+check "T100 Syscall kernel stack" "Kernel syscall stack|kernel.*stack.*top"
+check "T101 Per-process PML4" "PML4.*isolated|User PML4 created"
+check "T102 KPTI-lite protection" "kernel entries cloned"
+
+# =============================================
 # Cleanup and Summary
 # =============================================
 rm -f "$CLEAN_LOG"

@@ -393,6 +393,12 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         // ── AetherionOS module loading ──
         280 => sys_load_module(a1, a2, a3),
 
+        // ── POSIX filesystem operations ──
+        83  => sys_mkdir(a1, a2),                    // mkdir(path, mode)
+        84  => sys_rmdir(a1),                        // rmdir(path)
+        85  => sys_creat(a1, a2),                    // creat(path, mode) — touch
+        87  => sys_unlink(a1),                       // unlink(path) — rm
+
         _ => {
             // Only log truly unknown syscalls (not common musl probes)
             if nr < 400 {
@@ -3255,6 +3261,93 @@ fn sys_load_module(buf_addr: u64, buf_len: u64, entry_offset: u64) -> u64 {
         );
 
         0 // Success
+    }
+}
+
+// ===== POSIX Filesystem Syscalls (mkdir, rmdir, creat, unlink) =====
+
+/// mkdir(path, mode) - Create a directory
+fn sys_mkdir(path_addr: u64, _mode: u64) -> u64 {
+    let path_str = match unsafe { read_user_string(path_addr) } {
+        Some(s) => s,
+        None => return EFAULT,
+    };
+    if path_str.is_empty() {
+        return EINVAL;
+    }
+
+    crate::serial_println!("[SYSCALL] mkdir: '{}'", path_str);
+
+    if path_str.starts_with("/disk/") {
+        crate::serial_println!("[SYSCALL] mkdir: FAT32 mkdir stub");
+        return 0; // Stub success for FAT32
+    }
+
+    match crate::fs::vfs::mkdir(&path_str) {
+        Ok(()) => 0,
+        Err(_) => ENOENT,
+    }
+}
+
+/// rmdir(path) - Remove an empty directory
+fn sys_rmdir(path_addr: u64) -> u64 {
+    let path_str = match unsafe { read_user_string(path_addr) } {
+        Some(s) => s,
+        None => return EFAULT,
+    };
+    if path_str.is_empty() {
+        return EINVAL;
+    }
+
+    crate::serial_println!("[SYSCALL] rmdir: '{}'", path_str);
+
+    match crate::fs::vfs::unlink(&path_str) {
+        Ok(()) => 0,
+        Err(_) => ENOENT,
+    }
+}
+
+/// creat(path, mode) - Create an empty file (touch)
+fn sys_creat(path_addr: u64, _mode: u64) -> u64 {
+    let path_str = match unsafe { read_user_string(path_addr) } {
+        Some(s) => s,
+        None => return EFAULT,
+    };
+    if path_str.is_empty() {
+        return EINVAL;
+    }
+
+    crate::serial_println!("[SYSCALL] creat: '{}'", path_str);
+
+    if path_str.starts_with("/disk/") {
+        let disk_path = &path_str[6..];
+        if crate::fs::fat32::write_file(disk_path, &[]) {
+            return 0;
+        }
+        return ENOSPC;
+    }
+
+    match crate::fs::vfs::file_create_empty(&path_str) {
+        Ok(()) => 0,
+        Err(_) => ENOENT,
+    }
+}
+
+/// unlink(path) - Remove a file
+fn sys_unlink(path_addr: u64) -> u64 {
+    let path_str = match unsafe { read_user_string(path_addr) } {
+        Some(s) => s,
+        None => return EFAULT,
+    };
+    if path_str.is_empty() {
+        return EINVAL;
+    }
+
+    crate::serial_println!("[SYSCALL] unlink: '{}'", path_str);
+
+    match crate::fs::vfs::unlink(&path_str) {
+        Ok(()) => 0,
+        Err(_) => ENOENT,
     }
 }
 

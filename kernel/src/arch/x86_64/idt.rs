@@ -597,14 +597,14 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
     }
 
     // Let the scheduler decide if a switch is needed
-    // But DON'T actually perform the switch from the timer ISR —
-    // context switches happen cooperatively via sys_yield() or via
-    // check_pending_switch() in the idle loop.
+    // Context switches happen cooperatively via sys_yield().
+    // The timer ISR saves preempt state so that when a process calls yield,
+    // the scheduler knows which process to switch to. True preemptive
+    // switching from ISR context requires modifying the IRET frame directly
+    // (Phase D future work).
     if let Some((old_pid, new_pid, new_rip, new_rsp, _new_rflags, new_pml4)) =
         crate::scheduler::tick_preemptive()
     {
-        // Store the pending switch for later execution
-        // The actual switch happens in sys_yield or the idle loop
         if new_pid != old_pid && new_pml4 != 0 && new_rip != 0 {
             set_pending_switch(old_pid, new_pid, new_rip, new_rsp, new_pml4);
         }

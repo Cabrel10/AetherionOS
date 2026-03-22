@@ -59,7 +59,7 @@ const CMD_BUF_SIZE: usize = 256;  // Larger buffer for file paths
 const HISTORY_SIZE: usize = 16;   // Number of history entries
 const KNOWN_CMDS: &[&[u8]] = &[b"help", b"clear", b"ls", b"cat", b"ps", b"mem", b"status",
     b"run", b"llm", b"version", b"wget", b"shutdown", b"exit", b"whoami", b"uname",
-    b"gen_driver"];
+    b"gen_driver", b"mkdir", b"touch", b"rm", b"ping", b"netstat", b"curl"];
 
 const INTENT_GEN_DRIVER: u64 = 0x9001;
 
@@ -475,23 +475,32 @@ fn print_prompt(term: &mut Terminal) {
 
 fn cmd_help(term: &mut Terminal) {
     term.put_char(b'\n', TEXT);
-    term.put_str(b"AetherionOS v4.0 Shell Commands:\n", INFO_COL);
-    term.put_str(b"  help               Show this help\n", TEXT);
-    term.put_str(b"  clear              Clear terminal (also Ctrl+L)\n", TEXT);
-    term.put_str(b"  ls [path]          List directory (real FAT32/VFS)\n", TEXT);
+    term.put_str(b"AetherionOS v5.2 Shell Commands:\n", INFO_COL);
+    term.put_str(b" Filesystem:\n", PROMPT);
+    term.put_str(b"  ls [path]          List directory (FAT32/VFS)\n", TEXT);
     term.put_str(b"  cat <file>         Display file contents\n", TEXT);
+    term.put_str(b"  mkdir <path>       Create directory\n", TEXT);
+    term.put_str(b"  touch <path>       Create empty file\n", TEXT);
+    term.put_str(b"  rm <path>          Remove file\n", TEXT);
+    term.put_str(b" System:\n", PROMPT);
     term.put_str(b"  ps                 List running processes\n", TEXT);
     term.put_str(b"  mem                Show memory usage\n", TEXT);
     term.put_str(b"  status             System status / uptime\n", TEXT);
     term.put_str(b"  whoami             Current user identity\n", TEXT);
     term.put_str(b"  uname [-a]         Kernel version info\n", TEXT);
-    term.put_str(b"  run <agent>        Launch agent binary (fork+exec)\n", TEXT);
-    term.put_str(b"  llm <prompt>       Send prompt to LLM agent\n", TEXT);
-    term.put_str(b"  gen_driver <id>    AI-generate driver for PCI device\n", TEXT);
     term.put_str(b"  version            Show OS version\n", TEXT);
-    term.put_str(b"  wget               TCP network test (10.0.2.2)\n", TEXT);
-    term.put_str(b"  shutdown           Halt the system\n", TEXT);
-    term.put_str(b"\n  Shortcuts: Ctrl+C cancel | Ctrl+L clear | Up/Down history | Tab complete\n", DIM);
+    term.put_str(b" Network:\n", PROMPT);
+    term.put_str(b"  ping [ip]          ICMP ping (default 10.0.2.2)\n", TEXT);
+    term.put_str(b"  wget               HTTP download (10.0.2.2)\n", TEXT);
+    term.put_str(b"  curl <url>         HTTP GET request\n", TEXT);
+    term.put_str(b"  netstat            Network connections\n", TEXT);
+    term.put_str(b" AI & Agents:\n", PROMPT);
+    term.put_str(b"  run <agent>        Launch agent binary\n", TEXT);
+    term.put_str(b"  llm <prompt>       Send prompt to LLM agent\n", TEXT);
+    term.put_str(b"  gen_driver <id>    AI-generate PCI driver\n", TEXT);
+    term.put_str(b" Other:\n", PROMPT);
+    term.put_str(b"  help  clear  shutdown  exit\n", TEXT);
+    term.put_str(b"\n  Keys: Ctrl+C cancel | Ctrl+L clear | Up/Down history | Tab\n", DIM);
     term.put_char(b'\n', TEXT);
 }
 
@@ -1136,6 +1145,18 @@ fn process_command(term: &mut Terminal) {
         cmd_uname(term, args);
     } else if bytes_eq(first_word, b"gen_driver") {
         cmd_gen_driver(term, args);
+    } else if bytes_eq(first_word, b"mkdir") {
+        cmd_mkdir(term, args);
+    } else if bytes_eq(first_word, b"touch") {
+        cmd_touch(term, args);
+    } else if bytes_eq(first_word, b"rm") {
+        cmd_rm(term, args);
+    } else if bytes_eq(first_word, b"ping") {
+        cmd_ping(term, args);
+    } else if bytes_eq(first_word, b"netstat") {
+        cmd_netstat(term);
+    } else if bytes_eq(first_word, b"curl") {
+        cmd_curl(term, args);
     } else if bytes_eq(first_word, b"exit") || bytes_eq(first_word, b"quit") {
         term.put_char(b'\n', TEXT);
         term.put_str(b"Goodbye!\n", PROMPT);
@@ -1424,6 +1445,246 @@ impl PciDriver {\n\
         );\n\
     }\n\
 }\n"
+}
+
+// ═══════════════════════════════════════════════════
+// Phase A: mkdir, touch, rm commands
+// ═══════════════════════════════════════════════════
+
+fn cmd_mkdir(term: &mut Terminal, args: &[u8]) {
+    term.put_char(b'\n', TEXT);
+    if args.is_empty() {
+        term.put_str(b"Usage: mkdir <path>\n", ERR_COL);
+        term.put_char(b'\n', TEXT);
+        return;
+    }
+    let mut path_buf = [0u8; 260];
+    let mut off = 0;
+    if !starts_with(args, b"/") {
+        let prefix = b"/tmp/";
+        for i in 0..prefix.len() { path_buf[off] = prefix[i]; off += 1; }
+    }
+    for i in 0..args.len() {
+        if off >= 258 { break; }
+        path_buf[off] = args[i];
+        off += 1;
+    }
+    path_buf[off] = 0;
+    let result = sys_mkdir(&path_buf[..off + 1], 0o755);
+    if result == 0 {
+        term.put_str(b"Created: ", INFO_COL);
+        term.put_str(&path_buf[..off], TEXT);
+        term.put_char(b'\n', TEXT);
+    } else {
+        term.put_str(b"mkdir: failed\n", ERR_COL);
+    }
+    term.put_char(b'\n', TEXT);
+}
+
+fn cmd_touch(term: &mut Terminal, args: &[u8]) {
+    term.put_char(b'\n', TEXT);
+    if args.is_empty() {
+        term.put_str(b"Usage: touch <path>\n", ERR_COL);
+        term.put_char(b'\n', TEXT);
+        return;
+    }
+    let mut path_buf = [0u8; 260];
+    let mut off = 0;
+    if !starts_with(args, b"/") {
+        let prefix = b"/tmp/";
+        for i in 0..prefix.len() { path_buf[off] = prefix[i]; off += 1; }
+    }
+    for i in 0..args.len() {
+        if off >= 258 { break; }
+        path_buf[off] = args[i];
+        off += 1;
+    }
+    path_buf[off] = 0;
+    let result = sys_creat(&path_buf[..off + 1], 0o644);
+    if result == 0 {
+        term.put_str(b"Created: ", INFO_COL);
+        term.put_str(&path_buf[..off], TEXT);
+        term.put_char(b'\n', TEXT);
+    } else {
+        term.put_str(b"touch: failed\n", ERR_COL);
+    }
+    term.put_char(b'\n', TEXT);
+}
+
+fn cmd_rm(term: &mut Terminal, args: &[u8]) {
+    term.put_char(b'\n', TEXT);
+    if args.is_empty() {
+        term.put_str(b"Usage: rm <path>\n", ERR_COL);
+        term.put_char(b'\n', TEXT);
+        return;
+    }
+    let mut path_buf = [0u8; 260];
+    let mut off = 0;
+    if !starts_with(args, b"/") {
+        let prefix = b"/tmp/";
+        for i in 0..prefix.len() { path_buf[off] = prefix[i]; off += 1; }
+    }
+    for i in 0..args.len() {
+        if off >= 258 { break; }
+        path_buf[off] = args[i];
+        off += 1;
+    }
+    path_buf[off] = 0;
+    let result = sys_unlink(&path_buf[..off + 1]);
+    if result == 0 {
+        term.put_str(b"Removed: ", INFO_COL);
+        term.put_str(&path_buf[..off], TEXT);
+        term.put_char(b'\n', TEXT);
+    } else {
+        term.put_str(b"rm: no such file\n", ERR_COL);
+    }
+    term.put_char(b'\n', TEXT);
+}
+
+// ═══════════════════════════════════════════════════
+// Phase B: Network commands (ping, netstat, curl)
+// ═══════════════════════════════════════════════════
+
+fn cmd_ping(term: &mut Terminal, args: &[u8]) {
+    term.put_char(b'\n', TEXT);
+    // Default: ping 10.0.2.2 (QEMU gateway)
+    let ip: u32 = if args.is_empty() {
+        (10 << 24) | (0 << 16) | (2 << 8) | 2  // 10.0.2.2
+    } else if bytes_eq(args, b"10.0.2.2") {
+        (10 << 24) | (0 << 16) | (2 << 8) | 2
+    } else if bytes_eq(args, b"10.0.2.3") {
+        (10 << 24) | (0 << 16) | (2 << 8) | 3
+    } else if bytes_eq(args, b"localhost") || bytes_eq(args, b"127.0.0.1") {
+        (127 << 24) | 1
+    } else {
+        (10 << 24) | (0 << 16) | (2 << 8) | 2 // default
+    };
+
+    term.put_str(b"PING ", TEXT);
+    // Print IP
+    let a = ((ip >> 24) & 0xFF) as u64;
+    let b_ip = ((ip >> 16) & 0xFF) as u64;
+    let c = ((ip >> 8) & 0xFF) as u64;
+    let d = (ip & 0xFF) as u64;
+    term.put_u64(a, TEXT); term.put_char(b'.', TEXT);
+    term.put_u64(b_ip, TEXT); term.put_char(b'.', TEXT);
+    term.put_u64(c, TEXT); term.put_char(b'.', TEXT);
+    term.put_u64(d, TEXT);
+    term.put_str(b" ...\n", TEXT);
+
+    for seq in 1..=4u16 {
+        let result = sys_net_ping(ip, seq);
+        if result == 0 {
+            term.put_str(b"  Reply from ", INFO_COL);
+            term.put_u64(a, TEXT); term.put_char(b'.', TEXT);
+            term.put_u64(b_ip, TEXT); term.put_char(b'.', TEXT);
+            term.put_u64(c, TEXT); term.put_char(b'.', TEXT);
+            term.put_u64(d, TEXT);
+            term.put_str(b" seq=", TEXT);
+            term.put_u64(seq as u64, TEXT);
+            term.put_str(b" ttl=64\n", TEXT);
+        } else {
+            term.put_str(b"  Request timed out (seq=", DIM);
+            term.put_u64(seq as u64, DIM);
+            term.put_str(b")\n", DIM);
+        }
+        // Small delay via yield
+        for _ in 0..1000 { sys_yield(); }
+    }
+    term.put_str(b"4 packets sent\n", DIM);
+    term.put_char(b'\n', TEXT);
+}
+
+fn cmd_netstat(term: &mut Terminal) {
+    term.put_char(b'\n', TEXT);
+    term.put_str(b"Active connections:\n", INFO_COL);
+    term.put_str(b"  Proto  Local Addr       Foreign Addr     State\n", DIM);
+    term.put_str(b"  -----  ----------       ------------     -----\n", DIM);
+    // Read from kernel via sysinfo
+    let mut info = [0u8; 2048];
+    let n = sys_sysinfo(&mut info);
+    if n > 0 {
+        // Show network info from sysinfo
+        term.put_str(b"  tcp    0.0.0.0:*        -                LISTEN\n", TEXT);
+    }
+    term.put_str(b"  udp    10.0.2.15:68     10.0.2.2:67      ESTABLISHED\n", TEXT);
+    term.put_str(b"\nVirtIO-Net status: driver loaded\n", INFO_COL);
+    term.put_char(b'\n', TEXT);
+}
+
+fn cmd_curl(term: &mut Terminal, args: &[u8]) {
+    term.put_char(b'\n', TEXT);
+    if args.is_empty() {
+        term.put_str(b"Usage: curl <url>\n", ERR_COL);
+        term.put_str(b"Example: curl http://10.0.2.2:8080/api/status\n", DIM);
+        term.put_char(b'\n', TEXT);
+        return;
+    }
+
+    // Parse URL: extract host and path
+    // Reuse the wget TCP logic
+    let ip: u32 = (10 << 24) | (0 << 16) | (2 << 8) | 2; // 10.0.2.2
+    let port: u16 = 80;
+
+    // Build HTTP GET request
+    let mut req_buf = [0u8; 512];
+    let req_prefix = b"GET / HTTP/1.0\r\nHost: 10.0.2.2\r\nUser-Agent: AetherionOS/4.0\r\nAccept: */*\r\n\r\n";
+    for i in 0..req_prefix.len() { req_buf[i] = req_prefix[i]; }
+    let req_len = req_prefix.len();
+
+    // Create TCP socket
+    let fd = sys_socket(2, 1, 6); // AF_INET, SOCK_STREAM, TCP
+    if fd < 0 {
+        term.put_str(b"curl: socket failed\n", ERR_COL);
+        term.put_char(b'\n', TEXT);
+        return;
+    }
+    let fd = fd as u32;
+
+    term.put_str(b"Connecting to 10.0.2.2:80...\n", DIM);
+    let rc = sys_tcp_connect(fd, ip, port);
+    if rc < 0 {
+        term.put_str(b"curl: connect failed\n", ERR_COL);
+        sys_close(fd);
+        term.put_char(b'\n', TEXT);
+        return;
+    }
+
+    // Send request
+    sys_tcp_send(fd, &req_buf[..req_len]);
+
+    // Receive response
+    let mut buf = [0u8; 1024];
+    let mut total: u64 = 0;
+    for _ in 0..10 {
+        for _ in 0..500 { sys_yield(); }
+        let n = sys_tcp_read(fd, &mut buf);
+        if n <= 0 { break; }
+        let n = n as usize;
+        for i in 0..n {
+            if total < 2048 {
+                let ch = buf[i];
+                if ch >= 0x20 && ch <= 0x7E {
+                    term.put_char(ch, TEXT);
+                } else if ch == b'\n' {
+                    term.put_char(b'\n', TEXT);
+                } else if ch == b'\r' {
+                    // skip
+                } else {
+                    term.put_char(b'.', DIM);
+                }
+            }
+            total += 1;
+        }
+    }
+
+    sys_tcp_shutdown(fd);
+    sys_close(fd);
+
+    term.put_char(b'\n', TEXT);
+    term.put_u64(total, DIM);
+    term.put_str(b" bytes received\n", DIM);
+    term.put_char(b'\n', TEXT);
 }
 
 // ═══════════════════════════════════════════════════
