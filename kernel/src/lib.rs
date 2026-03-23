@@ -29,6 +29,7 @@ pub mod net;
 pub mod drivers;
 pub mod framebuffer;
 pub mod font;
+pub mod codegen;
 
 pub mod tests;
 

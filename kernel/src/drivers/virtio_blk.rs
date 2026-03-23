@@ -13,7 +13,6 @@
 //   - VirtIO 1.0 Spec, Section 5.2 (Block Device)
 //   - Legacy VirtIO specification
 
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Block device sector size

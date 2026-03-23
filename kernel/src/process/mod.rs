@@ -17,7 +17,7 @@ use spin::Mutex;
 use lazy_static::lazy_static;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-pub use task::{AgentRole, Process, ProcessState, FdTable, FileDescriptor, MAX_FDS, VirtualMemoryArea};
+pub use task::{AgentRole, Process, ProcessState, FdTable, FdType, FileDescriptor, MAX_FDS, VirtualMemoryArea};
 pub use crate::arch::x86_64::context::TaskContext;
 
 // ===== Keyboard Input Buffer =====
@@ -43,7 +43,6 @@ impl KbdBuffer {
 
     // Called from IRQ — must never block
     fn push(&self, byte: u8) {
-        use core::sync::atomic::Ordering;
         let wp = self.write_pos.load(Ordering::Relaxed);
         let next_wp = (wp + 1) % KBD_BUF_SIZE;
         let rp = self.read_pos.load(Ordering::Acquire);
@@ -59,7 +58,6 @@ impl KbdBuffer {
 
     // Called from sys_read — non-blocking
     fn pop(&self) -> Option<u8> {
-        use core::sync::atomic::Ordering;
         let rp = self.read_pos.load(Ordering::Relaxed);
         let wp = self.write_pos.load(Ordering::Acquire);
         if rp == wp { return None; }

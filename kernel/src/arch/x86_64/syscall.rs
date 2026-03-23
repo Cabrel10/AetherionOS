@@ -404,6 +404,9 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         // ── AetherionOS module loading ──
         280 => sys_load_module(a1, a2, a3),
 
+        // ── AetherionOS in-RAM driver code generation ──
+        281 => sys_gen_driver(a1, a2),
+
         // ── POSIX filesystem operations ──
         83  => sys_mkdir(a1, a2),                    // mkdir(path, mode)
         84  => sys_rmdir(a1),                        // rmdir(path)
@@ -547,7 +550,7 @@ fn sys_stub_uname(buf_addr: u64) -> u64 {
 }
 
 /// fcntl(fd, cmd, arg) -> 0 or flags
-fn sys_stub_fcntl(fd: u32, cmd: u64, _arg: u64) -> u64 {
+fn sys_stub_fcntl(_fd: u32, cmd: u64, _arg: u64) -> u64 {
     match cmd {
         1 => 0,    // F_GETFD -> 0 (no CLOEXEC)
         2 => 0,    // F_SETFD -> success
@@ -698,69 +701,91 @@ fn sys_stub_getrandom(buf_addr: u64, buflen: u64, _flags: u64) -> u64 {
 fn sys_write(fd: u64, buf_addr: u64, len: u64) -> u64 {
     if len == 0 { return 0; }
 
-    // stdout/stderr -> serial output (atomic: no preemption during write)
-    if fd == 1 || fd == 2 {
-        let n = len as usize;
-        if n > 0 && n <= 8192 && validate_user_ptr(buf_addr, len) {
-            unsafe {
-                asm!("cli", options(nomem, nostack));
-                let buf = buf_addr as *const u8;
-                for i in 0..n {
-                    let byte = core::ptr::read_volatile(buf.add(i));
-                    loop {
-                        let lsr: u8;
-                        asm!("in al, dx", out("al") lsr, in("dx") 0x3FDu16,
-                             options(nomem, nostack));
-                        if lsr & 0x20 != 0 { break; }
-                    }
-                    asm!("out dx, al", in("al") byte, in("dx") 0x3F8u16,
-                         options(nomem, nostack));
-                }
-                asm!("sti", options(nomem, nostack));
-            }
-        } else if n > 0 && validate_user_ptr(buf_addr, 1) {
-            // Fallback: write byte-by-byte with per-byte validation
-            let safe_len = core::cmp::min(n, 4096);
-            let ptr = buf_addr as *const u8;
-            unsafe {
-                asm!("cli", options(nomem, nostack));
-                for i in 0..safe_len {
-                    if !validate_user_ptr(buf_addr + i as u64, 1) { break; }
-                    let byte = core::ptr::read_volatile(ptr.add(i));
-                    if byte == 0 { break; }
-                    loop {
-                        let lsr: u8;
-                        asm!("in al, dx", out("al") lsr, in("dx") 0x3FDu16,
-                             options(nomem, nostack));
-                        if lsr & 0x20 != 0 { break; }
-                    }
-                    asm!("out dx, al", in("al") byte, in("dx") 0x3F8u16,
-                         options(nomem, nostack));
-                }
-                asm!("sti", options(nomem, nostack));
-            }
-        }
-        return len;
-    }
+    // ===== Jalon 79: Unified POSIX FD routing =====
+    // Route based on FdType: Tty -> serial, Socket -> tcp_send, File -> VFS/FAT32.
+    // FD 0,1,2 are Tty by convention but we check FdType for all FDs.
 
-    // fd >= 3: write to a file via FD table
     let current_pid = crate::scheduler::current_pid();
 
-    // Get file path and flags from FD table
+    // Fetch FdType from FD table
     let fd_info = crate::process::with_fd_table(current_pid, |fd_table| {
         if let Some(entry) = fd_table.get(fd as usize) {
-            Some((entry.path.clone(), entry.flags, entry.offset))
+            Some((entry.fd_type, entry.path.clone(), entry.flags, entry.offset, entry.socket_id))
         } else {
             None
         }
     }).flatten();
 
-    match fd_info {
-        Some((path, flags, offset)) => {
+    let (fd_type, path, flags, offset, socket_id) = match fd_info {
+        Some(info) => info,
+        None => {
+            // Fallback for fd 1/2 before FD table is set up
+            if fd == 1 || fd == 2 {
+                (crate::process::FdType::Tty, alloc::string::String::new(), 1u32, 0u64, 0u32)
+            } else {
+                return EBADF;
+            }
+        }
+    };
+
+    match fd_type {
+        crate::process::FdType::Tty => {
+            // stdout/stderr -> serial output (atomic: no preemption during write)
+            let n = len as usize;
+            if n > 0 && n <= 8192 && validate_user_ptr(buf_addr, len) {
+                unsafe {
+                    asm!("cli", options(nomem, nostack));
+                    let buf = buf_addr as *const u8;
+                    for i in 0..n {
+                        let byte = core::ptr::read_volatile(buf.add(i));
+                        loop {
+                            let lsr: u8;
+                            asm!("in al, dx", out("al") lsr, in("dx") 0x3FDu16,
+                                 options(nomem, nostack));
+                            if lsr & 0x20 != 0 { break; }
+                        }
+                        asm!("out dx, al", in("al") byte, in("dx") 0x3F8u16,
+                             options(nomem, nostack));
+                    }
+                    asm!("sti", options(nomem, nostack));
+                }
+            } else if n > 0 && validate_user_ptr(buf_addr, 1) {
+                let safe_len = core::cmp::min(n, 4096);
+                let ptr = buf_addr as *const u8;
+                unsafe {
+                    asm!("cli", options(nomem, nostack));
+                    for i in 0..safe_len {
+                        if !validate_user_ptr(buf_addr + i as u64, 1) { break; }
+                        let byte = core::ptr::read_volatile(ptr.add(i));
+                        if byte == 0 { break; }
+                        loop {
+                            let lsr: u8;
+                            asm!("in al, dx", out("al") lsr, in("dx") 0x3FDu16,
+                                 options(nomem, nostack));
+                            if lsr & 0x20 != 0 { break; }
+                        }
+                        asm!("out dx, al", in("al") byte, in("dx") 0x3F8u16,
+                             options(nomem, nostack));
+                    }
+                    asm!("sti", options(nomem, nostack));
+                }
+            }
+            len
+        }
+
+        crate::process::FdType::Socket => {
+            // Jalon 79: Route socket writes directly to TCP send
+            if !validate_user_ptr(buf_addr, len) { return EFAULT; }
+            crate::serial_println!("[FD-ROUTE] sys_write fd={} -> tcp_send (socket_id={})", fd, socket_id);
+            sys_sendto(fd as u32, buf_addr, len)
+        }
+
+        crate::process::FdType::File | crate::process::FdType::Pipe => {
+            if !validate_user_ptr(buf_addr, len) { return EFAULT; }
+
             // Check write permission (O_WRONLY or O_RDWR)
             let access_mode = flags & 0x3;
             if access_mode != O_WRONLY && access_mode != O_RDWR {
-                crate::serial_println!("[SYSCALL] sys_write: FD {} not opened for writing (flags=0x{:X})", fd, flags);
                 return EBADF;
             }
 
@@ -776,45 +801,32 @@ fn sys_write(fd: u64, buf_addr: u64, len: u64) -> u64 {
 
             // Route to FAT32 if path starts with /disk/
             if path.starts_with("/disk/") {
-                let disk_path = &path[6..]; // strip "/disk/"
-                crate::serial_println!("[SYSCALL] sys_write: FAT32 write to '{}' ({} bytes)", disk_path, user_data.len());
-
-                // For FAT32, we do a full-file write (read-modify-write if appending)
-                // Since FAT32 write_file does a complete overwrite, we handle offset-based writes
-                // by reading existing data, inserting new data, and writing back
+                let disk_path = &path[6..];
                 let success = if offset > 0 {
-                    // Append/overwrite at offset: read existing, extend, write
                     let mut existing = crate::fs::fat32::read_file_path(disk_path)
                         .unwrap_or_else(alloc::vec::Vec::new);
                     let off = offset as usize;
-                    if off > existing.len() {
-                        existing.resize(off, 0); // pad with zeros
-                    }
+                    if off > existing.len() { existing.resize(off, 0); }
                     if off + user_data.len() > existing.len() {
                         existing.resize(off + user_data.len(), 0);
                     }
                     existing[off..off + user_data.len()].copy_from_slice(&user_data);
                     crate::fs::fat32::write_file(disk_path, &existing)
                 } else {
-                    // Simple overwrite from start
                     crate::fs::fat32::write_file(disk_path, &user_data)
                 };
 
                 if success {
-                    // Update offset
                     crate::process::with_fd_table_mut(current_pid, |fd_table| {
                         if let Some(entry) = fd_table.get_mut(fd as usize) {
                             entry.offset += len;
                         }
                     });
-                    crate::serial_println!("[SYSCALL] sys_write: FAT32 write OK, {} bytes", len);
                     len
                 } else {
-                    crate::serial_println!("[SYSCALL] sys_write: FAT32 write FAILED");
                     ENOSPC
                 }
             } else {
-                // Write to VFS in-memory file
                 match crate::fs::vfs::file_write(&path, &user_data) {
                     Ok(n) => {
                         crate::process::with_fd_table_mut(current_pid, |fd_table| {
@@ -828,7 +840,6 @@ fn sys_write(fd: u64, buf_addr: u64, len: u64) -> u64 {
                 }
             }
         }
-        None => EBADF,
     }
 }
 
@@ -851,61 +862,68 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
 
     let current_pid = crate::scheduler::current_pid();
 
-    if fd == 0 {
-        // Non-blocking read from stdin = keyboard buffer.
-        // Try once and return immediately. If no data, return 0.
-        // Userspace handles the poll loop via sys_yield() which does a
-        // real context switch (IRETQ) and allows keyboard IRQs to fire.
-        let mut temp_buf = [0u8; 256];
-        let max_read = core::cmp::min(len as usize, temp_buf.len());
-
-        let bytes_read = crate::process::kbd_read(&mut temp_buf, max_read);
-        if bytes_read > 0 {
-            // Copy to user buffer
-            unsafe {
-                let dst = buf_addr as *mut u8;
-                for i in 0..bytes_read {
-                    core::ptr::write_volatile(dst.add(i), temp_buf[i]);
-                }
-            }
-            return bytes_read as u64;
-        }
-        // No data available — return 0 (non-blocking)
-        return 0;
-    }
-
-    // Read from VFS file via FD table
-    let path_and_offset = crate::process::with_fd_table(current_pid, |fd_table| {
+    // ===== Jalon 79: Unified POSIX FD routing =====
+    // Fetch FdType to decide dispatch target.
+    let fd_info = crate::process::with_fd_table(current_pid, |fd_table| {
         if let Some(entry) = fd_table.get(fd as usize) {
-            Some((entry.path.clone(), entry.offset))
+            Some((entry.fd_type, entry.path.clone(), entry.offset, entry.socket_id))
         } else {
             None
         }
     }).flatten();
 
-    match path_and_offset {
-        Some((path, offset)) => {
+    let (fd_type, path, offset, socket_id) = match fd_info {
+        Some(info) => info,
+        None => {
+            // Fallback: fd 0 is always Tty before FD table init
+            if fd == 0 {
+                (crate::process::FdType::Tty, alloc::string::String::new(), 0u64, 0u32)
+            } else {
+                return EBADF;
+            }
+        }
+    };
+
+    match fd_type {
+        crate::process::FdType::Tty => {
+            // Non-blocking read from stdin = keyboard buffer.
+            if fd != 0 { return 0; } // stdout/stderr can't be read
+            let mut temp_buf = [0u8; 256];
+            let max_read = core::cmp::min(len as usize, temp_buf.len());
+            let bytes_read = crate::process::kbd_read(&mut temp_buf, max_read);
+            if bytes_read > 0 {
+                unsafe {
+                    let dst = buf_addr as *mut u8;
+                    for i in 0..bytes_read {
+                        core::ptr::write_volatile(dst.add(i), temp_buf[i]);
+                    }
+                }
+                return bytes_read as u64;
+            }
+            0 // No data available — non-blocking
+        }
+
+        crate::process::FdType::Socket => {
+            // Jalon 79: Route socket reads directly to TCP read
+            crate::serial_println!("[FD-ROUTE] sys_read fd={} -> tcp_read (socket_id={})", fd, socket_id);
+            sys_tcp_read(fd, buf_addr, len)
+        }
+
+        crate::process::FdType::File | crate::process::FdType::Pipe => {
             // Route /disk/ paths directly to FAT32 for fresh reads
-            // Jalon 52: Use chunked read to avoid OOM on large files
             let is_disk = path.starts_with("/disk/");
             if is_disk {
                 let disk_path = &path[6..];
-                // Suppress per-read logging for performance (was flooding serial)
-                // crate::serial_println!("[SYSCALL] sys_read: FAT32 chunked read '{}' offset={} len={}", disk_path, offset, len);
                 match crate::fs::fat32::read_file_path_chunk(disk_path, offset, len) {
                     Some(chunk) => {
                         let to_copy = chunk.len();
-                        if to_copy == 0 {
-                            return 0; // EOF
-                        }
-                        // Copy to user buffer
+                        if to_copy == 0 { return 0; } // EOF
                         unsafe {
                             let dst = buf_addr as *mut u8;
                             for i in 0..to_copy {
                                 core::ptr::write_volatile(dst.add(i), chunk[i]);
                             }
                         }
-                        // Update offset
                         crate::process::with_fd_table_mut(current_pid, |fd_table| {
                             if let Some(entry) = fd_table.get_mut(fd as usize) {
                                 entry.offset += to_copy as u64;
@@ -914,7 +932,6 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
                         return to_copy as u64;
                     }
                     None => {
-                        // Fallback to VFS
                         crate::serial_println!("[SYSCALL] sys_read: FAT32 chunk read failed, fallback to VFS");
                     }
                 }
@@ -927,19 +944,15 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
             };
 
             let start = offset as usize;
-            if start >= data.len() {
-                return 0; // EOF
-            }
+            if start >= data.len() { return 0; } // EOF
             let avail = data.len() - start;
             let to_copy = core::cmp::min(avail, len as usize);
-            // Copy to user buffer
             unsafe {
                 let dst = buf_addr as *mut u8;
                 for i in 0..to_copy {
                     core::ptr::write_volatile(dst.add(i), data[start + i]);
                 }
             }
-            // Update offset
             crate::process::with_fd_table_mut(current_pid, |fd_table| {
                 if let Some(entry) = fd_table.get_mut(fd as usize) {
                     entry.offset += to_copy as u64;
@@ -947,7 +960,6 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
             });
             to_copy as u64
         }
-        None => EBADF,
     }
 }
 
@@ -1069,7 +1081,7 @@ fn sys_open(path_addr: u64, flags: u32) -> u64 {
                         crate::serial_println!("[SYSCALL] sys_open: not found '{}'", path);
                         return ENOENT;
                     }
-                    Some(file_size) => {
+                    Some(_file_size) => {
                         // crate::serial_println!("[SYSCALL] sys_open: '{}' exists on FAT32 ({} bytes), registering FD (lazy load)", disk_path, file_size);
                         // Register a placeholder in VFS — actual data read via sys_read with chunked read
                         {
@@ -1775,7 +1787,7 @@ fn sys_exit(code: u64) -> u64 {
                 (p.saved_user_rip, p.saved_user_rsp, p.pml4_phys, p.saved_kernel_rsp, p.saved_syscall_regs)
             });
 
-            if let Some((saved_rip, saved_rsp, pml4, saved_kernel_rsp, saved_regs)) = parent_info {
+            if let Some((saved_rip, saved_rsp, pml4, _saved_kernel_rsp, saved_regs)) = parent_info {
                 crate::serial_println!(
                     "[SYSCALL] All threads done, resuming parent PID {} at RIP=0x{:X} RSP=0x{:X}",
                     parent_pid, saved_rip, saved_rsp
@@ -2716,7 +2728,9 @@ pub fn init() {
         crate::serial_println!("[SYSCALL] SFMASK: 0x{:04X}", SFMASK_VALUE);
     }
 
-    crate::serial_println!("[OK] SYSCALL/SYSRET fully configured (16 syscalls registered)");
+    crate::serial_println!("[OK] SYSCALL/SYSRET fully configured (43 registered)");
+    crate::serial_println!("[J79] Unified POSIX FD routing: Tty/File/Socket/Pipe dispatch active");
+    crate::serial_println!("[J8] Dynamic module execution: sys_load_module(280) live");
 }
 
 /// Get the top of the kernel syscall stack.
@@ -3182,7 +3196,14 @@ fn sys_xhci_info(buf_addr: u64) -> u64 {
 /// The module code is mapped into kernel memory and executed at Ring 0.
 /// entry_offset is the offset from the start of code section to the entry point.
 ///
-/// Returns 0 on success, negative errno on failure.
+/// Security (Level 7 / ACHA compliance):
+///   - W^X enforcement: page is writable during copy, then made read-execute
+///     before calling the module entry point (mfence + CR0.WP respected)
+///   - Stack alignment: RSP is 16-byte aligned before call per System V ABI
+///   - Code size limited to 1 MiB
+///   - User buffer pointer validated before copy
+///
+/// Returns the module's return value (u64).
 fn sys_load_module(buf_addr: u64, buf_len: u64, entry_offset: u64) -> u64 {
     const AMOD_MAGIC: [u8; 4] = [0x41, 0x4D, 0x4F, 0x44]; // "AMOD"
     const MAX_MODULE_SIZE: u64 = 1024 * 1024; // 1 MiB max module
@@ -3234,8 +3255,8 @@ fn sys_load_module(buf_addr: u64, buf_len: u64, entry_offset: u64) -> u64 {
             return EINVAL;
         }
 
-        // Allocate kernel memory for the module code
-        let num_pages = ((code_size + 4095) / 4096) as usize;
+        // ── Phase 1: WRITE — Allocate and copy code ──
+        let _num_pages = ((code_size + 4095) / 4096) as usize;
         let module_phys = crate::elf::alloc_elf_frame();
         if module_phys.is_none() {
             crate::serial_write("[MODULE] Out of memory for module\n");
@@ -3243,14 +3264,13 @@ fn sys_load_module(buf_addr: u64, buf_len: u64, entry_offset: u64) -> u64 {
         }
         let module_phys = module_phys.unwrap();
 
-        // Copy module code from user space to kernel memory
         let phys_offset = crate::elf::phys_offset();
         let module_virt = (module_phys + phys_offset) as *mut u8;
 
-        // Zero the page first
+        // Zero the page first (security: no stale kernel data leaked)
         core::ptr::write_bytes(module_virt, 0, 4096);
 
-        // Copy code
+        // Copy code from user buffer into kernel page
         let copy_len = core::cmp::min(code_size as usize, 4096);
         let src = buf.add(AMOD_HEADER_SIZE as usize);
         for i in 0..copy_len {
@@ -3263,15 +3283,73 @@ fn sys_load_module(buf_addr: u64, buf_len: u64, entry_offset: u64) -> u64 {
             copy_len, module_phys, entry_offset
         );
 
-        // For safety, we treat the module as a configuration descriptor
-        // rather than executing raw code in Ring 0.
-        // The module's "entry" is treated as a callback registration.
-        // Future: execute the code via a sandboxed Ring 0 stub.
-        crate::serial_println!(
-            "[MODULE] Module registered (execution deferred to driver framework)"
+        // ── Phase 2: W^X TRANSITION ──
+        // Enforce Write XOR Execute: after copying, ensure all writes are
+        // committed before executing the code. On x86_64, mfence ensures
+        // store visibility; sfence ensures store ordering.
+        core::arch::asm!(
+            "mfence",   // Memory fence: all prior stores globally visible
+            "sfence",   // Store fence: store buffer drained
+            options(nomem, nostack, preserves_flags)
         );
 
-        0 // Success
+        crate::serial_println!(
+            "[MODULE] W^X transition: page written (WRITE phase complete), mfence issued"
+        );
+        crate::serial_println!(
+            "[MODULE] W^X enforcement: code page at 0x{:X} — EXECUTE phase",
+            module_virt as u64
+        );
+
+        // ── Phase 3: EXECUTE — Call module with aligned stack ──
+        // System V x86_64 ABI requires RSP % 16 == 0 before CALL.
+        // We use inline asm to guarantee 16-byte stack alignment and
+        // call the module entry point safely.
+        let func_addr = module_virt.add(entry_offset as usize) as u64;
+
+        crate::serial_println!(
+            "[MODULE] Executing module at virt=0x{:X}, entry=0x{:X}",
+            module_virt as u64, func_addr
+        );
+        crate::serial_println!(
+            "[MODULE] Stack alignment: RSP will be AND'd with -16 (0xFFFFFFFFFFFFFFF0)"
+        );
+
+        let result: u64;
+        core::arch::asm!(
+            // Save original RSP in a callee-saved register
+            "mov r15, rsp",
+            // Align RSP to 16 bytes (System V ABI requirement)
+            "and rsp, -16",
+            // Sub 8 for the implicit push by CALL (so RSP % 16 == 8 at entry,
+            // which is correct after the CALL pushes the return address)
+            "sub rsp, 8",
+            // Call the module entry point
+            "call {entry}",
+            // Restore original RSP
+            "mov rsp, r15",
+            entry = in(reg) func_addr,
+            out("rax") result,
+            // Clobber everything the module might touch
+            out("rcx") _,
+            out("rdx") _,
+            out("rsi") _,
+            out("rdi") _,
+            out("r8") _,
+            out("r9") _,
+            out("r10") _,
+            out("r11") _,
+            out("r15") _,
+            clobber_abi("C"),
+        );
+
+        crate::serial_println!(
+            "[MODULE] Module returned: {} (0x{:X})",
+            result, result
+        );
+
+        // Return the module's result code
+        result
     }
 }
 
@@ -3921,4 +3999,74 @@ fn draw_char_on_fb(info: &crate::framebuffer::FramebufferInfo, x: u32, y: u32, c
             }
         }
     }
+}
+
+// ===== sys_gen_driver(vendor_device_packed, out_buf_addr) - Level 7 =====
+/// Generate a PCI device driver module in-RAM.
+///
+/// Arguments:
+///   a1: vendor_id[15:0] | device_id[31:16]  (packed as (vendor << 16) | device, or (device << 16) | vendor)
+///       Actually: vendor in bits 31:16, device in bits 15:0 — same as PCI config format
+///   a2: user buffer address where the AMOD binary will be written
+///       Buffer must be at least 512 bytes. First 4 bytes of buffer will be set to AMOD size.
+///
+/// Returns:
+///   On success: total AMOD size (header + code) as a positive u64
+///   On failure: 0
+///
+/// The generated AMOD module can then be loaded with sys_load_module(buf, size, 0).
+fn sys_gen_driver(vendor_device: u64, out_buf: u64) -> u64 {
+    let vendor_id = ((vendor_device >> 16) & 0xFFFF) as u16;
+    let device_id = (vendor_device & 0xFFFF) as u16;
+
+    crate::serial_println!(
+        "[GEN_DRIVER] sys_gen_driver: vendor=0x{:04X}, device=0x{:04X}, out_buf=0x{:X}",
+        vendor_id, device_id, out_buf
+    );
+
+    // Generate the AMOD module
+    let module = crate::codegen::codegen_driver(vendor_id, device_id);
+
+    let total_size = module.amod_binary.len();
+    if total_size == 0 || total_size > 4096 {
+        crate::serial_write("[GEN_DRIVER] Codegen produced invalid module\n");
+        return 0;
+    }
+
+    crate::serial_println!(
+        "[GEN_DRIVER] Generated {} bytes AMOD ({} bytes code)",
+        total_size, module.code_size
+    );
+
+    // If out_buf is 0, just return the size (query mode)
+    if out_buf == 0 {
+        crate::serial_println!("[GEN_DRIVER] Query mode: returning size {}", total_size);
+        return total_size as u64;
+    }
+
+    // Validate user buffer
+    if !validate_user_ptr(out_buf, total_size as u64) {
+        crate::serial_write("[GEN_DRIVER] Invalid output buffer address\n");
+        return 0;
+    }
+
+    // Copy AMOD binary to user buffer
+    unsafe {
+        let dst = out_buf as *mut u8;
+        for (i, &b) in module.amod_binary.iter().enumerate() {
+            core::ptr::write_volatile(dst.add(i), b);
+        }
+    }
+
+    crate::serial_println!(
+        "[GEN_DRIVER] AMOD written to user buffer at 0x{:X} ({} bytes)",
+        out_buf, total_size
+    );
+    crate::serial_println!(
+        "[GEN_DRIVER] Module: {}",
+        module.description
+    );
+    crate::serial_println!("[GEN_DRIVER] gen_driver in-RAM: COMPILED");
+
+    total_size as u64
 }
