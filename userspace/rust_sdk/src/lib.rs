@@ -662,6 +662,10 @@ const SYS_RMDIR: u64 = 84;
 const SYS_CREAT: u64 = 85;
 const SYS_UNLINK: u64 = 87;
 
+// ── Level 7: Module loading + Driver codegen ──
+const SYS_LOAD_MODULE: u64 = 280;
+const SYS_GEN_DRIVER:  u64 = 281;
+
 /// mkdir(path, mode) - Create a directory
 pub fn sys_mkdir(path: &[u8], mode: u32) -> i64 {
     syscall2(SYS_MKDIR, path.as_ptr() as u64, mode as u64) as i64
@@ -680,6 +684,30 @@ pub fn sys_creat(path: &[u8], mode: u32) -> i64 {
 /// unlink(path) - Remove a file
 pub fn sys_unlink(path: &[u8]) -> i64 {
     syscall1(SYS_UNLINK, path.as_ptr() as u64) as i64
+}
+
+// ============================================================
+// Level 7: Module Loading & Driver Code Generation
+// ============================================================
+
+/// Load an AMOD module from a user-space buffer.
+/// buf: pointer to AMOD binary (magic + code)
+/// len: total buffer length
+/// entry_offset: offset from code start to entry point
+/// Returns 0 on success (module executed), or the module's return code.
+pub fn sys_load_module(buf: &[u8], entry_offset: u64) -> u64 {
+    syscall3(SYS_LOAD_MODULE, buf.as_ptr() as u64, buf.len() as u64, entry_offset)
+}
+
+/// Generate a PCI driver module in-RAM via kernel codegen.
+/// vendor_device: (vendor_id << 16) | device_id
+/// out_buf: mutable buffer where AMOD binary will be written (must be >= 512 bytes)
+/// Returns: total AMOD size on success, 0 on failure.
+/// If out_buf is empty (len=0), returns just the required size (query mode).
+pub fn sys_gen_driver(vendor_device: u32, out_buf: &mut [u8]) -> u64 {
+    let packed = vendor_device as u64;
+    let buf_addr = if out_buf.is_empty() { 0u64 } else { out_buf.as_mut_ptr() as u64 };
+    syscall2(SYS_GEN_DRIVER, packed, buf_addr)
 }
 
 // ============================================================
@@ -948,6 +976,7 @@ fn print_u64_to_fd(fd: u32, val: u64) {
 // ============================================================
 
 extern "C" {
+    #[allow(dead_code)]
     fn main() -> i64;
 }
 

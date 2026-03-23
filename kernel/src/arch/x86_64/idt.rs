@@ -395,7 +395,7 @@ extern "x86-interrupt" fn page_fault_handler(
                     
                     // Priority 3: FAT32 fallback
                     if bytes_read == 0 {
-                        bytes_read = crate::fs::fat32::read_file_at_offset(&file_path, file_offset, page_buf)
+                        let _ = crate::fs::fat32::read_file_at_offset(&file_path, file_offset, page_buf)
                             .unwrap_or(0);
                     }
                     

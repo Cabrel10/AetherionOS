@@ -1026,7 +1026,7 @@ pub fn read_file_path_chunk(disk_path: &str, offset: u64, len: u64) -> Option<Ve
         //     disk_path, offset, len, entry.file_size);
 
         let result = fs.read_file_chunk(entry.first_cluster, entry.file_size, offset, len);
-        if let Some(ref data) = result {
+        if let Some(ref _data) = result {
             // crate::serial_println!("[FAT32] read_file_path_chunk: OK, returned {} bytes", data.len());
         }
         result
@@ -1090,14 +1090,14 @@ pub fn run_tests() {
     // crate::serial_println!("[FAT32 TESTS] Couche 19 - FAT32 Filesystem");
     // crate::serial_println!("========================================\n");
 
-    let mut passed = 0u32;
+    let mut _passed = 0u32;
     let mut failed = 0u32;
 
     // Test 1: FAT32 mounted
     // crate::serial_write("  [TEST 1/3] FAT32 mounted... ");
     if is_mounted() {
         // crate::serial_write("OK\n");
-        passed += 1;
+        _passed += 1;
     } else {
         // crate::serial_write("SKIP (no FAT32 disk)\n");
         // crate::serial_println!("\n========================================");
@@ -1118,10 +1118,10 @@ pub fn run_tests() {
                 // crate::serial_println!("    {} ({} bytes)", entry.name, entry.file_size);
             }
         }
-        passed += 1;
+        _passed += 1;
     } else {
         // crate::serial_write("WARN (empty directory)\n");
-        passed += 1; // Could be an empty disk
+        _passed += 1; // Could be an empty disk
     }
 
     // Test 3: Read index.html
@@ -1130,14 +1130,14 @@ pub fn run_tests() {
         Some(data) => {
             // crate::serial_println!("OK ({} bytes)", data.len());
             let preview_len = core::cmp::min(data.len(), 100);
-            if let Ok(s) = core::str::from_utf8(&data[..preview_len]) {
+            if let Ok(_s) = core::str::from_utf8(&data[..preview_len]) {
                 // crate::serial_println!("    Content: {}", s);
             }
-            passed += 1;
+            _passed += 1;
         }
         None => {
             // crate::serial_write("SKIP (no index.html on disk)\n");
-            passed += 1;
+            _passed += 1;
         }
     }
 
@@ -1153,10 +1153,10 @@ pub fn run_tests() {
                 // crate::serial_println!("    /disk/models/{} ({} bytes)", entry.name, entry.file_size);
             }
         }
-        passed += 1;
+        _passed += 1;
     } else {
         // crate::serial_write("SKIP (no models/ directory)\n");
-        passed += 1;
+        _passed += 1;
     }
 
     // Test 5: Read first 16 bytes of a file from subdirectory (SAFE: chunked read, no OOM)
@@ -1167,7 +1167,7 @@ pub fn run_tests() {
             let path = alloc::format!("models/{}", entry.name);
             // CRITICAL FIX (#16): Use file_exists + chunked read instead of full read
             match file_exists(&path) {
-                Some(size) => {
+                Some(_size) => {
                     // crate::serial_println!("EXISTS ({} = {} bytes)", path, size);
                     // Only read first 16 bytes for preview (safe even for 2GB files)
                     match read_file_path_chunk(&path, 0, 16) {
@@ -1179,11 +1179,11 @@ pub fn run_tests() {
                                 let _ = write!(hex, "{:02X} ", b);
                             }
                             // crate::serial_println!("    First {} bytes: {}", preview_len, hex);
-                            passed += 1;
+                            _passed += 1;
                         }
                         None => {
                             // crate::serial_println!("WARN (chunk read failed, but file exists)");
-                            passed += 1;
+                            _passed += 1;
                         }
                     }
                 }
@@ -1194,11 +1194,11 @@ pub fn run_tests() {
             }
         } else {
             // crate::serial_write("SKIP (no files in models/)\n");
-            passed += 1;
+            _passed += 1;
         }
     } else {
         // crate::serial_write("SKIP (no models/ directory)\n");
-        passed += 1;
+        _passed += 1;
     }
 
     // crate::serial_println!("\n========================================");
