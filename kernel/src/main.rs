@@ -181,6 +181,9 @@ static AGENT_LLAMA_CORE_ELF: &[u8] = include_bytes!("../../userspace/agent_llama
 /// wget_real - Jalon 78 TCP Socket Validation (Ring 3 C app)
 static WGET_REAL_ELF: &[u8] = include_bytes!("../../userspace/c_apps/wget_real.elf");
 
+/// agent_mcp - Level 8 MCP (Model Context Protocol) Security Agent (Ring 3)
+static AGENT_MCP_ELF: &[u8] = include_bytes!("../../userspace/agent_mcp/target/x86_64-aetherion-user/release/agent_mcp");
+
 // VGA text buffer
 const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
 const VGA_WIDTH: usize = 80;
@@ -1550,6 +1553,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 ("agent_visual_term.elf", AGENT_VISUAL_TERM_ELF),
                 ("agent_q4_dequant.elf", AGENT_Q4_DEQUANT_ELF),
                 ("agent_llama_core.elf", AGENT_LLAMA_CORE_ELF),
+                ("agent_mcp.elf", AGENT_MCP_ELF),
             ];
             let mut mounted = 0u32;
             let mut root = crate::fs::vfs::lock_root();
@@ -1943,6 +1947,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 serial_println!("       [OK] /bin/agent_visual_term.elf ({} bytes)", AGENT_VISUAL_TERM_ELF.len());
                 serial_println!("       [OK] /bin/agent_q4_dequant.elf ({} bytes)", AGENT_Q4_DEQUANT_ELF.len());
                 serial_println!("       [OK] /bin/agent_llama_core.elf ({} bytes)", AGENT_LLAMA_CORE_ELF.len());
+                serial_println!("       [OK] /bin/agent_mcp.elf ({} bytes)", AGENT_MCP_ELF.len());
                 serial_println!("       [OK] /bin/wget_real.elf ({} bytes)", WGET_REAL_ELF.len());
             }
         }
@@ -2127,6 +2132,27 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             }
             Err(_e) => {
                 serial_write("  [J79] WARN: agent_llama_core.elf load failed\n");
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────
+        // STEP A4: Load agent_mcp.elf (Level 8 - MCP Security Agent)
+        // Must be queued BEFORE visual_term so it can receive bus messages
+        // from the terminal's mcp_test command.
+        // ──────────────────────────────────────────────────────────
+        match elf::load_elf_binary(AGENT_MCP_ELF) {
+            Ok(mcp_result) => {
+                let mcp_pid = process::spawn_userspace(
+                    "/bin/agent_mcp.elf", 0,
+                    mcp_result.entry_point, mcp_result.stack_pointer, mcp_result.pml4_phys
+                ).unwrap_or(0);
+                if mcp_pid != 0 {
+                    scheduler::enqueue_process(mcp_pid);
+                    serial_write("  [L8] agent_mcp.elf: QUEUED (MCP security agent)\n");
+                }
+            }
+            Err(_e) => {
+                serial_write("  [L8] WARN: agent_mcp.elf load failed\n");
             }
         }
 

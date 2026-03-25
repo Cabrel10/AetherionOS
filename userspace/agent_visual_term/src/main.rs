@@ -60,9 +60,12 @@ const HISTORY_SIZE: usize = 16;   // Number of history entries
 const KNOWN_CMDS: &[&[u8]] = &[b"help", b"clear", b"ls", b"cat", b"ps", b"mem", b"status",
     b"run", b"llm", b"version", b"wget", b"shutdown", b"exit", b"whoami", b"uname",
     b"gen_driver", b"mkdir", b"touch", b"rm", b"ping", b"netstat", b"curl",
-    b"kill", b"top", b"write", b"cp", b"echo", b"env", b"uptime", b"df", b"history"];
+    b"kill", b"top", b"write", b"cp", b"echo", b"env", b"uptime", b"df", b"history",
+    b"mcp_test"];
 
 const INTENT_GEN_DRIVER: u64 = 0x9001;
+const INTENT_MCP_EXECUTE: u64 = 0x9002;
+const INTENT_MCP_RESULT: u32  = 0x9003;
 
 const INTENT_VISUAL_TERM: u64     = 0xB059;
 const INTENT_TOKEN_GENERATED: u64 = 0x8002;    // From agent_llm_chat
@@ -478,7 +481,7 @@ fn print_prompt(term: &mut Terminal) {
 
 fn cmd_help(term: &mut Terminal) {
     term.put_char(b'\n', TEXT);
-    term.put_str(b"AetherionOS v6.1 Shell Commands (31 commands):\n", INFO_COL);
+    term.put_str(b"AetherionOS v6.2 Shell Commands (32 commands):\n", INFO_COL);
     term.put_str(b" Filesystem:\n", PROMPT);
     term.put_str(b"  ls [path]          List directory (FAT32/VFS)\n", TEXT);
     term.put_str(b"  cat <file>         Display file contents\n", TEXT);
@@ -928,23 +931,34 @@ fn cmd_llm(term: &mut Terminal, prompt_bytes: &[u8]) {
     term.put_str(b"[LLM] ", LLM_COL);
     loop {
         let mut bus_msg = [0u64; 6];
-        if sys_bus_consume(&mut bus_msg) == 0 {
-            let intent = bus_msg[2] as u32;
-            let payload = bus_msg[4];
-
-            // Accept tokens from both LLM agents
-            if intent == INTENT_TOKEN_GENERATED as u32 || intent == INTENT_TOKEN_GEN_CORE as u32 {
-                let token_char = (payload & 0xFF) as u8;
-                if token_char >= 0x20 && token_char <= 0x7E || token_char == b'\n' {
-                    term.put_char(token_char, LLM_COL);
-                    token_count += 1;
-                    term.tokens_received += 1;
-                }
-                idle_ticks = 0;
-            } else if intent == INTENT_GENERATION_DONE as u32 {
-                break;
+        let mut got_token = false;
+        // Intent-Based Routing: only consume LLM token intents
+        if sys_bus_consume_intent(&mut bus_msg, INTENT_TOKEN_GEN_CORE as u32) == 0 {
+            let payload = bus_msg[2];
+            let token_char = (payload & 0xFF) as u8;
+            if token_char >= 0x20 && token_char <= 0x7E || token_char == b'\n' {
+                term.put_char(token_char, LLM_COL);
+                token_count += 1;
+                term.tokens_received += 1;
             }
-        } else {
+            idle_ticks = 0;
+            got_token = true;
+        }
+        if sys_bus_consume_intent(&mut bus_msg, INTENT_TOKEN_GENERATED as u32) == 0 {
+            let payload = bus_msg[2];
+            let token_char = (payload & 0xFF) as u8;
+            if token_char >= 0x20 && token_char <= 0x7E || token_char == b'\n' {
+                term.put_char(token_char, LLM_COL);
+                token_count += 1;
+                term.tokens_received += 1;
+            }
+            idle_ticks = 0;
+            got_token = true;
+        }
+        if sys_bus_consume_intent(&mut bus_msg, INTENT_GENERATION_DONE as u32) == 0 {
+            break;
+        }
+        if !got_token {
             idle_ticks += 1;
             if idle_ticks > max_idle { break; }
         }
@@ -1295,6 +1309,8 @@ fn process_command(term: &mut Terminal) {
         cmd_df(term);
     } else if bytes_eq(first_word, b"history") {
         cmd_history(term);
+    } else if bytes_eq(first_word, b"mcp_test") {
+        cmd_mcp_test(term);
     } else if bytes_eq(first_word, b"exit") || bytes_eq(first_word, b"quit") {
         term.put_char(b'\n', TEXT);
         term.put_str(b"Goodbye!\n", PROMPT);
@@ -2248,6 +2264,73 @@ fn cmd_history(term: &mut Terminal) {
 }
 
 // ═══════════════════════════════════════════════════
+// MCP TEST — Level 8 JSON Contract Pipeline (Ring 3)
+// ═══════════════════════════════════════════════════
+
+/// cmd_mcp_test: Writes a JSON contract to VFS mailbox, publishes
+/// INTENT_MCP_EXECUTE (0x9002) on the Cognitive Bus, then waits for
+/// INTENT_MCP_RESULT (0x9003) from the MCP Agent using Intent-Based Routing.
+///
+/// ACHA Zero-Trust: The Terminal NEVER calls sys_gen_driver or sys_load_module.
+/// Only the MCP Agent (Ring 3) has that authority. The kernel never parses JSON.
+fn cmd_mcp_test(term: &mut Terminal) {
+    term.put_char(b'\n', TEXT);
+    term.put_str(b"[MCP-TEST] Level 8 - Model Context Protocol validation\n", INFO_COL);
+    sys_write(1, b"[TERM] mcp_test: starting MCP JSON contract pipeline\n");
+
+    // Step 1: Create the JSON contract in VFS mailbox
+    let json_contract: &[u8] = b"{\"action\":\"gen_driver\",\"params\":{\"vendor\":4660,\"device\":4369}}";
+    let mailbox_path: &[u8] = b"/tmp/mcp_contract.json\0";
+
+    let fd = sys_creat(mailbox_path, 0o644);
+    if fd < 0 {
+        term.put_str(b"[MCP-TEST] ERROR: Cannot create /tmp/mcp_contract.json\n", ERR_COL);
+        sys_write(1, b"[TERM] mcp_test: FAILED to create mailbox file\n");
+        return;
+    }
+    let fd = fd as u32;
+    sys_write_fd(fd, json_contract);
+    sys_close(fd);
+
+    term.put_str(b"[MCP-TEST] JSON Contract written to /tmp/mcp_contract.json\n", TEXT);
+    sys_write(1, b"[TERM] JSON Contract sent to MCP\n");
+    sys_write(1, b"[TERM] mcp_test: contract written, vendor=0x1234 device=0x1111\n");
+
+    // Step 2: Publish intent on Cognitive Bus to wake MCP agent
+    sys_bus_publish(INTENT_MCP_EXECUTE, 2, 0x12341111);
+    term.put_str(b"[MCP-TEST] Published INTENT_MCP_EXECUTE (0x9002) on bus\n", TEXT);
+    sys_write(1, b"[TERM] mcp_test: INTENT_MCP_EXECUTE published on bus\n");
+
+    // Step 3: Wait for MCP response using Intent-Based Routing.
+    // The Terminal listens ONLY for 0x9003 (INTENT_MCP_RESULT).
+    // The 0x9002 message stays on the bus for MCP to consume.
+    // This is the Pub/Sub fix: no message stealing.
+    term.put_str(b"[MCP-TEST] Waiting for MCP response (intent 0x9003)...\n", DIM);
+    sys_write(1, b"[TERM] mcp_test: waiting for INTENT_MCP_RESULT (0x9003)\n");
+
+    let mut mcp_msg = [0u64; 6];
+    let mut got_response = false;
+    for _wait in 0..10_000u32 {
+        sys_yield();
+        let r = sys_bus_consume_intent(&mut mcp_msg, INTENT_MCP_RESULT);
+        if r == 0 {
+            got_response = true;
+            break;
+        }
+    }
+
+    if got_response {
+        term.put_str(b"[MCP-TEST] MCP Agent responded with INTENT_MCP_RESULT\n", PROMPT);
+        sys_write(1, b"[TERM] mcp_test: MCP responded OK\n");
+    } else {
+        term.put_str(b"[MCP-TEST] MCP response timeout (check serial for [MCP] logs)\n", DIM);
+        sys_write(1, b"[TERM] mcp_test: MCP response timeout\n");
+    }
+    term.put_char(b'\n', TEXT);
+    sys_write(1, b"[TERM] mcp_test: pipeline complete\n");
+}
+
+// ═══════════════════════════════════════════════════
 // MAIN EVENT LOOP
 // ═══════════════════════════════════════════════════
 
@@ -2256,7 +2339,7 @@ pub extern "C" fn main() -> i64 {
     sys_write(1, b"[TERM] ========================================\n");
     sys_write(1, b"[TERM] AetherionOS v4.0 Production Terminal\n");
     sys_write(1, b"[TERM] Real Syscalls: ls/cat/ps/mem/llm\n");
-    sys_write(1, b"[TERM] Shell v6.1: help clear ls cat ps mem wget curl ping (31 commands)\n");
+    sys_write(1, b"[TERM] Shell v6.2: help clear ls cat ps mem wget curl ping mcp_test (32 commands)\n");
     sys_write(1, b"[TERM] ========================================\n");
 
     draw_chrome();
@@ -2277,6 +2360,11 @@ pub extern "C" fn main() -> i64 {
     sys_write(1, b"[TERM] Level 7: Auto-running gen_driver 1234:1111 (VGA probe)\n");
     cmd_gen_driver(&mut term, b"1234:1111");
     sys_write(1, b"[TERM] Level 7: gen_driver auto-test complete\n");
+
+    // ── Level 8: Auto-run mcp_test at boot to validate MCP pipeline ──
+    sys_write(1, b"[TERM] Level 8: Auto-running mcp_test (MCP JSON contract validation)\n");
+    cmd_mcp_test(&mut term);
+    sys_write(1, b"[TERM] Level 8: mcp_test auto-test complete\n");
 
     print_prompt(&mut term);
 
@@ -2323,27 +2411,35 @@ pub extern "C" fn main() -> i64 {
             idle_count += 1;
         }
 
-        // 2. Listen for bus messages (LLM tokens from both agents)
+        // 2. Listen for bus messages (LLM tokens) using Intent-Based Routing.
+        // Level 8: Only consume our own intents. MCP messages (0x9002) are
+        // left on the bus for the MCP agent. No message stealing.
         if !term.llm_active {
             let mut bus_msg = [0u64; 6];
-            if sys_bus_consume(&mut bus_msg) == 0 {
-                let intent = bus_msg[2] as u32;
-                let payload = bus_msg[4];
-
-                // J63: Accept tokens from agent_llm_chat (0x8002) AND agent_llama_core (0x8063)
-                if intent == INTENT_TOKEN_GENERATED as u32 || intent == INTENT_TOKEN_GEN_CORE as u32 {
-                    let token_char = (payload & 0xFF) as u8;
-                    if token_char >= 0x20 && token_char <= 0x7E || token_char == b'\n' {
-                        // Typewriter effect: render each token character as it arrives
-                        term.put_char(token_char, LLM_COL);
-                        term.tokens_received += 1;
-                    }
-                } else if intent == INTENT_GENERATION_DONE as u32 {
-                    term.put_char(b'\n', TEXT);
-                    term.put_str(b"[LLM] Done\n", DIM);
-                    term.llm_active = false;
-                    print_prompt(&mut term);
+            // Try agent_llama_core tokens (0x8063)
+            if sys_bus_consume_intent(&mut bus_msg, INTENT_TOKEN_GEN_CORE as u32) == 0 {
+                let payload = bus_msg[2]; // payload is at buf[2]
+                let token_char = (payload & 0xFF) as u8;
+                if token_char >= 0x20 && token_char <= 0x7E || token_char == b'\n' {
+                    term.put_char(token_char, LLM_COL);
+                    term.tokens_received += 1;
                 }
+            }
+            // Try agent_llm_chat tokens (0x8002)
+            if sys_bus_consume_intent(&mut bus_msg, INTENT_TOKEN_GENERATED as u32) == 0 {
+                let payload = bus_msg[2];
+                let token_char = (payload & 0xFF) as u8;
+                if token_char >= 0x20 && token_char <= 0x7E || token_char == b'\n' {
+                    term.put_char(token_char, LLM_COL);
+                    term.tokens_received += 1;
+                }
+            }
+            // Check for generation done (0x8003)
+            if sys_bus_consume_intent(&mut bus_msg, INTENT_GENERATION_DONE as u32) == 0 {
+                term.put_char(b'\n', TEXT);
+                term.put_str(b"[LLM] Done\n", DIM);
+                term.llm_active = false;
+                print_prompt(&mut term);
             }
         }
 

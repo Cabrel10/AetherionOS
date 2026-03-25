@@ -187,6 +187,42 @@ pub fn consume() -> Result<IntentMessage, BusError> {
     COGNITIVE_BUS.lock().pop()
 }
 
+/// Intent-Based Routing: Consume only messages matching a specific intent ID.
+/// All other messages are left untouched in the bus.
+///
+/// Level 8 (ACHA §3.7.1): This is the foundation of the Pub/Sub model.
+/// Each agent subscribes to its own intent(s) and never steals messages
+/// destined for other agents. This fixes the shared-bus race condition
+/// where the Terminal would accidentally consume MCP's 0x9002 messages.
+///
+/// # Returns
+/// * `Ok(IntentMessage)` with the highest-priority message matching `target_intent`
+/// * `Err(BusError::QueueEmpty)` if no matching message exists
+///
+/// # Performance
+/// O(n) scan + O(log n) re-heapify. Acceptable for bus sizes ≤ 1024.
+pub fn consume_intent(target_intent: u32) -> Result<IntentMessage, BusError> {
+    let mut bus = COGNITIVE_BUS.lock();
+    let mut found_idx = None;
+    for (i, pm) in bus.heap.iter().enumerate() {
+        if pm.msg.intent_id == target_intent {
+            found_idx = Some(i);
+            break;
+        }
+    }
+    if let Some(idx) = found_idx {
+        let last = bus.heap.len() - 1;
+        bus.heap.swap(idx, last);
+        let pm = bus.heap.pop().unwrap();
+        if !bus.heap.is_empty() && idx < bus.heap.len() {
+            bus.sift_down(idx);
+            bus.sift_up(idx);
+        }
+        return Ok(pm.msg);
+    }
+    Err(BusError::QueueEmpty)
+}
+
 /// Returns the number of messages currently in the bus
 pub fn len() -> usize {
     COGNITIVE_BUS.lock().len()

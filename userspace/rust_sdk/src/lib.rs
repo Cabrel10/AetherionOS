@@ -27,6 +27,9 @@
 
 extern crate alloc;
 
+// Level 8: Zero-allocation JSON parser for MCP contracts
+pub mod json;
+
 use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use linked_list_allocator::Heap;
@@ -105,6 +108,7 @@ pub const SYS_EXIT:         u64 = 60;
 pub const SYS_WAIT:         u64 = 61;
 pub const SYS_BUS_PUBLISH:  u64 = 270;  // Jalon 79: remapped from 201 to avoid Linux ABI conflict
 pub const SYS_BUS_CONSUME:  u64 = 203;
+pub const SYS_BUS_CONSUME_INTENT: u64 = 204;  // Level 8: Intent-Based Routing (Pub/Sub)
 pub const SYS_VGA_WRITE:    u64 = 202;
 pub const SYS_MMAP_FILE:    u64 = 240;
 pub const SYS_PREAD64:      u64 = 17;   // Jalon 73: pread64(fd, buf, offset) — no FD position change
@@ -312,6 +316,18 @@ pub fn sys_bus_publish(intent: u64, priority: u32, data: u64) -> i64 {
 ///   -EFAULT (-14) if buffer address is invalid
 pub fn sys_bus_consume(msg_buf: &mut [u64; 6]) -> i64 {
     syscall1(SYS_BUS_CONSUME, msg_buf.as_mut_ptr() as u64) as i64
+}
+
+/// Intent-Based Routing: Consume only messages matching `target_intent`.
+/// Level 8 (ACHA §3.7.1) — Pub/Sub primitive for the Cognitive Bus.
+///
+/// Each Ring 3 agent calls this with its own intent ID:
+///   - MCP agent: sys_bus_consume_intent(buf, 0x9002)
+///   - Terminal:  sys_bus_consume_intent(buf, 0x8063) for LLM tokens
+///
+/// Messages for other intents are left untouched in the bus.
+pub fn sys_bus_consume_intent(msg_buf: &mut [u64; 6], target_intent: u32) -> i64 {
+    syscall2(SYS_BUS_CONSUME_INTENT, msg_buf.as_mut_ptr() as u64, target_intent as u64) as i64
 }
 
 /// Write a colored character to VGA text buffer.

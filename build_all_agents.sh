@@ -77,6 +77,7 @@ agent_tokenizer
 agent_visual_term
 agent_weight_loader
 agent_wm
+agent_mcp
 "
 
 BUILT=0

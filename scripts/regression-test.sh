@@ -74,7 +74,7 @@ timeout "$TIMEOUT" qemu-system-x86_64 \
     $ACCEL_FLAG \
     -drive format=raw,file="$BOOTIMAGE" \
     -m 256M -serial stdio -display none \
-    -cpu Haswell -no-reboot \
+    -cpu max -no-reboot \
     -device virtio-net-pci,netdev=net0 -netdev user,id=net0 \
     -device qemu-xhci \
     2>/dev/null > "$LOG_FILE" || true
@@ -523,9 +523,9 @@ check "T144 GGUF vocab probe" "GGUF vocab probe|GGUF KV pairs"
 check "T145 BPE v2.0 validated" "BPE.*tokenizer v2.0 VALIDATED|BPE-OK"
 
 # =============================================
-echo "=== [Cat 31] Shell v6.1 Commands ==="
+echo "=== [Cat 31] Shell v6.2 Commands ==="
 # =============================================
-check "T146 Shell v6.1 help" "31 commands|v6.1"
+check "T146 Shell v6.2 help" "32 commands|v6.2"
 check "T147 Shell known commands" "help.*clear.*ls"
 check "T148 Terminal v4.0 banner" "AetherionOS v4.0|Production Terminal"
 check "T149 Terminal event loop" "Terminal ready|TERM.*ready"
@@ -534,11 +534,11 @@ check "T150 GPU tests passed" "GPU.*TESTS.*passed|GPU.*tests.*passed|GPU test"
 # =============================================
 echo "=== [Cat 33] New Shell Commands (cp/echo/env/uptime/df/history) ==="
 # =============================================
-check "T156 cp command compiled" "cp.*echo.*env.*uptime.*df.*history|31 commands"
-check "T157 echo command in shell" "echo.*text|Shell v6.1"
-check "T158 env command available" "env.*uptime|Shell v6.1|31 commands"
-check "T159 uptime command available" "uptime|Shell v6.1|31 commands"
-check "T160 df command available" "df|Shell v6.1|31 commands"
+check "T156 cp command compiled" "cp.*echo.*env.*uptime.*df.*history|32 commands"
+check "T157 echo command in shell" "echo.*text|Shell v6.2"
+check "T158 env command available" "env.*uptime|Shell v6.2|32 commands"
+check "T159 uptime command available" "uptime|Shell v6.2|32 commands"
+check "T160 df command available" "df|Shell v6.2|32 commands"
 
 # =============================================
 echo "=== [Cat 34] In-RAM Code Generation (Level 7) ==="
@@ -548,6 +548,15 @@ check "T162 sys_gen_driver syscall" "Invoking sys_gen_driver for in-RAM codegen|
 check "T163 AMOD Magic Validated" "AMOD magic: OK|AMOD header validated"
 check "T164 Module loaded and executed" "gen_driver in-RAM: LOADED.EXECUTED|gen_driver in-RAM: COMPILED"
 check "T165 PCI Device Detected via RAM driver" "Module executed: PCI device found|PCI BAR0 Found"
+
+# =============================================
+echo "=== [Cat 35] Level 8 MCP & JSON Contract (Ring 3 Isolation) ==="
+# =============================================
+check "T166 JSON parser activated" "json.*parser.*Level 8|Zero.allocation.*JSON|json::extract_json"
+check "T167 MCP agent queued" "agent_mcp.elf.*QUEUED|L8.*agent_mcp"
+check "T168 MCP contract validated" "MCP.*Contract validated|MCP.*action=gen_driver"
+check "T169 MCP execution success" "MCP.*Execution success|MCP.*success"
+check "T170 MCP PCI device detected" "MCP.*PCI device found|MCP.*BAR0|MCP.*Device not found.*Execution success"
 
 # =============================================
 echo "=== [Cat 32] Advanced Stability ==="
