@@ -113,6 +113,42 @@ pub fn scan_for_class(target_class: u8) -> alloc::vec::Vec<PciDevice> {
     found
 }
 
+/// Jalon 86: Scan PCI bus for xHCI USB 3.0 controllers
+/// Looks for class=0x0C (Serial Bus), subclass=0x03 (USB), prog_if=0x30 (xHCI)
+pub fn scan_for_xhci() -> alloc::vec::Vec<PciDevice> {
+    let devices = scan_for_class(0x0C);
+    let mut xhci = alloc::vec::Vec::new();
+    for dev in &devices {
+        if dev.subclass == 0x03 && dev.prog_if == 0x30 {
+            xhci.push(*dev);
+        }
+    }
+    xhci
+}
+
+/// Scan the entire PCI bus 0 and return all discovered devices.
+pub fn scan_all() -> alloc::vec::Vec<PciDevice> {
+    let mut found = alloc::vec::Vec::new();
+    for device_num in 0..32u8 {
+        let (vendor_id, device_id) = read_vendor_device(0, device_num, 0);
+        if vendor_id == 0xFFFF {
+            continue;
+        }
+        let (class_code, subclass, prog_if) = read_class(0, device_num, 0);
+        found.push(PciDevice {
+            bus: 0,
+            device: device_num,
+            function: 0,
+            vendor_id,
+            device_id,
+            class_code,
+            subclass,
+            prog_if,
+        });
+    }
+    found
+}
+
 /// Represents a discovered PCI device
 #[derive(Debug, Clone, Copy)]
 pub struct PciDevice {

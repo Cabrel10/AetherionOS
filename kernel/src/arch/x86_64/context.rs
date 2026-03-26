@@ -121,8 +121,6 @@ pub unsafe fn enable_sse() {
 pub fn cpu_has_avx() -> bool {
     let ecx: u32;
     unsafe {
-        // CPUID clobbers EAX, EBX, ECX, EDX. RBX is callee-saved and used by LLVM,
-        // so we save/restore it manually.
         asm!(
             "push rbx",
             "mov eax, 1",
@@ -136,6 +134,170 @@ pub fn cpu_has_avx() -> bool {
     }
     // ECX bit 28 = AVX
     (ecx & (1 << 28)) != 0
+}
+
+/// Check if the CPU supports AVX2 via CPUID leaf 7, subleaf 0.
+/// Returns true if CPUID.7.0:EBX.AVX2[bit 5] is set.
+pub fn cpu_has_avx2() -> bool {
+    let ebx: u32;
+    unsafe {
+        asm!(
+            "push rbx",
+            "mov eax, 7",
+            "xor ecx, ecx",
+            "cpuid",
+            "mov {0:e}, ebx",
+            "pop rbx",
+            out(reg) ebx,
+            out("eax") _,
+            out("ecx") _,
+            out("edx") _,
+            options(nomem),
+        );
+    }
+    // EBX bit 5 = AVX2
+    (ebx & (1 << 5)) != 0
+}
+
+/// Check if the CPU supports FMA3 via CPUID.
+/// Returns true if CPUID.1:ECX.FMA[bit 12] is set.
+pub fn cpu_has_fma() -> bool {
+    let ecx: u32;
+    unsafe {
+        asm!(
+            "push rbx",
+            "mov eax, 1",
+            "cpuid",
+            "pop rbx",
+            out("ecx") ecx,
+            out("eax") _,
+            out("edx") _,
+            options(nomem),
+        );
+    }
+    // ECX bit 12 = FMA
+    (ecx & (1 << 12)) != 0
+}
+
+/// CPU feature flags detected at boot
+#[derive(Debug, Clone, Copy)]
+pub struct CpuFeatures {
+    pub sse: bool,
+    pub sse2: bool,
+    pub avx: bool,
+    pub avx2: bool,
+    pub fma: bool,
+    pub pcid: bool,
+    pub brand: [u8; 48],
+}
+
+/// Detect all relevant CPU features
+pub fn detect_cpu_features() -> CpuFeatures {
+    let (ecx1, edx1): (u32, u32);
+    unsafe {
+        asm!(
+            "push rbx",
+            "mov eax, 1",
+            "cpuid",
+            "pop rbx",
+            out("ecx") ecx1,
+            out("edx") edx1,
+            out("eax") _,
+            options(nomem),
+        );
+    }
+
+    let mut brand = [0u8; 48];
+    // Try to read brand string (CPUID leaves 0x80000002-0x80000004)
+    let max_ext: u32;
+    unsafe {
+        asm!(
+            "push rbx",
+            "mov eax, 0x80000000",
+            "cpuid",
+            "pop rbx",
+            out("eax") max_ext,
+            out("ecx") _,
+            out("edx") _,
+            options(nomem),
+        );
+    }
+    if max_ext >= 0x80000004 {
+        for i in 0u32..3 {
+            let (eax, ebx_val, ecx, edx): (u32, u32, u32, u32);
+            unsafe {
+                let leaf = 0x80000002u32 + i;
+                asm!(
+                    "push rbx",
+                    "mov eax, {leaf:e}",
+                    "cpuid",
+                    "mov {out_ebx:e}, ebx",
+                    "pop rbx",
+                    leaf = in(reg) leaf,
+                    out_ebx = out(reg) ebx_val,
+                    lateout("eax") eax,
+                    out("ecx") ecx,
+                    out("edx") edx,
+                    options(nomem),
+                );
+            }
+            let off = (i as usize) * 16;
+            brand[off..off+4].copy_from_slice(&eax.to_le_bytes());
+            brand[off+4..off+8].copy_from_slice(&ebx_val.to_le_bytes());
+            brand[off+8..off+12].copy_from_slice(&ecx.to_le_bytes());
+            brand[off+12..off+16].copy_from_slice(&edx.to_le_bytes());
+        }
+    }
+
+    CpuFeatures {
+        sse: (edx1 & (1 << 25)) != 0,
+        sse2: (edx1 & (1 << 26)) != 0,
+        avx: (ecx1 & (1 << 28)) != 0,
+        avx2: cpu_has_avx2(),
+        fma: (ecx1 & (1 << 12)) != 0,
+        pcid: (ecx1 & (1 << 17)) != 0,
+        brand,
+    }
+}
+
+/// Log CPU features to serial
+pub fn log_cpu_features(features: &CpuFeatures) {
+    // Find end of brand string
+    let mut brand_len = 0;
+    for i in 0..48 {
+        if features.brand[i] == 0 { break; }
+        brand_len = i + 1;
+    }
+    if brand_len > 0 {
+        crate::serial_write("[CPU] Brand: ");
+        // Trim leading spaces and write character by character
+        let mut start = 0;
+        while start < brand_len && features.brand[start] == b' ' { start += 1; }
+        let mut buf = [0u8; 48];
+        let mut pos = 0;
+        for i in start..brand_len {
+            buf[pos] = features.brand[i];
+            pos += 1;
+        }
+        if pos > 0 {
+            if let Ok(s) = core::str::from_utf8(&buf[..pos]) {
+                crate::serial_write(s);
+            }
+        }
+        crate::serial_write("\n");
+    }
+
+    crate::serial_println!("[CPU] Features: SSE={} SSE2={} AVX={} AVX2={} FMA={} PCID={}",
+        features.sse, features.sse2, features.avx, features.avx2, features.fma, features.pcid);
+
+    if features.avx2 && features.fma {
+        crate::serial_println!("[CPU] Hardware acceleration: AVX2+FMA available for LLM inference");
+        crate::serial_println!("[CPU] Haswell+ detected: optimal for SIMD matrix operations");
+    } else if features.avx {
+        crate::serial_println!("[CPU] Hardware acceleration: AVX (no AVX2/FMA)");
+    } else {
+        crate::serial_println!("[CPU] Hardware acceleration: SSE only (no AVX)");
+    }
 }
 
 /// Enable AVX support: set CR4.OSXSAVE, then configure XCR0

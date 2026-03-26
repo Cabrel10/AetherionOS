@@ -362,66 +362,91 @@ extern "x86-interrupt" fn page_fault_handler(
         // Fall through to SIGSEGV
     }
 
-    // --- Demand paging for VMA-backed regions (Jalon 68/76: Zero-Copy Model Loading) ---
+    // --- Demand paging for VMA-backed regions (Jalon 68/76/91: Zero-Copy Model Loading + Readahead) ---
     // Check if the faulting address is in a file-backed VMA.
     // If so, allocate a frame, read the file data into it, and map it.
+    // Jalon 91 enhancement: readahead up to READAHEAD_PAGES adjacent pages
+    // to amortize page-fault overhead and reduce future faults during sequential access.
     // Supports: in-memory VFS files (/sys/*, /bin/*), exFAT, and FAT32 on /disk/.
     if is_user_mode {
         let current_pid = crate::scheduler::current_pid();
         if current_pid != 0 {
             if let Some((file_path, file_offset, writable)) = crate::process::find_vma(current_pid, addr_raw) {
-                // Allocate a physical frame
-                let frame_phys = unsafe { crate::elf::alloc_demand_frame() };
-                if let Some(phys) = frame_phys {
-                    let phys_offset = crate::elf::phys_offset();
-                    let buf_ptr = (phys + phys_offset) as *mut u8;
+                // Readahead: map the faulting page + up to 7 adjacent pages
+                // This reduces page-fault overhead for sequential model weight access
+                const READAHEAD_PAGES: u64 = 8; // 32 KiB readahead window
+                
+                let cr3: u64;
+                unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)); }
+                let pml4_phys = cr3 & !0xFFF;
+                
+                let mut mapped_count: u64 = 0;
+                
+                for ra_idx in 0..READAHEAD_PAGES {
+                    let ra_page_addr = page_addr + ra_idx * 4096;
                     
-                    // Zero the frame first
-                    unsafe { core::ptr::write_bytes(buf_ptr, 0, 4096); }
-                    
-                    // Read 4 KB from the file at the correct offset
-                    let page_buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, 4096) };
-                    
-                    // Priority 1: Try in-memory VFS (for /sys/*, /bin/*, etc.)
-                    let mut bytes_read = crate::fs::vfs::file_read_at_offset(&file_path, file_offset, page_buf);
-                    
-                    // Priority 2: Try exFAT (for /disk/ paths)
-                    if bytes_read == 0 && file_path.starts_with("/disk/") {
-                        if crate::fs::exfat::is_mounted() {
-                            let name = &file_path[6..];
-                            bytes_read = crate::fs::exfat::read_file(name, file_offset, page_buf);
-                        }
-                    }
-                    
-                    // Priority 3: FAT32 fallback
-                    if bytes_read == 0 {
-                        let _ = crate::fs::fat32::read_file_at_offset(&file_path, file_offset, page_buf)
-                            .unwrap_or(0);
-                    }
-                    
-                    // Map the page (even if bytes_read < 4096, rest is zeroed)
-                    let cr3: u64;
-                    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)); }
-                    let pml4_phys = cr3 & !0xFFF;
-                    
-                    // flags: PRESENT | USER | NX, optionally WRITABLE
-                    let mut flags: u64 = 0x01 | 0x04 | (1u64 << 63);
-                    if writable { flags |= 0x02; }
-                    
-                    match unsafe { crate::elf::demand_map_user_page(pml4_phys, page_addr, phys, flags) } {
-                        Ok(()) => {
-                            // Flush TLB for this page
-                            unsafe {
-                                core::arch::asm!("invlpg [{}]", in(reg) page_addr, options(nostack));
+                    // Check this readahead page is still within the VMA
+                    if let Some((ra_path, ra_file_offset, ra_writable)) = crate::process::find_vma(current_pid, ra_page_addr) {
+                        // Allocate a physical frame
+                        let frame_phys = unsafe { crate::elf::alloc_demand_frame() };
+                        if let Some(phys) = frame_phys {
+                            let phys_offset = crate::elf::phys_offset();
+                            let buf_ptr = (phys + phys_offset) as *mut u8;
+                            
+                            // Zero the frame first
+                            unsafe { core::ptr::write_bytes(buf_ptr, 0, 4096); }
+                            
+                            // Read 4 KB from the file at the correct offset
+                            let page_buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, 4096) };
+                            
+                            // Priority 1: Try in-memory VFS (for /sys/*, /bin/*, etc.)
+                            let mut bytes_read = crate::fs::vfs::file_read_at_offset(&ra_path, ra_file_offset, page_buf);
+                            
+                            // Priority 2: Try exFAT (for /disk/ paths)
+                            if bytes_read == 0 && ra_path.starts_with("/disk/") {
+                                if crate::fs::exfat::is_mounted() {
+                                    let name = &ra_path[6..];
+                                    bytes_read = crate::fs::exfat::read_file(name, ra_file_offset, page_buf);
+                                }
                             }
-                            return; // Resume execution
+                            
+                            // Priority 3: FAT32 fallback
+                            if bytes_read == 0 && ra_path.starts_with("/disk/") {
+                                let _ = crate::fs::fat32::read_file_at_offset(&ra_path, ra_file_offset, page_buf)
+                                    .unwrap_or(0);
+                            }
+                            
+                            // Map the page (even if bytes_read < 4096, rest is zeroed)
+                            let mut flags: u64 = 0x01 | 0x04 | (1u64 << 63); // PRESENT | USER | NX
+                            if ra_writable { flags |= 0x02; }
+                            
+                            match unsafe { crate::elf::demand_map_user_page(pml4_phys, ra_page_addr, phys, flags) } {
+                                Ok(()) => {
+                                    // Flush TLB for this page
+                                    unsafe {
+                                        core::arch::asm!("invlpg [{}]", in(reg) ra_page_addr, options(nostack));
+                                    }
+                                    mapped_count += 1;
+                                }
+                                Err(_) => {
+                                    // Page might already be mapped (readahead overlap), skip
+                                    break;
+                                }
+                            }
+                        } else {
+                            // Out of frames, stop readahead
+                            break;
                         }
-                        Err(_) => {
-                            crate::serial_println!("[VMA-PF] Map failed for 0x{:X}", page_addr);
-                        }
+                    } else {
+                        // Past end of VMA, stop readahead
+                        break;
                     }
                 }
-                // Fall through to SIGSEGV if allocation or mapping failed
+                
+                if mapped_count > 0 {
+                    return; // Resume execution — faulting page is now mapped
+                }
+                // Fall through to SIGSEGV if nothing was mapped
             }
         }
     }

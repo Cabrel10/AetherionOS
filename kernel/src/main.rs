@@ -184,6 +184,9 @@ static WGET_REAL_ELF: &[u8] = include_bytes!("../../userspace/c_apps/wget_real.e
 /// agent_mcp - Level 8 MCP (Model Context Protocol) Security Agent (Ring 3)
 static AGENT_MCP_ELF: &[u8] = include_bytes!("../../userspace/agent_mcp/target/x86_64-aetherion-user/release/agent_mcp");
 
+/// agent_validator - Immune System: JSON coherence validator (Ring 3)
+static AGENT_VALIDATOR_ELF: &[u8] = include_bytes!("../../userspace/agent_validator/target/x86_64-aetherion-user/release/agent_validator");
+
 // VGA text buffer
 const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
 const VGA_WIDTH: usize = 80;
@@ -1287,6 +1290,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     } else {
         serial_write("       [INFO] AVX not available on this CPU (SSE-only mode)\n");
     }
+    // Detect full CPU features (AVX2, FMA, PCID, brand string)
+    let cpu_features = arch::x86_64::context::detect_cpu_features();
+    arch::x86_64::context::log_cpu_features(&cpu_features);
 
     // === Step 2: IDT ===
     serial_write("[2/12] Loading IDT...\n");
@@ -1308,6 +1314,8 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_write("[4/12] Security init...\n");
     security::init();
     serial_write("       [OK] TPM stub + PCR0 + stack protector\n");
+    security::kpti::init();
+    serial_write("       [OK] KPTI-Lite: kernel/user page table isolation active\n");
 
     serial_write("\n[BOOT] Phase 2: Memory & Filesystem\n");
     serial_write("[BOOT] ──────────────────────────────────────\n");
@@ -1554,6 +1562,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 ("agent_q4_dequant.elf", AGENT_Q4_DEQUANT_ELF),
                 ("agent_llama_core.elf", AGENT_LLAMA_CORE_ELF),
                 ("agent_mcp.elf", AGENT_MCP_ELF),
+                ("agent_validator.elf", AGENT_VALIDATOR_ELF),
             ];
             let mut mounted = 0u32;
             let mut root = crate::fs::vfs::lock_root();
@@ -1636,6 +1645,16 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_write("\n[17c/19] USB 3.0 xHCI Controller (Jalon 77)...\n");
     drivers::usb::xhci::init();
     drivers::usb::xhci::run_tests();
+
+    // ===================================================================
+    // JALON 88: LOCAL APIC + SMP MULTI-CORE DETECTION
+    // ===================================================================
+    serial_write("\n[17d/19] Local APIC + SMP (Jalon 88)...\n");
+    arch::x86_64::apic::init();
+    arch::x86_64::apic::run_tests();
+    // Wake APs (disabled by default — enable with QEMU -smp N)
+    // arch::x86_64::apic::wake_application_processors();
+    serial_println!("[SMP] CPU count: {} (BSP only, AP wake-up ready)", arch::x86_64::apic::cpu_count());
 
     serial_write("\n[18/19] FAT32 Filesystem (Couche 19)...\n");
     fs::fat32::init();
@@ -1948,6 +1967,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 serial_println!("       [OK] /bin/agent_q4_dequant.elf ({} bytes)", AGENT_Q4_DEQUANT_ELF.len());
                 serial_println!("       [OK] /bin/agent_llama_core.elf ({} bytes)", AGENT_LLAMA_CORE_ELF.len());
                 serial_println!("       [OK] /bin/agent_mcp.elf ({} bytes)", AGENT_MCP_ELF.len());
+                serial_println!("       [OK] /bin/agent_validator.elf ({} bytes, Immune System)", AGENT_VALIDATOR_ELF.len());
                 serial_println!("       [OK] /bin/wget_real.elf ({} bytes)", WGET_REAL_ELF.len());
             }
         }
@@ -2091,25 +2111,24 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         }
 
         // ──────────────────────────────────────────────────────────
-        // STEP A2: Load agent_orchestrator.elf as a QUEUED process
+        // STEP A2: Load agent_orchestrator.elf as a QUEUED Worker
+        // Jalon 85: Thalamus Orchestrator — O(1) reflex memory + LLM routing
         // ──────────────────────────────────────────────────────────
-        serial_write("  [J79] agent_orchestrator.elf: DISABLED (terminal-only mode)\n");
-        // match elf::load_elf_binary(AGENT_ORCHESTRATOR_ELF) {
-        //     Ok(orch_result) => {
-        //         let orch_pid = process::spawn_userspace(
-        //             "/bin/agent_orchestrator.elf", 0,
-        //             orch_result.entry_point, orch_result.stack_pointer, orch_result.pml4_phys
-        //         ).unwrap_or(0);
-        //         if orch_pid != 0 {
-        //             scheduler::enqueue_process(orch_pid);
-        //             serial_println!("  [J60] Orchestrator PID={} queued (entry=0x{:X})",
-        //                 orch_pid, orch_result.entry_point);
-        //         }
-        //     }
-        //     Err(e) => {
-        //         serial_println!("  [J60] WARN: agent_orchestrator.elf load failed: {}", e);
-        //     }
-        // }
+        match elf::load_elf_binary(AGENT_ORCHESTRATOR_ELF) {
+            Ok(orch_result) => {
+                let orch_pid = process::spawn_userspace(
+                    "/bin/agent_orchestrator.elf", 0,
+                    orch_result.entry_point, orch_result.stack_pointer, orch_result.pml4_phys
+                ).unwrap_or(0);
+                if orch_pid != 0 {
+                    scheduler::enqueue_process(orch_pid);
+                    serial_write("  [J85] agent_orchestrator.elf: QUEUED (Thalamus + Hippocampe)\n");
+                }
+            }
+            Err(_e) => {
+                serial_write("  [J85] WARN: agent_orchestrator.elf load failed\n");
+            }
+        }
 
         // ──────────────────────────────────────────────────────────
         // STEP A3: Load agent_llama_core.elf as QUEUED process
@@ -2153,6 +2172,27 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             }
             Err(_e) => {
                 serial_write("  [L8] WARN: agent_mcp.elf load failed\n");
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────
+        // STEP A5: Load agent_validator.elf (Immune System - JSON Coherence)
+        // Validates all LLM JSON output before forwarding to MCP.
+        // Modes: Strict | Admin | God Mode (0x1337 + 0xBADC0DED)
+        // ──────────────────────────────────────────────────────────
+        match elf::load_elf_binary(AGENT_VALIDATOR_ELF) {
+            Ok(val_result) => {
+                let val_pid = process::spawn_userspace(
+                    "/bin/agent_validator.elf", 0,
+                    val_result.entry_point, val_result.stack_pointer, val_result.pml4_phys
+                ).unwrap_or(0);
+                if val_pid != 0 {
+                    scheduler::enqueue_process(val_pid);
+                    serial_println!("  [L9] agent_validator.elf: QUEUED ({} bytes, Immune System)", AGENT_VALIDATOR_ELF.len());
+                }
+            }
+            Err(_e) => {
+                serial_write("  [L9] WARN: agent_validator.elf load failed\n");
             }
         }
 
