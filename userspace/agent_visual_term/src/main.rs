@@ -61,7 +61,7 @@ const KNOWN_CMDS: &[&[u8]] = &[b"help", b"clear", b"ls", b"cat", b"ps", b"mem", 
     b"run", b"llm", b"version", b"wget", b"shutdown", b"exit", b"whoami", b"uname",
     b"gen_driver", b"mkdir", b"touch", b"rm", b"ping", b"netstat", b"curl",
     b"kill", b"top", b"write", b"cp", b"echo", b"env", b"uptime", b"df", b"history",
-    b"mcp_test"];
+    b"mcp_test", b"orch_test"];
 
 const INTENT_GEN_DRIVER: u64 = 0x9001;
 const INTENT_MCP_EXECUTE: u64 = 0x9002;
@@ -481,7 +481,7 @@ fn print_prompt(term: &mut Terminal) {
 
 fn cmd_help(term: &mut Terminal) {
     term.put_char(b'\n', TEXT);
-    term.put_str(b"AetherionOS v6.2 Shell Commands (32 commands):\n", INFO_COL);
+    term.put_str(b"AetherionOS v6.2 Shell Commands (33 commands):\n", INFO_COL);
     term.put_str(b" Filesystem:\n", PROMPT);
     term.put_str(b"  ls [path]          List directory (FAT32/VFS)\n", TEXT);
     term.put_str(b"  cat <file>         Display file contents\n", TEXT);
@@ -513,6 +513,8 @@ fn cmd_help(term: &mut Terminal) {
     term.put_str(b"  run <agent>        Launch agent binary\n", TEXT);
     term.put_str(b"  llm <prompt>       Send prompt to LLM agent\n", TEXT);
     term.put_str(b"  gen_driver <id>    AI-generate PCI driver\n", TEXT);
+    term.put_str(b"  mcp_test           Test MCP JSON contract pipeline\n", TEXT);
+    term.put_str(b"  orch_test          Test Orchestrator + Reflex Memory\n", TEXT);
     term.put_str(b" Other:\n", PROMPT);
     term.put_str(b"  help  clear  shutdown  exit\n", TEXT);
     term.put_str(b"\n  Keys: Ctrl+C | Ctrl+L | Up/Down | Tab\n", DIM);
@@ -1311,6 +1313,8 @@ fn process_command(term: &mut Terminal) {
         cmd_history(term);
     } else if bytes_eq(first_word, b"mcp_test") {
         cmd_mcp_test(term);
+    } else if bytes_eq(first_word, b"orch_test") {
+        cmd_orch_test(term);
     } else if bytes_eq(first_word, b"exit") || bytes_eq(first_word, b"quit") {
         term.put_char(b'\n', TEXT);
         term.put_str(b"Goodbye!\n", PROMPT);
@@ -2331,6 +2335,43 @@ fn cmd_mcp_test(term: &mut Terminal) {
 }
 
 // ═══════════════════════════════════════════════════
+// cmd_orch_test: Publishes INTENT_USER_PROMPT with a known reflex hash
+// Tests: Orchestrator receives prompt, Hippocampe matches, response published
+// ═══════════════════════════════════════════════════
+fn cmd_orch_test(term: &mut Terminal) {
+    term.put_char(b'\n', TEXT);
+    term.put_str(b"[ORCH-TEST] Testing Thalamus Orchestrator...\n", INFO_COL);
+    sys_write(1, b"[TERM] orch_test: starting Orchestrator pipeline\n");
+
+    // Test 1: Known reflex query — "hello" (should trigger Hippocampe reflex)
+    sys_write(1, b"[TERM] orch_test: publishing INTENT_USER_PROMPT (reflex: hello)\n");
+    let mut hash: u64 = 5381;
+    for &b in b"hello" {
+        hash = hash.wrapping_mul(33).wrapping_add(b as u64);
+    }
+    sys_bus_publish(INTENT_USER_PROMPT, 2, hash);
+    term.put_str(b"[ORCH-TEST] Published: hello (reflex)\n", DIM);
+
+    // Brief yield to let orchestrator process
+    for _ in 0..100 { sys_yield(); }
+
+    // Test 2: Unknown query — should trigger LLM wakeup
+    sys_write(1, b"[TERM] orch_test: publishing INTENT_USER_PROMPT (unknown query)\n");
+    let mut hash2: u64 = 5381;
+    for &b in b"explain quantum entanglement in simple terms" {
+        hash2 = hash2.wrapping_mul(33).wrapping_add(b as u64);
+    }
+    sys_bus_publish(INTENT_USER_PROMPT, 2, hash2);
+    term.put_str(b"[ORCH-TEST] Published: complex query (LLM route)\n", DIM);
+
+    for _ in 0..100 { sys_yield(); }
+
+    term.put_str(b"[ORCH-TEST] Pipeline complete\n", INFO_COL);
+    sys_write(1, b"[TERM] orch_test: pipeline complete\n");
+    term.put_char(b'\n', TEXT);
+}
+
+// ═══════════════════════════════════════════════════
 // MAIN EVENT LOOP
 // ═══════════════════════════════════════════════════
 
@@ -2339,7 +2380,7 @@ pub extern "C" fn main() -> i64 {
     sys_write(1, b"[TERM] ========================================\n");
     sys_write(1, b"[TERM] AetherionOS v4.0 Production Terminal\n");
     sys_write(1, b"[TERM] Real Syscalls: ls/cat/ps/mem/llm\n");
-    sys_write(1, b"[TERM] Shell v6.2: help clear ls cat ps mem wget curl ping mcp_test (32 commands)\n");
+    sys_write(1, b"[TERM] Shell v6.2: help clear ls cat ps mem wget curl ping mcp_test orch_test (33 commands)\n");
     sys_write(1, b"[TERM] ========================================\n");
 
     draw_chrome();
@@ -2365,6 +2406,11 @@ pub extern "C" fn main() -> i64 {
     sys_write(1, b"[TERM] Level 8: Auto-running mcp_test (MCP JSON contract validation)\n");
     cmd_mcp_test(&mut term);
     sys_write(1, b"[TERM] Level 8: mcp_test auto-test complete\n");
+
+    // ── Jalon 85: Auto-run orch_test at boot to validate Orchestrator pipeline ──
+    sys_write(1, b"[TERM] Jalon 85: Auto-running orch_test (Thalamus + Hippocampe)\n");
+    cmd_orch_test(&mut term);
+    sys_write(1, b"[TERM] Jalon 85: orch_test auto-test complete\n");
 
     print_prompt(&mut term);
 

@@ -348,7 +348,7 @@ impl VirtioBlkDevice {
 pub fn init() {
     crate::serial_println!("[BLK] Scanning PCI for VirtIO-Block devices...");
 
-    // Scan PCI for storage controllers (class 0x01)
+    // Strategy 1: Scan PCI for storage controllers (class 0x01)
     let devices = crate::arch::x86_64::pci::scan_for_class(0x01);
     crate::serial_println!("[BLK] PCI scan: found {} storage controller(s)", devices.len());
 
@@ -370,6 +370,39 @@ pub fn init() {
                 }
                 None => {
                     crate::serial_println!("[BLK] Failed to initialize VirtIO-Block");
+                }
+            }
+        }
+    }
+
+    // Strategy 2: Direct PCI scan for VirtIO vendor (0x1AF4) across ALL classes
+    // Modern QEMU virtio-blk may appear under different class codes
+    crate::serial_println!("[BLK] Fallback: scanning all PCI devices for VirtIO vendor 0x1AF4...");
+    for bus in 0u8..=0 {
+        for device in 0u8..32 {
+            let vendor = crate::arch::x86_64::pci::read_config_u32(bus, device, 0, 0) as u16;
+            if vendor == 0x1AF4 {
+                let dev_id = (crate::arch::x86_64::pci::read_config_u32(bus, device, 0, 0) >> 16) as u16;
+                let class_word = crate::arch::x86_64::pci::read_config_u32(bus, device, 0, 0x08);
+                let class_code = ((class_word >> 24) & 0xFF) as u8;
+                let subclass = ((class_word >> 16) & 0xFF) as u8;
+                crate::serial_println!("[BLK] Found VirtIO device: bus={} dev={} id=0x{:04X} class=0x{:02X} sub=0x{:02X}",
+                    bus, device, dev_id, class_code, subclass);
+                if dev_id == 0x1001 || dev_id == 0x1042 || (class_code == 0x01 && subclass == 0x00) {
+                    crate::serial_println!("[BLK] VirtIO-Block device detected (fallback)!");
+                    match VirtioBlkDevice::init(bus, device, 0) {
+                        Some(blk_dev) => {
+                            let capacity = blk_dev.capacity_sectors;
+                            unsafe { BLK_DEVICE = Some(blk_dev); }
+                            BLK_INITIALIZED.store(true, Ordering::SeqCst);
+                            crate::serial_println!("[BLK] VirtIO-Block ready: {} sectors ({} KiB)",
+                                capacity, capacity * SECTOR_SIZE as u64 / 1024);
+                            return;
+                        }
+                        None => {
+                            crate::serial_println!("[BLK] Failed to initialize VirtIO-Block (fallback)");
+                        }
+                    }
                 }
             }
         }

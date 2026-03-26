@@ -134,6 +134,16 @@ pub const SYS_RDTSC:        u64 = 230;
 pub const SYS_EXEC:         u64 = 59;   // execve(path, argv, envp)
 pub const SYS_FORK:         u64 = 57;   // fork()
 
+// ── Jalon 91: mmap prefetch + enhanced file mmap ──
+pub const SYS_MMAP_PREFETCH:  u64 = 241;  // prefetch pages in mmap region
+pub const SYS_MMAP_FILE_V2:   u64 = 242;  // mmap + immediate prefetch (combined)
+
+// ── Jalon 92: SMP parallel inference ──
+pub const SYS_SPAWN_THREAD_ON_CORE: u64 = 243; // spawn thread on AP core
+pub const SYS_PARALLEL_MATMUL:      u64 = 244; // dispatch parallel matmul
+pub const SYS_PARALLEL_RESULT:      u64 = 245; // collect parallel result
+pub const SYS_CPU_COUNT:            u64 = 246; // get available CPU count
+
 // POSIX open flags
 pub const O_RDONLY: u32 = 0;
 pub const O_WRONLY: u32 = 1;
@@ -598,6 +608,50 @@ pub fn sys_mmap(len: usize) -> u64 {
 /// Returns the virtual address, or negative error code.
 pub fn sys_mmap_file(fd: u32, length: u64, offset: u64) -> u64 {
     syscall3(SYS_MMAP_FILE, fd as u64, length, offset)
+}
+
+/// Jalon 91: Prefetch pages in an existing mmap region to force demand paging
+/// before the data is actually needed. This eliminates page-fault latency
+/// during critical inference paths.
+/// vaddr: start of the mmap'd region
+/// length: number of bytes to prefetch
+/// Returns: number of pages prefetched
+pub fn sys_mmap_prefetch(vaddr: u64, length: u64) -> u64 {
+    syscall3(SYS_MMAP_PREFETCH, vaddr, length, 0)
+}
+
+/// Jalon 91: Enhanced mmap with immediate prefetch — all pages are loaded
+/// into RAM before the syscall returns. No page faults during access.
+/// fd: file descriptor
+/// length: mapping size
+/// offset: file offset
+/// Returns: virtual address of the mapping (all pages already in RAM)
+pub fn sys_mmap_file_v2(fd: u32, length: u64, offset: u64) -> u64 {
+    syscall3(SYS_MMAP_FILE_V2, fd as u64, length, offset)
+}
+
+/// Jalon 92: Spawn a thread on a specific AP core for SMP parallel inference.
+/// core_id: target core (1..N, 0=BSP is reserved)
+/// entry_fn: function pointer to execute
+/// arg: argument to pass to the function
+/// Returns: 0 on success, negative error code on failure
+pub fn sys_spawn_thread_on_core(core_id: u32, entry_fn: u64, arg: u64) -> i64 {
+    syscall3(SYS_SPAWN_THREAD_ON_CORE, core_id as u64, entry_fn, arg) as i64
+}
+
+/// Jalon 92: Dispatch a parallel matmul across available AP cores.
+/// work_desc: pointer to { mat: *f32, vec: *f32, out: *f32 } struct
+/// total_rows: number of rows in the matrix
+/// ncols: number of columns
+/// Returns: number of workers assigned
+pub fn sys_parallel_matmul_dispatch(work_desc: &[u64; 3], total_rows: usize, ncols: usize) -> u64 {
+    syscall3(SYS_PARALLEL_MATMUL, work_desc.as_ptr() as u64, total_rows as u64, ncols as u64)
+}
+
+/// Jalon 92: Get the number of available CPUs (including BSP).
+/// Returns: CPU count (1 = single core, >1 = SMP active)
+pub fn sys_cpu_count() -> u64 {
+    syscall0(SYS_CPU_COUNT)
 }
 
 /// Seek a file descriptor to a given offset. Returns new offset.

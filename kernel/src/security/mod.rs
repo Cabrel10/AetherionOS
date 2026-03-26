@@ -1,5 +1,8 @@
 // src/security/mod.rs - Security Implementation (Couche 1 HAL)
 // TPM stub + PCR (Platform Configuration Register) measurements
+// + KPTI-Lite: Kernel Page Table Isolation (Jalon 89)
+
+pub mod kpti;
 
 use sha2::{Sha256, Digest};
 
