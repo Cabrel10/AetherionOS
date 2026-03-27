@@ -1321,46 +1321,36 @@ pub extern "C" fn main() -> i64 {
 
     // ═══════════════════════════════════════════════════
     // Phase 1: Open GGUF file and mmap it (Jalon 91)
+    // Standard model paths: 8.3 FAT32-safe names first
     // ═══════════════════════════════════════════════════
-    println("[LLM] Phase 1: Opening model from /disk/models/real_model.gguf");
+    println("[LLM] Phase 1: Opening model file...");
 
-    let fd = sys_open(b"/disk/models/real_model.gguf\0", 0);
+    let model_paths: [&[u8]; 5] = [
+        b"/disk/models/MODEL.GGU\0",              // Standard 8.3 name (primary)
+        b"/disk/models/real_model.gguf\0",         // LFN fallback
+        b"/disk/models/smollm2-135m.gguf\0",
+        b"/disk/models/model.gguf\0",
+        b"/models/test.gguf\0",                    // VFS-embedded test model
+    ];
+
+    let mut fd: i64 = -1;
+    for path in &model_paths {
+        let result = sys_open(*path, 0);
+        if result >= 0 && result < 256 {
+            fd = result;
+            print("[LLM] Opened: "); sys_write(1, &path[..path.len()-1]); println("");
+            break;
+        }
+    }
+
     if fd < 0 {
-        println("[LLM] ERROR: Cannot open /disk/models/real_model.gguf");
-        print("[LLM]   errno="); print_u64((-fd) as u64); println("");
-        println("[LLM] Trying fallback: /models/test.gguf");
-        let fd2 = sys_open(b"/models/test.gguf\0", 0);
-        if fd2 < 0 {
-            println("[LLM] No model available. Exiting.");
-            sys_bus_publish(INTENT_LLAMA_CORE, 3, 0);
-            return -1;
-        }
-        return run_inference(fd2 as u32);
+        println("[LLM] No model available. Exiting.");
+        sys_bus_publish(INTENT_LLAMA_CORE, 3, 0);
+        return -1;
     }
-    let fd_u = fd as u32;
+    // Launch inference directly (mmap handled inside run_inference)
     print("[LLM] Opened model file (fd="); print_u64(fd as u64); println(")");
-
-    // Try to mmap the model file for zero-copy access (Jalon 91)
-    // First, get file size via seek
-    let file_size = sys_lseek(fd_u, 0, 2); // SEEK_END
-    if file_size > 0 {
-        let _ = sys_lseek(fd_u, 0, 0); // SEEK_SET (reset position)
-        print("[LLM] Model file size: "); print_u64(file_size as u64);
-        print(" bytes ("); print_u64((file_size as u64) / (1024 * 1024)); println(" MiB)");
-        
-        // Use sys_mmap_file (not v2 — we'll prefetch during weight loading)
-        let mmap_addr = sys_mmap_file(fd_u, file_size as u64, 0);
-        if mmap_addr < 0x0000_8000_0000_0000 && mmap_addr > 0x1000 {
-            unsafe { MMAP_BASE_PTR = mmap_addr; MMAP_SIZE = file_size as u64; }
-            print("[LLM] Model mmap'd at 0x"); print_u64(mmap_addr);
-            print(" ("); print_u64((file_size as u64) / (1024*1024)); println(" MiB zero-copy)");
-            println("[LLM] *** MMAP active: tensor reads = memory access (no pread64) ***");
-        } else {
-            println("[LLM] mmap failed, falling back to pread64 (slower path)");
-        }
-    }
-
-    run_inference(fd_u)
+    run_inference(fd as u32)
 }
 
 fn run_inference(fd: u32) -> i64 {

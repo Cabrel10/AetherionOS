@@ -59,8 +59,8 @@ const USER_STACK_TOP: u64 = 0x7FFF_FFFF_F000;
 /// - Safe: 16 bytes below unmapped boundary at 0x7FFF_FFFF_F000
 const USER_STACK_INITIAL_RSP: u64 = USER_STACK_TOP - 16;
 /// User stack size: 8 MiB virtual range reserved.
-/// 256 pages (1 MiB) initially mapped — sufficient for TCP, DNS, FAT32 ops.
-const USER_STACK_PAGES: u64 = 256; // 1 MiB initial mapping
+/// 512 pages (2 MiB) initially mapped — sufficient for SmolLM2 GGUF parsing (272 tensors).
+const USER_STACK_PAGES: u64 = 512; // 2 MiB initial mapping
 
 /// Maximum valid user-space address
 const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
@@ -391,6 +391,36 @@ unsafe fn create_user_pml4() -> Result<u64, ElfError> {
     Ok(new_pml4_phys)
 }
 
+/// Look up whether a virtual address is already mapped in this PML4.
+/// Returns the physical frame address if the page is present, None otherwise.
+/// Used to detect overlapping ELF segments that share the same page.
+unsafe fn lookup_page_frame(pml4_phys: u64, vaddr: u64) -> Option<u64> {
+    let indices = [
+        ((vaddr >> 39) & 0x1FF) as usize,
+        ((vaddr >> 30) & 0x1FF) as usize,
+        ((vaddr >> 21) & 0x1FF) as usize,
+        ((vaddr >> 12) & 0x1FF) as usize,
+    ];
+
+    let mut table_phys = pml4_phys;
+    for level in 0..3 {
+        let table_virt = phys_to_virt(table_phys) as *const u64;
+        let entry = core::ptr::read_volatile(table_virt.add(indices[level]));
+        if entry & 0x01 == 0 {
+            return None;
+        }
+        table_phys = entry & !0xFFF;
+    }
+
+    let pt_virt = phys_to_virt(table_phys) as *const u64;
+    let pte = core::ptr::read_volatile(pt_virt.add(indices[3]));
+    if pte & 0x01 != 0 {
+        Some(pte & !0xFFF)
+    } else {
+        None
+    }
+}
+
 /// Map a single 4K page in the user page tables.
 /// Walks PML4 -> PDPT -> PD -> PT, allocating intermediate tables as needed.
 ///
@@ -554,6 +584,11 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
     // Step 4: Map PT_LOAD segments
     let mut segments_loaded = 0usize;
 
+    // Track already-mapped pages to handle overlapping segments (e.g., .rodata + .got
+    // sharing the same 4K page). Max 256 unique pages per ELF (~1 MiB of mapped code/data).
+    let mut mapped_pages: [(u64, u64); 256] = [(0, 0); 256];
+    let mut mapped_page_count: usize = 0;
+
     for (i, phdr) in phdrs.iter().enumerate() {
         let p_type = phdr.p_type;
         if p_type != PT_LOAD {
@@ -599,17 +634,37 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
         for page_idx in 0..num_pages {
             let page_vaddr = page_start + (page_idx as u64) * PAGE_SIZE;
 
-            // Allocate a physical frame
-            let frame_phys = unsafe { alloc_elf_frame().ok_or(ElfError::OutOfMemory)? };
-
-            // Zero the frame first (handles BSS and partial pages)
-            unsafe {
-                core::ptr::write_bytes(
-                    phys_to_virt(frame_phys) as *mut u8,
-                    0,
-                    PAGE_SIZE as usize,
-                );
+            // FIX: Check if this page was already mapped by a previous segment.
+            // Uses a simple O(n) scan of already-mapped pages instead of walking
+            // potentially-unstable page tables during ELF load.
+            let mut existing_frame: Option<u64> = None;
+            for k in 0..mapped_page_count {
+                if mapped_pages[k].0 == page_vaddr {
+                    existing_frame = Some(mapped_pages[k].1);
+                    break;
+                }
             }
+
+            let frame_phys = if let Some(f) = existing_frame {
+                // Reuse existing frame — do NOT zero, previous segment data preserved
+                f
+            } else {
+                // New page — allocate and zero
+                let new_frame = unsafe { alloc_elf_frame().ok_or(ElfError::OutOfMemory)? };
+                unsafe {
+                    core::ptr::write_bytes(
+                        phys_to_virt(new_frame) as *mut u8,
+                        0,
+                        PAGE_SIZE as usize,
+                    );
+                }
+                // Record this mapping
+                if mapped_page_count < mapped_pages.len() {
+                    mapped_pages[mapped_page_count] = (page_vaddr, new_frame);
+                    mapped_page_count += 1;
+                }
+                new_frame
+            };
 
             // Copy file data into the frame if applicable
             let page_offset_in_segment = page_vaddr.saturating_sub(vaddr);
@@ -637,6 +692,7 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
             // Pages beyond filesz are already zeroed (BSS)
 
             // Map the page in the user page table
+            // (for reused frames, this updates flags; for new frames, this creates the mapping)
             unsafe {
                 map_user_page(pml4_phys, page_vaddr, frame_phys, page_flags)?;
             }

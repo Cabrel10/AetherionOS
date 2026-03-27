@@ -999,8 +999,16 @@ fn sys_open(path_addr: u64, flags: u32) -> u64 {
 
     let current_pid = crate::scheduler::current_pid();
 
-    // Hot-path: logging disabled
-    // crate::serial_println!("[SYSCALL] sys_open(\"{}\", flags=0x{:X}) from PID {}", path, flags, current_pid);
+    // Reject empty paths (fixes root-directory-as-model-file bug)
+    if path.is_empty() {
+        crate::serial_println!("[SYSCALL] sys_open: EMPTY path from PID {} (addr=0x{:X})", current_pid, path_addr);
+        return ENOENT;
+    }
+
+    // Log only /disk/ opens to avoid serial flood slowing QEMU boot
+    if path.starts_with("/disk/") {
+        crate::serial_println!("[SYSCALL] sys_open(\"{}\", flags=0x{:X}) from PID {}", path, flags, current_pid);
+    }
 
     // For /disk/ paths with O_CREAT, we allow creating files that don't exist yet
     if path.starts_with("/disk/") && (flags & O_CREAT) != 0 {
@@ -1139,7 +1147,9 @@ fn sys_open(path_addr: u64, flags: u32) -> u64 {
         fd_table.alloc_fd(&path, flags)
     }) {
         Some(Some(fd)) => {
-            crate::serial_println!("[SYSCALL] sys_open(\"{}\") = FD {}", path, fd);
+            if path.starts_with("/disk/") {
+                crate::serial_println!("[SYSCALL] sys_open(\"{}\") = FD {}", path, fd);
+            }
             fd as u64
         }
         _ => EMFILE,

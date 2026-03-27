@@ -340,7 +340,7 @@ pub fn find_ready_child_thread(parent_pid: u64) -> Option<(u64, u64, u64, u64)> 
 ///
 /// Returns (pid, entry_point, stack_pointer, pml4_phys, name) or None.
 pub fn find_next_ready_userspace(exclude_pid: u64) -> Option<(u64, u64, u64, u64, String)> {
-    let table = PROCESS_TABLE.lock();
+    let mut table = PROCESS_TABLE.lock();
     
     // First pass: look for processes that were actively running (have valid saved state)
     // ONLY processes in Ready state are eligible — Running, Blocked, Terminated are skipped.
@@ -357,13 +357,18 @@ pub fn find_next_ready_userspace(exclude_pid: u64) -> Option<(u64, u64, u64, u64
             && proc.saved_user_rip != proc.entry_point;
         
         if has_valid_saved_state {
-            return Some((
+            let result = (
                 proc.pid,
                 proc.entry_point,
                 proc.stack_pointer,
                 proc.pml4_phys,
                 proc.name.clone(),
-            ));
+            );
+            // Atomically mark as Running under the same lock to prevent double-launch
+            if let Some(p) = table.get_mut(&result.0) {
+                p.state = ProcessState::Running;
+            }
+            return Some(result);
         }
     }
     
@@ -375,14 +380,18 @@ pub fn find_next_ready_userspace(exclude_pid: u64) -> Option<(u64, u64, u64, u64
         if proc.entry_point == 0 || proc.pml4_phys == 0 { continue; }
         if proc.role == AgentRole::KernelThread { continue; }
         
-        // Any process with a valid entry point can be launched
-        return Some((
+        let result = (
             proc.pid,
             proc.entry_point,
             proc.stack_pointer,
             proc.pml4_phys,
             proc.name.clone(),
-        ));
+        );
+        // Atomically mark as Running under the same lock
+        if let Some(p) = table.get_mut(&result.0) {
+            p.state = ProcessState::Running;
+        }
+        return Some(result);
     }
     
     None

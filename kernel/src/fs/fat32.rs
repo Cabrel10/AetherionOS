@@ -169,6 +169,7 @@ impl Fat32DirEntry {
             .map(|&b| (b as char).to_ascii_lowercase())
             .collect();
 
+        // Build both the 8.3 short name and an extended name for matching
         let name = if ext_part.is_empty() {
             name_part
         } else {
@@ -219,6 +220,61 @@ fn name_to_8_3(filename: &str) -> [u8; 11] {
     }
 
     result
+}
+
+/// Match a FAT32 directory entry name against a target filename.
+///
+/// Handles three cases:
+/// 1. Exact match: "model.ggu" == "model.ggu"
+/// 2. Tilde match: "real_m~1.ggu" matches "real_model.gguf" because the 8.3
+///    short name is a truncated version of the long name
+/// 3. Extension truncation: ".gguf" stored as ".ggu" (3-char limit)
+///
+/// Both `entry_name` and `target` should already be lowercase.
+fn fat32_name_matches(entry_name: &str, target: &str) -> bool {
+    // Case 1: exact match
+    if entry_name == target {
+        return true;
+    }
+
+    // Case 2: target is a long filename and entry_name is its 8.3 tilde form
+    // e.g. entry="real_m~1.ggu" vs target="real_model.gguf"
+    if entry_name.contains('~') {
+        // Split entry on tilde
+        if let Some(tilde_pos) = entry_name.find('~') {
+            let entry_prefix = &entry_name[..tilde_pos]; // "real_m"
+            // Check if target starts with the same prefix
+            let target_lower = target.to_ascii_lowercase();
+            if target_lower.starts_with(entry_prefix) {
+                // Also check extension: entry ".ggu" should match target ".gguf" (truncated)
+                let entry_ext = entry_name.rfind('.').map(|p| &entry_name[p+1..]).unwrap_or("");
+                let target_ext = target_lower.rfind('.').map(|p| &target_lower[p+1..]).unwrap_or("");
+                // Extension matches if entry_ext is a prefix of target_ext (3-char truncation)
+                // or if they're exactly equal
+                if target_ext.starts_with(entry_ext) || entry_ext == target_ext {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Case 3: entry is an 8.3 name without tilde, but target has a longer extension
+    // e.g. entry="model.ggu" vs target="model.gguf"
+    // The entry extension is at most 3 chars; if target ext starts with entry ext, match
+    let entry_dot = entry_name.rfind('.');
+    let target_dot = target.rfind('.');
+    if let (Some(epos), Some(tpos)) = (entry_dot, target_dot) {
+        let entry_base = &entry_name[..epos];
+        let target_base = &target[..tpos];
+        let entry_ext = &entry_name[epos+1..];
+        let target_ext = &target[tpos+1..];
+        if entry_base == target_base && entry_ext.len() <= 3
+            && target_ext.starts_with(entry_ext) {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// FAT32 filesystem instance
@@ -523,12 +579,13 @@ impl Fat32Fs {
     }
 
     /// Read a file by name from the root directory
+    /// Uses LFN-aware matching via fat32_name_matches.
     pub fn read_file(&self, name: &str) -> Option<Vec<u8>> {
         let entries = self.list_root();
         let target = name.to_ascii_lowercase();
 
         for entry in &entries {
-            if entry.name == target && !entry.is_directory {
+            if !entry.is_directory && fat32_name_matches(&entry.name, &target) {
                 return self.read_file_data(entry.first_cluster, entry.file_size);
             }
         }
@@ -622,12 +679,14 @@ impl Fat32Fs {
     }
 
     /// Find and read a file in a subdirectory
+    /// Supports both exact 8.3 names (e.g. "model.ggu") and long names
+    /// that would match the 8.3 tilde form (e.g. "real_model.gguf" matches "real_m~1.ggu").
     pub fn read_file_in_dir(&self, dir_cluster: u32, name: &str) -> Option<Vec<u8>> {
         let entries = self.list_directory(dir_cluster);
         let target = name.to_ascii_lowercase();
 
         for entry in &entries {
-            if entry.name == target && !entry.is_directory {
+            if !entry.is_directory && fat32_name_matches(&entry.name, &target) {
                 return self.read_file_data(entry.first_cluster, entry.file_size);
             }
         }
@@ -637,6 +696,7 @@ impl Fat32Fs {
 
     /// Navigate a path like "var/sagas" from root, returning the cluster of the final directory.
     /// Each component must be an existing directory.
+    /// Uses case-insensitive + tilde-aware matching for LFN compatibility.
     pub fn navigate_to_dir(&self, path_components: &[&str]) -> Option<u32> {
         let mut current_cluster = self.bpb.root_cluster;
 
@@ -645,12 +705,8 @@ impl Fat32Fs {
             let entries = self.list_directory(current_cluster);
             let mut found = false;
 
-            // Suppress verbose logging after first few calls
-            // crate::serial_println!("[FAT32] navigate_to_dir: looking for '{}' in cluster {}", target, current_cluster);
-
             for entry in &entries {
-                if entry.name == target && entry.is_directory {
-                    // crate::serial_println!("[FAT32] navigate_to_dir: found dir '{}' -> cluster {}", entry.name, entry.first_cluster);
+                if entry.is_directory && fat32_name_matches(&entry.name, &target) {
                     current_cluster = entry.first_cluster;
                     found = true;
                     break;
@@ -658,7 +714,6 @@ impl Fat32Fs {
             }
 
             if !found {
-                // crate::serial_println!("[FAT32] Directory component '{}' not found in cluster {}", component, current_cluster);
                 return None;
             }
         }
@@ -669,6 +724,7 @@ impl Fat32Fs {
     /// Find a directory entry by path (supports recursive subdirectories).
     /// Path format: "models/mistral_part_aa" (no leading slash).
     /// Returns the Fat32DirEntry if found.
+    /// Uses case-insensitive + tilde-aware matching for LFN compatibility.
     pub fn find_directory_entry(&self, path: &str) -> Option<Fat32DirEntry> {
         let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
         if parts.is_empty() {
@@ -679,10 +735,6 @@ impl Fat32Fs {
         let dir_parts = &parts[..parts.len() - 1];
         let target = filename.to_ascii_lowercase();
 
-        // Suppress verbose per-read logging for performance
-        // crate::serial_println!("[FAT32] find_directory_entry: path='{}' dirs={:?} file='{}'",
-        //     path, dir_parts, filename);
-
         let dir_cluster = if dir_parts.is_empty() {
             self.bpb.root_cluster
         } else {
@@ -691,14 +743,11 @@ impl Fat32Fs {
 
         let entries = self.list_directory(dir_cluster);
         for entry in &entries {
-            if entry.name == target {
-                // crate::serial_println!("[FAT32] find_directory_entry: FOUND '{}' size={} cluster={} is_dir={}",
-                //     entry.name, entry.file_size, entry.first_cluster, entry.is_directory);
+            if fat32_name_matches(&entry.name, &target) {
                 return Some(entry.clone());
             }
         }
 
-        // crate::serial_println!("[FAT32] find_directory_entry: '{}' NOT FOUND in cluster {}", filename, dir_cluster);
         None
     }
 
