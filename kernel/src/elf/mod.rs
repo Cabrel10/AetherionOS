@@ -24,6 +24,26 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// ELF magic bytes
 const ELF_MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
 
+// ===== Linux ABI Auxiliary Vector (AuxV) Constants =====
+// Required for musl/glibc binaries to initialize correctly.
+// Reference: https://man7.org/linux/man-pages/man3/getauxval.3.html
+const AT_NULL: u64     = 0;   // End of AuxV
+const AT_PHDR: u64     = 3;   // Program headers address in memory
+const AT_PHENT: u64    = 4;   // Size of program header entry
+const AT_PHNUM: u64    = 5;   // Number of program headers
+const AT_PAGESZ: u64   = 6;   // System page size
+const AT_BASE: u64     = 7;   // Interpreter base address (0 for static)
+const AT_FLAGS: u64    = 8;   // Flags
+const AT_ENTRY: u64    = 9;   // Program entry point
+const AT_UID: u64      = 11;  // Real user ID
+const AT_EUID: u64     = 12;  // Effective user ID
+const AT_GID: u64      = 13;  // Real group ID
+const AT_EGID: u64     = 14;  // Effective group ID
+const AT_SECURE: u64   = 23;  // Secure mode boolean
+const AT_RANDOM: u64   = 25;  // Address of 16 random bytes
+const AT_HWCAP: u64    = 16;  // Hardware capabilities (SSE, AVX, etc.)
+const AT_HWCAP2: u64   = 26;  // Extended hardware capabilities
+
 /// ELF class: 64-bit
 const ELFCLASS64: u8 = 2;
 /// ELF data: little-endian
@@ -33,8 +53,12 @@ const ET_EXEC: u16 = 2;
 /// ELF machine: x86-64
 const EM_X86_64: u16 = 62;
 
-/// Program header type: loadable segment
+/// Program header types
 const PT_LOAD: u32 = 1;
+const PT_NOTE: u32 = 4;
+const PT_GNU_EH_FRAME: u32 = 0x6474e550;
+const PT_GNU_STACK: u32 = 0x6474e551;
+const PT_GNU_RELRO: u32 = 0x6474e552;
 
 /// Segment permission flags
 const PF_X: u32 = 1; // Execute
@@ -59,8 +83,8 @@ const USER_STACK_TOP: u64 = 0x7FFF_FFFF_F000;
 /// - Safe: 16 bytes below unmapped boundary at 0x7FFF_FFFF_F000
 const USER_STACK_INITIAL_RSP: u64 = USER_STACK_TOP - 16;
 /// User stack size: 8 MiB virtual range reserved.
-/// 256 pages (1 MiB) initially mapped — sufficient for TCP, DNS, FAT32 ops.
-const USER_STACK_PAGES: u64 = 256; // 1 MiB initial mapping
+/// 512 pages (2 MiB) initially mapped — sufficient for SmolLM2 GGUF parsing (272 tensors).
+const USER_STACK_PAGES: u64 = 512; // 2 MiB initial mapping
 
 /// Maximum valid user-space address
 const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
@@ -391,6 +415,36 @@ unsafe fn create_user_pml4() -> Result<u64, ElfError> {
     Ok(new_pml4_phys)
 }
 
+/// Look up whether a virtual address is already mapped in this PML4.
+/// Returns the physical frame address if the page is present, None otherwise.
+/// Used to detect overlapping ELF segments that share the same page.
+unsafe fn lookup_page_frame(pml4_phys: u64, vaddr: u64) -> Option<u64> {
+    let indices = [
+        ((vaddr >> 39) & 0x1FF) as usize,
+        ((vaddr >> 30) & 0x1FF) as usize,
+        ((vaddr >> 21) & 0x1FF) as usize,
+        ((vaddr >> 12) & 0x1FF) as usize,
+    ];
+
+    let mut table_phys = pml4_phys;
+    for level in 0..3 {
+        let table_virt = phys_to_virt(table_phys) as *const u64;
+        let entry = core::ptr::read_volatile(table_virt.add(indices[level]));
+        if entry & 0x01 == 0 {
+            return None;
+        }
+        table_phys = entry & !0xFFF;
+    }
+
+    let pt_virt = phys_to_virt(table_phys) as *const u64;
+    let pte = core::ptr::read_volatile(pt_virt.add(indices[3]));
+    if pte & 0x01 != 0 {
+        Some(pte & !0xFFF)
+    } else {
+        None
+    }
+}
+
 /// Map a single 4K page in the user page tables.
 /// Walks PML4 -> PDPT -> PD -> PT, allocating intermediate tables as needed.
 ///
@@ -554,9 +608,25 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
     // Step 4: Map PT_LOAD segments
     let mut segments_loaded = 0usize;
 
+    // Track already-mapped pages to handle overlapping segments (e.g., .rodata + .got
+    // sharing the same 4K page). Max 256 unique pages per ELF (~1 MiB of mapped code/data).
+    let mut mapped_pages: [(u64, u64); 256] = [(0, 0); 256];
+    let mut mapped_page_count: usize = 0;
+
     for (i, phdr) in phdrs.iter().enumerate() {
         let p_type = phdr.p_type;
         if p_type != PT_LOAD {
+            // Silently skip known Linux ELF program header types
+            match p_type {
+                PT_NOTE | PT_GNU_EH_FRAME | PT_GNU_STACK | PT_GNU_RELRO => {
+                    // Expected Linux headers — no warning needed
+                }
+                _ => {
+                    crate::serial_println!(
+                        "[ELF] Skipping segment {}: type=0x{:X} (non-PT_LOAD)", i, p_type
+                    );
+                }
+            }
             continue;
         }
 
@@ -599,17 +669,37 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
         for page_idx in 0..num_pages {
             let page_vaddr = page_start + (page_idx as u64) * PAGE_SIZE;
 
-            // Allocate a physical frame
-            let frame_phys = unsafe { alloc_elf_frame().ok_or(ElfError::OutOfMemory)? };
-
-            // Zero the frame first (handles BSS and partial pages)
-            unsafe {
-                core::ptr::write_bytes(
-                    phys_to_virt(frame_phys) as *mut u8,
-                    0,
-                    PAGE_SIZE as usize,
-                );
+            // FIX: Check if this page was already mapped by a previous segment.
+            // Uses a simple O(n) scan of already-mapped pages instead of walking
+            // potentially-unstable page tables during ELF load.
+            let mut existing_frame: Option<u64> = None;
+            for k in 0..mapped_page_count {
+                if mapped_pages[k].0 == page_vaddr {
+                    existing_frame = Some(mapped_pages[k].1);
+                    break;
+                }
             }
+
+            let frame_phys = if let Some(f) = existing_frame {
+                // Reuse existing frame — do NOT zero, previous segment data preserved
+                f
+            } else {
+                // New page — allocate and zero
+                let new_frame = unsafe { alloc_elf_frame().ok_or(ElfError::OutOfMemory)? };
+                unsafe {
+                    core::ptr::write_bytes(
+                        phys_to_virt(new_frame) as *mut u8,
+                        0,
+                        PAGE_SIZE as usize,
+                    );
+                }
+                // Record this mapping
+                if mapped_page_count < mapped_pages.len() {
+                    mapped_pages[mapped_page_count] = (page_vaddr, new_frame);
+                    mapped_page_count += 1;
+                }
+                new_frame
+            };
 
             // Copy file data into the frame if applicable
             let page_offset_in_segment = page_vaddr.saturating_sub(vaddr);
@@ -637,6 +727,7 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
             // Pages beyond filesz are already zeroed (BSS)
 
             // Map the page in the user page table
+            // (for reused frames, this updates flags; for new frames, this creates the mapping)
             unsafe {
                 map_user_page(pml4_phys, page_vaddr, frame_phys, page_flags)?;
             }
@@ -662,9 +753,19 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
     // Stack flags: PRESENT | WRITABLE | USER_ACCESSIBLE | NO_EXECUTE
     let stack_flags: u64 = 0x01 | 0x02 | 0x04 | (1u64 << 63);
 
+    // Capture the physical frame of the top stack page for AuxV injection.
+    // This avoids the dangerous lookup_page_frame() call that caused #GP
+    // by walking partially-built page tables.
+    let mut top_stack_frame_phys: u64 = 0;
+
     for page_idx in 0..USER_STACK_PAGES {
         let page_vaddr = stack_bottom + page_idx * PAGE_SIZE;
         let frame_phys = unsafe { alloc_elf_frame().ok_or(ElfError::OutOfMemory)? };
+
+        // Save the frame for the top-most stack page (USER_STACK_TOP - PAGE_SIZE)
+        if page_vaddr == USER_STACK_TOP - PAGE_SIZE {
+            top_stack_frame_phys = frame_phys;
+        }
 
         // Zero the stack frame
         unsafe {
@@ -682,17 +783,149 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
 
     let frames_after = unsafe { ELF_POOL.frames_used };
 
+    // ═══════════════════════════════════════════════════════════════
+    // Step 7: Linux ABI Stack Layout — Inject AuxV, argv, envp
+    // This allows unmodified Linux static binaries (musl/glibc) to boot.
+    // Layout (growing DOWN from USER_STACK_TOP):
+    //   [16 random bytes]        <- AT_RANDOM points here
+    //   [program name string]    <- argv[0] points here
+    //   [AuxV entries]           <- pairs of (type, value), ends with AT_NULL
+    //   [NULL]                   <- end of envp
+    //   [NULL]                   <- end of argv
+    //   [argv[0] ptr]            <- pointer to program name
+    //   [argc = 1]               <- top of stack (RSP points here)
+    // ═══════════════════════════════════════════════════════════════
+    let linux_rsp = unsafe {
+        // Use the physical frame saved during stack allocation (Step 6).
+        // This avoids the dangerous lookup_page_frame() which walks
+        // partially-built user page tables and causes #GP kernel panics.
+        let frame_phys = top_stack_frame_phys;
+        if frame_phys == 0 {
+            crate::serial_println!("[ELF] WARNING: Cannot find stack top page for AuxV injection");
+            return Ok(ElfLoadResult {
+                entry_point: entry,
+                stack_pointer: USER_STACK_INITIAL_RSP,
+                pml4_phys,
+                segments_loaded,
+                frames_used: frames_after - frames_before,
+            });
+        }
+
+        let page_base = phys_to_virt(frame_phys) as *mut u8;
+        let top_stack_page = USER_STACK_TOP - PAGE_SIZE; // vaddr 0x7FFF_FFFF_E000
+        // The page maps vaddr [0x7FFF_FFFF_E000 .. 0x7FFF_FFFF_EFFF]
+        // We'll write data starting from the END of this page, growing down.
+
+        // --- Write 16 random bytes at offset 0xF00 in page (vaddr 0x7FFF_FFFF_EF00) ---
+        let random_offset: usize = 0xF00;
+        let random_vaddr: u64 = top_stack_page + random_offset as u64;
+        {
+            // Use RDTSC as entropy source for pseudo-random bytes
+            let tsc: u64;
+            core::arch::asm!("rdtsc", "shl rdx, 32", "or rax, rdx",
+                             out("rax") tsc, out("rdx") _, options(nomem, nostack));
+            let random_ptr = page_base.add(random_offset);
+            let mut seed = tsc;
+            for i in 0..16 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                core::ptr::write_volatile(random_ptr.add(i), (seed >> 33) as u8);
+            }
+        }
+
+        // --- Write program name "aetherion" at offset 0xF10 ---
+        let progname_offset: usize = 0xF10;
+        let progname_vaddr: u64 = top_stack_page + progname_offset as u64;
+        {
+            let name = b"aetherion\0";
+            let dst = page_base.add(progname_offset);
+            for (i, &b) in name.iter().enumerate() {
+                core::ptr::write_volatile(dst.add(i), b);
+            }
+        }
+
+        // --- Build the stack frame growing DOWN from offset 0xEF0 ---
+        // We use offset 0xE00 as the base for our stack data (plenty of room)
+        // Each entry is 8 bytes (u64). We build bottom-up then set RSP.
+
+        // Compute AuxV entries
+        let auxv: [(u64, u64); 14] = [
+            (AT_PAGESZ,  4096),
+            (AT_PHDR,    entry & !0xFFF),       // Approximate: base of first segment
+            (AT_PHENT,   56),                    // sizeof(Elf64_Phdr)
+            (AT_PHNUM,   phdrs.len() as u64),
+            (AT_ENTRY,   entry),
+            (AT_BASE,    0),                     // No interpreter (static binary)
+            (AT_FLAGS,   0),
+            (AT_UID,     0),
+            (AT_EUID,    0),
+            (AT_GID,     0),
+            (AT_EGID,    0),
+            (AT_SECURE,  0),
+            (AT_RANDOM,  random_vaddr),
+            (AT_HWCAP,   0x078bfbff),            // SSE, SSE2, AVX, AVX2, FMA
+        ];
+
+        // Layout (addresses grow DOWN):
+        // [argc]           <- RSP
+        // [argv[0] ptr]
+        // [NULL]           <- end of argv
+        // [NULL]           <- end of envp
+        // [auxv[0].type]   [auxv[0].value]
+        // ...
+        // [AT_NULL]        [0]
+
+        // Total u64 entries: 1 (argc) + 1 (argv ptr) + 1 (null) + 1 (null) + 14*2 (auxv) + 2 (AT_NULL) = 34
+        let total_entries: usize = 1 + 1 + 1 + 1 + auxv.len() * 2 + 2;
+        let stack_data_size = total_entries * 8;
+
+        // Place RSP at a 16-byte aligned address well within the page
+        // Start from offset 0xEF0 and go backwards
+        let rsp_offset = 0xEF0 - stack_data_size;
+        let rsp_offset_aligned = rsp_offset & !0xF; // 16-byte align
+        let rsp_vaddr = top_stack_page + rsp_offset_aligned as u64;
+
+        let mut pos = rsp_offset_aligned;
+        let write_u64 = |off: usize, val: u64| {
+            let ptr = page_base.add(off) as *mut u64;
+            core::ptr::write_volatile(ptr, val);
+        };
+
+        // argc = 1
+        write_u64(pos, 1); pos += 8;
+        // argv[0] = pointer to program name
+        write_u64(pos, progname_vaddr); pos += 8;
+        // argv terminator (NULL)
+        write_u64(pos, 0); pos += 8;
+        // envp terminator (NULL)
+        write_u64(pos, 0); pos += 8;
+        // AuxV entries
+        for &(atype, aval) in auxv.iter() {
+            write_u64(pos, atype); pos += 8;
+            write_u64(pos, aval);  pos += 8;
+        }
+        // AT_NULL terminator
+        write_u64(pos, AT_NULL); pos += 8;
+        write_u64(pos, 0);
+
+        crate::serial_println!(
+            "[ELF] Linux ABI: AuxV injected, RSP=0x{:X}, argc=1, AT_RANDOM=0x{:X}",
+            rsp_vaddr, random_vaddr
+        );
+
+        rsp_vaddr
+    };
+
     crate::serial_println!(
         "[ELF] Load complete: entry=0x{:X}, stack_rsp=0x{:X}, segments={}, frames={}",
         entry,
-        USER_STACK_INITIAL_RSP,
+        linux_rsp,
         segments_loaded,
         frames_after - frames_before
     );
 
     Ok(ElfLoadResult {
         entry_point: entry,
-        stack_pointer: USER_STACK_INITIAL_RSP,
+        stack_pointer: linux_rsp,
         pml4_phys,
         segments_loaded,
         frames_used: frames_after - frames_before,

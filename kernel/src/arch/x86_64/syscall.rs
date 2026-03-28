@@ -319,110 +319,125 @@ extern "C" fn syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 /// Syscall numbers match Linux x86_64 ABI for POSIX compatibility.
 fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     match nr {
-        // ── Core POSIX file I/O (Linux ABI) ──
+        // ── Core POSIX file I/O (Linux x86_64 ABI) ──
+        // Reference: https://filippo.io/linux-syscall-table/
         0  => sys_read(a1 as u32, a2, a3),          // read(fd, buf, count)
         1  => sys_write(a1, a2, a3),                 // write(fd, buf, count)
         2  => sys_open(a1, a2 as u32),               // open(path, flags, mode)
         3  => sys_close(a1 as u32),                  // close(fd)
-        4  => sys_stub_stat(a1, a2),                 // stat(path, buf)    [stub for musl]
-        5  => sys_stub_fstat(a1 as u32, a2),         // fstat(fd, buf)     [stub for musl]
+        4  => sys_stub_stat(a1, a2),                 // stat(path, buf)    [stub]
+        5  => sys_stub_fstat(a1 as u32, a2),         // fstat(fd, buf)     [stub]
         7  => sys_stub_poll(a1, a2, a3),             // poll(fds, nfds, timeout) [stub]
         8  => sys_seek(a1 as u32, a2 as i64, a3 as u32), // lseek(fd, off, whence)
         9  => sys_mmap(a1, a2, a3),                  // mmap(addr, len, prot)
-        10 => sys_stub_mprotect(a1, a2, a3),         // mprotect [stub for musl]
-        11 => sys_poll_hid(),                        // AetherionOS: HID event polling
+        10 => sys_stub_mprotect(a1, a2, a3),         // mprotect [stub]
+        11 => sys_stub_munmap(a1, a2),               // munmap(addr, len) [stub]
         12 => sys_brk(a1),                           // brk(new_break)
-        16 => sys_stub_ioctl(a1 as u32, a2, a3),    // ioctl(fd, cmd, arg)  [stub for musl]
+        13 => sys_stub_rt_sigaction(a1, a2, a3),     // rt_sigaction [stub for musl/glibc]
+        14 => sys_stub_rt_sigprocmask(a1, a2, a3),   // rt_sigprocmask [stub for musl/glibc]
+        15 => 0,                                      // rt_sigreturn [stub — handled by kernel]
+        16 => sys_stub_ioctl(a1 as u32, a2, a3),    // ioctl(fd, cmd, arg)  [stub → ENOTTY]
         17 => sys_pread64(a1 as u32, a2, a3, saved_user_r10()),  // pread64(fd, buf, count, offset)
-        19 => sys_stub_readv(a1 as u32, a2, a3),     // readv [stub for musl]
-        20 => sys_getpid(),                          // getpid()
+        18 => sys_stub_pwrite64(a1 as u32, a2, a3, saved_user_r10()), // pwrite64 [stub]
+        19 => sys_stub_readv(a1 as u32, a2, a3),     // readv [stub]
+        20 => sys_stub_writev(a1 as u32, a2, a3),    // writev(fd, iov, iovcnt)
+        21 => sys_stub_access(a1, a2),               // access(path, mode) [stub]
         22 => sys_pipe(a1),                          // pipe(pipefd[2])
         24 => sys_yield(),                           // sched_yield()
+        25 => 0,                                      // mremap [stub — return 0]
+        28 => 0,                                      // madvise [stub]
         33 => sys_dup2(a1 as u32, a2 as u32),        // dup2(oldfd, newfd)
-        35 => sys_stub_nanosleep(a1, a2),            // nanosleep [stub - yield]
-        39 => sys_getppid(),                         // getppid()
+        35 => sys_stub_nanosleep(a1, a2),            // nanosleep [stub → yield]
+        37 => 0,                                      // alarm [stub]
+        38 => 0,                                      // setitimer [stub]
+        39 => sys_getpid(),                          // getpid()
         41 => sys_socket(a1 as u32, a2 as u32, a3 as u32), // socket(domain, type, proto)
         42 => sys_tcp_connect(a1 as u32, a2, a3),    // connect(fd, addr, len)
-        43 => sys_stub_accept(a1 as u32, a2, a3),    // accept [stub for musl]
+        43 => sys_stub_accept(a1 as u32, a2, a3),    // accept [stub]
         44 => sys_sendto(a1 as u32, a2, a3),         // sendto
         45 => sys_recvfrom(a1 as u32, a2, a3),       // recvfrom
-        47 => sys_tcp_shutdown_syscall(a1 as u32),   // shutdown(fd, how) - reused
+        47 => sys_tcp_shutdown_syscall(a1 as u32),   // shutdown(fd, how)
         49 => sys_bind(a1 as u32, a2 as u16),        // bind(fd, addr, len)
-        50 => sys_stub_listen(a1 as u32, a2),        // listen [stub for musl]
+        50 => sys_stub_listen(a1 as u32, a2),        // listen [stub]
         56 => sys_clone(a1),                         // clone(flags)
         57 => sys_fork(),                            // fork()
         59 => sys_exec(a1),                          // execve(path, argv, envp)
         60 => sys_exit(a1),                          // exit(code)
         61 => sys_wait(a1),                          // wait4(pid)
         62 => sys_kill(a1, a2 as u32),               // kill(pid, sig)
-        63 => sys_stub_uname(a1),                    // uname(buf) [stub for musl]
-        72 => sys_stub_fcntl(a1 as u32, a2, a3),     // fcntl [stub for musl]
+        63 => sys_stub_uname(a1),                    // uname(buf)
+        72 => sys_stub_fcntl(a1 as u32, a2, a3),     // fcntl [stub]
         78 => sys_getdents(a1 as u32, a2, a3),       // getdents(fd, buf, len)
-        79 => sys_stub_getcwd(a1, a2),               // getcwd [stub for musl]
+        79 => sys_stub_getcwd(a1, a2),               // getcwd [stub]
+        83 => sys_mkdir(a1, a2),                     // mkdir(path, mode)
+        87 => sys_unlink(a1),                         // unlink(path) — rm
         96 => sys_stub_gettimeofday(a1, a2),         // gettimeofday [stub]
-        97 => sys_stub_getrlimit(a1, a2),            // getrlimit [stub for musl]
+        97 => sys_stub_getrlimit(a1, a2),            // getrlimit [stub]
         102 => sys_stub_getuid(),                     // getuid [stub]
         104 => sys_stub_getgid(),                     // getgid [stub]
         107 => sys_stub_geteuid(),                    // geteuid [stub]
         108 => sys_stub_getegid(),                    // getegid [stub]
-        110 => sys_stub_getppid_compat(),             // getpgrp [stub]
-        131 => sys_stub_sigaltstack(a1, a2),          // sigaltstack [stub for musl]
-        158 => sys_stub_arch_prctl(a1, a2),           // arch_prctl [stub for musl]
+        110 => sys_getppid(),                         // getppid (Linux ABI #110)
+        131 => sys_stub_sigaltstack(a1, a2),          // sigaltstack [stub]
+        158 => sys_stub_arch_prctl(a1, a2),           // arch_prctl [stub]
         186 => sys_stub_gettid(),                     // gettid [stub]
         201 => sys_stub_time(a1),                     // time [stub]
-        218 => sys_stub_set_tid_address(a1),          // set_tid_address [stub for musl]
-        228 => sys_stub_clock_gettime(a1, a2),        // clock_gettime [stub for musl]
+        202 => sys_stub_futex(a1, a2, a3),            // futex [stub — return 0]
+        204 => sys_yield(),                           // sched_getaffinity [stub → yield]
+        218 => sys_stub_set_tid_address(a1),          // set_tid_address [stub]
+        228 => sys_stub_clock_gettime(a1, a2),        // clock_gettime [stub]
         231 => sys_stub_exit_group(a1),               // exit_group = exit
         257 => sys_stub_openat(a1, a2, a3),           // openat [routed to sys_open]
-        262 => sys_stub_newfstatat(a1, a2, a3),       // newfstatat [stub for musl]
-        302 => sys_stub_prlimit64(a1, a2, a3),        // prlimit64 [stub for musl]
-        318 => sys_stub_getrandom(a1, a2, a3),        // getrandom [stub for musl]
+        262 => sys_stub_newfstatat(a1, a2, a3),       // newfstatat [stub]
+        273 => 0,                                      // set_robust_list [stub — musl init]
+        302 => sys_stub_prlimit64(a1, a2, a3),        // prlimit64 [stub]
+        318 => sys_stub_getrandom(a1, a2, a3),        // getrandom
 
-        // ── AetherionOS custom syscalls (200-299) ──
-        200 => sys_ps(),
-        // 201 => used by Linux time() stub above
-        202 => sys_vga_write(a1 as usize, a2 as usize, a3),
-        203 => sys_bus_consume(a1),
-        204 => sys_bus_consume_intent(a1, a2 as u32),
-        210 => sys_net_ping(a1, a2 as u16),
-        211 => sys_gethostbyname(a1),
-        212 => sys_tcp_read(a1 as u32, a2, a3),
-        213 => sys_tcp_recv_blocking(a1 as u32, a2, a3),
-        214 => sys_socket_close(a1 as u32),
-        220 => sys_fb_fill_rect(a1, a2, a3),
-        221 => sys_fb_draw_char(a1, a2),
-        222 => sys_fb_draw_string(a1, a2, a3),
-        223 => sys_fb_get_info(a1),
-        230 => sys_rdtsc(),
-        240 => sys_mmap_file(a1, a2, a3),
-        241 => sys_mmap_prefetch(a1, a2, a3),            // Jalon 91: prefetch mmap pages
-        242 => sys_mmap_file_v2(a1, a2, a3),             // Jalon 91: mmap + immediate prefetch
-        243 => sys_spawn_thread_on_core(a1 as u32, a2, a3), // Jalon 92: SMP parallel thread
-        244 => sys_parallel_matmul_dispatch(a1, a2, a3), // Jalon 92: dispatch matmul work
-        245 => sys_parallel_matmul_result(a1),           // Jalon 92: collect matmul result
-        246 => sys_cpu_count(),                           // Jalon 92: get available CPU count
-        250 => sys_getprocs(a1, a2),
-        251 => sys_sysinfo(a1),
-        260 => sys_xhci_info(a1),
+        // ── AetherionOS custom syscalls (500+, no Linux ABI conflicts) ──
+        500 => sys_ps(),
+        502 => sys_vga_write(a1 as usize, a2 as usize, a3),
+        503 => sys_bus_consume(a1),
+        504 => sys_bus_consume_intent(a1, a2 as u32),
+        510 => sys_net_ping(a1, a2 as u16),
+        511 => sys_gethostbyname(a1),
+        512 => sys_tcp_read(a1 as u32, a2, a3),
+        513 => sys_tcp_recv_blocking(a1 as u32, a2, a3),
+        514 => sys_socket_close(a1 as u32),
+        520 => sys_fb_fill_rect(a1, a2, a3),
+        521 => sys_fb_draw_char(a1, a2),
+        522 => sys_fb_draw_string(a1, a2, a3),
+        523 => sys_fb_get_info(a1),
+        530 => sys_rdtsc(),
+        540 => sys_mmap_file(a1, a2, a3),
+        541 => sys_mmap_prefetch(a1, a2, a3),            // Jalon 91: prefetch mmap pages
+        542 => sys_mmap_file_v2(a1, a2, a3),             // Jalon 91: mmap + immediate prefetch
+        543 => sys_spawn_thread_on_core(a1 as u32, a2, a3), // Jalon 92: SMP parallel thread
+        544 => sys_parallel_matmul_dispatch(a1, a2, a3), // Jalon 92: dispatch matmul work
+        545 => sys_parallel_matmul_result(a1),           // Jalon 92: collect matmul result
+        546 => sys_cpu_count(),                           // Jalon 92: get available CPU count
+        550 => sys_getprocs(a1, a2),
+        551 => sys_sysinfo(a1),
+        560 => sys_xhci_info(a1),
 
-        // ── AetherionOS custom IPC (remap bus_publish to avoid conflict with Linux 201) ──
-        270 => sys_bus_publish(a1, a2 as u32, a3),
+        // ── AetherionOS custom IPC ──
+        570 => sys_bus_publish(a1, a2 as u32, a3),
 
         // ── AetherionOS module loading ──
-        280 => sys_load_module(a1, a2, a3),
+        580 => sys_load_module(a1, a2, a3),
 
         // ── AetherionOS in-RAM driver code generation ──
-        281 => sys_gen_driver(a1, a2),
+        581 => sys_gen_driver(a1, a2),
+
+        // ── AetherionOS HID polling (moved from Linux #11) ──
+        590 => sys_poll_hid(),
 
         // ── POSIX filesystem operations ──
-        83  => sys_mkdir(a1, a2),                    // mkdir(path, mode)
         84  => sys_rmdir(a1),                        // rmdir(path)
         85  => sys_creat(a1, a2),                    // creat(path, mode) — touch
-        87  => sys_unlink(a1),                       // unlink(path) — rm
 
         _ => {
             // Only log truly unknown syscalls (not common musl probes)
-            if nr < 400 {
+            if nr < 600 {
                 crate::serial_write("[SYSCALL] Unknown nr=");
                 print_u64_raw(nr);
                 crate::serial_write("\n");
@@ -431,6 +446,59 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         }
     }
 }
+
+// ===== Linux ABI Stub Syscalls (Jalon 93: Full Linux Compatibility Layer) =====
+// These return sensible defaults so musl/glibc-linked static binaries don't crash.
+
+/// munmap(addr, len) -> 0 (no-op, we don't reclaim pages yet)
+fn sys_stub_munmap(_addr: u64, _len: u64) -> u64 { 0 }
+
+/// rt_sigaction(signum, act, oldact) -> 0 (accept signal registrations silently)
+fn sys_stub_rt_sigaction(_signum: u64, _act: u64, _oldact: u64) -> u64 { 0 }
+
+/// rt_sigprocmask(how, set, oldset) -> 0 (accept signal mask changes silently)
+fn sys_stub_rt_sigprocmask(_how: u64, _set: u64, _oldset: u64) -> u64 { 0 }
+
+/// pwrite64(fd, buf, count, offset) -> count (pretend write succeeded)
+fn sys_stub_pwrite64(_fd: u32, _buf: u64, count: u64, _offset: u64) -> u64 { count }
+
+/// writev(fd, iov, iovcnt) -> simulate with sequential writes
+fn sys_stub_writev(fd: u32, iov_addr: u64, iovcnt: u64) -> u64 {
+    if iovcnt == 0 { return 0; }
+    if !validate_user_ptr(iov_addr, iovcnt * 16) { return EFAULT; }
+    let mut total: u64 = 0;
+    for i in 0..core::cmp::min(iovcnt, 16) as usize {
+        let base_ptr = (iov_addr + (i * 16) as u64) as *const u64;
+        let len_ptr = (iov_addr + (i * 16 + 8) as u64) as *const u64;
+        let base = unsafe { core::ptr::read_volatile(base_ptr) };
+        let len = unsafe { core::ptr::read_volatile(len_ptr) };
+        if len > 0 && validate_user_ptr(base, len) {
+            let n = sys_write(fd as u64, base, len);
+            if (n as i64) < 0 { return n; }
+            total += n;
+            if n < len { break; } // short write
+        }
+    }
+    total
+}
+
+/// access(path, mode) -> 0 if file exists, ENOENT otherwise
+fn sys_stub_access(path_addr: u64, _mode: u64) -> u64 {
+    let path = match unsafe { read_user_string(path_addr) } {
+        Some(p) => p,
+        None => return EFAULT,
+    };
+    // Check VFS
+    if crate::fs::vfs::file_read(&path).is_ok() { return 0; }
+    // Check /disk/ paths via FAT32
+    if path.starts_with("/disk/") {
+        if crate::fs::fat32::file_exists(&path[6..]).is_some() { return 0; }
+    }
+    ENOENT
+}
+
+/// futex(uaddr, futex_op, val) -> 0 (stub — single-threaded OK)
+fn sys_stub_futex(_uaddr: u64, _op: u64, _val: u64) -> u64 { 0 }
 
 // ===== Musl-libc Stub Syscalls (Jalon 79: POSIX Compatibility) =====
 // These return sensible defaults so musl-linked binaries don't crash.
@@ -803,6 +871,11 @@ fn sys_write(fd: u64, buf_addr: u64, len: u64) -> u64 {
         crate::process::FdType::File | crate::process::FdType::Pipe => {
             if !validate_user_ptr(buf_addr, len) { return EFAULT; }
 
+            // ═══ Linux ABI Pseudo-Device Intercepts for write (Jalon 93) ═══
+            if path == "/dev/null" {
+                return len; // /dev/null: accept all writes, return requested len
+            }
+
             // Check write permission (O_WRONLY or O_RDWR)
             let access_mode = flags & 0x3;
             if access_mode != O_WRONLY && access_mode != O_RDWR {
@@ -930,6 +1003,38 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
         }
 
         crate::process::FdType::File | crate::process::FdType::Pipe => {
+            // ═══ Linux ABI Pseudo-Device Intercepts (Jalon 93) ═══
+            if path == "/dev/null" {
+                return 0; // EOF — /dev/null reads return 0 bytes
+            }
+            if path == "/dev/zero" {
+                // Fill buffer with zeros
+                let to_fill = core::cmp::min(len as usize, 4096);
+                unsafe {
+                    let dst = buf_addr as *mut u8;
+                    for i in 0..to_fill {
+                        core::ptr::write_volatile(dst.add(i), 0u8);
+                    }
+                }
+                return to_fill as u64;
+            }
+            if path == "/dev/urandom" || path == "/dev/random" {
+                // Generate pseudo-random bytes using RDTSC + LCG
+                let to_fill = core::cmp::min(len as usize, 4096);
+                unsafe {
+                    let tsc: u64;
+                    core::arch::asm!("rdtsc", "shl rdx, 32", "or rax, rdx",
+                                     out("rax") tsc, out("rdx") _, options(nomem, nostack));
+                    let dst = buf_addr as *mut u8;
+                    let mut seed = tsc ^ (current_pid as u64 * 0x9E3779B97F4A7C15);
+                    for i in 0..to_fill {
+                        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        core::ptr::write_volatile(dst.add(i), (seed >> 33) as u8);
+                    }
+                }
+                return to_fill as u64;
+            }
+
             // Route /disk/ paths directly to FAT32 for fresh reads
             let is_disk = path.starts_with("/disk/");
             if is_disk {
@@ -999,8 +1104,16 @@ fn sys_open(path_addr: u64, flags: u32) -> u64 {
 
     let current_pid = crate::scheduler::current_pid();
 
-    // Hot-path: logging disabled
-    // crate::serial_println!("[SYSCALL] sys_open(\"{}\", flags=0x{:X}) from PID {}", path, flags, current_pid);
+    // Reject empty paths (fixes root-directory-as-model-file bug)
+    if path.is_empty() {
+        crate::serial_println!("[SYSCALL] sys_open: EMPTY path from PID {} (addr=0x{:X})", current_pid, path_addr);
+        return ENOENT;
+    }
+
+    // Log only /disk/ opens to avoid serial flood slowing QEMU boot
+    if path.starts_with("/disk/") {
+        crate::serial_println!("[SYSCALL] sys_open(\"{}\", flags=0x{:X}) from PID {}", path, flags, current_pid);
+    }
 
     // For /disk/ paths with O_CREAT, we allow creating files that don't exist yet
     if path.starts_with("/disk/") && (flags & O_CREAT) != 0 {
@@ -1139,7 +1252,9 @@ fn sys_open(path_addr: u64, flags: u32) -> u64 {
         fd_table.alloc_fd(&path, flags)
     }) {
         Some(Some(fd)) => {
-            crate::serial_println!("[SYSCALL] sys_open(\"{}\") = FD {}", path, fd);
+            if path.starts_with("/disk/") {
+                crate::serial_println!("[SYSCALL] sys_open(\"{}\") = FD {}", path, fd);
+            }
             fd as u64
         }
         _ => EMFILE,

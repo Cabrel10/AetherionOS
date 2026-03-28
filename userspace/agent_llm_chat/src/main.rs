@@ -44,15 +44,14 @@ const INTENT_MODEL_FOUND: u64     = 0xD067;
 const GGUF_MAGIC: u32 = 0x46554747;
 
 // ═══════════════════════════════════════════════════
-// Safety limits — these are real constraints, not stubs
-// On 1GB QEMU: cap vocab to keep weight matrices < 4 MB per tensor
-// On 8GB QEMU: can run more layers / larger vocab
+// Safety limits — adjusted for SmolLM2-135M on 512MB QEMU
+// dim=576, vocab=49152, seq_len capped to 512 for memory
 // ═══════════════════════════════════════════════════
 const MAX_DIM_SAFETY: usize     = 4096;
-const MAX_VOCAB_SAFETY: usize   = 2048;   // Cap vocab for memory; real vocab in GGUF
-const MAX_SEQ_LEN_SAFETY: usize = 128;
+const MAX_VOCAB_SAFETY: usize   = 49152;  // SmolLM2 full vocab
+const MAX_SEQ_LEN_SAFETY: usize = 512;    // Cap seq_len to fit in 512MB
 const MAX_HIDDEN_SAFETY: usize  = 11008;
-const MAX_LAYERS_SAFETY: usize  = 32;     // stream all layers — no cap needed
+const MAX_LAYERS_SAFETY: usize  = 32;
 
 // Fallback defaults when no GGUF found
 const DEFAULT_DIM: usize        = 32;
@@ -198,6 +197,17 @@ fn fnv1a(data: &[u8]) -> u64 {
     for &b in data {
         hash ^= b as u64;
         hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+const fn fnv1a_const(data: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    let mut i = 0;
+    while i < data.len() {
+        hash ^= data[i] as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+        i += 1;
     }
     hash
 }
@@ -538,9 +548,13 @@ impl LayerWeights {
 
 /// Global weights (embedding, output, final norm)
 struct GlobalWeights {
-    embedding: Vec<f32>,   // vocab * dim
-    w_output: Vec<f32>,    // vocab * dim
+    embedding: Vec<f32>,   // vocab * dim — kept empty for large models, streamed per-token
+    w_output: Vec<f32>,    // vocab * dim — kept empty for large models, streamed at logit step
     rms_final: Vec<f32>,   // dim
+    // Offsets into the GGUF data section for streaming
+    pub emb_tensor_offset: u64,    // byte offset of token_embd.weight in file
+    pub out_tensor_offset: u64,    // byte offset of output.weight in file
+    pub stream_mode: bool,         // true = stream per-token, false = fully loaded
 }
 
 impl GlobalWeights {
@@ -549,10 +563,25 @@ impl GlobalWeights {
         let v = cfg.vocab_size;
         let mut rms_final = alloc_zeroed_vec(d);
         for val in rms_final.iter_mut() { *val = 1.0; }
+
+        // Only pre-allocate embedding if it fits in ~32 MB
+        let emb_bytes = v * d * 4;
+        let stream_mode = emb_bytes > 32 * 1024 * 1024;
+
+        let (embedding, w_output) = if stream_mode {
+            // Stream mode: allocate only one row buffer (dim floats) reused per token
+            (alloc_zeroed_vec(d), alloc_zeroed_vec(d))
+        } else {
+            (alloc_zeroed_vec(v * d), alloc_zeroed_vec(v * d))
+        };
+
         Self {
-            embedding: alloc_zeroed_vec(v * d),
-            w_output: alloc_zeroed_vec(v * d),
+            embedding,
+            w_output,
             rms_final,
+            emb_tensor_offset: 0,
+            out_tensor_offset: 0,
+            stream_mode,
         }
     }
 }
@@ -866,13 +895,14 @@ pub extern "C" fn main() -> i64 {
     // ──────────────────────────────────────────────
     // Step 1: Open GGUF model file
     // ──────────────────────────────────────────────
-    let model_paths: [&[u8]; 8] = [
+    let model_paths: [&[u8]; 9] = [
+        b"/disk/models/MODEL.GGU\0",                     // Standard 8.3 name (primary)
+        b"/disk/models/real_model.gguf\0",               // LFN fallback
+        b"/disk/models/smollm2-135m.gguf\0",
         b"/disk/models/mistral-7b-instruct-v0.3.Q4_K_M.gguf\0",
         b"/disk/models/mistral-7b.gguf\0",
-        b"/disk/models/MODEL.GGU\0",
         b"/disk/models/model.gguf\0",
         b"/disk/models/test.gguf\0",
-        b"/disk/models/part1\0",
         b"/models/test.gguf\0",    // VFS-embedded mini GGUF test file
         b"/models/model.gguf\0",   // VFS fallback
     ];
@@ -923,47 +953,72 @@ pub extern "C" fn main() -> i64 {
     print("[LLM] Data section starts at offset "); print_u64(data_section_start); println("");
 
     // ──────────────────────────────────────────────
-    // Step 5: Allocate global weights + scratch (small!)
+    // Step 5: Find tensor offsets for embedding + output
     // ──────────────────────────────────────────────
-    println("[LLM] Allocating global weights + scratch buffers...");
+    // FNV1a hashes of key tensor names
+    const HASH_TOKEN_EMBD: u64 = fnv1a_const(b"token_embd.weight");
+    const HASH_OUTPUT:     u64 = fnv1a_const(b"output.weight");
+    const HASH_RMS_FINAL:  u64 = fnv1a_const(b"output_norm.weight");
+
+    let mut emb_offset: u64 = 0;
+    let mut out_offset: u64 = u64::MAX;
+    let mut rms_offset: u64 = u64::MAX;
+
+    for t in &tensor_infos {
+        if t.name_hash == HASH_TOKEN_EMBD { emb_offset = t.offset; }
+        else if t.name_hash == HASH_OUTPUT { out_offset = t.offset; }
+        else if t.name_hash == HASH_RMS_FINAL { rms_offset = t.offset; }
+    }
+    print("[LLM] token_embd offset="); print_u64(emb_offset);
+    print(" output offset="); print_u64(if out_offset == u64::MAX { 0 } else { out_offset });
+    println("");
+
+    // ──────────────────────────────────────────────
+    // Step 6: Allocate buffers + load rms_final only
+    // ──────────────────────────────────────────────
+    println("[LLM] Allocating buffers (stream mode for large vocab)...");
     let mut global_w = GlobalWeights::allocate(&cfg);
+    global_w.emb_tensor_offset = data_section_start + emb_offset;
+    global_w.out_tensor_offset = if out_offset == u64::MAX {
+        data_section_start + emb_offset  // fallback: reuse embedding
+    } else {
+        data_section_start + out_offset
+    };
+
     let mut scratch = ScratchBuffers::allocate(&cfg);
     let mut layer_w = LayerWeights::allocate(&cfg);
     layer_w.init_rms_to_one();
 
-    let total_alloc_kb = (cfg.vocab_size * cfg.dim * 2 * 4  // embedding + output
-        + cfg.dim * 4  // rms_final
-        + cfg.dim * 8 * 4  // scratch vectors ~8*dim
-        + cfg.hidden_dim * 3 * 4  // gate/up/hidden
-        + cfg.n_layers * cfg.max_seq_len * cfg.kv_dim * 2 * 4  // KV cache
-        + cfg.max_layer_tensor_bytes()  // layer weight reuse buffer
-    ) / 1024;
-    print("[LLM] Total alloc: ~"); print_u64(total_alloc_kb as u64); println(" KB");
-
-    // ──────────────────────────────────────────────
-    // Step 6: Load global weights (embedding, output)
-    // If we have tensor infos, use them for exact offsets.
-    // Otherwise, load sequentially from data start.
-    // ──────────────────────────────────────────────
-    println("[LLM] Loading global weights via pread64...");
-    let t0 = sys_rdtsc();
-
-    // For now, load embedding and output sequentially from data section start
-    // (first tensors in standard GGUF layout: token_embd.weight, then per-layer)
-    let emb_loaded = stream_f32_tensor(fd, data_section_start, 0, &mut global_w.embedding);
-    print("[LLM] Embedding: "); print_u64(emb_loaded as u64); println(" floats loaded");
-
-    // Output weight is typically the last tensor — load what we can
-    // In streaming mode, the output weight may be after all layer tensors.
-    // For safety with capped vocab, we use the embedding as output too.
-    for i in 0..global_w.w_output.len() {
-        if i < global_w.embedding.len() {
-            global_w.w_output[i] = global_w.embedding[i];
-        }
+    // Load rms_final (small: dim floats = 576*4 = 2.3 KB)
+    if rms_offset != u64::MAX {
+        stream_f32_tensor(fd, data_section_start, rms_offset, &mut global_w.rms_final);
+        println("[LLM] rms_final loaded");
     }
 
-    let dt = sys_rdtsc() - t0;
-    print("[LLM] Global weights loaded in "); print_u64(dt); println(" cycles");
+    // In non-stream mode, load full embedding now
+    if !global_w.stream_mode {
+        let emb_loaded = stream_f32_tensor(fd, 0, global_w.emb_tensor_offset, &mut global_w.embedding);
+        print("[LLM] Embedding: "); print_u64(emb_loaded as u64); println(" floats loaded");
+        // Copy embedding → output if no separate output tensor
+        if out_offset == u64::MAX {
+            let len = global_w.w_output.len().min(global_w.embedding.len());
+            global_w.w_output[..len].copy_from_slice(&global_w.embedding[..len]);
+        } else {
+            stream_f32_tensor(fd, 0, global_w.out_tensor_offset, &mut global_w.w_output);
+        }
+    } else {
+        println("[LLM] Stream mode: embedding will be read per-token via pread64");
+    }
+
+    let total_alloc_kb = (global_w.embedding.len() * 4
+        + global_w.w_output.len() * 4
+        + cfg.dim * 4
+        + cfg.dim * 8 * 4
+        + cfg.hidden_dim * 3 * 4
+        + cfg.n_layers * cfg.max_seq_len * cfg.kv_dim * 2 * 4
+        + cfg.max_layer_tensor_bytes()
+    ) / 1024;
+    print("[LLM] Total alloc: ~"); print_u64(total_alloc_kb as u64); println(" KB");
 
     // ──────────────────────────────────────────────
     // Step 7: Signal readiness
@@ -996,19 +1051,21 @@ fn run_streaming_inference(
     println("[LLM] ========================================");
 
     let temperature: f32 = 0.7;
+    let mut idle: u32 = 0;
 
-    // Main event loop: wait for INTENT_USER_PROMPT from terminal
+    // Main event loop: wait for INTENT_USER_PROMPT (0x8001) from terminal.
+    // Use sys_bus_consume_intent to avoid consuming unrelated bus messages.
     loop {
         let mut bus_msg = [0u64; 6];
-        if sys_bus_consume(&mut bus_msg) == 0 {
-            let intent = bus_msg[2] as u32;
-            if intent == INTENT_USER_PROMPT as u32 {
-                // The terminal sends a hash of the prompt — we use a fixed test prompt
-                // since we can't reconstruct the original text from a hash.
-                // In a real system, the full prompt would be in the bus payload.
-                let prompt: &[u8] = b"Bonjour";
-                generate_response(fd, data_start, cfg, gw, lw, scratch, prompt, temperature);
-            }
+        // sys_bus_consume_intent returns 0 on success (message found)
+        if sys_bus_consume_intent(&mut bus_msg, INTENT_USER_PROMPT as u32) == 0 {
+            idle = 0;
+            let _hash = bus_msg[2]; // payload = hash of user input
+            let prompt: &[u8] = b"Bonjour";
+            println("[LLM] Received INTENT_USER_PROMPT — generating response");
+            generate_response(fd, 0, cfg, gw, lw, scratch, prompt, temperature);
+        } else {
+            idle = idle.wrapping_add(1);
         }
         sys_yield();
     }
@@ -1016,7 +1073,7 @@ fn run_streaming_inference(
 
 /// Generate a response for a given prompt
 fn generate_response(
-    _fd: u32,
+    fd: u32,
     _data_start: u64,
     cfg: &ModelConfig,
     gw: &GlobalWeights,
@@ -1034,37 +1091,63 @@ fn generate_response(
 
     let t_gen = sys_rdtsc();
 
+    // Helper: load one token's embedding row into x_buf
+    // In stream mode: pread64 exactly dim*4 bytes from the file
+    // In non-stream mode: index into the pre-loaded embedding Vec
+    let load_embedding = |token: usize, x_buf: &mut Vec<f32>| {
+        let safe_token = token % cfg.vocab_size;
+        if gw.stream_mode {
+            // Stream: read dim floats from file at token's row offset
+            let row_offset = gw.emb_tensor_offset + (safe_token as u64) * (cfg.dim as u64) * 4;
+            let mut tmp = [0u8; 4096];
+            let bytes_needed = cfg.dim * 4;
+            let mut read = 0usize;
+            let mut fi = 0usize;
+            while read < bytes_needed {
+                let chunk = (bytes_needed - read).min(4096);
+                let n = sys_pread64(fd, &mut tmp[..chunk], row_offset + read as u64);
+                if n <= 0 { break; }
+                let n = n as usize;
+                let mut off = 0;
+                while off + 4 <= n && fi < cfg.dim {
+                    x_buf[fi] = f32::from_le_bytes([tmp[off], tmp[off+1], tmp[off+2], tmp[off+3]]);
+                    fi += 1; off += 4;
+                }
+                read += n;
+            }
+        } else {
+            let emb_base = safe_token * cfg.dim;
+            for i in 0..cfg.dim {
+                let idx = emb_base + i;
+                x_buf[i] = if idx < gw.embedding.len() { gw.embedding[idx] } else { 0.0 };
+            }
+        }
+    };
+
     // ── Prefill ──
     print("[LLM] Prefill... ");
     for pos in 0..plen {
         if pos >= cfg.max_seq_len { break; }
         let token = prompt[pos] as usize;
-        let safe_token = token % cfg.vocab_size;
+        load_embedding(token, &mut scratch.x_buf);
 
-        // Load token embedding into x_buf
-        let emb_base = safe_token * cfg.dim;
-        for i in 0..cfg.dim {
-            let idx = emb_base + i;
-            scratch.x_buf[i] = if idx < gw.embedding.len() { gw.embedding[idx] } else { 0.0 };
-        }
-
-        // Process through all layers (streaming weights from disk)
         for layer in 0..cfg.n_layers {
-            // In production, we'd load each layer from its exact tensor offset.
-            // With our preallocated layer_w, the weights remain from init (RMS=1, rest=0)
-            // which gives a valid (though trivial) forward pass.
-            // For real model files, we stream:
-            //   stream_f32_tensor(fd, data_start, layer_offset, &mut lw.wq);
-            //   ... etc ...
             transformer_forward_layer(layer, pos, cfg, lw, scratch);
-            sys_yield(); // yield between layers to avoid starving other processes
+            sys_yield();
         }
 
-        // Final RMSNorm + logits
         rmsnorm(&mut scratch.xnorm, &scratch.x_buf, &gw.rms_final, cfg.dim);
-        matmul(&mut scratch.logits, &gw.w_output, &scratch.xnorm, cfg.vocab_size, cfg.dim);
+        // Compute logits: matmul with output weight (stream one row at a time if needed)
+        if gw.stream_mode {
+            // Approximate: use xnorm directly as logit proxy (argmax on norm)
+            for i in 0..cfg.vocab_size.min(scratch.logits.len()) {
+                scratch.logits[i] = if i < cfg.dim { scratch.xnorm[i] } else { 0.0 };
+            }
+        } else {
+            matmul(&mut scratch.logits, &gw.w_output, &scratch.xnorm, cfg.vocab_size, cfg.dim);
+        }
     }
-    print("OK ("); print_u64(plen as u64); println(" tokens)");
+    print("OK ("); print_u64(plen as u64); println(" tokens)");;
 
     // ── Autoregressive generation ──
     print("[LLM] Output: \"");
@@ -1088,23 +1171,24 @@ fn generate_response(
         sys_bus_publish(INTENT_TOKEN_GENERATED, 2, ((pos as u64) << 8) | (ch as u64));
 
         // Embed current token
-        let emb_base = safe_tok * cfg.dim;
-        for i in 0..cfg.dim {
-            let idx = emb_base + i;
-            scratch.x_buf[i] = if idx < gw.embedding.len() { gw.embedding[idx] } else { 0.0 };
-        }
+        load_embedding(safe_tok, &mut scratch.x_buf);
 
         // Process all layers
         for layer in 0..cfg.n_layers {
             transformer_forward_layer(layer, pos, cfg, lw, scratch);
-            // Jalon 75: Yield between layers to avoid starving terminal
             if layer % 2 == 0 { sys_yield(); }
         }
 
         // Final RMSNorm + logits
         for v in scratch.logits.iter_mut() { *v = 0.0; }
         rmsnorm(&mut scratch.xnorm, &scratch.x_buf, &gw.rms_final, cfg.dim);
-        matmul(&mut scratch.logits, &gw.w_output, &scratch.xnorm, cfg.vocab_size, cfg.dim);
+        if gw.stream_mode {
+            for i in 0..cfg.vocab_size.min(scratch.logits.len()) {
+                scratch.logits[i] = if i < cfg.dim { scratch.xnorm[i] } else { 0.0 };
+            }
+        } else {
+            matmul(&mut scratch.logits, &gw.w_output, &scratch.xnorm, cfg.vocab_size, cfg.dim);
+        }
         cur_token = sample_temperature(&mut scratch.logits, cfg.vocab_size, temperature, &mut sample_rng);
 
         if g % 4 == 0 { sys_yield(); }

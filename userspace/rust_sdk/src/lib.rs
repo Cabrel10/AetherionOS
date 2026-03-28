@@ -101,48 +101,48 @@ pub const SYS_OPEN:         u64 = 2;
 pub const SYS_CLOSE:        u64 = 3;
 pub const SYS_MMAP:         u64 = 9;
 pub const SYS_BRK:          u64 = 12;
-pub const SYS_GETPID:       u64 = 20;
+pub const SYS_GETPID:       u64 = 39;  // Linux x86_64 ABI: getpid = 39 (was incorrectly 20)
 pub const SYS_YIELD:        u64 = 24;
 pub const SYS_CLONE:        u64 = 56;
 pub const SYS_EXIT:         u64 = 60;
 pub const SYS_WAIT:         u64 = 61;
-pub const SYS_BUS_PUBLISH:  u64 = 270;  // Jalon 79: remapped from 201 to avoid Linux ABI conflict
-pub const SYS_BUS_CONSUME:  u64 = 203;
-pub const SYS_BUS_CONSUME_INTENT: u64 = 204;  // Level 8: Intent-Based Routing (Pub/Sub)
-pub const SYS_VGA_WRITE:    u64 = 202;
-pub const SYS_MMAP_FILE:    u64 = 240;
-pub const SYS_PREAD64:      u64 = 17;   // Jalon 73: pread64(fd, buf, offset) — no FD position change
-pub const SYS_GETDENTS:     u64 = 78;   // Jalon 73: getdents(fd, buf, len) — real directory listing
-pub const SYS_GETPROCS:     u64 = 250;  // Jalon 73: list processes to user buffer
-pub const SYS_SYSINFO:      u64 = 251;  // Jalon 73: system info to user buffer
-pub const SYS_SEEK:         u64 = 8;    // lseek(fd, offset, whence)
-pub const SYS_NET_PING:     u64 = 210;
-pub const SYS_GETHOSTBYNAME:u64 = 211;
-pub const SYS_SOCKET:       u64 = 41;
-pub const SYS_TCP_CONNECT:  u64 = 42;
-pub const SYS_SENDTO:       u64 = 44;
-pub const SYS_RECVFROM:     u64 = 45;
-pub const SYS_TCP_SHUTDOWN: u64 = 47;
-pub const SYS_TCP_READ:     u64 = 212;
-pub const SYS_MMAP_FB:      u64 = 10;   // Jalon 79: NOTE - conflicts with mprotect(10) in Linux ABI
-pub const SYS_POLL_HID:     u64 = 11;   // Jalon 79: NOTE - conflicts with munmap(11) in Linux ABI
-pub const SYS_FB_FILL_RECT: u64 = 220;
-pub const SYS_FB_DRAW_CHAR: u64 = 221;
-pub const SYS_FB_DRAW_STR:  u64 = 222;
-pub const SYS_FB_GET_INFO:  u64 = 223;
-pub const SYS_RDTSC:        u64 = 230;
-pub const SYS_EXEC:         u64 = 59;   // execve(path, argv, envp)
-pub const SYS_FORK:         u64 = 57;   // fork()
+pub const SYS_BUS_PUBLISH:  u64 = 570;  // Jalon 93: moved to 500+ (was 270) for Linux ABI compat
+pub const SYS_BUS_CONSUME:  u64 = 503;  // Jalon 93: moved from 203
+pub const SYS_BUS_CONSUME_INTENT: u64 = 504;  // Level 8: Intent-Based Routing (Pub/Sub)
+pub const SYS_VGA_WRITE:    u64 = 502;  // Jalon 93: moved from 202
+pub const SYS_MMAP_FILE:    u64 = 540;  // Jalon 93: moved from 240
+pub const SYS_PREAD64:      u64 = 17;   // Jalon 73: pread64(fd, buf, offset) — Linux ABI native
+pub const SYS_GETDENTS:     u64 = 78;   // Jalon 73: getdents(fd, buf, len) — Linux ABI native
+pub const SYS_GETPROCS:     u64 = 550;  // Jalon 93: moved from 250
+pub const SYS_SYSINFO:      u64 = 551;  // Jalon 93: moved from 251
+pub const SYS_SEEK:         u64 = 8;    // lseek(fd, offset, whence) — Linux ABI native
+pub const SYS_NET_PING:     u64 = 510;  // Jalon 93: moved from 210
+pub const SYS_GETHOSTBYNAME:u64 = 511;  // Jalon 93: moved from 211
+pub const SYS_SOCKET:       u64 = 41;   // Linux ABI native
+pub const SYS_TCP_CONNECT:  u64 = 42;   // Linux ABI native
+pub const SYS_SENDTO:       u64 = 44;   // Linux ABI native
+pub const SYS_RECVFROM:     u64 = 45;   // Linux ABI native
+pub const SYS_TCP_SHUTDOWN: u64 = 47;   // Linux ABI native
+pub const SYS_TCP_READ:     u64 = 512;  // Jalon 93: moved from 212
+pub const SYS_POLL_HID:     u64 = 590;  // Jalon 93: moved from 11 (was conflicting with munmap)
+pub const SYS_FB_FILL_RECT: u64 = 520;  // Jalon 93: moved from 220
+pub const SYS_FB_DRAW_CHAR: u64 = 521;  // Jalon 93: moved from 221
+pub const SYS_FB_DRAW_STR:  u64 = 522;  // Jalon 93: moved from 222
+pub const SYS_FB_GET_INFO:  u64 = 523;  // Jalon 93: moved from 223
+pub const SYS_MMAP_FB:      u64 = 523;  // Alias for FB_GET_INFO (was 10, conflicted with mprotect)
+pub const SYS_RDTSC:        u64 = 530;  // Jalon 93: moved from 230
+pub const SYS_EXEC:         u64 = 59;   // execve(path, argv, envp) — Linux ABI native
+pub const SYS_FORK:         u64 = 57;   // fork() — Linux ABI native
 
 // ── Jalon 91: mmap prefetch + enhanced file mmap ──
-pub const SYS_MMAP_PREFETCH:  u64 = 241;  // prefetch pages in mmap region
-pub const SYS_MMAP_FILE_V2:   u64 = 242;  // mmap + immediate prefetch (combined)
+pub const SYS_MMAP_PREFETCH:  u64 = 541;  // Jalon 93: moved from 241
+pub const SYS_MMAP_FILE_V2:   u64 = 542;  // Jalon 93: moved from 242
 
 // ── Jalon 92: SMP parallel inference ──
-pub const SYS_SPAWN_THREAD_ON_CORE: u64 = 243; // spawn thread on AP core
-pub const SYS_PARALLEL_MATMUL:      u64 = 244; // dispatch parallel matmul
-pub const SYS_PARALLEL_RESULT:      u64 = 245; // collect parallel result
-pub const SYS_CPU_COUNT:            u64 = 246; // get available CPU count
+pub const SYS_SPAWN_THREAD_ON_CORE: u64 = 543; // Jalon 93: moved from 243
+pub const SYS_PARALLEL_MATMUL:      u64 = 544; // Jalon 93: moved from 244
+pub const SYS_PARALLEL_RESULT:      u64 = 545; // Jalon 93: moved from 245
+pub const SYS_CPU_COUNT:            u64 = 546; // Jalon 93: moved from 246
 
 // POSIX open flags
 pub const O_RDONLY: u32 = 0;
@@ -733,8 +733,8 @@ const SYS_CREAT: u64 = 85;
 const SYS_UNLINK: u64 = 87;
 
 // ── Level 7: Module loading + Driver codegen ──
-const SYS_LOAD_MODULE: u64 = 280;
-const SYS_GEN_DRIVER:  u64 = 281;
+const SYS_LOAD_MODULE: u64 = 580;  // Jalon 93: moved from 280 for Linux ABI compat
+const SYS_GEN_DRIVER:  u64 = 581;  // Jalon 93: moved from 281 for Linux ABI compat
 
 /// mkdir(path, mode) - Create a directory
 pub fn sys_mkdir(path: &[u8], mode: u32) -> i64 {
