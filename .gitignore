@@ -50,3 +50,4 @@ disk.img
 mistral_part_*
 *.gguf
 micro_model*
+*/target

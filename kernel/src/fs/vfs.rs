@@ -723,24 +723,59 @@ fn find_node_mut<'a>(
 }
 
 /// Initialize the VFS with default structure
-/// Creates /dev and /tmp directories
+/// Creates /dev, /tmp directories and Linux ABI pseudo-devices
 pub fn init() -> Result<(), VfsError> {
     crate::serial_println!("[VFS] Initializing virtual filesystem...");
 
     {
         let mut root = VFS_ROOT.lock();
-        root.insert(
-            String::from("dev"),
-            VfsNode::Directory(BTreeMap::new()),
-        );
+
+        // Create /dev directory with pseudo-devices
+        let mut dev_dir = BTreeMap::new();
+
+        // /dev/null — writes succeed (return len), reads return EOF (0)
+        dev_dir.insert(String::from("null"), VfsNode::File(Vec::new()));
+        // /dev/zero — reads return zeroed bytes (handled in sys_read)
+        dev_dir.insert(String::from("zero"), VfsNode::File(Vec::new()));
+        // /dev/urandom — reads return pseudo-random bytes (handled in sys_read)
+        dev_dir.insert(String::from("urandom"), VfsNode::File(Vec::new()));
+        // /dev/random — alias for urandom on this OS
+        dev_dir.insert(String::from("random"), VfsNode::File(Vec::new()));
+        // /dev/tty — placeholder terminal device
+        dev_dir.insert(String::from("tty"), VfsNode::File(Vec::new()));
+        // /dev/stdin, /dev/stdout, /dev/stderr — symlink placeholders
+        dev_dir.insert(String::from("stdin"), VfsNode::File(Vec::new()));
+        dev_dir.insert(String::from("stdout"), VfsNode::File(Vec::new()));
+        dev_dir.insert(String::from("stderr"), VfsNode::File(Vec::new()));
+
+        root.insert(String::from("dev"), VfsNode::Directory(dev_dir));
+
+        // Create /tmp directory
         root.insert(
             String::from("tmp"),
             VfsNode::Directory(BTreeMap::new()),
         );
+
+        // Create /proc directory (Linux ABI: many tools probe /proc/self/*)
+        let mut proc_dir = BTreeMap::new();
+        let mut self_dir = BTreeMap::new();
+        // /proc/self/exe — empty placeholder (tools check existence)
+        self_dir.insert(String::from("exe"), VfsNode::File(Vec::new()));
+        // /proc/self/maps — empty (tools like ASLR checkers read this)
+        self_dir.insert(String::from("maps"), VfsNode::File(Vec::new()));
+        proc_dir.insert(String::from("self"), VfsNode::Directory(self_dir));
+        root.insert(String::from("proc"), VfsNode::Directory(proc_dir));
+
+        // Create /sys directory
+        root.insert(
+            String::from("sys"),
+            VfsNode::Directory(BTreeMap::new()),
+        );
     }
 
-    VFS_METRICS.total_nodes.fetch_add(2, Ordering::Relaxed);
-    crate::serial_println!("[VFS] Created /dev and /tmp directories");
+    VFS_METRICS.total_nodes.fetch_add(16, Ordering::Relaxed);
+    crate::serial_println!("[VFS] Created directories: /dev (null,zero,urandom,tty), /tmp, /proc, /sys");
+    crate::serial_println!("[VFS] Linux ABI pseudo-devices: READY");
 
     Ok(())
 }
