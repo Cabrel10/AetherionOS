@@ -75,9 +75,34 @@ unsafe impl Send for KbdBuffer {}
 
 static KBD_BUFFER: KbdBuffer = KbdBuffer::new();
 
+/// PID of process blocked waiting for keyboard input (0 = none)
+static KBD_WAITER_PID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Set the PID that is waiting for keyboard input
+pub fn kbd_set_waiter(pid: u64) {
+    KBD_WAITER_PID.store(pid, core::sync::atomic::Ordering::SeqCst);
+}
+
+/// Wake the process blocked on keyboard read (called from keyboard IRQ handler)
+/// Returns true if a process was woken
+pub fn kbd_wake_blocked() -> bool {
+    let pid = KBD_WAITER_PID.swap(0, core::sync::atomic::Ordering::SeqCst);
+    if pid != 0 {
+        if let Some(state) = get_state(pid) {
+            if state == ProcessState::Blocked {
+                let _ = set_state(pid, ProcessState::Ready);
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Push a byte into the keyboard input buffer (called from keyboard IRQ handler)
 pub fn kbd_push_byte(byte: u8) {
     KBD_BUFFER.push(byte);
+    // Jalon 96: If a process is blocked waiting for keyboard, wake it
+    kbd_wake_blocked();
 }
 
 /// Read up to `len` bytes from the keyboard buffer into a slice
@@ -648,6 +673,21 @@ pub fn set_wait_ticks(pid: u64, ticks: u64) {
     if let Some(p) = table.get_mut(&pid) {
         p.wait_ticks = ticks;
     }
+}
+
+/// Jalon 96: Set CPU core affinity for a process
+/// 0xFF = no affinity (any core), 0 = BSP only, 1+ = specific AP core
+pub fn set_cpu_affinity(pid: u64, core: u8) {
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(p) = table.get_mut(&pid) {
+        p.cpu_affinity = core;
+    }
+}
+
+/// Jalon 96: Get CPU core affinity for a process
+pub fn get_cpu_affinity(pid: u64) -> u8 {
+    let table = PROCESS_TABLE.lock();
+    table.get(&pid).map(|p| p.cpu_affinity).unwrap_or(0xFF)
 }
 
 /// Jalon 55/79: Save user-mode state for preemptive context switch.

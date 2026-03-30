@@ -2101,8 +2101,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     chat_result.entry_point, chat_result.stack_pointer, chat_result.pml4_phys
                 ).unwrap_or(0);
                 if chat_pid != 0 {
+                    // Jalon 96: Pin LLM chat agent to Core 1 for SMP isolation
+                    process::set_cpu_affinity(chat_pid, 1);
                     scheduler::enqueue_process(chat_pid);
-                    serial_write("  [J79] agent_llm_chat.elf: QUEUED (GGUF verification via sys_pread64)\n");
+                    serial_write("  [J79] agent_llm_chat.elf: QUEUED (GGUF verification via sys_pread64) [Core 1]\n");
                 }
             }
             Err(_e) => {
@@ -2145,8 +2147,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     llama_entry, llama_stack, llama_pml4
                 ).unwrap_or(0);
                 if llama_pid != 0 {
+                    // Jalon 96: Pin LLaMA core agent to Core 1 for SMP isolation
+                    process::set_cpu_affinity(llama_pid, 1);
                     scheduler::enqueue_process(llama_pid);
-                    serial_write("  [J79] agent_llama_core.elf: QUEUED (multi-agent scheduling ENABLED)\n");
+                    serial_write("  [J79] agent_llama_core.elf: QUEUED (multi-agent scheduling ENABLED) [Core 1]\n");
                 }
             }
             Err(_e) => {
