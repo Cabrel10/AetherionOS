@@ -51,3 +51,5 @@ mistral_part_*
 *.gguf
 micro_model*
 */target
+userspace/agent_mcp/target/
+userspace/agent_validator/target/

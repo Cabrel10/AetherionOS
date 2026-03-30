@@ -771,11 +771,50 @@ pub fn init() -> Result<(), VfsError> {
             String::from("sys"),
             VfsNode::Directory(BTreeMap::new()),
         );
+
+        // ── Jalon 94: Create /etc directory with Linux compatibility files ──
+        // Tools like nmap, wget, curl probe /etc/resolv.conf, /etc/protocols, etc.
+        let mut etc_dir = BTreeMap::new();
+
+        // /etc/resolv.conf — DNS resolver config (QEMU gateway as DNS)
+        etc_dir.insert(String::from("resolv.conf"),
+            VfsNode::File(b"nameserver 10.0.2.3\nsearch local\n".to_vec()));
+
+        // /etc/hostname
+        etc_dir.insert(String::from("hostname"),
+            VfsNode::File(b"aetherion\n".to_vec()));
+
+        // /etc/hosts — minimal hosts file
+        etc_dir.insert(String::from("hosts"),
+            VfsNode::File(b"127.0.0.1\tlocalhost\n::1\t\tlocalhost\n127.0.1.1\taetherion\n".to_vec()));
+
+        // /etc/passwd — minimal POSIX passwd for whoami/id
+        etc_dir.insert(String::from("passwd"),
+            VfsNode::File(b"root:x:0:0:root:/root:/bin/sh\nnobody:x:65534:65534:nobody:/:/usr/sbin/nologin\n".to_vec()));
+
+        // /etc/group — minimal group file
+        etc_dir.insert(String::from("group"),
+            VfsNode::File(b"root:x:0:\nnogroup:x:65534:\n".to_vec()));
+
+        // /etc/protocols — needed by nmap and socket tools
+        etc_dir.insert(String::from("protocols"),
+            VfsNode::File(b"ip\t0\tIP\nicmp\t1\tICMP\ntcp\t6\tTCP\nudp\t17\tUDP\ngre\t47\tGRE\n".to_vec()));
+
+        // /etc/services — needed by nmap for port name resolution
+        etc_dir.insert(String::from("services"),
+            VfsNode::File(b"ftp\t21/tcp\nssh\t22/tcp\ntelnet\t23/tcp\nsmtp\t25/tcp\ndns\t53/tcp\nhttp\t80/tcp\nhttps\t443/tcp\n".to_vec()));
+
+        // /etc/nsswitch.conf — name service switch (musl reads this)
+        etc_dir.insert(String::from("nsswitch.conf"),
+            VfsNode::File(b"passwd: files\ngroup: files\nhosts: files dns\n".to_vec()));
+
+        root.insert(String::from("etc"), VfsNode::Directory(etc_dir));
     }
 
-    VFS_METRICS.total_nodes.fetch_add(16, Ordering::Relaxed);
-    crate::serial_println!("[VFS] Created directories: /dev (null,zero,urandom,tty), /tmp, /proc, /sys");
+    VFS_METRICS.total_nodes.fetch_add(30, Ordering::Relaxed);
+    crate::serial_println!("[VFS] Created directories: /dev, /tmp, /proc, /sys, /etc");
     crate::serial_println!("[VFS] Linux ABI pseudo-devices: READY");
+    crate::serial_println!("[VFS] /etc: resolv.conf, hosts, passwd, group, protocols, services");
 
     Ok(())
 }

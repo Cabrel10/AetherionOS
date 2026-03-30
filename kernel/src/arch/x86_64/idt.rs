@@ -206,7 +206,7 @@ const USER_HEAP_DEMAND_HIGH: u64 = 0x0000_3002_0000_0000;
 
 /// Helper: try to demand-map a user page at `page_addr`.
 /// Returns true if the page was successfully mapped.
-fn try_demand_map_user_page(page_addr: u64) -> bool {
+fn try_demand_map_user_page(page_addr: u64, is_instruction_fetch: bool) -> bool {
     let frame_phys = unsafe { crate::elf::alloc_demand_frame() };
     match frame_phys {
         Some(phys) => {
@@ -217,8 +217,13 @@ fn try_demand_map_user_page(page_addr: u64) -> bool {
             let cr3: u64;
             unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)); }
             let pml4_phys = cr3 & !0xFFF;
-            // flags: PRESENT | WRITABLE | USER | NX
-            let flags: u64 = 0x01 | 0x02 | 0x04 | (1u64 << 63);
+            // Jalon 96: If this is an instruction fetch, map as executable (no NX)
+            // Otherwise, map as data (WRITABLE + NX for W^X enforcement)
+            let flags: u64 = if is_instruction_fetch {
+                0x01 | 0x04 // PRESENT | USER (executable, read-only)
+            } else {
+                0x01 | 0x02 | 0x04 | (1u64 << 63) // PRESENT | WRITABLE | USER | NX
+            };
             match unsafe { crate::elf::demand_map_user_page(pml4_phys, page_addr, phys, flags) } {
                 Ok(()) => true,
                 Err(_) => {
@@ -243,6 +248,16 @@ fn try_demand_map_user_page(page_addr: u64) -> bool {
 fn kill_user_and_switch(current_pid: u64, addr_raw: u64) {
     let _ = crate::process::set_state(current_pid, crate::process::ProcessState::Terminated);
     crate::serial_println!("[SIGSEGV] PID {} terminated (addr 0x{:X})", current_pid, addr_raw);
+
+    // ── Jalon 94: GC — Free the terminated process's page table ──
+    let pml4 = crate::process::with_process(current_pid, |p| p.pml4_phys).unwrap_or(0);
+    if pml4 != 0 {
+        let active_cr3: u64;
+        unsafe { core::arch::asm!("mov {}, cr3", out(reg) active_cr3, options(nomem, nostack)); }
+        if pml4 != (active_cr3 & !0xFFF) {
+            unsafe { crate::elf::free_user_page_table(pml4); }
+        }
+    }
 
     // Use scheduler's yield_to_next which handles re-queuing properly
     let next = crate::scheduler::yield_to_next(current_pid);
@@ -339,7 +354,7 @@ extern "x86-interrupt" fn page_fault_handler(
         && addr_raw >= USER_STACK_DEMAND_LOW
         && addr_raw < USER_STACK_DEMAND_HIGH
     {
-        if try_demand_map_user_page(page_addr) {
+        if try_demand_map_user_page(page_addr, false) {
             return; // Resume faulting instruction
         }
         // Fall through to SIGSEGV
@@ -355,9 +370,27 @@ extern "x86-interrupt" fn page_fault_handler(
             .unwrap_or(USER_HEAP_DEMAND_LOW);
         // Only map if address is below the current break (valid heap)
         if addr_raw < heap_break {
-            if try_demand_map_user_page(page_addr) {
+            if try_demand_map_user_page(page_addr, false) {
                 return; // Resume
             }
+        }
+        // Fall through to SIGSEGV
+    }
+
+    // --- Demand paging for ELF BSS/Data region (Jalon 93: prevent SIGSEGV on BSS extension) ---
+    // ELF binaries are mapped starting at 0x8000000000. The BSS section may extend
+    // beyond the file-backed pages. When the allocator touches a BSS page that wasn't
+    // pre-mapped, we demand-map it here instead of killing the process.
+    // Jalon 96 fix: detect instruction-fetch faults to avoid mapping code pages as NX.
+    const ELF_DEMAND_LOW: u64 = 0x0000_0080_0000_0000; // 0x8000000000
+    const ELF_DEMAND_HIGH: u64 = 0x0000_0080_1000_0000; // +256 MiB guard
+    if is_user_mode
+        && addr_raw >= ELF_DEMAND_LOW
+        && addr_raw < ELF_DEMAND_HIGH
+    {
+        let is_ifetch = error_code.contains(PageFaultErrorCode::INSTRUCTION_FETCH);
+        if try_demand_map_user_page(page_addr, is_ifetch) {
+            return; // Resume — BSS/code page now mapped
         }
         // Fall through to SIGSEGV
     }

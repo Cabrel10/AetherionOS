@@ -183,19 +183,33 @@ impl core::fmt::Display for ElfError {
 }
 
 // ===== ELF Frame Pool =====
-// A simple bump allocator for physical frames used by ELF loading.
-// In a real OS this would integrate with the main frame allocator.
+// A bump allocator with freelist for physical frames used by ELF loading.
+// Jalon 94: Added freelist-based recycling to prevent OOM on process exit.
+
+/// Maximum number of freed frames we can track for recycling.
+/// When a process exits, its frames are pushed here and reused by the next allocation.
+const FREELIST_MAX: usize = 8192; // 32 MiB of recyclable frames
 
 struct ElfFramePool {
     base_frame: u64,    // Physical base address (frame-aligned)
     frames_used: usize,
     max_frames: usize,
+    // Freelist: stack of recycled physical frame addresses
+    freelist: [u64; FREELIST_MAX],
+    freelist_count: usize,
+    // Stats
+    total_freed: usize,
+    total_recycled: usize,
 }
 
 static mut ELF_POOL: ElfFramePool = ElfFramePool {
     base_frame: 0,
     frames_used: 0,
     max_frames: 0,
+    freelist: [0; FREELIST_MAX],
+    freelist_count: 0,
+    total_freed: 0,
+    total_recycled: 0,
 };
 
 static ELF_POOL_INITIALIZED: core::sync::atomic::AtomicBool =
@@ -214,11 +228,20 @@ pub unsafe fn init_frame_pool(base_phys: u64, num_frames: usize) {
     );
 }
 
-/// Allocate a physical frame from the ELF pool
+/// Allocate a physical frame from the ELF pool.
+/// Jalon 94: Checks freelist first (recycled frames), then bumps.
 pub unsafe fn alloc_elf_frame() -> Option<u64> {
     if !ELF_POOL_INITIALIZED.load(Ordering::SeqCst) {
         return None;
     }
+    // Priority 1: Reuse a freed frame from the freelist
+    if ELF_POOL.freelist_count > 0 {
+        ELF_POOL.freelist_count -= 1;
+        let phys = ELF_POOL.freelist[ELF_POOL.freelist_count];
+        ELF_POOL.total_recycled += 1;
+        return Some(phys);
+    }
+    // Priority 2: Bump allocate a new frame
     if ELF_POOL.frames_used >= ELF_POOL.max_frames {
         return None;
     }
@@ -227,9 +250,137 @@ pub unsafe fn alloc_elf_frame() -> Option<u64> {
     Some(phys)
 }
 
-/// Get pool usage stats
+/// Return a physical frame to the freelist for recycling.
+/// SAFETY: The frame must have been allocated from this pool and must not be
+/// referenced by any active page table.
+pub unsafe fn free_elf_frame(phys: u64) {
+    if !ELF_POOL_INITIALIZED.load(Ordering::SeqCst) {
+        return;
+    }
+    // Validate frame belongs to our pool
+    let pool_end = ELF_POOL.base_frame + (ELF_POOL.max_frames as u64) * PAGE_SIZE;
+    if phys < ELF_POOL.base_frame || phys >= pool_end {
+        return; // Not from our pool — don't free
+    }
+    if phys & 0xFFF != 0 {
+        return; // Not page-aligned
+    }
+    // Push onto freelist if space available
+    if ELF_POOL.freelist_count < FREELIST_MAX {
+        ELF_POOL.freelist[ELF_POOL.freelist_count] = phys;
+        ELF_POOL.freelist_count += 1;
+        ELF_POOL.total_freed += 1;
+    }
+    // If freelist is full, frame is leaked — acceptable for stability
+}
+
+/// Get pool usage stats: (used, max, freelist_count, total_freed, total_recycled)
 pub fn pool_stats() -> (usize, usize) {
     unsafe { (ELF_POOL.frames_used, ELF_POOL.max_frames) }
+}
+
+/// Get detailed pool stats for diagnostics
+pub fn pool_stats_detailed() -> (usize, usize, usize, usize, usize) {
+    unsafe { (ELF_POOL.frames_used, ELF_POOL.max_frames,
+              ELF_POOL.freelist_count, ELF_POOL.total_freed, ELF_POOL.total_recycled) }
+}
+
+/// Free all user-space pages and intermediate page tables for a terminated process.
+/// Walks the 4-level page table (PML4 → PDPT → PD → PT), freeing:
+///   - All leaf page frames (PT entries with PRESENT bit)
+///   - All intermediate page table frames allocated from ELF_POOL
+///   - The PML4 frame itself
+///
+/// SAFETY: The PML4 must not be the active CR3. Call only after the process
+/// has been fully terminated and no CPU is using this address space.
+///
+/// We skip PML4 entries that point outside the ELF pool (kernel entries copied
+/// verbatim from the kernel PML4) to avoid corrupting kernel page tables.
+pub unsafe fn free_user_page_table(pml4_phys: u64) {
+    if pml4_phys == 0 || pml4_phys & 0xFFF != 0 {
+        return;
+    }
+
+    let pool_base = ELF_POOL.base_frame;
+    let pool_end = pool_base + (ELF_POOL.max_frames as u64) * PAGE_SIZE;
+
+    // Helper: check if a physical address belongs to ELF_POOL
+    let in_pool = |phys: u64| -> bool {
+        phys >= pool_base && phys < pool_end && phys & 0xFFF == 0
+    };
+
+    let mut freed_count: usize = 0;
+    let pml4_virt = phys_to_virt(pml4_phys) as *const u64;
+
+    // Walk all 512 PML4 entries
+    for pml4_idx in 0..512usize {
+        let pml4_entry = core::ptr::read_volatile(pml4_virt.add(pml4_idx));
+        if pml4_entry & 0x01 == 0 { continue; } // Not present
+
+        let pdpt_phys = pml4_entry & !0xFFF;
+        if !in_pool(pdpt_phys) { continue; } // Kernel entry — don't touch
+
+        let pdpt_virt = phys_to_virt(pdpt_phys) as *const u64;
+
+        // Walk all 512 PDPT entries
+        for pdpt_idx in 0..512usize {
+            let pdpt_entry = core::ptr::read_volatile(pdpt_virt.add(pdpt_idx));
+            if pdpt_entry & 0x01 == 0 { continue; }
+            // Check for 1 GiB huge page (bit 7)
+            if pdpt_entry & 0x80 != 0 { continue; } // Don't free huge pages
+
+            let pd_phys = pdpt_entry & !0xFFF;
+            if !in_pool(pd_phys) { continue; }
+
+            let pd_virt = phys_to_virt(pd_phys) as *const u64;
+
+            // Walk all 512 PD entries
+            for pd_idx in 0..512usize {
+                let pd_entry = core::ptr::read_volatile(pd_virt.add(pd_idx));
+                if pd_entry & 0x01 == 0 { continue; }
+                // Check for 2 MiB huge page (bit 7)
+                if pd_entry & 0x80 != 0 { continue; }
+
+                let pt_phys = pd_entry & !0xFFF;
+                if !in_pool(pt_phys) { continue; }
+
+                let pt_virt = phys_to_virt(pt_phys) as *const u64;
+
+                // Walk all 512 PT entries — free leaf page frames
+                for pt_idx in 0..512usize {
+                    let pt_entry = core::ptr::read_volatile(pt_virt.add(pt_idx));
+                    if pt_entry & 0x01 == 0 { continue; }
+
+                    let frame_phys = pt_entry & !0xFFF;
+                    if in_pool(frame_phys) {
+                        free_elf_frame(frame_phys);
+                        freed_count += 1;
+                    }
+                }
+
+                // Free the PT itself
+                free_elf_frame(pt_phys);
+                freed_count += 1;
+            }
+
+            // Free the PD itself
+            free_elf_frame(pd_phys);
+            freed_count += 1;
+        }
+
+        // Free the PDPT itself
+        free_elf_frame(pdpt_phys);
+        freed_count += 1;
+    }
+
+    // Free the PML4 itself
+    free_elf_frame(pml4_phys);
+    freed_count += 1;
+
+    crate::serial_println!(
+        "[GC] Freed {} frames from PML4 0x{:X} (freelist: {}/{})",
+        freed_count, pml4_phys, ELF_POOL.freelist_count, FREELIST_MAX
+    );
 }
 
 /// Allocate a frame for demand paging (called from page fault handler)

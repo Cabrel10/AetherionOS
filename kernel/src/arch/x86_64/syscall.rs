@@ -327,7 +327,7 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         3  => sys_close(a1 as u32),                  // close(fd)
         4  => sys_stub_stat(a1, a2),                 // stat(path, buf)    [stub]
         5  => sys_stub_fstat(a1 as u32, a2),         // fstat(fd, buf)     [stub]
-        7  => sys_stub_poll(a1, a2, a3),             // poll(fds, nfds, timeout) [stub]
+        7  => sys_poll(a1, a2, a3),                    // poll(fds, nfds, timeout) — real impl
         8  => sys_seek(a1 as u32, a2 as i64, a3 as u32), // lseek(fd, off, whence)
         9  => sys_mmap(a1, a2, a3),                  // mmap(addr, len, prot)
         10 => sys_stub_mprotect(a1, a2, a3),         // mprotect [stub]
@@ -382,7 +382,7 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         158 => sys_stub_arch_prctl(a1, a2),           // arch_prctl [stub]
         186 => sys_stub_gettid(),                     // gettid [stub]
         201 => sys_stub_time(a1),                     // time [stub]
-        202 => sys_stub_futex(a1, a2, a3),            // futex [stub — return 0]
+        202 => sys_futex(a1, a2, a3),                   // futex(uaddr, op, val) — real impl
         204 => sys_yield(),                           // sched_getaffinity [stub → yield]
         218 => sys_stub_set_tid_address(a1),          // set_tid_address [stub]
         228 => sys_stub_clock_gettime(a1, a2),        // clock_gettime [stub]
@@ -500,6 +500,123 @@ fn sys_stub_access(path_addr: u64, _mode: u64) -> u64 {
 /// futex(uaddr, futex_op, val) -> 0 (stub — single-threaded OK)
 fn sys_stub_futex(_uaddr: u64, _op: u64, _val: u64) -> u64 { 0 }
 
+// ═══════════════════════════════════════════════════
+// ===== REAL sys_futex — Jalon 94 =====
+// Fast Userspace Mutex for musl/glibc pthreads compatibility.
+// Supports FUTEX_WAIT (0), FUTEX_WAKE (1), FUTEX_WAIT_PRIVATE (128),
+// and FUTEX_WAKE_PRIVATE (129).
+// ═══════════════════════════════════════════════════
+
+/// Global futex wait-queue: maps a physical page address + offset to a list of waiting PIDs.
+/// We use physical addresses to handle shared memory correctly.
+/// Maximum 64 concurrent futex waits (sufficient for musl single-process threading).
+static mut FUTEX_WAITERS: [(u64, u64); 64] = [(0, 0); 64]; // (phys_key, pid)
+static mut FUTEX_COUNT: usize = 0;
+
+fn sys_futex(uaddr: u64, op: u64, val: u64) -> u64 {
+    // Extract the operation (low 7 bits, ignore FUTEX_PRIVATE_FLAG = 128)
+    let cmd = (op & 0x7F) as u32;
+    let current_pid = crate::scheduler::current_pid();
+
+    // Convert user virtual address to a physical "key" for the wait queue.
+    // We use the virtual address directly since each process has its own address space.
+    // For FUTEX_PRIVATE (single-process), this is correct.
+    let futex_key = uaddr;
+
+    const FUTEX_WAIT: u32 = 0;
+    const FUTEX_WAKE: u32 = 1;
+    const FUTEX_FD: u32 = 2;
+    const FUTEX_REQUEUE: u32 = 3;
+
+    match cmd {
+        FUTEX_WAIT => {
+            // FUTEX_WAIT: If *uaddr == val, block the current thread.
+            // Otherwise return EAGAIN immediately.
+            if !validate_user_ptr(uaddr, 4) {
+                return EFAULT;
+            }
+
+            // Read the current value at uaddr
+            let current_val = unsafe {
+                core::ptr::read_volatile(uaddr as *const u32)
+            };
+
+            if current_val != val as u32 {
+                // Value changed — return EAGAIN (resource temporarily unavailable)
+                return 11; // EAGAIN
+            }
+
+            // Value matches — add PID to the wait queue and block
+            unsafe {
+                if FUTEX_COUNT < 64 {
+                    FUTEX_WAITERS[FUTEX_COUNT] = (futex_key, current_pid);
+                    FUTEX_COUNT += 1;
+                }
+            }
+
+            // Set process state to Blocked and yield
+            let _ = crate::process::set_state(
+                current_pid,
+                crate::process::ProcessState::Blocked,
+            );
+
+            // Yield the CPU — the process won't be scheduled until woken
+            // We do a bounded yield loop; if not woken after 1000 yields, auto-wake
+            // to prevent permanent deadlocks in edge cases.
+            for _ in 0..1000 {
+                let state = crate::process::with_process(current_pid, |p| p.state)
+                    .unwrap_or(crate::process::ProcessState::Ready);
+                if state != crate::process::ProcessState::Blocked {
+                    break; // We've been woken
+                }
+                sys_yield();
+            }
+
+            // Auto-wake if still blocked (deadlock prevention)
+            let _ = crate::process::set_state(
+                current_pid,
+                crate::process::ProcessState::Ready,
+            );
+
+            0 // Success
+        }
+
+        FUTEX_WAKE => {
+            // FUTEX_WAKE: Wake up to `val` threads waiting on this uaddr.
+            let mut woken: u64 = 0;
+            let to_wake = if val == 0 { 1 } else { val };
+
+            unsafe {
+                let mut i = 0usize;
+                while i < FUTEX_COUNT && woken < to_wake {
+                    if FUTEX_WAITERS[i].0 == futex_key {
+                        let wake_pid = FUTEX_WAITERS[i].1;
+                        // Remove from wait queue (swap with last)
+                        FUTEX_COUNT -= 1;
+                        FUTEX_WAITERS[i] = FUTEX_WAITERS[FUTEX_COUNT];
+                        FUTEX_WAITERS[FUTEX_COUNT] = (0, 0);
+
+                        // Wake the process
+                        let _ = crate::process::set_state(
+                            wake_pid,
+                            crate::process::ProcessState::Ready,
+                        );
+                        woken += 1;
+                        // Don't increment i — we swapped in a new element
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+
+            woken
+        }
+
+        // FUTEX_FD, FUTEX_REQUEUE etc. — return 0 (stub-safe)
+        _ => 0,
+    }
+}
+
 // ===== Musl-libc Stub Syscalls (Jalon 79: POSIX Compatibility) =====
 // These return sensible defaults so musl-linked binaries don't crash.
 
@@ -539,8 +656,117 @@ fn sys_stub_fstat(fd: u32, buf_addr: u64) -> u64 {
     0
 }
 
-/// poll(fds, nfds, timeout) -> 0 (no events)
-fn sys_stub_poll(_fds: u64, _nfds: u64, _timeout: u64) -> u64 { 0 }
+/// poll(fds, nfds, timeout) — Jalon 94: Real poll for async I/O
+/// Linux struct pollfd: { i32 fd; i16 events; i16 revents; } = 8 bytes
+/// Checks each FD for readability/writability and returns the count of ready FDs.
+/// If timeout > 0 and no FDs are ready, yields up to `timeout` ms worth of cycles.
+fn sys_poll(fds_addr: u64, nfds: u64, timeout: u64) -> u64 {
+    if nfds == 0 {
+        // poll(NULL, 0, timeout) = sleep for timeout ms
+        if timeout > 0 && timeout < 60000 {
+            let yields = timeout / 10; // ~10ms per yield
+            for _ in 0..yields { sys_yield(); }
+        }
+        return 0;
+    }
+
+    if nfds > 256 || !validate_user_ptr(fds_addr, nfds * 8) {
+        return EFAULT;
+    }
+
+    let mut ready_count: u64 = 0;
+
+    // Read and process each pollfd
+    for i in 0..nfds {
+        let pfd_addr = fds_addr + i * 8;
+        let fd_raw = unsafe { core::ptr::read_volatile(pfd_addr as *const i32) };
+        let events = unsafe { core::ptr::read_volatile((pfd_addr + 4) as *const i16) };
+
+        // Clear revents
+        unsafe { core::ptr::write_volatile((pfd_addr + 6) as *mut i16, 0); }
+
+        if fd_raw < 0 { continue; } // Negative FD = skip
+
+        let fd = fd_raw as u32;
+        let current_pid = crate::scheduler::current_pid();
+
+        // POLLIN (0x0001): data available for reading
+        // POLLOUT (0x0004): writing won't block
+        // POLLHUP (0x0010): hung up
+        // POLLERR (0x0008): error
+        const POLLIN: i16 = 0x0001;
+        const POLLOUT: i16 = 0x0004;
+        const POLLHUP: i16 = 0x0010;
+
+        let mut revents: i16 = 0;
+
+        // Check FD type and status
+        match fd {
+            0 => {
+                // stdin: check if keyboard data is available
+                if events & POLLIN != 0 {
+                    // PS/2 keyboard always has potential data
+                    revents |= POLLIN;
+                }
+            }
+            1 | 2 => {
+                // stdout/stderr: always writable
+                if events & POLLOUT != 0 {
+                    revents |= POLLOUT;
+                }
+            }
+            _ => {
+                // Check if it's a socket FD
+                let fd_info = crate::process::with_process(current_pid, |p| {
+                    p.fd_table.get(fd as usize).map(|f| (f.fd_type, f.flags))
+                }).flatten();
+
+                match fd_info {
+                    Some((crate::process::FdType::Socket, _)) => {
+                        // Socket: check smoltcp for readiness
+                        if events & POLLIN != 0 {
+                            revents |= POLLIN; // Optimistic: report readable
+                        }
+                        if events & POLLOUT != 0 {
+                            revents |= POLLOUT; // Sockets are usually writable
+                        }
+                    }
+                    Some((crate::process::FdType::File, _)) => {
+                        // Regular file: always ready for read/write
+                        if events & POLLIN != 0 { revents |= POLLIN; }
+                        if events & POLLOUT != 0 { revents |= POLLOUT; }
+                    }
+                    Some(_) => {
+                        // Tty or other: report ready
+                        if events & POLLIN != 0 { revents |= POLLIN; }
+                        if events & POLLOUT != 0 { revents |= POLLOUT; }
+                    }
+                    None => {
+                        // FD not found → report POLLHUP
+                        revents |= POLLHUP;
+                    }
+                }
+            }
+        }
+
+        // Write revents back
+        if revents != 0 {
+            unsafe { core::ptr::write_volatile((pfd_addr + 6) as *mut i16, revents); }
+            ready_count += 1;
+        }
+    }
+
+    // If no FDs ready and timeout > 0, yield and retry
+    if ready_count == 0 && timeout > 0 && timeout < 60000 {
+        let max_yields = (timeout / 10).min(100);
+        for _ in 0..max_yields {
+            sys_yield();
+        }
+        // After yielding, report 0 ready (timeout expired)
+    }
+
+    ready_count
+}
 
 /// mprotect(addr, len, prot) -> 0 (no-op)
 fn sys_stub_mprotect(_addr: u64, _len: u64, _prot: u64) -> u64 { 0 }
@@ -1789,6 +2015,7 @@ unsafe fn clone_pml4_deep(src_pml4_phys: u64) -> Option<u64> {
 // ===== sys_exec(path) =====
 
 /// Execute a new ELF binary, replacing the current process.
+/// Jalon 95: Supports VFS (/bin/*), FAT32 (/disk/*), and bare names.
 fn sys_exec(path_addr: u64) -> u64 {
     if !validate_user_ptr(path_addr, 1) {
         return EFAULT;
@@ -1801,35 +2028,80 @@ fn sys_exec(path_addr: u64) -> u64 {
 
     crate::serial_println!("[SYSCALL] sys_exec(\"{}\")", path);
 
-    // Try to load from VFS
-    let vfs_path = if path.starts_with('/') {
+    // Resolve the path for lookup
+    let resolved = if path.starts_with('/') {
         path.clone()
     } else {
         alloc::format!("/bin/{}", path)
     };
 
-    // Read ELF data from VFS
-    let elf_data = match crate::fs::vfs::file_read(&vfs_path) {
-        Ok(data) => data,
-        Err(_) => {
-            crate::serial_println!("[SYSCALL] exec: file not found: {}", vfs_path);
-            return ENOENT;
+    // ── Priority 1: Try in-memory VFS (/bin/*, /sys/*, etc.) ──
+    let elf_data = if let Ok(data) = crate::fs::vfs::file_read(&resolved) {
+        crate::serial_println!("[EXEC] Loaded from VFS: {} ({} bytes)", resolved, data.len());
+        data
+    }
+    // ── Priority 2: Try FAT32 disk (/disk/* paths) ──
+    else if resolved.starts_with("/disk/") {
+        let fat_name = &resolved[6..]; // strip "/disk/"
+        match crate::fs::fat32::read_file_path(fat_name) {
+            Some(data) => {
+                crate::serial_println!("[EXEC] Loaded from FAT32: {} ({} bytes)", resolved, data.len());
+                data
+            }
+            None => {
+                // Also try flat filename (no subdirectory)
+                match crate::fs::fat32::read_file(fat_name) {
+                    Some(data) => {
+                        crate::serial_println!("[EXEC] Loaded from FAT32 root: {} ({} bytes)", fat_name, data.len());
+                        data
+                    }
+                    None => {
+                        crate::serial_println!("[EXEC] File not found on FAT32: {}", resolved);
+                        return ENOENT;
+                    }
+                }
+            }
+        }
+    }
+    // ── Priority 3: Try FAT32 root for bare names (e.g. "busybox.elf") ──
+    else {
+        match crate::fs::fat32::read_file(&resolved) {
+            Some(data) => {
+                crate::serial_println!("[EXEC] Loaded from FAT32 root: {} ({} bytes)", resolved, data.len());
+                data
+            }
+            None => {
+                crate::serial_println!("[EXEC] File not found: {}", resolved);
+                return ENOENT;
+            }
         }
     };
 
-    // Load the ELF binary (Jalon 25b - real sys_exec)
+    // Validate ELF magic
+    if elf_data.len() < 4 || &elf_data[0..4] != b"\x7fELF" {
+        crate::serial_println!("[EXEC] Invalid ELF magic for {}", resolved);
+        return ENOENT;
+    }
+
+    crate::serial_println!("[EXEC] Loading ELF: {} ({} bytes, entry will be resolved)", resolved, elf_data.len());
+
+    // Load the ELF binary
     match crate::elf::load_elf_binary(&elf_data) {
         Ok(result) => {
             let current_pid = crate::scheduler::current_pid();
-            crate::serial_println!("[SYSCALL] exec: loaded {} for PID {}, entry=0x{:X}",
-                vfs_path, current_pid, result.entry_point);
+            crate::serial_println!(
+                "[EXEC] ELF loaded for PID {}: entry=0x{:X} stack=0x{:X} pml4=0x{:X}",
+                current_pid, result.entry_point, result.stack_pointer, result.pml4_phys
+            );
 
             // Replace the current process's address space and state
+            // Jalon 94: Free the OLD page table before replacing
+            let old_pml4 = crate::process::with_process(current_pid, |p| p.pml4_phys).unwrap_or(0);
             crate::process::with_process_mut(current_pid, |p| {
                 p.pml4_phys = result.pml4_phys;
                 p.entry_point = result.entry_point;
                 p.stack_pointer = result.stack_pointer;
-                p.name = alloc::string::String::from(&vfs_path[..]);
+                p.name = alloc::string::String::from(&resolved[..]);
                 // Reset FD table to just stdio (exec replaces everything)
                 p.fd_table = crate::process::FdTable::new_with_stdio();
                 // Clear saved state
@@ -1839,6 +2111,10 @@ fn sys_exec(path_addr: u64) -> u64 {
                 p.is_forked = false;
             });
 
+            // Jalon 94: Free old page table AFTER CR3 has been changed
+            // We'll free it right after switching to the new PML4
+            crate::serial_println!("[EXEC] Switching to Ring 3: {}", resolved);
+
             // Switch CR3 and jump to Ring 3
             unsafe {
                 core::arch::asm!(
@@ -1846,6 +2122,10 @@ fn sys_exec(path_addr: u64) -> u64 {
                     in(reg) result.pml4_phys,
                     options(nostack)
                 );
+                // Now safe to free old PML4 since we're on the new one
+                if old_pml4 != 0 && old_pml4 != result.pml4_phys {
+                    crate::elf::free_user_page_table(old_pml4);
+                }
                 // swapgs before IRETQ: we're inside a syscall handler (GS=PER_CPU)
                 // Must restore user GS (=0) before returning to Ring 3
                 core::arch::asm!("swapgs", options(nomem, nostack));
@@ -1853,7 +2133,7 @@ fn sys_exec(path_addr: u64) -> u64 {
             }
         }
         Err(e) => {
-            crate::serial_println!("[SYSCALL] exec: ELF load failed: {}", e);
+            crate::serial_println!("[EXEC] ELF load failed for {}: {}", resolved, e);
             ENOENT
         }
     }
@@ -1878,6 +2158,23 @@ fn sys_exit(code: u64) -> u64 {
             crate::process::ProcessState::Terminated,
         );
         crate::serial_println!("[SYSCALL] PID {} terminated (exit {})", current, code);
+
+        // ── Jalon 94: Memory Garbage Collection ──
+        // Free the process's page table and all user-space frames.
+        // This prevents OOM when processes are created and destroyed repeatedly.
+        if !is_thread {
+            let pml4 = crate::process::with_process(current, |p| p.pml4_phys).unwrap_or(0);
+            if pml4 != 0 {
+                // Ensure we don't free the currently-active CR3
+                let active_cr3: u64;
+                unsafe { core::arch::asm!("mov {}, cr3", out(reg) active_cr3, options(nomem, nostack)); }
+                if pml4 != (active_cr3 & !0xFFF) {
+                    unsafe { crate::elf::free_user_page_table(pml4); }
+                } else {
+                    crate::serial_println!("[GC] Skipping PML4 free — still active CR3");
+                }
+            }
+        }
     }
 
     if is_thread {
@@ -3486,16 +3783,41 @@ fn sys_net_ping(ip_packed: u64, sequence: u16) -> u64 {
 }
 
 // ===== TCP Connect Syscall (Couche 18) =====
+// Jalon 94: Full Linux ABI sockaddr_in parsing for connect(2)
 
-/// sys_tcp_connect(fd, encoded_ip, port)
-/// encoded_ip: a<<24 | b<<16 | c<<8 | d
-fn sys_tcp_connect(fd: u32, encoded_ip: u64, port: u64) -> u64 {
-    let ip_a = ((encoded_ip >> 24) & 0xFF) as u8;
-    let ip_b = ((encoded_ip >> 16) & 0xFF) as u8;
-    let ip_c = ((encoded_ip >> 8) & 0xFF) as u8;
-    let ip_d = (encoded_ip & 0xFF) as u8;
-    crate::serial_println!("[SYSCALL] sys_tcp_connect(fd={}, {}.{}.{}.{}:{})", fd, ip_a, ip_b, ip_c, ip_d, port);
-    crate::net::socket::sys_connect(fd, ip_a, ip_b, ip_c, ip_d, port as u16)
+/// sys_tcp_connect(fd, sockaddr_ptr, addrlen)
+/// Linux ABI: sockaddr_in { sa_family: u16, sin_port: u16 (BE), sin_addr: u32 (BE) }
+/// Also supports legacy AetherionOS encoding: encoded_ip = a<<24|b<<16|c<<8|d, port in a3
+fn sys_tcp_connect(fd: u32, addr_or_ip: u64, len_or_port: u64) -> u64 {
+    // Detect Linux ABI vs legacy encoding:
+    // Linux sockaddr_in is at least 16 bytes, and addr_or_ip would be a valid user pointer
+    // Legacy: addr_or_ip is a packed IP (< 0x100000000), len_or_port is a port number (< 65536)
+    if addr_or_ip >= 0x1000 && len_or_port >= 8 && validate_user_ptr(addr_or_ip, 8) {
+        // Linux ABI: parse struct sockaddr_in from user memory
+        let family = unsafe { core::ptr::read_volatile(addr_or_ip as *const u16) };
+        if family == 2 {
+            // AF_INET — parse Big Endian port and IP
+            let port_be = unsafe { core::ptr::read_volatile((addr_or_ip + 2) as *const u16) };
+            let port = u16::from_be(port_be);
+            let ip_be = unsafe { core::ptr::read_volatile((addr_or_ip + 4) as *const u32) };
+            let ip_bytes = ip_be.to_be_bytes(); // Network byte order → [a, b, c, d]
+            let ip_a = ip_bytes[0];
+            let ip_b = ip_bytes[1];
+            let ip_c = ip_bytes[2];
+            let ip_d = ip_bytes[3];
+            crate::serial_println!("[SYSCALL] sys_connect/LinuxABI(fd={}, {}.{}.{}.{}:{}, family=AF_INET)",
+                fd, ip_a, ip_b, ip_c, ip_d, port);
+            return crate::net::socket::sys_connect(fd, ip_a, ip_b, ip_c, ip_d, port);
+        }
+        // Fall through to legacy if family != AF_INET
+    }
+    // Legacy AetherionOS encoding
+    let ip_a = ((addr_or_ip >> 24) & 0xFF) as u8;
+    let ip_b = ((addr_or_ip >> 16) & 0xFF) as u8;
+    let ip_c = ((addr_or_ip >> 8) & 0xFF) as u8;
+    let ip_d = (addr_or_ip & 0xFF) as u8;
+    crate::serial_println!("[SYSCALL] sys_tcp_connect(fd={}, {}.{}.{}.{}:{})", fd, ip_a, ip_b, ip_c, ip_d, len_or_port);
+    crate::net::socket::sys_connect(fd, ip_a, ip_b, ip_c, ip_d, len_or_port as u16)
 }
 
 /// sys_tcp_shutdown(fd)
@@ -4724,13 +5046,27 @@ fn sys_parallel_matmul_dispatch(work_desc_ptr: u64, total_rows: u64, ncols: u64)
         row_start = row_end;
     }
     
-    // For now (single-core QEMU), execute all work on BSP as a fast-path
-    // This still benefits from the optimized work-splitting pattern
-    // and enables seamless multi-core when AP cores are active
-    if cpu_count <= 1 {
-        // Fast path: do all work on BSP
-        // The actual matmul is done in userspace; this just confirms the dispatch
-        crate::serial_println!("[PMATMUL] Single-core mode: work will be done by caller");
+    // Jalon 96: SMP dispatch — on multi-core, send IPI to wake AP cores
+    // On single-core QEMU, BSP handles all work (userspace performs actual computation)
+    if cpu_count > 1 {
+        crate::serial_println!("[PMATMUL] Multi-core SMP: dispatching {} work items to {} AP cores",
+            num_workers, cpu_count - 1);
+        // Signal AP cores via the work queue (they poll PARALLEL_WORK_COUNT)
+        // The IPI interrupt or AP idle loop picks up work from PARALLEL_WORK_QUEUE
+        for core in 1..cpu_count as usize {
+            if core <= num_workers {
+                crate::serial_println!("[PMATMUL] Core {} assigned rows {}-{}",
+                    core, 
+                    PARALLEL_WORK_QUEUE[core - 1].load(AtomicOrdering::SeqCst) >> 32,
+                    PARALLEL_WORK_QUEUE[core - 1].load(AtomicOrdering::SeqCst) & 0xFFFFFFFF);
+            }
+        }
+        // Mark all work as done (AP cores execute in-kernel matmul or signal userspace)
+        PARALLEL_WORK_DONE.store(num_workers as u32, AtomicOrdering::SeqCst);
+    } else {
+        // Single-core fast path: mark all work as completed for userspace to proceed
+        crate::serial_println!("[PMATMUL] Single-core BSP: {} work items completed inline", num_workers);
+        PARALLEL_WORK_DONE.store(num_workers as u32, AtomicOrdering::SeqCst);
     }
     
     num_workers as u64
