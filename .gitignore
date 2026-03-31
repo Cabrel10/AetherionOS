@@ -53,3 +53,5 @@ micro_model*
 */target
 userspace/agent_mcp/target/
 userspace/agent_validator/target/
+userspace/agent_mcp/target/
+userspace/agent_validator/target/
