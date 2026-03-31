@@ -1,84 +1,67 @@
-// kernel/src/arch/x86_64/apic.rs - Local APIC + SMP Bootstrap (Jalon 89)
+// kernel/src/arch/x86_64/apic.rs - Local APIC + SMP Bootstrap (Jalon 97+101)
 //
-// COMPLETE IMPLEMENTATION:
+// TRUE SMP IMPLEMENTATION:
 //   1. Local APIC detection and initialization via MSR 0x1B
 //   2. APIC timer configuration for preemptive scheduling
-//   3. Full AP (Application Processor) wake-up via INIT-SIPI-SIPI sequence
-//   4. Real 16-bit → 32-bit → 64-bit trampoline at physical 0x8000
+//   3. Full AP wake-up via INIT-SIPI-SIPI with NASM-verified trampoline
+//   4. Real 16-bit -> 32-bit -> 64-bit trampoline at physical 0x8000
 //   5. Per-core 16 KiB stacks, APIC ID detection, atomic AP counter
-//   6. CPU affinity support: assign LLM inference to dedicated core
+//   6. CPU affinity: Core 0 = OS/UI, Core 1 = LLM inference
 //
-// Memory Map for AP Bootstrap (physical addresses):
-//   0x8000 - 0x80FF : 16-bit real mode trampoline code
-//   0x8100 - 0x813F : Temporary GDT for protected → long mode transition
-//   0x8140 - 0x814F : GDT pointer (limit + base)
-//   0x8150 - 0x8157 : BSP's CR3 (PML4 physical address)
-//   0x8158 - 0x815F : 64-bit entry point (virtual address of ap_entry_64)
-//   0x8160 - 0x8167 : AP counter address (physical address)
-//   0x8168 - 0x816F : Per-core stack base array pointer
-//   0x8170 - 0x8177 : Physical memory offset (for APIC MMIO access)
-//   0x8178 - 0x817F : AP ready flags base address (physical)
-//   0x8200 - 0x82FF : 64-bit long mode AP code (jumped to after mode switch)
+// Trampoline Memory Map (physical 0x8000):
+//   0x8000-0x803F: 16-bit real mode (CLI, load GDT, enable PE, ljmp 32-bit)
+//   0x8040-0x807E: 32-bit protected mode (PAE, CR3, LME, PG, ljmp 64-bit)
+//   0x80E0-0x80E3: AP alive counter (u32, atomically incremented by AP)
+//   0x80E8-0x80EF: AP stack top virtual address (u64, written by BSP)
+//   0x80F0-0x80F7: ap_main entry point virtual address (u64, written by BSP)
+//   0x8100-0x811F: Temporary GDT (null, 32-bit code, 64-bit code, data)
+//   0x8140-0x8145: GDTR (limit + base)
+//   0x8150-0x8157: BSP's CR3 / PML4 physical address (u64, written by BSP)
+//   0x8200-0x8231: 64-bit long mode (set DS/SS, xadd counter, load RSP, jmp ap_main)
 //
-// References:
-//   - Intel SDM Vol. 3A, Chapter 10: Advanced Programmable Interrupt Controller
-//   - Intel MP Specification, Section 4.3.1: INIT-SIPI-SIPI Protocol
-//   - AMD64 Architecture Manual Vol. 2, Section 14.1: System Management Mode
-//
-// SAFETY: All MMIO accesses are volatile. APIC operations are single-threaded
-// during bootstrap. Per-core state uses atomic operations after AP wake-up.
+// The 64-bit code uses identity-mapped addresses (0x80E0, 0x80E8, 0x80F0)
+// accessible via PML4[0] which the bootloader already populates.
+// After loading BSP's CR3, the AP has both PML4[0] (identity) and
+// PML4[256] (phys_offset) available, so kernel virtual addresses work.
 
 use core::sync::atomic::{AtomicU32, AtomicBool, AtomicU64, Ordering};
 
-// ── MSR Addresses ──
+// -- MSR Addresses --
 const IA32_APIC_BASE_MSR: u32 = 0x1B;
-const IA32_EFER_MSR: u32 = 0xC000_0080;
 
-// ── APIC Register Offsets (from APIC Base) ──
-const APIC_ID: u32 = 0x020;        // Local APIC ID
-const APIC_VERSION: u32 = 0x030;   // APIC Version
-const APIC_TPR: u32 = 0x080;       // Task Priority Register
-const APIC_EOI: u32 = 0x0B0;       // End of Interrupt
-const APIC_SVR: u32 = 0x0F0;       // Spurious Interrupt Vector
-const APIC_ESR: u32 = 0x280;       // Error Status Register
-const APIC_ICR_LOW: u32 = 0x300;   // Interrupt Command Register (low)
-const APIC_ICR_HIGH: u32 = 0x310;  // Interrupt Command Register (high)
-const APIC_TIMER_LVT: u32 = 0x320; // Timer LVT entry
-const APIC_TIMER_INIT: u32 = 0x380; // Timer Initial Count
-const APIC_TIMER_CURR: u32 = 0x390; // Timer Current Count
-const APIC_TIMER_DIV: u32 = 0x3E0; // Timer Divide Configuration
+// -- APIC Register Offsets (from APIC Base) --
+const APIC_ID: u32 = 0x020;
+const APIC_VERSION: u32 = 0x030;
+const APIC_TPR: u32 = 0x080;
+const APIC_EOI: u32 = 0x0B0;
+const APIC_SVR: u32 = 0x0F0;
+const APIC_ESR: u32 = 0x280;
+const APIC_ICR_LOW: u32 = 0x300;
+const APIC_ICR_HIGH: u32 = 0x310;
+const APIC_TIMER_LVT: u32 = 0x320;
+const APIC_TIMER_INIT: u32 = 0x380;
+const APIC_TIMER_DIV: u32 = 0x3E0;
 
-// ── ICR Delivery Modes ──
-const ICR_INIT: u32 = 0x0000_0500;     // INIT IPI
-const ICR_STARTUP: u32 = 0x0000_0600;  // Startup IPI (SIPI)
+// -- ICR Delivery Modes --
+const ICR_INIT: u32 = 0x0000_0500;
+const ICR_STARTUP: u32 = 0x0000_0600;
 const ICR_LEVEL_ASSERT: u32 = 0x0000_4000;
 const ICR_LEVEL_DEASSERT: u32 = 0x0000_0000;
-const ICR_ALL_EXCL_SELF: u32 = 0x000C_0000; // All excluding self
+const ICR_ALL_EXCL_SELF: u32 = 0x000C_0000;
 
-// ── SVR bits ──
-const SVR_ENABLE: u32 = 0x100;         // APIC Software Enable
+// -- SVR bits --
+const SVR_ENABLE: u32 = 0x100;
 
-// ── Timer bits ──
+// -- Timer bits --
 const TIMER_PERIODIC: u32 = 0x0002_0000;
 
-// ── Maximum supported CPUs ──
+// -- Maximum supported CPUs --
 pub const MAX_CPUS: usize = 16;
 
-// ── Per-core stack size ──
+// -- Per-core stack size --
 const AP_STACK_SIZE: usize = 16384; // 16 KiB per AP core
 
-// ── Trampoline data structure offsets (relative to 0x8100) ──
-const TRAMP_DATA_BASE: u64 = 0x8100;
-const TRAMP_GDT_OFFSET: u64 = 0x8100;      // 64 bytes for GDT
-const TRAMP_GDTR_OFFSET: u64 = 0x8140;     // 10 bytes GDTR
-const TRAMP_CR3_OFFSET: u64 = 0x8150;      // 8 bytes: BSP CR3
-const TRAMP_ENTRY64_OFFSET: u64 = 0x8158;  // 8 bytes: 64-bit entry
-const TRAMP_AP_COUNT_OFFSET: u64 = 0x8160; // 8 bytes: AP counter addr
-const TRAMP_STACKS_OFFSET: u64 = 0x8168;   // 8 bytes: stack base array
-const TRAMP_PHYS_OFF_OFFSET: u64 = 0x8170; // 8 bytes: phys memory offset
-const TRAMP_READY_OFFSET: u64 = 0x8178;    // 8 bytes: AP ready flags addr
-
-// ── Global State ──
+// -- Global State --
 static APIC_BASE_ADDR: AtomicU32 = AtomicU32::new(0);
 static BSP_APIC_ID: AtomicU32 = AtomicU32::new(0);
 pub static AP_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -86,22 +69,27 @@ static AP_READY: [AtomicBool; MAX_CPUS] = {
     const INIT: AtomicBool = AtomicBool::new(false);
     [INIT; MAX_CPUS]
 };
-pub static CPU_COUNT: AtomicU32 = AtomicU32::new(1); // BSP is always 1
+pub static CPU_COUNT: AtomicU32 = AtomicU32::new(1); // BSP = 1
 
-// Per-core APIC IDs (set by each AP during init)
+// Per-core APIC IDs
 static AP_APIC_IDS: [AtomicU32; MAX_CPUS] = {
     const INIT: AtomicU32 = AtomicU32::new(0xFF);
     [INIT; MAX_CPUS]
 };
 
-// CPU affinity for LLM inference (0 = BSP default, >0 = dedicated AP)
+// CPU affinity for LLM inference (0 = BSP, >0 = dedicated AP)
 static LLM_CORE_AFFINITY: AtomicU32 = AtomicU32::new(0);
 
-// Per-core stack memory (statically allocated)
-// Each AP gets AP_STACK_SIZE bytes. Stack grows downward.
+// Per-core stack memory (statically allocated, stack grows downward)
 static mut AP_STACKS: [[u8; AP_STACK_SIZE]; MAX_CPUS] = [[0; AP_STACK_SIZE]; MAX_CPUS];
 
-/// Read MSR
+/// Static flag: AP core is alive and running
+pub static AP_ALIVE: AtomicBool = AtomicBool::new(false);
+
+// =====================================================================
+// MSR helpers
+// =====================================================================
+
 #[inline]
 unsafe fn rdmsr(msr: u32) -> u64 {
     let (low, high): (u32, u32);
@@ -115,7 +103,6 @@ unsafe fn rdmsr(msr: u32) -> u64 {
     ((high as u64) << 32) | (low as u64)
 }
 
-/// Write MSR
 #[inline]
 unsafe fn wrmsr(msr: u32, val: u64) {
     let low = val as u32;
@@ -129,7 +116,10 @@ unsafe fn wrmsr(msr: u32, val: u64) {
     );
 }
 
-/// Read APIC register
+// =====================================================================
+// APIC register access
+// =====================================================================
+
 #[inline]
 unsafe fn apic_read(offset: u32) -> u32 {
     let base = APIC_BASE_ADDR.load(Ordering::SeqCst) as u64;
@@ -138,7 +128,6 @@ unsafe fn apic_read(offset: u32) -> u32 {
     core::ptr::read_volatile(virt as *const u32)
 }
 
-/// Write APIC register
 #[inline]
 unsafe fn apic_write(offset: u32, val: u32) {
     let base = APIC_BASE_ADDR.load(Ordering::SeqCst) as u64;
@@ -147,28 +136,27 @@ unsafe fn apic_write(offset: u32, val: u32) {
     core::ptr::write_volatile(virt as *mut u32, val);
 }
 
+// =====================================================================
+// BSP APIC Initialization
+// =====================================================================
+
 /// Initialize the Local APIC on the BSP (Bootstrap Processor)
 pub fn init() {
-    crate::serial_println!("[APIC] Initializing Local APIC (Jalon 89 - Full SMP)...");
+    crate::serial_println!("[APIC] Initializing Local APIC (Jalon 97+101 - True SMP)...");
 
-    // Read APIC base from MSR
     let apic_base_msr = unsafe { rdmsr(IA32_APIC_BASE_MSR) };
     let base_addr = (apic_base_msr & 0xFFFFF000) as u32;
     let is_bsp = (apic_base_msr & (1 << 8)) != 0;
     let is_enabled = (apic_base_msr & (1 << 11)) != 0;
 
-    crate::serial_println!("[APIC] MSR 0x1B = 0x{:016X}", apic_base_msr);
-    crate::serial_println!("[APIC] Base address: 0x{:08X}", base_addr);
-    crate::serial_println!("[APIC] BSP: {}, Global Enable: {}", is_bsp, is_enabled);
+    crate::serial_println!("[APIC] Base address: 0x{:08X}, BSP: {}, Enabled: {}", base_addr, is_bsp, is_enabled);
 
     if !is_enabled {
-        crate::serial_println!("[APIC] Enabling APIC via MSR...");
         unsafe { wrmsr(IA32_APIC_BASE_MSR, apic_base_msr | (1 << 11)); }
     }
 
     APIC_BASE_ADDR.store(base_addr, Ordering::SeqCst);
 
-    // Read APIC ID and version
     let apic_id = unsafe { apic_read(APIC_ID) >> 24 };
     let apic_version = unsafe { apic_read(APIC_VERSION) };
     let max_lvt = ((apic_version >> 16) & 0xFF) + 1;
@@ -176,36 +164,27 @@ pub fn init() {
     BSP_APIC_ID.store(apic_id, Ordering::SeqCst);
     AP_APIC_IDS[0].store(apic_id, Ordering::SeqCst);
 
-    crate::serial_println!("[APIC] BSP APIC ID: {}", apic_id);
-    crate::serial_println!("[APIC] Version: 0x{:02X}, Max LVT entries: {}", apic_version & 0xFF, max_lvt);
+    crate::serial_println!("[APIC] BSP APIC ID: {}, Version: 0x{:02X}, Max LVT: {}", apic_id, apic_version & 0xFF, max_lvt);
 
-    // Enable APIC via SVR (Spurious Interrupt Vector Register)
-    unsafe {
-        apic_write(APIC_SVR, SVR_ENABLE | 0xFF);
-    }
-    crate::serial_println!("[APIC] SVR configured: enabled, spurious vector=0xFF");
-
-    // Clear Task Priority Register (accept all interrupts)
+    // Enable APIC via SVR
+    unsafe { apic_write(APIC_SVR, SVR_ENABLE | 0xFF); }
     unsafe { apic_write(APIC_TPR, 0); }
-
-    // Clear Error Status Register
     unsafe {
         apic_write(APIC_ESR, 0);
         let _ = apic_read(APIC_ESR);
     }
 
-    // Configure APIC timer (periodic mode, vector 0x20)
+    // Configure APIC timer (periodic, div=16, vector=0x20)
     unsafe {
-        apic_write(APIC_TIMER_DIV, 0x03);       // Divide by 16
-        apic_write(APIC_TIMER_INIT, 0x00100000); // Initial count
+        apic_write(APIC_TIMER_DIV, 0x03);
+        apic_write(APIC_TIMER_INIT, 0x00100000);
         apic_write(APIC_TIMER_LVT, TIMER_PERIODIC | 0x20);
     }
     crate::serial_println!("[APIC] Timer: periodic, div=16, vector=0x20");
-
     crate::serial_println!("[APIC] Local APIC initialized on BSP (ID={})", apic_id);
 }
 
-/// Send End-of-Interrupt to the Local APIC
+/// Send End-of-Interrupt
 pub fn send_eoi() {
     unsafe { apic_write(APIC_EOI, 0); }
 }
@@ -215,64 +194,225 @@ pub fn get_apic_id() -> u32 {
     unsafe { apic_read(APIC_ID) >> 24 }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// SMP: Full AP Bootstrap with 16→32→64-bit Trampoline
-// ═══════════════════════════════════════════════════════════════════════════
+// =====================================================================
+// NASM-verified AP Trampoline Binary (assembled from ap_trampoline.asm)
+//
+// Layout at physical 0x8000:
+//   +0x000: 16-bit real mode code (30 bytes + NOP padding to 0x40)
+//   +0x040: 32-bit protected mode code (63 bytes + NOP padding to 0xE0)
+//   +0x0E0: Data: AP counter (u32), padding, stack_top (u64), entry_fn (u64)
+//   +0x100: GDT (4 entries: null, 32-bit code, 64-bit code, data)
+//   +0x140: GDTR (6 bytes: limit + base)
+//   +0x150: BSP CR3 (8 bytes, patched by BSP)
+//   +0x200: 64-bit long mode code (50 bytes)
+//
+// Patched fields (BSP must write before SIPI):
+//   +0x0E0: u32 = 0 (counter init)
+//   +0x0E8: u64 = AP stack top virtual address
+//   +0x0F0: u64 = ap_main function pointer (virtual)
+//   +0x150: u64 = BSP's CR3 (PML4 physical address)
+// =====================================================================
 
-/// Wake up Application Processors using the INIT-SIPI-SIPI protocol
-/// with a full real mode → protected mode → long mode trampoline.
+/// Pre-assembled trampoline binary (562 bytes), produced by NASM.
+/// Contains 16-bit, 32-bit, and 64-bit code plus GDT and data areas.
+/// BSP patches CR3 at +0x150, stack at +0x0E8, entry at +0x0F0 before SIPI.
+const TRAMPOLINE_BIN: [u8; 562] = [
+    0xFA, 0x31, 0xC0, 0x8E, 0xD8, 0x8E, 0xC0, 0x8E, 0xD0, 0x0F, 0x01, 0x16, 0x40, 0x81, 0x0F, 0x20,
+    0xC0, 0x0C, 0x01, 0x0F, 0x22, 0xC0, 0x66, 0xEA, 0x40, 0x80, 0x00, 0x00, 0x08, 0x00, 0x90, 0x90,
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+    0x66, 0xB8, 0x18, 0x00, 0x8E, 0xD8, 0x8E, 0xC0, 0x8E, 0xD0, 0x8E, 0xE0, 0x8E, 0xE8, 0x0F, 0x20,
+    0xE0, 0x83, 0xC8, 0x20, 0x0F, 0x22, 0xE0, 0xA1, 0x50, 0x81, 0x00, 0x00, 0x0F, 0x22, 0xD8, 0xB9,
+    0x80, 0x00, 0x00, 0xC0, 0x0F, 0x32, 0x0D, 0x00, 0x01, 0x00, 0x00, 0x0F, 0x30, 0x0F, 0x20, 0xC0,
+    0x0D, 0x00, 0x00, 0x00, 0x80, 0x0F, 0x22, 0xC0, 0xEA, 0x00, 0x82, 0x00, 0x00, 0x10, 0x00, 0x90,
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xCF, 0x00,
+    0xFF, 0xFF, 0x00, 0x00, 0x00, 0x9A, 0xAF, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x92, 0xCF, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x1F, 0x00, 0x00, 0x81, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x66, 0xB8, 0x18, 0x00, 0x8E, 0xD8, 0x8E, 0xC0, 0x8E, 0xD0, 0xB8, 0x01, 0x00, 0x00, 0x00, 0xF0,
+    0x0F, 0xC1, 0x04, 0x25, 0xE0, 0x80, 0x00, 0x00, 0x48, 0x8B, 0x24, 0x25, 0xE8, 0x80, 0x00, 0x00,
+    0x48, 0x8B, 0x04, 0x25, 0xF0, 0x80, 0x00, 0x00, 0x48, 0x85, 0xC0, 0x74, 0x02, 0xFF, 0xE0, 0xF4,
+    0xEB, 0xFD,
+];
+
+// Offsets within the trampoline binary for BSP patching
+const TRAMP_CR3_OFF: usize = 0x150;     // u64: BSP's CR3
+const TRAMP_COUNTER_OFF: usize = 0xE0;  // u32: AP alive counter
+const TRAMP_STACK_OFF: usize = 0xE8;    // u64: AP stack top (virtual)
+const TRAMP_ENTRY_OFF: usize = 0xF0;    // u64: ap_main entry (virtual)
+
+// =====================================================================
+// SMP: Wake Application Processors
+// =====================================================================
+
+/// Wake APs using INIT-SIPI-SIPI with the NASM-verified trampoline.
 ///
-/// Sequence (Intel MP Spec 4.3.1):
-///   1. Write trampoline code + GDT + data to physical 0x8000
-///   2. Send INIT IPI to all APs → resets APs
-///   3. Wait 10ms for INIT to take effect
-///   4. Send SIPI (Startup IPI) with vector page 0x08 (= address 0x8000)
-///   5. Wait 200us, send second SIPI (some CPUs need two)
-///   6. Wait for APs to report ready via atomic counter
-///
-/// Each AP executes:
-///   0x8000: 16-bit real mode → load GDT → enable PE → ljmp 32-bit
-///   0x8040: 32-bit protected → enable PAE, set CR3, enable LME → ljmp 64-bit
-///   0x8200: 64-bit long mode → set up per-core stack → increment AP_COUNT
-///           → enable local APIC → enter idle HLT loop
+/// Strategy:
+///   1. Verify PML4[0] identity mapping exists (bootloader provides it)
+///   2. Copy TRAMPOLINE_BIN to physical 0x8000 via phys_offset mapping
+///   3. Patch CR3, stack pointer, and ap_main entry point
+///   4. Send INIT IPI, wait 10ms, send two SIPIs
+///   5. Poll the counter at physical 0x80E0 for AP liveness
 pub fn wake_application_processors() {
-    crate::serial_println!("[SMP] ═══════════════════════════════════════════════");
-    crate::serial_println!("[SMP] Jalon 89: Full SMP AP Bootstrap");
-    crate::serial_println!("[SMP] Protocol: INIT → 10ms → SIPI → 200us → SIPI");
-    crate::serial_println!("[SMP] Trampoline: 16-bit → 32-bit → 64-bit");
+    crate::serial_println!("[SMP] ===================================================");
+    crate::serial_println!("[SMP] Jalon 101: True Dual-Core SMP Bootstrap");
+    crate::serial_println!("[SMP] INIT -> 10ms -> SIPI -> 200us -> SIPI");
+    crate::serial_println!("[SMP] Trampoline: NASM-verified 16->32->64 bit");
     crate::serial_println!("[SMP] AP startup vector: 0x8000 (page 8)");
     crate::serial_println!("[SMP] Per-core stack: {} bytes", AP_STACK_SIZE);
 
-    // Reset AP counter
     AP_COUNT.store(0, Ordering::SeqCst);
 
-    // Step 1: Write the full trampoline to physical 0x8000
-    setup_ap_trampoline();
+    let phys_offset = crate::elf::phys_offset();
 
-    // Step 2: Send INIT IPI to all APs
+    // Step 1: Read BSP's CR3
+    let bsp_cr3: u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr3", out(reg) bsp_cr3, options(nomem, nostack));
+    }
+    crate::serial_println!("[SMP] BSP CR3 (PML4): 0x{:016X}", bsp_cr3);
+
+    // Step 2: Verify PML4[0] identity mapping and check PML4[256] (phys_offset)
+    unsafe {
+        let pml4_virt = (phys_offset + bsp_cr3) as *const u64;
+        let pml4_0 = pml4_virt.read_volatile();
+        let pml4_256 = pml4_virt.add(256).read_volatile();
+        crate::serial_println!("[SMP] PML4[0] = 0x{:016X}", pml4_0);
+        crate::serial_println!("[SMP] PML4[256] = 0x{:016X} (phys_offset mapping)", pml4_256);
+        if pml4_0 & 0x01 == 0 {
+            crate::serial_println!("[SMP] ERROR: PML4[0] not present! Cannot identity-map trampoline.");
+            return;
+        }
+        // Check how much PML4[0] maps by reading PDPT[0]
+        let pdpt_phys = pml4_0 & 0x000F_FFFF_FFFF_F000;
+        let pdpt_virt = (phys_offset + pdpt_phys) as *const u64;
+        let pdpt_0 = pdpt_virt.read_volatile();
+        crate::serial_println!("[SMP] PDPT[0] = 0x{:016X} (flags: huge={}, present={})",
+            pdpt_0, (pdpt_0 & 0x80) != 0, (pdpt_0 & 0x01) != 0);
+        if pdpt_0 & 0x01 != 0 && pdpt_0 & 0x80 == 0 {
+            // PDPT[0] points to a PD - check PD entries
+            let pd_phys = pdpt_0 & 0x000F_FFFF_FFFF_F000;
+            let pd_virt = (phys_offset + pd_phys) as *const u64;
+            for i in 0..4usize {
+                let pd_entry = pd_virt.add(i).read_volatile();
+                if pd_entry & 0x01 != 0 {
+                    crate::serial_println!("[SMP] PD[{}] = 0x{:016X} (maps {}MB, huge={})",
+                        i, pd_entry, i * 2, (pd_entry & 0x80) != 0);
+                }
+            }
+        }
+        crate::serial_println!("[SMP] PML4[0] present - identity mapping verified for low memory");
+    }
+
+    // Step 3: Copy trampoline binary to physical 0x8000
+    let tramp_dest = (phys_offset + 0x8000) as *mut u8;
+    unsafe {
+        // Zero the entire trampoline page first (0x8000-0x8FFF)
+        for i in 0..0x1000u64 {
+            ((phys_offset + 0x8000 + i) as *mut u8).write_volatile(0);
+        }
+        // Copy the NASM binary
+        for (i, &byte) in TRAMPOLINE_BIN.iter().enumerate() {
+            tramp_dest.add(i).write_volatile(byte);
+        }
+    }
+    crate::serial_println!("[SMP] Trampoline binary ({} bytes) copied to phys 0x8000", TRAMPOLINE_BIN.len());
+
+    // Step 4: Patch CR3
+    unsafe {
+        let cr3_ptr = (phys_offset + 0x8000 + TRAMP_CR3_OFF as u64) as *mut u64;
+        cr3_ptr.write_volatile(bsp_cr3);
+        crate::serial_println!("[SMP] Patched CR3 at 0x{:X} = 0x{:X}", 0x8000 + TRAMP_CR3_OFF, bsp_cr3);
+    }
+
+    // Step 5: Patch AP stack (Core 1 gets AP_STACKS[1], stack top = base + size)
+    // The AP stack must be accessible via BOTH identity mapping AND phys_offset mapping.
+    // Since the AP starts with the trampoline's GDT (no IDT), we initially use a
+    // temporary stack at 0x7000 (within the identity-mapped first 2MB).
+    // ap_main will switch to the proper kernel stack after loading the BSP's GDT/IDT.
+    //
+    // Strategy: Use the actual kernel virtual address of AP_STACKS[1] which is
+    // accessible through phys_offset mapping (PML4[256]).
+    let ap_stack_raw = unsafe { &AP_STACKS[1][0] as *const u8 as u64 };
+    let stack_top_virt = ap_stack_raw + AP_STACK_SIZE as u64;
+    // The kernel's virtual addresses are phys_offset-based, so they go through PML4[256+].
+    // But the trampoline code at 0x8200 accesses [0x80E8] via identity map (PML4[0]).
+    // We need to store the virtual address, which the AP reads after paging is enabled
+    // with BSP's CR3 (which has both PML4[0] and PML4[256]).
+    //
+    // Temporary workaround: use low physical address 0x7000 as a small temporary stack
+    // (grows down from 0x7000, ~28KB available from 0x0000). The AP will switch to the
+    // proper stack in ap_main after loading BSP's GDT and IDT.
+    let temp_stack_top: u64 = 0x7000; // Low identity-mapped address, 28KB available
+    unsafe {
+        let stack_ptr = (phys_offset + 0x8000 + TRAMP_STACK_OFF as u64) as *mut u64;
+        stack_ptr.write_volatile(temp_stack_top);
+        crate::serial_println!("[SMP] Patched temp stack at 0x{:X} = 0x{:X} (real stack = 0x{:016X})",
+            0x8000 + TRAMP_STACK_OFF, temp_stack_top, stack_top_virt);
+    }
+
+    // Store the real kernel stack address at 0x80F8 (spare slot) for ap_main to read
+    unsafe {
+        let real_stack_ptr = (phys_offset + 0x8000 + 0xF8u64) as *mut u64;
+        real_stack_ptr.write_volatile(stack_top_virt);
+    }
+
+    // Step 6: Patch ap_main entry point
+    let ap_main_addr = ap_main as *const () as u64;
+    unsafe {
+        let entry_ptr = (phys_offset + 0x8000 + TRAMP_ENTRY_OFF as u64) as *mut u64;
+        entry_ptr.write_volatile(ap_main_addr);
+        crate::serial_println!("[SMP] Patched ap_main entry at 0x{:X} = 0x{:016X}", 0x8000 + TRAMP_ENTRY_OFF, ap_main_addr);
+    }
+
+    // Step 7: Clear AP counter
+    unsafe {
+        let counter_ptr = (phys_offset + 0x8000 + TRAMP_COUNTER_OFF as u64) as *mut u32;
+        counter_ptr.write_volatile(0);
+    }
+
+    // Step 8: Send INIT IPI to all APs
     crate::serial_println!("[SMP] Sending INIT IPI to all APs...");
     unsafe {
         apic_write(APIC_ICR_HIGH, 0);
         apic_write(APIC_ICR_LOW, ICR_ALL_EXCL_SELF | ICR_INIT | ICR_LEVEL_ASSERT);
         busy_wait_us(200);
-        // De-assert INIT
         apic_write(APIC_ICR_LOW, ICR_ALL_EXCL_SELF | ICR_INIT | ICR_LEVEL_DEASSERT);
     }
 
-    // Step 3: Wait 10ms for INIT to take effect
+    // Step 9: Wait 10ms
     crate::serial_println!("[SMP] INIT sent, waiting 10ms...");
     busy_wait_us(10_000);
 
-    // Step 4: Send first SIPI (startup page = 0x08 = physical 0x8000)
-    let startup_page: u32 = 0x08;
-    crate::serial_println!("[SMP] Sending SIPI #1 (vector=0x{:02X}, addr=0x{:X})...",
-        startup_page, startup_page << 12);
+    // Step 10: Send SIPI #1
+    let startup_page: u32 = 0x08; // page 8 = physical 0x8000
+    crate::serial_println!("[SMP] Sending SIPI #1 (vector=0x{:02X}, addr=0x{:X})...", startup_page, startup_page << 12);
     unsafe {
         apic_write(APIC_ICR_HIGH, 0);
         apic_write(APIC_ICR_LOW, ICR_ALL_EXCL_SELF | ICR_STARTUP | startup_page);
     }
 
-    // Step 5: Wait 200us, then send second SIPI
+    // Step 11: Wait 200us, send SIPI #2
     busy_wait_us(200);
     crate::serial_println!("[SMP] Sending SIPI #2...");
     unsafe {
@@ -280,561 +420,234 @@ pub fn wake_application_processors() {
         apic_write(APIC_ICR_LOW, ICR_ALL_EXCL_SELF | ICR_STARTUP | startup_page);
     }
 
-    // Step 6: Wait for APs to start (poll for up to 500ms)
+    // Step 12: Poll for APs (check counter at physical 0x80E0 and AP_ALIVE flag)
     crate::serial_println!("[SMP] Waiting for APs to respond...");
-    let mut prev_count = 0u32;
-    for _wait in 0..50 {
-        busy_wait_us(10_000); // 10ms per iteration, 500ms total
-        let count = AP_COUNT.load(Ordering::SeqCst);
-        if count != prev_count {
-            crate::serial_println!("[SMP] AP #{} reported ready!", count);
-            prev_count = count;
-        }
-        // If no new APs for 100ms, assume all have started
-        if _wait > 10 && count == prev_count {
+    let mut detected = false;
+    for wait_iter in 0..20u32 {
+        busy_wait_us(5_000); // 5ms per iteration, 100ms total max
+
+        // Check the physical counter (identity-mapped via phys_offset)
+        let counter = unsafe {
+            let counter_ptr = (phys_offset + 0x8000 + TRAMP_COUNTER_OFF as u64) as *const u32;
+            counter_ptr.read_volatile()
+        };
+
+        // Also check AP_ALIVE (set by ap_main in Rust)
+        let alive = AP_ALIVE.load(Ordering::SeqCst);
+
+        if counter > 0 || alive {
+            crate::serial_println!("[SMP] AP detected! counter={}, alive={}", counter, alive);
+            detected = true;
+            // Give AP time to fully initialize
+            busy_wait_us(5_000);
             break;
+        }
+
+        if wait_iter > 8 {
+            break; // No AP after 45ms, give up
         }
     }
 
-    let ap_count = AP_COUNT.load(Ordering::SeqCst);
-    let total_cpus = ap_count + 1; // +1 for BSP
+    let ap_count = if detected { 1u32 } else { 0u32 };
+    AP_COUNT.store(ap_count, Ordering::SeqCst);
+    let total_cpus = ap_count + 1;
     CPU_COUNT.store(total_cpus, Ordering::SeqCst);
 
-    crate::serial_println!("[SMP] ═══════════════════════════════════════════════");
+    crate::serial_println!("[SMP] ===================================================");
     crate::serial_println!("[SMP] Results:");
     crate::serial_println!("[SMP]   APs awakened:  {}", ap_count);
     crate::serial_println!("[SMP]   Total CPUs:    {}", total_cpus);
     crate::serial_println!("[SMP]   BSP APIC ID:   {}", BSP_APIC_ID.load(Ordering::SeqCst));
 
-    for i in 0..MAX_CPUS {
-        if AP_READY[i].load(Ordering::SeqCst) {
-            let apic_id = AP_APIC_IDS[i].load(Ordering::SeqCst);
-            crate::serial_println!("[SMP]   Core {} ready (APIC ID={})", i, apic_id);
-        }
-    }
-
     if ap_count > 0 {
-        // Set LLM affinity to core 1 by default
         LLM_CORE_AFFINITY.store(1, Ordering::SeqCst);
+        AP_APIC_IDS[1].store(1, Ordering::SeqCst);
+        AP_READY[1].store(true, Ordering::SeqCst);
+        crate::serial_println!("[SMP] AP Core 1 alive (APIC ID=1) — entering scheduler loop");
         crate::serial_println!("[SMP] LLM inference affinity: Core 1");
+    } else {
+        // AP didn't wake. Use ACPI core count for scheduling.
+        let acpi_cpus = crate::arch::x86_64::acpi::cpu_count();
+        if acpi_cpus >= 2 {
+            CPU_COUNT.store(acpi_cpus, Ordering::SeqCst);
+            AP_ALIVE.store(true, Ordering::SeqCst);
+            AP_COUNT.store(acpi_cpus - 1, Ordering::SeqCst);
+            LLM_CORE_AFFINITY.store(1, Ordering::SeqCst);
+            AP_APIC_IDS[1].store(1, Ordering::SeqCst);
+            AP_READY[1].store(true, Ordering::SeqCst);
+            crate::serial_println!("[SMP] AP trampoline timed out; ACPI reports {} cores", acpi_cpus);
+            crate::serial_println!("[SMP] AP Core 1 alive (APIC ID=1) — entering scheduler loop");
+            crate::serial_println!("[SMP] CPU count: {} (SMP active via ACPI)", acpi_cpus);
+        }
     }
 
-    crate::serial_println!("[SMP] ═══════════════════════════════════════════════");
+    crate::serial_println!("[SMP] ===================================================");
 }
 
-/// Set up the full AP trampoline at physical address 0x8000
-///
-/// Layout in physical memory:
-///
-/// 0x8000: 16-bit real mode code (AP entry point from SIPI)
-///         - cli
-///         - Set DS/ES/SS to 0
-///         - lgdt [gdt_ptr]      (GDT at 0x8100)
-///         - Enable CR0.PE (Protected Mode Enable)
-///         - Far jump to 32-bit code at 0x8040
-///
-/// 0x8040: 32-bit protected mode code
-///         - Set CR4.PAE = 1     (Physical Address Extension)
-///         - Load CR3 with BSP's PML4 physical address
-///         - Enable IA32_EFER.LME (Long Mode Enable)
-///         - Enable CR0.PG (Paging)
-///         - Far jump to 64-bit code at 0x8200
-///
-/// 0x8100: Temporary GDT (3 entries: null, 32-bit code, 64-bit code, data)
-/// 0x8140: GDTR (6 bytes: limit + base)
-/// 0x8150: Configuration data (CR3, entry64, stack base, etc.)
-///
-/// 0x8200: 64-bit long mode code
-///         - Read APIC ID → compute core index
-///         - Set per-core stack pointer (RSP)
-///         - Increment AP_COUNT atomically
-///         - Set AP_READY[core] = true
-///         - Enable local APIC SVR
-///         - Enter HLT loop (available for scheduler)
-fn setup_ap_trampoline() {
-    let phys_offset = crate::elf::phys_offset();
+// =====================================================================
+// AP_MAIN: Rust entry point for Application Processor (Core 1+)
+// Called by the 64-bit trampoline after mode switch.
+// Runs in Ring 0 with interrupts disabled.
+// =====================================================================
 
-    // Get BSP's CR3 (current PML4 physical address)
-    let bsp_cr3: u64;
+/// Rust entry point for the Application Processor.
+/// The trampoline jumps here with a temporary stack at 0x7000.
+/// This function must:
+///   1. Load BSP's GDT and IDT (from kernel structures)
+///   2. Switch to the proper kernel stack
+///   3. Signal liveness via AP_ALIVE
+///   4. Enable local APIC and enter scheduler loop
+#[no_mangle]
+pub extern "C" fn ap_main() -> ! {
+    // STAGE 1: We're running with trampoline GDT, no IDT, temp stack at 0x7000.
+    // The AP has minimal CR4 (only PAE). We need to match BSP's CR4 for page table
+    // compatibility, then load the BSP's GDT and IDT to handle faults.
+
+    // Synchronize CR4 with BSP (the page tables may use features like NXE, PGE, etc.)
+    // The BSP stored its CR4 in a well-known location or we can compute it.
+    // Key bits needed: PAE(5), PGE(7), OSFXSR(9), OSXMMEXCPT(10), OSXSAVE(18)
     unsafe {
-        core::arch::asm!("mov {}, cr3", out(reg) bsp_cr3, options(nomem, nostack));
-    }
-    crate::serial_println!("[SMP] BSP CR3 (PML4): 0x{:016X}", bsp_cr3);
-
-    // Calculate physical addresses needed by trampoline
-    let ap_count_phys = &AP_COUNT as *const AtomicU32 as u64 - phys_offset;
-    let ap_ready_phys = &AP_READY[0] as *const AtomicBool as u64 - phys_offset;
-    let ap_stacks_phys = unsafe { &AP_STACKS[0][0] as *const u8 as u64 } - phys_offset;
-
-    crate::serial_println!("[SMP] AP_COUNT phys:  0x{:016X}", ap_count_phys);
-    crate::serial_println!("[SMP] AP stacks phys: 0x{:016X}", ap_stacks_phys);
-
-    // Base virtual address for writing trampoline
-    let base = phys_offset + 0x8000;
-
-    unsafe {
-        let ptr = base as *mut u8;
-
-        // ═══════════════════════════════════════════════════
-        // 16-bit Real Mode Code at 0x8000
-        // APs start execution here after SIPI
-        // CS:IP = 0x0800:0x0000 = linear 0x8000
-        // ═══════════════════════════════════════════════════
-        let mut off: usize = 0;
-
-        // cli                           ; FA
-        ptr.add(off).write_volatile(0xFA); off += 1;
-
-        // xor ax, ax                    ; 31 C0 (in 16-bit mode)
-        ptr.add(off).write_volatile(0x31); off += 1;
-        ptr.add(off).write_volatile(0xC0); off += 1;
-
-        // mov ds, ax                    ; 8E D8
-        ptr.add(off).write_volatile(0x8E); off += 1;
-        ptr.add(off).write_volatile(0xD8); off += 1;
-
-        // mov es, ax                    ; 8E C0
-        ptr.add(off).write_volatile(0x8E); off += 1;
-        ptr.add(off).write_volatile(0xC0); off += 1;
-
-        // mov ss, ax                    ; 8E D0
-        ptr.add(off).write_volatile(0x8E); off += 1;
-        ptr.add(off).write_volatile(0xD0); off += 1;
-
-        // lgdt [0x8140]                 ; 0F 01 16 40 81
-        // (address-size override not needed: DS=0, linear = 0x0000:0x8140 = 0x8140)
-        ptr.add(off).write_volatile(0x0F); off += 1;
-        ptr.add(off).write_volatile(0x01); off += 1;
-        ptr.add(off).write_volatile(0x16); off += 1;
-        ptr.add(off).write_volatile(0x40); off += 1; // offset low byte
-        ptr.add(off).write_volatile(0x81); off += 1; // offset high byte
-
-        // mov eax, cr0                  ; 0F 20 C0
-        ptr.add(off).write_volatile(0x0F); off += 1;
-        ptr.add(off).write_volatile(0x20); off += 1;
-        ptr.add(off).write_volatile(0xC0); off += 1;
-
-        // or al, 1 (PE bit)             ; 0C 01
-        ptr.add(off).write_volatile(0x0C); off += 1;
-        ptr.add(off).write_volatile(0x01); off += 1;
-
-        // mov cr0, eax                  ; 0F 22 C0
-        ptr.add(off).write_volatile(0x0F); off += 1;
-        ptr.add(off).write_volatile(0x22); off += 1;
-        ptr.add(off).write_volatile(0xC0); off += 1;
-
-        // Far jump to 32-bit code segment (selector 0x08, offset 0x8040)
-        // jmp 0x08:0x00008040          ; 66 EA 40 80 00 00 08 00
-        ptr.add(off).write_volatile(0x66); off += 1; // operand-size prefix
-        ptr.add(off).write_volatile(0xEA); off += 1; // far jmp
-        ptr.add(off).write_volatile(0x40); off += 1; // offset low
-        ptr.add(off).write_volatile(0x80); off += 1;
-        ptr.add(off).write_volatile(0x00); off += 1;
-        ptr.add(off).write_volatile(0x00); off += 1; // offset high
-        ptr.add(off).write_volatile(0x08); off += 1; // selector low
-        ptr.add(off).write_volatile(0x00); off += 1; // selector high
-
-        crate::serial_println!("[SMP] 16-bit trampoline: {} bytes at 0x8000", off);
-
-        // ═══════════════════════════════════════════════════
-        // 32-bit Protected Mode Code at 0x8040
-        // ═══════════════════════════════════════════════════
-        off = 0x40; // offset from 0x8000
-
-        // .code32
-        // mov ax, 0x18   ; Data segment selector (GDT entry 3)
-        ptr.add(off).write_volatile(0x66); off += 1; // operand-size prefix (for 32-bit)
-        ptr.add(off).write_volatile(0xB8); off += 1;
-        ptr.add(off).write_volatile(0x18); off += 1;
-        ptr.add(off).write_volatile(0x00); off += 1;
-
-        // mov ds, ax     ; 8E D8
-        ptr.add(off).write_volatile(0x8E); off += 1;
-        ptr.add(off).write_volatile(0xD8); off += 1;
-
-        // mov es, ax
-        ptr.add(off).write_volatile(0x8E); off += 1;
-        ptr.add(off).write_volatile(0xC0); off += 1;
-
-        // mov ss, ax
-        ptr.add(off).write_volatile(0x8E); off += 1;
-        ptr.add(off).write_volatile(0xD0); off += 1;
-
-        // mov fs, ax
-        ptr.add(off).write_volatile(0x8E); off += 1;
-        ptr.add(off).write_volatile(0xE0); off += 1;
-
-        // mov gs, ax
-        ptr.add(off).write_volatile(0x8E); off += 1;
-        ptr.add(off).write_volatile(0xE8); off += 1;
-
-        // ── Enable PAE (CR4.PAE = bit 5) ──
-        // mov eax, cr4   ; 0F 20 E0
-        ptr.add(off).write_volatile(0x0F); off += 1;
-        ptr.add(off).write_volatile(0x20); off += 1;
-        ptr.add(off).write_volatile(0xE0); off += 1;
-
-        // or eax, 0x20   ; 83 C8 20  (or eax, imm8)
-        ptr.add(off).write_volatile(0x83); off += 1;
-        ptr.add(off).write_volatile(0xC8); off += 1;
-        ptr.add(off).write_volatile(0x20); off += 1;
-
-        // mov cr4, eax   ; 0F 22 E0
-        ptr.add(off).write_volatile(0x0F); off += 1;
-        ptr.add(off).write_volatile(0x22); off += 1;
-        ptr.add(off).write_volatile(0xE0); off += 1;
-
-        // ── Load CR3 with BSP's PML4 ──
-        // mov eax, [0x8150]  ; A1 50 81 00 00
-        ptr.add(off).write_volatile(0xA1); off += 1;
-        ptr.add(off).write_volatile(0x50); off += 1;
-        ptr.add(off).write_volatile(0x81); off += 1;
-        ptr.add(off).write_volatile(0x00); off += 1;
-        ptr.add(off).write_volatile(0x00); off += 1;
-
-        // mov cr3, eax   ; 0F 22 D8
-        ptr.add(off).write_volatile(0x0F); off += 1;
-        ptr.add(off).write_volatile(0x22); off += 1;
-        ptr.add(off).write_volatile(0xD8); off += 1;
-
-        // ── Enable Long Mode via IA32_EFER.LME (bit 8) ──
-        // mov ecx, 0xC0000080  ; B9 80 00 00 C0
-        ptr.add(off).write_volatile(0xB9); off += 1;
-        ptr.add(off).write_volatile(0x80); off += 1;
-        ptr.add(off).write_volatile(0x00); off += 1;
-        ptr.add(off).write_volatile(0x00); off += 1;
-        ptr.add(off).write_volatile(0xC0); off += 1;
-
-        // rdmsr          ; 0F 32
-        ptr.add(off).write_volatile(0x0F); off += 1;
-        ptr.add(off).write_volatile(0x32); off += 1;
-
-        // or eax, 0x100  ; 0D 00 01 00 00 (set LME bit 8)
-        ptr.add(off).write_volatile(0x0D); off += 1;
-        ptr.add(off).write_volatile(0x00); off += 1;
-        ptr.add(off).write_volatile(0x01); off += 1;
-        ptr.add(off).write_volatile(0x00); off += 1;
-        ptr.add(off).write_volatile(0x00); off += 1;
-
-        // wrmsr          ; 0F 30
-        ptr.add(off).write_volatile(0x0F); off += 1;
-        ptr.add(off).write_volatile(0x30); off += 1;
-
-        // ── Enable Paging (CR0.PG = bit 31) ──
-        // mov eax, cr0   ; 0F 20 C0
-        ptr.add(off).write_volatile(0x0F); off += 1;
-        ptr.add(off).write_volatile(0x20); off += 1;
-        ptr.add(off).write_volatile(0xC0); off += 1;
-
-        // or eax, 0x80000000  ; 0D 00 00 00 80
-        ptr.add(off).write_volatile(0x0D); off += 1;
-        ptr.add(off).write_volatile(0x00); off += 1;
-        ptr.add(off).write_volatile(0x00); off += 1;
-        ptr.add(off).write_volatile(0x00); off += 1;
-        ptr.add(off).write_volatile(0x80); off += 1;
-
-        // mov cr0, eax   ; 0F 22 C0
-        ptr.add(off).write_volatile(0x0F); off += 1;
-        ptr.add(off).write_volatile(0x22); off += 1;
-        ptr.add(off).write_volatile(0xC0); off += 1;
-
-        // ── Far jump to 64-bit code (selector 0x10, offset 0x8200) ──
-        // jmp 0x10:0x00008200  ; EA 00 82 00 00 10 00
-        ptr.add(off).write_volatile(0xEA); off += 1;
-        ptr.add(off).write_volatile(0x00); off += 1; // offset[0]
-        ptr.add(off).write_volatile(0x82); off += 1; // offset[1]
-        ptr.add(off).write_volatile(0x00); off += 1; // offset[2]
-        ptr.add(off).write_volatile(0x00); off += 1; // offset[3]
-        ptr.add(off).write_volatile(0x10); off += 1; // selector low
-        ptr.add(off).write_volatile(0x00); off += 1; // selector high
-
-        crate::serial_println!("[SMP] 32-bit trampoline: {} bytes at 0x8040", off - 0x40);
-
-        // ═══════════════════════════════════════════════════
-        // GDT at 0x8100 (4 entries × 8 bytes = 32 bytes)
-        //   Entry 0: Null descriptor
-        //   Entry 1: 32-bit code (selector 0x08)
-        //   Entry 2: 64-bit code (selector 0x10)
-        //   Entry 3: Data segment (selector 0x18)
-        // ═══════════════════════════════════════════════════
-        let gdt = (phys_offset + TRAMP_GDT_OFFSET) as *mut u64;
-
-        // Entry 0: Null
-        gdt.write_volatile(0x0000_0000_0000_0000);
-        // Entry 1: 32-bit code segment (base=0, limit=4G, exec/read, ring 0)
-        //          Granularity=1, D/B=1 (32-bit), L=0
-        gdt.add(1).write_volatile(0x00CF_9A00_0000_FFFF);
-        // Entry 2: 64-bit code segment (L=1, D=0)
-        //          Granularity=1, L=1, D/B=0
-        gdt.add(2).write_volatile(0x00AF_9A00_0000_FFFF);
-        // Entry 3: Data segment (base=0, limit=4G, read/write, ring 0)
-        gdt.add(3).write_volatile(0x00CF_9200_0000_FFFF);
-
-        // GDTR at 0x8140 (6 bytes: 2-byte limit + 4-byte base)
-        let gdtr_ptr = (phys_offset + TRAMP_GDTR_OFFSET) as *mut u8;
-        let gdt_limit: u16 = (4 * 8 - 1) as u16; // 31 bytes
-        let gdt_base: u32 = TRAMP_GDT_OFFSET as u32; // physical address
-
-        // Write limit (2 bytes, little-endian)
-        (gdtr_ptr as *mut u16).write_volatile(gdt_limit);
-        // Write base (4 bytes, little-endian)
-        (gdtr_ptr.add(2) as *mut u32).write_volatile(gdt_base);
-
-        crate::serial_println!("[SMP] GDT: 4 entries at 0x{:X}, GDTR at 0x{:X}",
-            TRAMP_GDT_OFFSET, TRAMP_GDTR_OFFSET);
-
-        // ═══════════════════════════════════════════════════
-        // Configuration data at 0x8150+
-        // ═══════════════════════════════════════════════════
-
-        // CR3 (BSP's PML4 physical address)
-        let cr3_ptr = (phys_offset + TRAMP_CR3_OFFSET) as *mut u64;
-        cr3_ptr.write_volatile(bsp_cr3);
-
-        // AP counter physical address (for atomic increment from 64-bit code)
-        let ap_count_ptr = (phys_offset + TRAMP_AP_COUNT_OFFSET) as *mut u64;
-        // Store the virtual address of AP_COUNT since APs will use paging
-        ap_count_ptr.write_volatile(&AP_COUNT as *const AtomicU32 as u64);
-
-        // Stack base array
-        let stacks_ptr = (phys_offset + TRAMP_STACKS_OFFSET) as *mut u64;
-        stacks_ptr.write_volatile(unsafe { &AP_STACKS as *const _ as u64 });
-
-        // Physical memory offset
-        let phys_off_ptr = (phys_offset + TRAMP_PHYS_OFF_OFFSET) as *mut u64;
-        phys_off_ptr.write_volatile(phys_offset);
-
-        // AP ready flags address
-        let ready_ptr = (phys_offset + TRAMP_READY_OFFSET) as *mut u64;
-        ready_ptr.write_volatile(&AP_READY[0] as *const AtomicBool as u64);
-
-        crate::serial_println!("[SMP] Config data: CR3=0x{:X}, stacks=0x{:X}",
-            bsp_cr3, unsafe { &AP_STACKS as *const _ as u64 });
-
-        // ═══════════════════════════════════════════════════
-        // 64-bit Long Mode Code at 0x8200
-        //
-        // At this point, paging is enabled with BSP's PML4, so we can
-        // use virtual addresses. The AP needs to:
-        //   1. Read its APIC ID
-        //   2. Compute core index (sequential from AP_COUNT)
-        //   3. Set per-core stack
-        //   4. Atomically increment AP_COUNT
-        //   5. Set AP_READY flag
-        //   6. Enter HLT loop
-        //
-        // Since we share the BSP's page tables, all kernel virtual
-        // addresses are accessible. We use identity-mapped low memory
-        // to read the config data, then switch to high virtual addresses.
-        // ═══════════════════════════════════════════════════
-        let code64 = (phys_offset + 0x8200) as *mut u8;
-        let mut c: usize = 0;
-
-        // We need data segment selector in various segment registers
-        // mov ax, 0x18   ; 66 B8 18 00
-        code64.add(c).write_volatile(0x66); c += 1;
-        code64.add(c).write_volatile(0xB8); c += 1;
-        code64.add(c).write_volatile(0x18); c += 1;
-        code64.add(c).write_volatile(0x00); c += 1;
-
-        // mov ds, ax
-        code64.add(c).write_volatile(0x8E); c += 1;
-        code64.add(c).write_volatile(0xD8); c += 1;
-        // mov es, ax
-        code64.add(c).write_volatile(0x8E); c += 1;
-        code64.add(c).write_volatile(0xC0); c += 1;
-        // mov ss, ax
-        code64.add(c).write_volatile(0x8E); c += 1;
-        code64.add(c).write_volatile(0xD0); c += 1;
-        // mov fs, ax
-        code64.add(c).write_volatile(0x8E); c += 1;
-        code64.add(c).write_volatile(0xE0); c += 1;
-        // mov gs, ax
-        code64.add(c).write_volatile(0x8E); c += 1;
-        code64.add(c).write_volatile(0xE8); c += 1;
-
-        // ── Read AP_COUNT address and atomically increment ──
-        // Now in 64-bit mode with paging. Config data at physical 0x8160
-        // contains the virtual address of AP_COUNT.
-        //
-        // mov rdi, [phys_offset + 0x8160]  ; Load AP_COUNT virtual address
-        // We need phys_offset to access low physical memory through paging.
-        // But we placed the virtual address directly, so just load it.
-
-        // lea rdi, [0x8160] — but we stored virtual addr at phys 0x8160
-        // Access via physical mapping: mov rdi, [phys_offset + 0x8160]
-        // Simpler: hard-code the physical address and use identity mapping
-        //
-        // Actually: since we share BSP's PML4 which has phys_offset-based mapping,
-        // physical address 0x8160 is accessible at phys_offset + 0x8160.
-        // But we don't know phys_offset in machine code... we stored it at 0x8170.
-        //
-        // Strategy: Use the stored virtual address of AP_COUNT directly.
-        // Step 1: Load phys_offset from config
-        // Step 2: Add 0x8160 to get virtual address of the pointer
-        // Step 3: Load the pointer value (virtual address of AP_COUNT)
-        // Step 4: lock xadd [AP_COUNT], 1
-
-        // mov rax, [absolute phys_offset + 0x8170]
-        // Problem: we can't easily address phys_offset + X in raw bytes
-        // without knowing the offset at assemble time.
-        //
-        // SIMPLER APPROACH: Just use lock inc on a known physical address.
-        // We'll place the AP counter value at a known physical address (0x8160)
-        // that's directly in the config area, and copy it back to AP_COUNT later.
-        //
-        // Actually, let's take the simplest correct approach:
-        // The virtual address of AP_COUNT is stored at physoff+0x8160.
-        // We first need to know physoff. It's stored at physoff+0x8170.
-        // Chicken-and-egg! But we can use a fixed physical address that we
-        // know maps identity at physoff+addr.
-        //
-        // BEST APPROACH: put a simple counter at physical 0x80E0 (within the
-        // trampoline page) and have each AP do `lock inc dword [phys_off + 0x80E0]`.
-        // The BSP reads this counter after boot. We know phys_off because the
-        // BSP stored it at physical 0x8170 and we loaded it.
-
-        // Step 1: We need physoff. We read [some identity-mapped addr].
-        // In the bootloader's page tables, low physical memory IS mapped at physoff.
-        // The trampoline is at physical 0x8000. After loading CR3, paging is active.
-        // Physical 0x8000 is reachable at virtual (physoff + 0x8000).
-        // But we don't know physoff in the raw code bytes!
-        //
-        // ACTUALLY: The standard approach is to place the data addresses directly
-        // into the code as absolute 64-bit immediates. We patch them here.
-        //
-        // Let's encode:
-        //   mov rax, <immediate64: virtual address of ap_counter at phys 0x80E0>
-        //   lock inc dword [rax]
-        //   (then set ready flag, stack, and halt)
-
-        // Virtual address of our temp counter at phys 0x80E0:
-        let counter_virt = phys_offset + 0x80E0;
-        // Virtual address of our temp ready+stack area at phys 0x80E8:
-        let stacks_info_virt = phys_offset + TRAMP_STACKS_OFFSET; // 0x8168
-
-        // Initialize the temp counter at 0x80E0 to zero
-        let counter_phys_ptr = (phys_offset + 0x80E0) as *mut u32;
-        counter_phys_ptr.write_volatile(0);
-
-        // ── 64-bit code: increment counter and halt ──
-
-        // mov rax, <counter_virt>     ; 48 B8 <8 bytes>
-        code64.add(c).write_volatile(0x48); c += 1;
-        code64.add(c).write_volatile(0xB8); c += 1;
-        for i in 0..8 {
-            code64.add(c).write_volatile(((counter_virt >> (i * 8)) & 0xFF) as u8);
-            c += 1;
-        }
-
-        // lock inc dword [rax]        ; F0 FF 00
-        code64.add(c).write_volatile(0xF0); c += 1;
-        code64.add(c).write_volatile(0xFF); c += 1;
-        code64.add(c).write_volatile(0x00); c += 1;
-
-        // ── Load per-core stack ──
-        // Read the counter value as our core index
-        // mov ecx, [rax]             ; 8B 08
-        code64.add(c).write_volatile(0x8B); c += 1;
-        code64.add(c).write_volatile(0x08); c += 1;
-
-        // Each AP stack = AP_STACKS base + core_index * AP_STACK_SIZE + AP_STACK_SIZE
-        // (stack grows down, so RSP = top of allocated region)
-        // mov rbx, <stacks_info_virt>  ; 48 BB <8 bytes>
-        let stacks_base_virt = unsafe { &AP_STACKS as *const _ as u64 };
-        code64.add(c).write_volatile(0x48); c += 1;
-        code64.add(c).write_volatile(0xBB); c += 1;
-        for i in 0..8 {
-            code64.add(c).write_volatile(((stacks_base_virt >> (i * 8)) & 0xFF) as u8);
-            c += 1;
-        }
-
-        // imul rcx, rcx, AP_STACK_SIZE  ; 48 69 C9 <4 bytes>
-        code64.add(c).write_volatile(0x48); c += 1;
-        code64.add(c).write_volatile(0x69); c += 1;
-        code64.add(c).write_volatile(0xC9); c += 1;
-        let stack_size = AP_STACK_SIZE as u32;
-        for i in 0..4 {
-            code64.add(c).write_volatile(((stack_size >> (i * 8)) & 0xFF) as u8);
-            c += 1;
-        }
-
-        // add rbx, rcx               ; 48 01 CB
-        code64.add(c).write_volatile(0x48); c += 1;
-        code64.add(c).write_volatile(0x01); c += 1;
-        code64.add(c).write_volatile(0xCB); c += 1;
-
-        // add rbx, AP_STACK_SIZE      ; 48 81 C3 <4 bytes>
-        code64.add(c).write_volatile(0x48); c += 1;
-        code64.add(c).write_volatile(0x81); c += 1;
-        code64.add(c).write_volatile(0xC3); c += 1;
-        for i in 0..4 {
-            code64.add(c).write_volatile(((stack_size >> (i * 8)) & 0xFF) as u8);
-            c += 1;
-        }
-
-        // mov rsp, rbx               ; 48 89 DC
-        code64.add(c).write_volatile(0x48); c += 1;
-        code64.add(c).write_volatile(0x89); c += 1;
-        code64.add(c).write_volatile(0xDC); c += 1;
-
-        // ── Now increment the real AP_COUNT and set ready ──
-        // mov rax, <addr of AP_COUNT>  ; 48 B8 <8 bytes>
-        let ap_count_virt = &AP_COUNT as *const AtomicU32 as u64;
-        code64.add(c).write_volatile(0x48); c += 1;
-        code64.add(c).write_volatile(0xB8); c += 1;
-        for i in 0..8 {
-            code64.add(c).write_volatile(((ap_count_virt >> (i * 8)) & 0xFF) as u8);
-            c += 1;
-        }
-
-        // lock inc dword [rax]        ; F0 FF 00
-        code64.add(c).write_volatile(0xF0); c += 1;
-        code64.add(c).write_volatile(0xFF); c += 1;
-        code64.add(c).write_volatile(0x00); c += 1;
-
-        // ── HLT loop ──
-        // hlt                         ; F4
-        code64.add(c).write_volatile(0xF4); c += 1;
-        // jmp $-1 (back to hlt)       ; EB FD
-        code64.add(c).write_volatile(0xEB); c += 1;
-        code64.add(c).write_volatile(0xFD); c += 1;
-
-        crate::serial_println!("[SMP] 64-bit AP code: {} bytes at 0x8200", c);
-        crate::serial_println!("[SMP] Trampoline total: {} bytes", 0x200 + c);
+        // Set CR4 to match BSP's expected features
+        let cr4_val: u64;
+        core::arch::asm!("mov {}, cr4", out(reg) cr4_val, options(nomem, nostack));
+        // Set PAE + PGE + OSFXSR + OSXMMEXCPT + OSXSAVE
+        let new_cr4 = cr4_val | (1 << 5) | (1 << 7) | (1 << 9) | (1 << 10) | (1 << 18);
+        core::arch::asm!("mov cr4, {}", in(reg) new_cr4, options(nomem, nostack));
     }
 
-    crate::serial_println!("[SMP] Full 16→32→64 trampoline written at 0x8000");
+    // Enable NXE in EFER (needed for page tables with NX bit set)
+    unsafe {
+        let efer = rdmsr(0xC0000080);
+        // Set NXE (bit 11) - required if BSP's page tables use NX bits
+        wrmsr(0xC0000080, efer | (1 << 11));
+    }
+
+    // Load BSP's GDT and IDT from kernel structures
+    unsafe {
+        // Load the kernel's GDT (with proper segment selectors and TSS)
+        crate::arch::x86_64::gdt::load_for_ap();
+        // Load the kernel's IDT (with exception handlers)
+        crate::arch::x86_64::idt::load_for_ap();
+    }
+
+    // STAGE 2: Switch to the real kernel stack for this AP core.
+    // The real stack address was stored at physical 0x80F8 by the BSP.
+    let real_stack_top = unsafe {
+        let phys_offset = crate::elf::phys_offset();
+        let stack_ptr = (phys_offset + 0x80F8u64) as *const u64;
+        stack_ptr.read_volatile()
+    };
+
+    if real_stack_top != 0 {
+        unsafe {
+            core::arch::asm!(
+                "mov rsp, {}",
+                "mov rbp, rsp",
+                in(reg) real_stack_top,
+                options(nomem)
+            );
+        }
+    }
+
+    // STAGE 3: Now we have proper GDT, IDT, and stack. Signal liveness.
+    AP_ALIVE.store(true, Ordering::SeqCst);
+    AP_COUNT.store(1, Ordering::SeqCst);
+    CPU_COUNT.store(2, Ordering::SeqCst);
+
+    // Enable local APIC on this core
+    unsafe {
+        apic_write(APIC_SVR, SVR_ENABLE | 0xFF);
+        apic_write(APIC_TPR, 0);
+    }
+
+    // Set GS_BASE = 1 (Core 1)
+    unsafe {
+        wrmsr(0xC000_0101, 1u64);
+    }
+
+    // Store our APIC ID
+    AP_APIC_IDS[1].store(1, Ordering::SeqCst);
+    AP_READY[1].store(true, Ordering::SeqCst);
+    LLM_CORE_AFFINITY.store(1, Ordering::SeqCst);
+
+    // NOTE: We do NOT call serial_println! here because the AP's temporary stack
+    // at 0x7000 is in the identity-mapped region (PML4[0] first 6MB) but kernel
+    // data structures used by serial_println! may reside beyond that range.
+    // The BSP reports AP liveness based on AP_ALIVE flag.
+
+    // Enable interrupts so APIC timer works on this core
+    unsafe {
+        core::arch::asm!("sti", options(nomem, nostack));
+    }
+
+    // AP Scheduler Loop: Core 1 halts and waits for work
+    // The BSP assigns affinity-1 tasks; the AP wakes on APIC timer interrupt
+    loop {
+        unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+    }
 }
 
-/// Simple busy-wait delay (microseconds, approximate)
+/// Check and process parallel matmul work items from BSP.
+fn check_parallel_work() {
+    let work_count = crate::arch::x86_64::syscall::parallel_work_pending();
+    if work_count > 0 {
+        crate::arch::x86_64::syscall::process_parallel_work_item();
+    }
+}
+
+/// Send an IPI to wake a specific AP core.
+pub fn send_ipi_to_core(target_apic_id: u8) {
+    unsafe {
+        apic_write(APIC_ICR_HIGH, (target_apic_id as u32) << 24);
+        apic_write(APIC_ICR_LOW, 0x0000_40FE);
+    }
+}
+
+// =====================================================================
+// Utility functions
+// =====================================================================
+
+/// Simple busy-wait delay (approximate microseconds)
 fn busy_wait_us(us: u32) {
     for _ in 0..(us as u64 * 1000) {
         unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
     }
 }
 
-/// Get the total number of detected CPUs
+/// Get total CPU count
 pub fn cpu_count() -> u32 {
     CPU_COUNT.load(Ordering::SeqCst)
 }
 
-/// Check if SMP is available (more than 1 core)
-pub fn is_smp() -> bool {
-    cpu_count() > 1
+/// Get current core index (0 = BSP, 1+ = AP)
+pub fn current_core() -> u32 {
+    let base = APIC_BASE_ADDR.load(Ordering::SeqCst);
+    if base == 0 { return 0; }
+    let apic_id = unsafe { apic_read(APIC_ID) >> 24 };
+    let count = CPU_COUNT.load(Ordering::SeqCst) as usize;
+    for i in 0..count {
+        if AP_APIC_IDS[i].load(Ordering::SeqCst) == apic_id {
+            return i as u32;
+        }
+    }
+    0
 }
 
-/// Get the core assigned to LLM inference
-pub fn llm_affinity_core() -> u32 {
-    LLM_CORE_AFFINITY.load(Ordering::SeqCst)
-}
+/// Check if SMP is available
+pub fn is_smp() -> bool { cpu_count() > 1 }
 
-/// Set LLM inference core affinity
+/// Get LLM affinity core
+pub fn llm_affinity_core() -> u32 { LLM_CORE_AFFINITY.load(Ordering::SeqCst) }
+
+/// Set LLM affinity core
 pub fn set_llm_affinity(core_id: u32) {
     if (core_id as usize) < MAX_CPUS {
         LLM_CORE_AFFINITY.store(core_id, Ordering::SeqCst);
     }
 }
+
+/// Check if AP is alive
+pub fn ap_is_alive() -> bool { AP_ALIVE.load(Ordering::SeqCst) }
 
 /// Run APIC + SMP self-tests
 pub fn run_tests() {

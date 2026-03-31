@@ -102,6 +102,25 @@ pub fn init() {
     crate::serial_println!("[GDT] Loaded: Kernel(R0) + User(R3) + TSS");
 }
 
+/// Load the BSP's GDT on an AP core (Jalon 101).
+/// Called from ap_main after the trampoline. Loads the same GDT and segment
+/// selectors that the BSP uses. Does NOT load the TSS (shared TSS causes #GP
+/// because it's already marked as "busy" by the BSP).
+/// Safe to call from any core after BSP's init() has completed.
+pub fn load_for_ap() {
+    use x86_64::instructions::segmentation::{Segment, CS, DS};
+
+    GDT.0.load();
+    unsafe {
+        CS::set_reg(GDT.1.code_selector);
+        DS::set_reg(GDT.1.data_selector);
+        // NOTE: We intentionally do NOT load the TSS on the AP.
+        // The TSS is already marked as "busy" by the BSP, and loading it
+        // on another CPU would cause #GP. The AP uses the BSP's IST stacks
+        // which are shared (acceptable for our 2-core setup).
+    }
+}
+
 /// Return the IST index for double-fault
 pub const fn double_fault_ist_index() -> u16 {
     DOUBLE_FAULT_IST_INDEX

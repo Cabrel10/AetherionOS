@@ -883,6 +883,53 @@ fn swiglu(out: &mut [f32], gate: &[f32], up: &[f32], size: usize) {
     }
 }
 
+// ═══════════════════════════════════════════════════════
+// Jalon 98: INT8 KV Cache Quantization (TurboQuant)
+// ═══════════════════════════════════════════════════════
+// Per-vector symmetric quantization:
+//   scale = max(|x_i|) / 127.0
+//   q_i   = round(x_i / scale)  clamped to [-127, 127]
+//   x_i'  = q_i * scale   (dequantize)
+//
+// Memory savings: f32 (4 bytes) -> i8 (1 byte) + 1 scale per vector
+// = 4x reduction in KV cache footprint
+// ═══════════════════════════════════════════════════════
+
+/// Quantize a f32 vector to INT8 with symmetric per-vector scaling.
+/// Returns the scale factor. Writes quantized values to `out_q`.
+#[inline]
+fn quantize_int8(src: &[f32], out_q: &mut [i8], n: usize) -> f32 {
+    if n == 0 { return 1.0; }
+    let len = core::cmp::min(n, core::cmp::min(src.len(), out_q.len()));
+    // Find max absolute value for scale
+    let mut absmax: f32 = 0.0;
+    for i in 0..len {
+        let a = if src[i] < 0.0 { -src[i] } else { src[i] };
+        if a > absmax { absmax = a; }
+    }
+    if absmax < 1e-10 {
+        // All zeros — no quantization needed
+        for i in 0..len { out_q[i] = 0; }
+        return 1e-10;
+    }
+    let scale = absmax / 127.0;
+    let inv_scale = 127.0 / absmax;
+    for i in 0..len {
+        let q = src[i] * inv_scale;
+        // Round and clamp to [-127, 127]
+        let qi = if q > 0.0 { q + 0.5 } else { q - 0.5 };
+        let clamped = if qi > 127.0 { 127 } else if qi < -127.0 { -127 } else { qi as i32 };
+        out_q[i] = clamped as i8;
+    }
+    scale
+}
+
+/// Dequantize a single INT8 value back to f32: value = q * scale
+#[inline(always)]
+fn dequant_i8(q: i8, scale: f32) -> f32 {
+    (q as f32) * scale
+}
+
 fn rope(q: &mut [f32], k: &mut [f32], pos: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, rope_dim: usize, freq_base: f32) {
     let rdim = if rope_dim > 0 { rope_dim } else { head_dim };
     // Apply RoPE to Q heads
@@ -969,9 +1016,12 @@ struct TransformerEngine {
     scores: Vec<f32>,    // [max_seq_len]
     // Jalon 91: CACHED layer weights (loaded once, zero per-token I/O)
     layers: Vec<LayerWeights>,
-    // KV cache (stored across positions)
-    key_cache: Vec<f32>,   // [max_seq * kv_dim]
-    val_cache: Vec<f32>,   // [max_seq * kv_dim]
+    // Jalon 98: INT8 Quantized KV cache (4x memory reduction)
+    // Each position stores kv_dim INT8 values + 1 f32 scale factor
+    key_cache_q: Vec<i8>,       // [max_seq * kv_dim] quantized keys
+    val_cache_q: Vec<i8>,       // [max_seq * kv_dim] quantized values
+    key_scales: Vec<f32>,       // [max_seq] per-position key scale
+    val_scales: Vec<f32>,       // [max_seq] per-position val scale
     // Embedding table (loaded once)
     embedding: Vec<f32>,   // [vocab_size * d_model]
     // Final norm + output weight
@@ -1018,9 +1068,11 @@ impl TransformerEngine {
             });
         }
 
-        print("[LLM]   kv_cache="); print_u64((max_seq * kv * 2 * 4) as u64);
-        print(" embedding="); print_u64((vs * d * 4) as u64);
-        println(" bytes");
+        // Jalon 98: INT8 KV cache = 4x memory reduction
+        print("[LLM]   kv_cache_int8="); print_u64((max_seq * kv * 2) as u64);
+        print(" (was "); print_u64((max_seq * kv * 2 * 4) as u64);
+        print(") embedding="); print_u64((vs * d * 4) as u64);
+        println(" bytes (4x KV savings)");
 
         TransformerEngine {
             x: vec![0.0; d],
@@ -1037,8 +1089,10 @@ impl TransformerEngine {
             logits: vec![0.0; vs],
             scores: vec![0.0; max_seq],
             layers,
-            key_cache: vec![0.0; max_seq * kv],
-            val_cache: vec![0.0; max_seq * kv],
+            key_cache_q: vec![0i8; max_seq * kv],
+            val_cache_q: vec![0i8; max_seq * kv],
+            key_scales: vec![0.0f32; max_seq],
+            val_scales: vec![0.0f32; max_seq],
             embedding: vec![0.0; vs * d],
             final_norm: vec![0.0; d],
             output_weight: vec![0.0; vs * d],
@@ -1178,13 +1232,15 @@ impl TransformerEngine {
         // 5. RoPE
         rope(&mut self.q, &mut self.k, pos, head_dim, nh, nkv, self.cfg.rope_dim, self.cfg.rope_freq_base);
 
-        // 6. KV cache store
+        // 6. KV cache store (Jalon 98: quantize to INT8 before storing)
         let kv_base = pos * kv;
-        if kv_base + kv <= self.key_cache.len() {
-            for i in 0..kv {
-                self.key_cache[kv_base + i] = self.k[i];
-                self.val_cache[kv_base + i] = self.v[i];
-            }
+        if kv_base + kv <= self.key_cache_q.len() && pos < self.key_scales.len() {
+            self.key_scales[pos] = quantize_int8(
+                &self.k[..kv], &mut self.key_cache_q[kv_base..kv_base+kv], kv
+            );
+            self.val_scales[pos] = quantize_int8(
+                &self.v[..kv], &mut self.val_cache_q[kv_base..kv_base+kv], kv
+            );
         }
 
         // 7. Multi-Head Attention with GQA
@@ -1198,10 +1254,12 @@ impl TransformerEngine {
             for t in 0..=core::cmp::min(pos, self.max_seq - 1) {
                 let mut dot: f32 = 0.0;
                 let kb = t * kv + kv_h * head_dim;
-                if kb + head_dim <= self.key_cache.len() {
+                // Jalon 98: Dequantize key from INT8 during attention
+                if kb + head_dim <= self.key_cache_q.len() && t < self.key_scales.len() {
+                    let k_scale = self.key_scales[t];
                     for dd in 0..head_dim {
                         if qoff + dd < self.q.len() {
-                            dot += self.q[qoff + dd] * self.key_cache[kb + dd];
+                            dot += self.q[qoff + dd] * dequant_i8(self.key_cache_q[kb + dd], k_scale);
                         }
                     }
                 }
@@ -1215,10 +1273,12 @@ impl TransformerEngine {
             for t in 0..safe_pos {
                 let vb = t * kv + kv_h * head_dim;
                 let w = self.scores[t];
-                if vb + head_dim <= self.val_cache.len() {
+                // Jalon 98: Dequantize value from INT8 during attention
+                if vb + head_dim <= self.val_cache_q.len() && t < self.val_scales.len() {
+                    let v_scale = self.val_scales[t];
                     for dd in 0..head_dim {
                         if qoff + dd < self.attn_out.len() {
-                            self.attn_out[qoff + dd] += w * self.val_cache[vb + dd];
+                            self.attn_out[qoff + dd] += w * dequant_i8(self.val_cache_q[vb + dd], v_scale);
                         }
                     }
                 }
@@ -1286,7 +1346,9 @@ impl TransformerEngine {
 #[no_mangle]
 pub extern "C" fn main() -> i64 {
     println("============================================================");
-    println("[LLM] AetherionOS Hyper-Performance GGUF Inference v10.0");
+    println("[LLM] AetherionOS Hyper-Performance GGUF Inference v11.0");
+    println("[LLM] Jalon 98: INT8 KV Cache Quantization (TurboQuant) ACTIVE");
+    println("[LLM] Memory: KV cache 4x compressed (i8 + per-vector scale)");
     println("[LLM] Jalon 91: mmap + weight caching (zero per-token I/O)");
     println("[LLM] Jalon 92: SMP parallel matmul + 8-wide unrolled loops");
     println("[LLM] Target: 15-25 tokens/s (was ~0.12 tokens/s)");
@@ -1509,7 +1571,7 @@ fn run_inference(fd: u32) -> i64 {
     sys_bus_publish(INTENT_LLAMA_CORE, 3, num_tokens as u64);
 
     println("[LLM] ================================================");
-    println("[LLM-OK] Hyper-Performance GGUF Inference v10.0 VALIDATED");
+    println("[LLM-OK] Hyper-Performance GGUF Inference v11.0+INT8 VALIDATED");
     println("[LLM-OK] Jalon 91: mmap + weight caching (zero per-token I/O)");
     println("[LLM-OK] Jalon 92: 8-wide matmul + SMP infrastructure");
     if mmap_active {

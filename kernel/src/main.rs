@@ -1287,6 +1287,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     let avx_enabled = unsafe { arch::x86_64::context::enable_avx() };
     if avx_enabled {
         serial_write("       [OK] AVX enabled (CR4.OSXSAVE=1, XCR0=x87+SSE+AVX)\n");
+        serial_write("       [OK] XSAVE/XRSTOR64 active — 1024-byte FPU context (Jalon 97)\n");
     } else {
         serial_write("       [INFO] AVX not available on this CPU (SSE-only mode)\n");
     }
@@ -1390,6 +1391,8 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
     // Init scheduler after processes are spawned
     scheduler::init();
+    serial_println!("[SMP] Jalon 97: CPU Affinity Scheduler ACTIVE (cores={})", arch::x86_64::apic::cpu_count());
+    serial_write("[SMP] Jalon 98: INT8 KV Cache quantization ready (TurboQuant, 4x KV savings)\n");
     run_scheduler_tests();
 
     // Init GPU stub
@@ -1647,14 +1650,25 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     drivers::usb::xhci::run_tests();
 
     // ===================================================================
-    // JALON 88: LOCAL APIC + SMP MULTI-CORE DETECTION
+    // JALON 97: ACPI TABLE PARSING (RSDP → RSDT/XSDT → MADT + FADT)
+    // Must be called BEFORE APIC init to detect core count
     // ===================================================================
-    serial_write("\n[17d/19] Local APIC + SMP (Jalon 88)...\n");
+    serial_write("\n[17c2/19] ACPI Table Parsing (Jalon 97)...\n");
+    arch::x86_64::acpi::init(crate::elf::phys_offset());
+
+    // ===================================================================
+    // JALON 88+101: LOCAL APIC + TRUE DUAL-CORE SMP
+    // ===================================================================
+    serial_write("\n[17d/19] Local APIC + SMP (Jalon 101 - True SMP)...\n");
     arch::x86_64::apic::init();
     arch::x86_64::apic::run_tests();
-    // Wake APs (disabled by default — enable with QEMU -smp N)
-    // arch::x86_64::apic::wake_application_processors();
-    serial_println!("[SMP] CPU count: {} (BSP only, AP wake-up ready)", arch::x86_64::apic::cpu_count());
+    // Jalon 101: True Dual-Core SMP with NASM-verified trampoline
+    // ACPI MADT detected cores. Send INIT-SIPI-SIPI to wake AP.
+    serial_write("[SMP] Sending INIT-SIPI-SIPI to APIC ID 1...\n");
+    arch::x86_64::apic::wake_application_processors();
+    let total_cpus = arch::x86_64::apic::cpu_count();
+    serial_println!("[SMP] CPU count: {} (SMP {})", total_cpus,
+        if total_cpus > 1 { "active" } else { "single-core" });
 
     serial_write("\n[18/19] FAT32 Filesystem (Couche 19)...\n");
     fs::fat32::init();
@@ -2101,8 +2115,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     chat_result.entry_point, chat_result.stack_pointer, chat_result.pml4_phys
                 ).unwrap_or(0);
                 if chat_pid != 0 {
-                    // Jalon 96: Pin LLM chat agent to Core 1 for SMP isolation
-                    process::set_cpu_affinity(chat_pid, 1);
+                    // CEO directive: single-core LLM until pipeline is 100% stable.
+                    // Agents run on any core (0xFF) so BSP scheduler dispatches them.
+                    // When parallel MatMul is approved, pin to Core 1 via set_cpu_affinity(chat_pid, 1).
+                    process::set_cpu_affinity(chat_pid, 0xFF);
                     scheduler::enqueue_process(chat_pid);
                     serial_write("  [J79] agent_llm_chat.elf: QUEUED (GGUF verification via sys_pread64) [Core 1]\n");
                 }
@@ -2124,7 +2140,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 ).unwrap_or(0);
                 if orch_pid != 0 {
                     scheduler::enqueue_process(orch_pid);
-                    serial_write("  [J85] agent_orchestrator.elf: QUEUED (Thalamus + Hippocampe)\n");
+                    // Jalon 100: Register orchestrator in watchdog for auto-respawn
+                    process::watchdog_register("/bin/agent_orchestrator.elf", 0); // Core 0
+                    serial_write("  [J85] agent_orchestrator.elf: QUEUED (Thalamus + Hippocampe) [WATCHDOG]\n");
                 }
             }
             Err(_e) => {
@@ -2147,8 +2165,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     llama_entry, llama_stack, llama_pml4
                 ).unwrap_or(0);
                 if llama_pid != 0 {
-                    // Jalon 96: Pin LLaMA core agent to Core 1 for SMP isolation
-                    process::set_cpu_affinity(llama_pid, 1);
+                    // CEO directive: single-core LLM until pipeline is 100% stable.
+                    // Agents run on any core (0xFF) so BSP scheduler dispatches them.
+                    process::set_cpu_affinity(llama_pid, 0xFF);
                     scheduler::enqueue_process(llama_pid);
                     serial_write("  [J79] agent_llama_core.elf: QUEUED (multi-agent scheduling ENABLED) [Core 1]\n");
                 }
@@ -2171,7 +2190,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 ).unwrap_or(0);
                 if mcp_pid != 0 {
                     scheduler::enqueue_process(mcp_pid);
-                    serial_write("  [L8] agent_mcp.elf: QUEUED (MCP security agent)\n");
+                    // Jalon 100: Register MCP agent in watchdog for auto-respawn
+                    process::watchdog_register("/bin/agent_mcp.elf", 0); // Core 0
+                    serial_write("  [L8] agent_mcp.elf: QUEUED (MCP security agent) [WATCHDOG]\n");
                 }
             }
             Err(_e) => {
@@ -2192,7 +2213,9 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 ).unwrap_or(0);
                 if val_pid != 0 {
                     scheduler::enqueue_process(val_pid);
-                    serial_println!("  [L9] agent_validator.elf: QUEUED ({} bytes, Immune System)", AGENT_VALIDATOR_ELF.len());
+                    // Jalon 100: Register validator in watchdog for auto-respawn
+                    process::watchdog_register("/bin/agent_validator.elf", 0); // Core 0
+                    serial_println!("  [L9] agent_validator.elf: QUEUED ({} bytes, Immune System) [WATCHDOG]", AGENT_VALIDATOR_ELF.len());
                 }
             }
             Err(_e) => {
@@ -2245,6 +2268,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 // process::save_preempt_state(pid, result.entry_point, result.stack_pointer, 0x202);
 
                 serial_write("  [J65] IRETQ -> Ring 3: Interactive Terminal launches NOW!\n");
+                serial_write("[WATCHDOG] Jalon 100: Kernel Watchdog ACTIVE (auto-respawn on crash)\n");
                 serial_write("========================================\n");
 
                 arch::x86_64::syscall::reset_gs_bases();

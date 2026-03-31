@@ -895,9 +895,10 @@ pub extern "C" fn main() -> i64 {
     // ──────────────────────────────────────────────
     // Step 1: Open GGUF model file
     // ──────────────────────────────────────────────
-    let model_paths: [&[u8]; 9] = [
-        b"/disk/models/MODEL.GGU\0",                     // Standard 8.3 name (primary)
-        b"/disk/models/real_model.gguf\0",               // LFN fallback
+    let model_paths: [&[u8]; 10] = [
+        b"/disk/models/smollm.gguf\0",                     // SmolLM-135M (primary)
+        b"/disk/models/MODEL.GGU\0",                       // Standard 8.3 name
+        b"/disk/models/real_model.gguf\0",                 // LFN fallback
         b"/disk/models/smollm2-135m.gguf\0",
         b"/disk/models/mistral-7b-instruct-v0.3.Q4_K_M.gguf\0",
         b"/disk/models/mistral-7b.gguf\0",

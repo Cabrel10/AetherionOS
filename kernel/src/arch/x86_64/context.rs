@@ -20,24 +20,27 @@
 
 use core::arch::asm;
 
-/// 512-byte FPU/SSE save area for fxsave/fxrstor.
-/// Must be 16-byte aligned per Intel specification.
+/// 1024-byte FPU/SSE/AVX save area for xsave64/xrstor64.
+/// Must be 64-byte aligned per Intel XSAVE specification.
+/// Supports x87 (bytes 0-159), SSE/XMM (bytes 160-415),
+/// XSAVE header (bytes 512-575), and AVX/YMM (bytes 576-831).
+/// Jalon 97: Expanded from 512B fxsave to 1024B xsave for AVX2 context switching.
 #[derive(Clone, Copy)]
-#[repr(C, align(16))]
+#[repr(C, align(64))]
 pub struct FpuState {
-    pub data: [u8; 512],
+    pub data: [u8; 1024],
 }
 
 impl FpuState {
-    /// Create a zeroed FPU state (default x87/SSE registers)
+    /// Create a zeroed FPU state (default x87/SSE/AVX registers)
     pub const fn zero() -> Self {
-        FpuState { data: [0u8; 512] }
+        FpuState { data: [0u8; 1024] }
     }
 }
 
 impl core::fmt::Debug for FpuState {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-        write!(f, "FpuState([..512 bytes..])")
+        write!(f, "FpuState([..1024 bytes xsave..])")
     }
 }
 
@@ -331,41 +334,61 @@ pub unsafe fn enable_avx() -> bool {
         options(nostack, nomem),
     );
 
+    crate::serial_println!("[CPU] XCR0 configured for AVX/YMM context switching (XSAVE ready)");
+
     true
 }
 
-/// Initialize a default SSE/FPU state with proper MXCSR.
+/// Initialize a default SSE/FPU/AVX state with proper MXCSR.
 /// This sets MXCSR to the Intel default (0x1F80) which masks
 /// all SIMD exceptions for safe Ring 3 execution.
+/// Jalon 97: Uses 1024-byte xsave layout.
 pub fn init_default_fpu_state(state: &mut FpuState) {
-    state.data = [0u8; 512];
-    // MXCSR is at offset 24 in the FXSAVE area
+    state.data = [0u8; 1024];
+    // MXCSR is at offset 24 in the FXSAVE area (same offset in xsave)
     // Default value: 0x1F80 (all exceptions masked)
     let mxcsr: u32 = 0x1F80;
     state.data[24..28].copy_from_slice(&mxcsr.to_le_bytes());
     // x87 FPU Control Word at offset 0: 0x037F (default)
     let fcw: u16 = 0x037F;
     state.data[0..2].copy_from_slice(&fcw.to_le_bytes());
+    // XSAVE header at offset 512: set XSTATE_BV bits for x87+SSE+AVX (0x07)
+    let xstate_bv: u64 = 0x07;
+    state.data[512..520].copy_from_slice(&xstate_bv.to_le_bytes());
 }
 
-/// Save FPU/SSE state to the given 512-byte aligned buffer.
-/// # Safety: `area` must point to a valid 16-byte aligned 512-byte buffer.
+/// Save FPU/SSE/AVX state using xsave64 to the given 64-byte aligned 1024-byte buffer.
+/// Falls back to fxsave if OSXSAVE is not enabled.
+/// Jalon 97: Upgraded from fxsave to xsave64 for AVX2 context preservation.
+/// # Safety: `area` must point to a valid 64-byte aligned 1024-byte buffer.
 #[inline(always)]
 pub unsafe fn fpu_save(area: *mut FpuState) {
+    // Use xsave64 with mask 0x07 (x87 + SSE + AVX)
+    // EDX:EAX = save mask. We set EAX=7, EDX=0 to save x87/SSE/AVX.
     asm!(
-        "fxsave [{}]",
+        "mov eax, 0x07",
+        "xor edx, edx",
+        "xsave64 [{}]",
         in(reg) area,
+        out("eax") _,
+        out("edx") _,
         options(nostack),
     );
 }
 
-/// Restore FPU/SSE state from the given 512-byte aligned buffer.
-/// # Safety: `area` must point to a valid 16-byte aligned 512-byte buffer.
+/// Restore FPU/SSE/AVX state using xrstor64 from the given 64-byte aligned 1024-byte buffer.
+/// Jalon 97: Upgraded from fxrstor to xrstor64 for AVX2 context restoration.
+/// # Safety: `area` must point to a valid 64-byte aligned 1024-byte buffer.
 #[inline(always)]
 pub unsafe fn fpu_restore(area: *const FpuState) {
+    // Use xrstor64 with mask 0x07 (x87 + SSE + AVX)
     asm!(
-        "fxrstor [{}]",
+        "mov eax, 0x07",
+        "xor edx, edx",
+        "xrstor64 [{}]",
         in(reg) area,
+        out("eax") _,
+        out("edx") _,
         options(nostack),
     );
 }

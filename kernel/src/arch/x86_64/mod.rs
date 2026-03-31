@@ -8,6 +8,7 @@ pub mod pci;
 pub mod context;
 pub mod syscall;
 pub mod apic;
+pub mod acpi;
 
 /// Initialize all x86_64 HAL modules
 /// Critical order: GDT -> IDT -> Interrupts

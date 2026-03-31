@@ -104,6 +104,12 @@ pub fn init() {
     crate::serial_println!("[IDT] Loaded with 20 exception handlers + demand paging");
 }
 
+/// Load the BSP's IDT on an AP core (Jalon 101).
+/// Called from ap_main after loading the GDT.
+pub fn load_for_ap() {
+    IDT.load();
+}
+
 /// Retourne une reference statique a l'IDT (pour tests)
 pub fn idt_ref() -> &'static InterruptDescriptorTable {
     &IDT
@@ -256,6 +262,20 @@ fn kill_user_and_switch(current_pid: u64, addr_raw: u64) {
         unsafe { core::arch::asm!("mov {}, cr3", out(reg) active_cr3, options(nomem, nostack)); }
         if pml4 != (active_cr3 & !0xFFF) {
             unsafe { crate::elf::free_user_page_table(pml4); }
+        }
+    }
+
+    // ── Jalon 100: Watchdog — Auto-respawn critical agents ──
+    // Get the crashed process's name and attempt respawn from VFS
+    let crashed_name = crate::process::with_process(current_pid, |p| p.name.clone())
+        .unwrap_or_else(|| alloc::string::String::new());
+    if !crashed_name.is_empty() {
+        let respawn_pid = crate::process::watchdog_try_respawn(&crashed_name);
+        if respawn_pid != 0 {
+            crate::serial_println!(
+                "[WATCHDOG] Agent {} (PID {}) crashed -> respawned as PID {}",
+                crashed_name, current_pid, respawn_pid
+            );
         }
     }
 

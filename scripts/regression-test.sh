@@ -68,14 +68,14 @@ else
     echo "[QEMU] No KVM — using software emulation (slower)"
 fi
 
-echo "[QEMU] Launching headless QEMU (timeout=${TIMEOUT}s, cpu=Haswell, ram=512M)..."
+echo "[QEMU] Launching headless QEMU (timeout=${TIMEOUT}s, cpu=Haswell, smp=2, ram=512M)..."
 cd "$PROJECT_DIR"
 timeout "$TIMEOUT" qemu-system-x86_64 \
     $ACCEL_FLAG \
     -drive format=raw,file="$BOOTIMAGE" \
     -drive file="$PROJECT_DIR/disk.img",format=raw,if=ide \
     -m 512M -serial stdio -display none \
-    -cpu Haswell -no-reboot \
+    -cpu Haswell -smp 2 -no-reboot \
     -device virtio-net-pci,netdev=net0 -netdev user,id=net0 \
     -device qemu-xhci \
     > "$LOG_FILE" 2>/dev/null || true
@@ -586,6 +586,24 @@ check "T172 Reflex memory trigger" "REFLEX HIT|Reflex.*action|Hippocampe|reflex 
 check "T173 LLM wake-up route" "INTENT_LLM_WAKEUP|LLM_CHAT_INIT|Routing to LLM|No reflex match|orch_test.*pipeline|orch_test.*INTENT_USER_PROMPT"
 check "T174 GGUF file opened" "Opened model file|Opening model from|GGUF v3|GGUF v|Phase 1.*Opening model|models.*gguf"
 check "T175 Architecture validated" "Architecture.*llama|Model dim.*576|d_model.*576|MODEL CONFIGURATION|Architecture validated|Architecture:.*test|GGUF v3.*tensors"
+
+# =============================================
+echo "=== [Cat 37] Jalon 97-100: SMP Affinity, INT8 KV, HTTP, Watchdog ==="
+# =============================================
+check "T176 CPU Affinity Scheduler active" "CPU Affinity Scheduler ACTIVE|Jalon 97.*Affinity|affinity.*Scheduler"
+check "T177 INT8 KV Cache quantization active" "INT8 KV Cache|TurboQuant|kv_cache_int8|4x KV savings|Jalon 98.*INT8|v11.0.*INT8|Inference v11|v11.0.INT8"
+check "T178 HTTP API Bridge loaded" "agent_http.elf.*bytes|HTTP.*Bridge|HTTP.*API|INTENT_HTTP_READY|HTTP.*parser.*VALIDATED|HTTP-OK|World Connection via HTTP"
+check "T179 Watchdog active" "WATCHDOG.*Registered|WATCHDOG.*ACTIVE|Jalon 100.*Watchdog|watchdog.*auto-respawn"
+check "T180 Agents pinned to cores" "Core 1.*QUEUED|QUEUED.*Core 1|Core 0.*QUEUED|QUEUED.*WATCHDOG|agent_orchestrator.*WATCHDOG|agent_mcp.*WATCHDOG"
+
+# =============================================
+echo "=== [Cat 38] Jalon 97 SMP: True Dual-Core, ACPI, AVX2/XSAVE ==="
+# =============================================
+check "T181 ACPI MADT parsed" "MADT Parsed|MADT.*Found.*CPU|ACPI.*MADT|ACPI.*2 CPUs|APIC IDs.*0.*1"
+check "T182 XSAVE/AVX context ready" "XCR0 configured.*AVX|XSAVE ready|XSAVE.*XRSTOR|xsave.*active|1024-byte FPU"
+check "T183 INIT-SIPI-SIPI sent" "Sending INIT.*SIPI|INIT-SIPI-SIPI|SIPI.*APIC ID|SMP.*Sending"
+check "T184 AP core alive" "AP Core.*alive|AP.*entering scheduler|AP.*ready.*APIC|APs awakened.*1|Total CPUs.*2"
+check "T185 SMP dual-core active" "CPU count.*2|SMP active|2.*core|Total CPUs.*2|SMP.*Results"
 
 # =============================================
 # Cleanup and Summary

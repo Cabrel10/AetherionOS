@@ -93,15 +93,72 @@ impl PriorityScheduler {
 
     /// Dequeue the highest-priority ready PID (strict priority: starves lower queues)
     fn dequeue_next(&mut self) -> Option<(u64, SchedPriority)> {
-        // Scan from highest (Critical=4) to lowest (Idle=0)
+        self.dequeue_next_for_core(0xFF) // 0xFF = any core (legacy behavior)
+    }
+
+    /// Jalon 97: Dequeue highest-priority PID that matches the given core affinity.
+    /// A process with cpu_affinity == 0xFF runs on any core.
+    /// A process with cpu_affinity == N runs only on core N.
+    /// The `core_id` parameter is the ID of the currently executing core.
+    ///
+    /// Two-pass strategy for SMP compatibility:
+    ///   Pass 1: Prefer processes whose affinity matches this core (or 0xFF)
+    ///   Pass 2: If no match, schedule ANY ready process (prevents starvation
+    ///           when AP cores aren't fully running, e.g., QEMU single-thread)
+    fn dequeue_next_for_core(&mut self, core_id: u32) -> Option<(u64, SchedPriority)> {
+        // Pass 1: Try to find a process matching this core's affinity
+        if core_id != 0xFF {
+            for idx in (0..5).rev() {
+                let mut i = 0;
+                while i < self.queues[idx].len() {
+                    let pid = self.queues[idx][i];
+                    if let Some(state) = process::get_state(pid) {
+                        if state == process::ProcessState::Terminated {
+                            self.queues[idx].remove(i); // Clean up dead process
+                            continue;
+                        }
+                        if state == process::ProcessState::Blocked {
+                            i += 1;
+                            continue;
+                        }
+                    }
+                    let affinity = process::get_cpu_affinity(pid);
+                    // Match: affinity is this core, or process has no affinity preference
+                    if affinity == core_id as u8 || affinity == 0xFF {
+                        let pid = self.queues[idx].remove(i).unwrap();
+                        let prio = match idx {
+                            4 => SchedPriority::Critical,
+                            3 => SchedPriority::High,
+                            2 => SchedPriority::Normal,
+                            1 => SchedPriority::Low,
+                            _ => SchedPriority::Idle,
+                        };
+                        return Some((pid, prio));
+                    }
+                    i += 1;
+                }
+            }
+        }
+
+        // Pass 2: Fallback — schedule ANY ready process regardless of affinity.
+        // This prevents starvation when AP cores aren't active (QEMU single-thread mode).
+        // Also cleans up terminated processes from queues.
         for idx in (0..5).rev() {
-            while let Some(pid) = self.queues[idx].pop_front() {
-                // Skip terminated processes
+            let mut i = 0;
+            while i < self.queues[idx].len() {
+                let pid = self.queues[idx][i];
                 if let Some(state) = process::get_state(pid) {
                     if state == process::ProcessState::Terminated {
-                        continue; // Skip this PID, try next
+                        self.queues[idx].remove(i); // Remove dead process
+                        continue; // Don't increment i
+                    }
+                    if state == process::ProcessState::Blocked {
+                        i += 1;
+                        continue; // Skip blocked, keep in queue
                     }
                 }
+                // Ready or Running — schedule it
+                let pid = self.queues[idx].remove(i).unwrap();
                 let prio = match idx {
                     4 => SchedPriority::Critical,
                     3 => SchedPriority::High,
@@ -158,6 +215,12 @@ impl PriorityScheduler {
 
     /// Perform a scheduler tick: apply aging, preempt current, pick next
     fn tick(&mut self) -> TickResult {
+        self.tick_on_core(0xFF) // Legacy: no affinity filtering
+    }
+
+    /// Jalon 97: Affinity-aware scheduler tick.
+    /// Only selects processes whose cpu_affinity matches `core_id` (or 0xFF = any).
+    fn tick_on_core(&mut self, core_id: u32) -> TickResult {
         self.total_ticks += 1;
 
         // Apply anti-starvation aging
@@ -166,7 +229,6 @@ impl PriorityScheduler {
         // Re-enqueue the current process if still alive
         let old_pid = self.current_pid;
         if old_pid != 0 {
-            // Check if process is still alive before re-enqueuing
             if let Some(state) = process::get_state(old_pid) {
                 if state != process::ProcessState::Terminated {
                     if let Some((role, _prio)) = process::get_role_priority(old_pid) {
@@ -177,14 +239,13 @@ impl PriorityScheduler {
             }
         }
 
-        // Pick the next process
-        if let Some((next_pid, next_prio)) = self.dequeue_next() {
+        // Pick the next process — respecting CPU affinity
+        if let Some((next_pid, next_prio)) = self.dequeue_next_for_core(core_id) {
             let switched = next_pid != old_pid;
             if switched {
                 self.context_switches += 1;
             }
             self.current_pid = next_pid;
-            // Reset wait_ticks for the newly running process
             process::set_wait_ticks(next_pid, 0);
             TickResult {
                 old_pid,
@@ -194,7 +255,7 @@ impl PriorityScheduler {
                 tick_number: self.total_ticks,
             }
         } else {
-            // No ready processes; stay idle
+            // No ready processes for this core; stay idle
             self.current_pid = 0;
             TickResult {
                 old_pid,
@@ -294,36 +355,63 @@ pub fn schedule_next() {
     }
 }
 
-/// Yield from `current` to the next ready process. Uses a blocking lock.
+/// Yield from `current` to the next ready process.
 /// Returns the PID of the next process (or 0/current if no switch).
+/// Jalon 101: Uses try_lock to prevent SMP deadlock. Disables interrupts
+/// while holding the scheduler lock to avoid priority inversion.
+/// Strict CPU affinity: Core 0 = OS/UI (affinity 0/0xFF), Core 1 = LLM (affinity 1/0xFF).
 pub fn yield_to_next(current: u64) -> u64 {
     if !SCHEDULER_ACTIVE.load(Ordering::Relaxed) {
         return current;
     }
-    let mut sched = SCHEDULER.lock();  // blocking lock, guaranteed
-    // Re-enqueue current if still alive
-    if current != 0 {
-        if let Some(state) = process::get_state(current) {
-            if state != process::ProcessState::Terminated {
-                if let Some((role, _)) = process::get_role_priority(current) {
-                    let prio = role_to_priority(role);
-                    sched.enqueue(current, prio);
+    // Disable interrupts while accessing scheduler (prevents deadlock with timer ISR)
+    let flags: u64;
+    unsafe {
+        core::arch::asm!("pushfq; pop {}; cli", out(reg) flags, options(nomem));
+    }
+
+    let raw_core = crate::arch::x86_64::apic::current_core();
+    // Strict affinity: use exact core ID when SMP is active
+    let core_id = if raw_core == 0 && !crate::arch::x86_64::apic::ap_is_alive() {
+        0xFF // Single-core fallback: BSP runs everything
+    } else {
+        raw_core
+    };
+
+    // Use try_lock to avoid spinning if another core holds the lock
+    let result = if let Some(mut sched) = SCHEDULER.try_lock() {
+        // Re-enqueue current if still alive
+        if current != 0 {
+            if let Some(state) = process::get_state(current) {
+                if state != process::ProcessState::Terminated {
+                    if let Some((role, _)) = process::get_role_priority(current) {
+                        let prio = role_to_priority(role);
+                        sched.enqueue(current, prio);
+                    }
                 }
             }
         }
-    }
-    // Dequeue next
-    if let Some((next_pid, _next_prio)) = sched.dequeue_next() {
-        if next_pid != current {
-            sched.context_switches += 1;
+        // Dequeue next — respecting CPU affinity
+        if let Some((next_pid, _next_prio)) = sched.dequeue_next_for_core(core_id) {
+            if next_pid != current {
+                sched.context_switches += 1;
+            }
+            sched.current_pid = next_pid;
+            process::set_wait_ticks(next_pid, 0);
+            next_pid
+        } else {
+            sched.current_pid = 0;
+            0
         }
-        sched.current_pid = next_pid;
-        process::set_wait_ticks(next_pid, 0);
-        next_pid
     } else {
-        sched.current_pid = 0;
-        0
+        current // Lock contended, return current (no switch)
+    };
+
+    // Restore interrupt flags
+    unsafe {
+        core::arch::asm!("push {}; popfq", in(reg) flags, options(nomem));
     }
+    result
 }
 
 /// Get current scheduler metrics
@@ -356,7 +444,14 @@ pub fn tick_preemptive() -> Option<(u64, u64, u64, u64, u64, u64)> {
     }
     // Try to acquire the lock; if contended, skip
     let mut sched = SCHEDULER.try_lock()?;
-    let result = sched.tick();
+    // Jalon 97: Strict affinity for preemptive scheduling
+    let raw_core = crate::arch::x86_64::apic::current_core();
+    let core_id = if raw_core == 0 && !crate::arch::x86_64::apic::ap_is_alive() {
+        0xFF // Single-core fallback
+    } else {
+        raw_core
+    };
+    let result = sched.tick_on_core(core_id);
 
     if !result.switched || result.new_pid == 0 {
         return None;
