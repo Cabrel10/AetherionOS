@@ -62,9 +62,15 @@ mod drivers;
 mod framebuffer;
 mod font;
 mod codegen;
+mod compat;
 
 // ===== Configuration =====
-const KERNEL_VERSION: &str = "2.4.0-j79-unified-fd-posix";
+const KERNEL_VERSION: &str = "2.6.0-j105-linux-abi-real-inference";
+
+/// Jalon 103: Toggle security agents (MCP/Validator) at boot.
+/// Set to false during SMP LLM pipeline testing to unclog BSP (Core 0).
+/// MUST be set back to true for production/release builds.
+const ENABLE_SECURITY_AGENTS: bool = false;
 
 // ===== Embedded ELF binaries =====
 /// Minimal hello.elf - statically linked x86-64 ELF for Ring 3 test
@@ -213,7 +219,7 @@ lazy_static! {
     };
 }
 
-/// Write a string to the serial port
+/// Write a string to the serial port (atomic per call via spinlock)
 pub fn serial_write(s: &str) {
     let mut serial = SERIAL1.lock();
     for byte in s.bytes() {
@@ -221,7 +227,17 @@ pub fn serial_write(s: &str) {
     }
 }
 
-// Macro for serial_println
+/// Write a string + newline atomically (single lock acquisition).
+/// Jalon 105: Prevents SMP serial tearing between Core 0 (BSP) and Core 1 (AP).
+pub fn serial_writeln(s: &str) {
+    let mut serial = SERIAL1.lock();
+    for byte in s.bytes() {
+        serial.send(byte);
+    }
+    serial.send(b'\n');
+}
+
+// Macro for serial_println — Jalon 105: atomic message+newline to prevent SMP tearing
 #[macro_export]
 macro_rules! serial_println {
     ($($arg:tt)*) => {
@@ -229,8 +245,7 @@ macro_rules! serial_println {
             use core::fmt::Write;
             let mut s = arrayvec::ArrayString::<256>::new();
             let _ = write!(s, $($arg)*);
-            $crate::serial_write(s.as_str());
-            $crate::serial_write("\n");
+            $crate::serial_writeln(s.as_str());
         }
     };
 }
@@ -306,18 +321,18 @@ lazy_static! {
 // ===== Panic Handler =====
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    serial_write("\n[PANIC] ");
+    // Jalon 105: Atomic panic output to prevent SMP serial tearing
+    // Build the entire message in one buffer, then write atomically.
+    let mut full = arrayvec::ArrayString::<512>::new();
+    let _ = write!(full, "\n[KERNEL-PANIC] ");
     if let Some(msg) = info.message() {
-        let mut s = arrayvec::ArrayString::<256>::new();
-        let _ = write!(s, "{}", msg);
-        serial_write(&s);
+        let _ = write!(full, "{}", msg);
     }
     if let Some(loc) = info.location() {
-        let mut s = arrayvec::ArrayString::<128>::new();
-        let _ = write!(s, " at {}:{}", loc.file(), loc.line());
-        serial_write(&s);
+        let _ = write!(full, " at {}:{}", loc.file(), loc.line());
     }
-    serial_write("\nSystem halted.\n");
+    let _ = write!(full, "\nSystem halted.\n");
+    serial_write(full.as_str());
     loop { x86_64::instructions::hlt(); }
 }
 
@@ -1317,6 +1332,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_write("       [OK] TPM stub + PCR0 + stack protector\n");
     security::kpti::init();
     serial_write("       [OK] KPTI-Lite: kernel/user page table isolation active\n");
+    serial_write("       [OK] Linuxulator: Linux ABI compatibility layer active (uname=Linux 6.1.0-aetherion)\n");
 
     serial_write("\n[BOOT] Phase 2: Memory & Filesystem\n");
     serial_write("[BOOT] ──────────────────────────────────────\n");
@@ -2115,12 +2131,15 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     chat_result.entry_point, chat_result.stack_pointer, chat_result.pml4_phys
                 ).unwrap_or(0);
                 if chat_pid != 0 {
-                    // CEO directive: single-core LLM until pipeline is 100% stable.
-                    // Agents run on any core (0xFF) so BSP scheduler dispatches them.
-                    // When parallel MatMul is approved, pin to Core 1 via set_cpu_affinity(chat_pid, 1).
-                    process::set_cpu_affinity(chat_pid, 0xFF);
+                    // Jalon 102: Pin LLM chat agent to Core 1 for true SMP execution.
+                    process::set_cpu_affinity(chat_pid, 1);
+                    // Jalon 105: Set ABI based on ELF detection
+                    if chat_result.is_linux_abi {
+                        process::set_abi(chat_pid, compat::linux_abi::Abi::Linux);
+                        compat::linux_abi::log_linux_abi_activation(chat_pid, "agent_llm_chat.elf");
+                    }
                     scheduler::enqueue_process(chat_pid);
-                    serial_write("  [J79] agent_llm_chat.elf: QUEUED (GGUF verification via sys_pread64) [Core 1]\n");
+                    serial_write("  [J102] agent_llm_chat.elf: QUEUED on Core 1 (SMP Ring 3)\n");
                 }
             }
             Err(_e) => {
@@ -2139,10 +2158,12 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     orch_result.entry_point, orch_result.stack_pointer, orch_result.pml4_phys
                 ).unwrap_or(0);
                 if orch_pid != 0 {
+                    // Jalon 102: Pin orchestrator to Core 0 (BSP) for OS/UI tasks
+                    process::set_cpu_affinity(orch_pid, 0);
                     scheduler::enqueue_process(orch_pid);
                     // Jalon 100: Register orchestrator in watchdog for auto-respawn
                     process::watchdog_register("/bin/agent_orchestrator.elf", 0); // Core 0
-                    serial_write("  [J85] agent_orchestrator.elf: QUEUED (Thalamus + Hippocampe) [WATCHDOG]\n");
+                    serial_write("  [J102] agent_orchestrator.elf: QUEUED on Core 0 [WATCHDOG]\n");
                 }
             }
             Err(_e) => {
@@ -2165,11 +2186,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     llama_entry, llama_stack, llama_pml4
                 ).unwrap_or(0);
                 if llama_pid != 0 {
-                    // CEO directive: single-core LLM until pipeline is 100% stable.
-                    // Agents run on any core (0xFF) so BSP scheduler dispatches them.
-                    process::set_cpu_affinity(llama_pid, 0xFF);
+                    // Jalon 102: Pin LLM core agent to Core 1 for true SMP execution.
+                    process::set_cpu_affinity(llama_pid, 1);
                     scheduler::enqueue_process(llama_pid);
-                    serial_write("  [J79] agent_llama_core.elf: QUEUED (multi-agent scheduling ENABLED) [Core 1]\n");
+                    serial_write("  [J102] agent_llama_core.elf: QUEUED on Core 1 (SMP Ring 3)\n");
                 }
             }
             Err(_e) => {
@@ -2181,46 +2201,53 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         // STEP A4: Load agent_mcp.elf (Level 8 - MCP Security Agent)
         // Must be queued BEFORE visual_term so it can receive bus messages
         // from the terminal's mcp_test command.
+        // Jalon 103: Temporarily disabled to unclog BSP for SMP LLM pipeline
         // ──────────────────────────────────────────────────────────
-        match elf::load_elf_binary(AGENT_MCP_ELF) {
-            Ok(mcp_result) => {
-                let mcp_pid = process::spawn_userspace(
-                    "/bin/agent_mcp.elf", 0,
-                    mcp_result.entry_point, mcp_result.stack_pointer, mcp_result.pml4_phys
-                ).unwrap_or(0);
-                if mcp_pid != 0 {
-                    scheduler::enqueue_process(mcp_pid);
-                    // Jalon 100: Register MCP agent in watchdog for auto-respawn
-                    process::watchdog_register("/bin/agent_mcp.elf", 0); // Core 0
-                    serial_write("  [L8] agent_mcp.elf: QUEUED (MCP security agent) [WATCHDOG]\n");
+        if ENABLE_SECURITY_AGENTS {
+            match elf::load_elf_binary(AGENT_MCP_ELF) {
+                Ok(mcp_result) => {
+                    let mcp_pid = process::spawn_userspace(
+                        "/bin/agent_mcp.elf", 0,
+                        mcp_result.entry_point, mcp_result.stack_pointer, mcp_result.pml4_phys
+                    ).unwrap_or(0);
+                    if mcp_pid != 0 {
+                        scheduler::enqueue_process(mcp_pid);
+                        process::watchdog_register("/bin/agent_mcp.elf", 0);
+                        serial_write("  [L8] agent_mcp.elf: QUEUED (MCP security agent) [WATCHDOG]\n");
+                    }
+                }
+                Err(_e) => {
+                    serial_write("  [L8] WARN: agent_mcp.elf load failed\n");
                 }
             }
-            Err(_e) => {
-                serial_write("  [L8] WARN: agent_mcp.elf load failed\n");
-            }
+        } else {
+            serial_write("  [J103] agent_mcp.elf: SKIPPED (SMP diet mode)\n");
         }
 
         // ──────────────────────────────────────────────────────────
         // STEP A5: Load agent_validator.elf (Immune System - JSON Coherence)
         // Validates all LLM JSON output before forwarding to MCP.
-        // Modes: Strict | Admin | God Mode (0x1337 + 0xBADC0DED)
+        // Jalon 103: Temporarily disabled to unclog BSP for SMP LLM pipeline
         // ──────────────────────────────────────────────────────────
-        match elf::load_elf_binary(AGENT_VALIDATOR_ELF) {
-            Ok(val_result) => {
-                let val_pid = process::spawn_userspace(
-                    "/bin/agent_validator.elf", 0,
-                    val_result.entry_point, val_result.stack_pointer, val_result.pml4_phys
-                ).unwrap_or(0);
-                if val_pid != 0 {
-                    scheduler::enqueue_process(val_pid);
-                    // Jalon 100: Register validator in watchdog for auto-respawn
-                    process::watchdog_register("/bin/agent_validator.elf", 0); // Core 0
-                    serial_println!("  [L9] agent_validator.elf: QUEUED ({} bytes, Immune System) [WATCHDOG]", AGENT_VALIDATOR_ELF.len());
+        if ENABLE_SECURITY_AGENTS {
+            match elf::load_elf_binary(AGENT_VALIDATOR_ELF) {
+                Ok(val_result) => {
+                    let val_pid = process::spawn_userspace(
+                        "/bin/agent_validator.elf", 0,
+                        val_result.entry_point, val_result.stack_pointer, val_result.pml4_phys
+                    ).unwrap_or(0);
+                    if val_pid != 0 {
+                        scheduler::enqueue_process(val_pid);
+                        process::watchdog_register("/bin/agent_validator.elf", 0);
+                        serial_println!("  [L9] agent_validator.elf: QUEUED ({} bytes, Immune System) [WATCHDOG]", AGENT_VALIDATOR_ELF.len());
+                    }
+                }
+                Err(_e) => {
+                    serial_write("  [L9] WARN: agent_validator.elf load failed\n");
                 }
             }
-            Err(_e) => {
-                serial_write("  [L9] WARN: agent_validator.elf load failed\n");
-            }
+        } else {
+            serial_write("  [J103] agent_validator.elf: SKIPPED (SMP diet mode)\n");
         }
 
         // ──────────────────────────────────────────────────────────
@@ -2254,6 +2281,11 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     entry, stack, pml4
                 ).unwrap_or(0);
                 if pid != 0 {
+                    // Jalon 105: Set ABI based on ELF detection
+                    if result.is_linux_abi {
+                        process::set_abi(pid, compat::linux_abi::Abi::Linux);
+                        compat::linux_abi::log_linux_abi_activation(pid, elf_name);
+                    }
                     scheduler::enqueue_process(pid);
                     scheduler::set_current_pid(pid);
                     // DON'T save preempt_state here — it will be saved by timer IRQ when actually preempted

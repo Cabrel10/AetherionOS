@@ -690,6 +690,14 @@ pub fn get_cpu_affinity(pid: u64) -> u8 {
     table.get(&pid).map(|p| p.cpu_affinity).unwrap_or(0xFF)
 }
 
+/// Jalon 105: Set ABI compatibility mode for a process
+pub fn set_abi(pid: u64, abi: crate::compat::linux_abi::Abi) {
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(p) = table.get_mut(&pid) {
+        p.abi = abi;
+    }
+}
+
 /// Jalon 55/79: Save user-mode state for preemptive context switch.
 /// Called from timer interrupt handler or sys_yield when preempting a Ring 3 process.
 /// Also saves callee-saved registers (r15,r14,r13,r12,rbx,rbp,r11,rcx) from

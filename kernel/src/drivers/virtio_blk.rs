@@ -13,7 +13,7 @@
 //   - VirtIO 1.0 Spec, Section 5.2 (Block Device)
 //   - Legacy VirtIO specification
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 /// Block device sector size
 pub const SECTOR_SIZE: usize = 512;
@@ -70,6 +70,29 @@ struct VringDesc {
 /// Global block device state
 static BLK_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static mut BLK_DEVICE: Option<VirtioBlkDevice> = None;
+
+/// SMP spinlock for block device I/O (prevents concurrent VirtIO queue corruption)
+static BLK_IO_LOCK: AtomicU8 = AtomicU8::new(0);
+
+#[inline]
+fn blk_lock() {
+    loop {
+        match BLK_IO_LOCK.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(_) => {
+                // Spin with PAUSE for power efficiency
+                while BLK_IO_LOCK.load(Ordering::Relaxed) != 0 {
+                    unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
+                }
+            }
+        }
+    }
+}
+
+#[inline]
+fn blk_unlock() {
+    BLK_IO_LOCK.store(0, Ordering::Release);
+}
 
 pub struct VirtioBlkDevice {
     io_base: u16,
@@ -417,26 +440,32 @@ pub fn is_available() -> bool {
     BLK_INITIALIZED.load(Ordering::SeqCst)
 }
 
-/// Read a sector from the block device
+/// Read a sector from the block device (SMP-safe via spinlock)
 pub fn read_sector(lba: u64, buf: &mut [u8]) -> bool {
-    unsafe {
+    blk_lock();
+    let result = unsafe {
         if let Some(ref mut dev) = BLK_DEVICE {
             dev.read_sector(lba, buf)
         } else {
             false
         }
-    }
+    };
+    blk_unlock();
+    result
 }
 
-/// Write a sector to the block device
+/// Write a sector to the block device (SMP-safe via spinlock)
 pub fn write_sector(lba: u64, buf: &[u8]) -> bool {
-    unsafe {
+    blk_lock();
+    let result = unsafe {
         if let Some(ref mut dev) = BLK_DEVICE {
             dev.write_sector(lba, buf)
         } else {
             false
         }
-    }
+    };
+    blk_unlock();
+    result
 }
 
 /// Get disk capacity in sectors

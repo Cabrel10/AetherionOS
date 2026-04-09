@@ -305,6 +305,9 @@ pub struct Process {
     /// Jalon 96: CPU core affinity (0 = BSP/any, 1+ = pinned to AP core)
     /// 0xFF = no affinity (run on any core)
     pub cpu_affinity: u8,
+    /// Jalon 105: ABI compatibility mode (AetherionOS native vs Linux)
+    /// Linux ABI processes get Linux-specific uname, arch_prctl, etc.
+    pub abi: crate::compat::linux_abi::Abi,
 }
 
 /// Virtual Memory Area — describes a file-backed memory mapping
@@ -363,6 +366,7 @@ impl Process {
             heap_break: 0x0000_3000_0000_0000, // Initial heap base (PML4[96])
             vmas: Vec::new(),
             cpu_affinity: 0xFF, // Default: no affinity (run on any core)
+            abi: crate::compat::linux_abi::Abi::AetherionOS, // Default: native ABI
         }
     }
 

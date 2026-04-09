@@ -30,6 +30,7 @@ pub mod drivers;
 pub mod framebuffer;
 pub mod font;
 pub mod codegen;
+pub mod compat;
 
 pub mod tests;
 
@@ -79,15 +80,14 @@ macro_rules! serial_print {
 #[macro_export]
 macro_rules! serial_println {
     () => {
-        $crate::serial_write("\n")
+        $crate::serial_writeln("")
     };
     ($($arg:tt)*) => {
         {
             use core::fmt::Write;
             let mut s = $crate::util::ArrayWriter::<256>::new();
             let _ = core::write!(&mut s, $($arg)*);
-            $crate::serial_write(s.as_str());
-            $crate::serial_write("\n");
+            $crate::serial_writeln(s.as_str());
         }
     };
 }
@@ -140,6 +140,11 @@ pub mod util {
 
 /// Fonction stub pour serial_write (sera définie dans main.rs)
 pub fn serial_write(_s: &str) {
+    // Stub - sera remplacé par main.rs
+}
+
+/// Fonction stub pour serial_writeln (sera définie dans main.rs)
+pub fn serial_writeln(_s: &str) {
     // Stub - sera remplacé par main.rs
 }
 

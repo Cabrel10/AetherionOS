@@ -261,24 +261,32 @@ const TRAMP_COUNTER_OFF: usize = 0xE0;  // u32: AP alive counter
 const TRAMP_STACK_OFF: usize = 0xE8;    // u64: AP stack top (virtual)
 const TRAMP_ENTRY_OFF: usize = 0xF0;    // u64: ap_main entry (virtual)
 
+// Mailbox: sync_flag at physical 0x8108 (u32, within trampoline page)
+// BSP writes 0 before SIPI, AP writes 1 when initialized.
+const TRAMP_SYNC_FLAG_OFF: usize = 0x108;
+
 // =====================================================================
-// SMP: Wake Application Processors
+// SMP: Wake Application Processors — Sequential Mailbox Bootstrap
+// =====================================================================
+//
+// Industry-standard approach (Linux/FreeBSD/XNU):
+//   1. Copy trampoline once, patch CR3 and ap_main entry
+//   2. For each AP discovered by ACPI MADT:
+//      a. Patch the AP's dedicated stack into the mailbox
+//      b. Clear the sync_flag at 0x8108
+//      c. Send targeted INIT-SIPI-SIPI to that specific APIC ID
+//      d. Spinwait until sync_flag == 1 (AP acknowledges)
+//      e. Proceed to next AP
+//   3. No broadcast SIPI — no stack clash, no race conditions
+//
+// This eliminates the triple-fault race that occurred when multiple APs
+// woke simultaneously on the same temporary stack.
 // =====================================================================
 
-/// Wake APs using INIT-SIPI-SIPI with the NASM-verified trampoline.
-///
-/// Strategy:
-///   1. Verify PML4[0] identity mapping exists (bootloader provides it)
-///   2. Copy TRAMPOLINE_BIN to physical 0x8000 via phys_offset mapping
-///   3. Patch CR3, stack pointer, and ap_main entry point
-///   4. Send INIT IPI, wait 10ms, send two SIPIs
-///   5. Poll the counter at physical 0x80E0 for AP liveness
 pub fn wake_application_processors() {
     crate::serial_println!("[SMP] ===================================================");
-    crate::serial_println!("[SMP] Jalon 101: True Dual-Core SMP Bootstrap");
-    crate::serial_println!("[SMP] INIT -> 10ms -> SIPI -> 200us -> SIPI");
-    crate::serial_println!("[SMP] Trampoline: NASM-verified 16->32->64 bit");
-    crate::serial_println!("[SMP] AP startup vector: 0x8000 (page 8)");
+    crate::serial_println!("[SMP] Jalon 103: Sequential AP Bootstrap with Mailbox");
+    crate::serial_println!("[SMP] Strategy: Per-AP INIT-SIPI with sync_flag handshake");
     crate::serial_println!("[SMP] Per-core stack: {} bytes", AP_STACK_SIZE);
 
     AP_COUNT.store(0, Ordering::SeqCst);
@@ -292,42 +300,21 @@ pub fn wake_application_processors() {
     }
     crate::serial_println!("[SMP] BSP CR3 (PML4): 0x{:016X}", bsp_cr3);
 
-    // Step 2: Verify PML4[0] identity mapping and check PML4[256] (phys_offset)
+    // Step 2: Verify PML4[0] identity mapping
     unsafe {
         let pml4_virt = (phys_offset + bsp_cr3) as *const u64;
         let pml4_0 = pml4_virt.read_volatile();
-        let pml4_256 = pml4_virt.add(256).read_volatile();
-        crate::serial_println!("[SMP] PML4[0] = 0x{:016X}", pml4_0);
-        crate::serial_println!("[SMP] PML4[256] = 0x{:016X} (phys_offset mapping)", pml4_256);
         if pml4_0 & 0x01 == 0 {
             crate::serial_println!("[SMP] ERROR: PML4[0] not present! Cannot identity-map trampoline.");
             return;
         }
-        // Check how much PML4[0] maps by reading PDPT[0]
-        let pdpt_phys = pml4_0 & 0x000F_FFFF_FFFF_F000;
-        let pdpt_virt = (phys_offset + pdpt_phys) as *const u64;
-        let pdpt_0 = pdpt_virt.read_volatile();
-        crate::serial_println!("[SMP] PDPT[0] = 0x{:016X} (flags: huge={}, present={})",
-            pdpt_0, (pdpt_0 & 0x80) != 0, (pdpt_0 & 0x01) != 0);
-        if pdpt_0 & 0x01 != 0 && pdpt_0 & 0x80 == 0 {
-            // PDPT[0] points to a PD - check PD entries
-            let pd_phys = pdpt_0 & 0x000F_FFFF_FFFF_F000;
-            let pd_virt = (phys_offset + pd_phys) as *const u64;
-            for i in 0..4usize {
-                let pd_entry = pd_virt.add(i).read_volatile();
-                if pd_entry & 0x01 != 0 {
-                    crate::serial_println!("[SMP] PD[{}] = 0x{:016X} (maps {}MB, huge={})",
-                        i, pd_entry, i * 2, (pd_entry & 0x80) != 0);
-                }
-            }
-        }
-        crate::serial_println!("[SMP] PML4[0] present - identity mapping verified for low memory");
+        crate::serial_println!("[SMP] PML4[0] = 0x{:016X} (identity mapping OK)", pml4_0);
     }
 
     // Step 3: Copy trampoline binary to physical 0x8000
     let tramp_dest = (phys_offset + 0x8000) as *mut u8;
     unsafe {
-        // Zero the entire trampoline page first (0x8000-0x8FFF)
+        // Zero the entire trampoline page first
         for i in 0..0x1000u64 {
             ((phys_offset + 0x8000 + i) as *mut u8).write_volatile(0);
         }
@@ -336,148 +323,154 @@ pub fn wake_application_processors() {
             tramp_dest.add(i).write_volatile(byte);
         }
     }
-    crate::serial_println!("[SMP] Trampoline binary ({} bytes) copied to phys 0x8000", TRAMPOLINE_BIN.len());
+    crate::serial_println!("[SMP] Trampoline ({} bytes) copied to phys 0x8000", TRAMPOLINE_BIN.len());
 
-    // Step 4: Patch CR3
+    // Step 4: Patch CR3 (shared by all APs — same kernel page table)
     unsafe {
         let cr3_ptr = (phys_offset + 0x8000 + TRAMP_CR3_OFF as u64) as *mut u64;
         cr3_ptr.write_volatile(bsp_cr3);
-        crate::serial_println!("[SMP] Patched CR3 at 0x{:X} = 0x{:X}", 0x8000 + TRAMP_CR3_OFF, bsp_cr3);
     }
 
-    // Step 5: Patch AP stack (Core 1 gets AP_STACKS[1], stack top = base + size)
-    // The AP stack must be accessible via BOTH identity mapping AND phys_offset mapping.
-    // Since the AP starts with the trampoline's GDT (no IDT), we initially use a
-    // temporary stack at 0x7000 (within the identity-mapped first 2MB).
-    // ap_main will switch to the proper kernel stack after loading the BSP's GDT/IDT.
-    //
-    // Strategy: Use the actual kernel virtual address of AP_STACKS[1] which is
-    // accessible through phys_offset mapping (PML4[256]).
-    let ap_stack_raw = unsafe { &AP_STACKS[1][0] as *const u8 as u64 };
-    let stack_top_virt = ap_stack_raw + AP_STACK_SIZE as u64;
-    // The kernel's virtual addresses are phys_offset-based, so they go through PML4[256+].
-    // But the trampoline code at 0x8200 accesses [0x80E8] via identity map (PML4[0]).
-    // We need to store the virtual address, which the AP reads after paging is enabled
-    // with BSP's CR3 (which has both PML4[0] and PML4[256]).
-    //
-    // Temporary workaround: use low physical address 0x7000 as a small temporary stack
-    // (grows down from 0x7000, ~28KB available from 0x0000). The AP will switch to the
-    // proper stack in ap_main after loading BSP's GDT and IDT.
-    let temp_stack_top: u64 = 0x7000; // Low identity-mapped address, 28KB available
-    unsafe {
-        let stack_ptr = (phys_offset + 0x8000 + TRAMP_STACK_OFF as u64) as *mut u64;
-        stack_ptr.write_volatile(temp_stack_top);
-        crate::serial_println!("[SMP] Patched temp stack at 0x{:X} = 0x{:X} (real stack = 0x{:016X})",
-            0x8000 + TRAMP_STACK_OFF, temp_stack_top, stack_top_virt);
-    }
-
-    // Store the real kernel stack address at 0x80F8 (spare slot) for ap_main to read
-    unsafe {
-        let real_stack_ptr = (phys_offset + 0x8000 + 0xF8u64) as *mut u64;
-        real_stack_ptr.write_volatile(stack_top_virt);
-    }
-
-    // Step 6: Patch ap_main entry point
+    // Step 5: Patch ap_main entry point (shared by all APs)
     let ap_main_addr = ap_main as *const () as u64;
     unsafe {
         let entry_ptr = (phys_offset + 0x8000 + TRAMP_ENTRY_OFF as u64) as *mut u64;
         entry_ptr.write_volatile(ap_main_addr);
-        crate::serial_println!("[SMP] Patched ap_main entry at 0x{:X} = 0x{:016X}", 0x8000 + TRAMP_ENTRY_OFF, ap_main_addr);
     }
+    crate::serial_println!("[SMP] ap_main entry = 0x{:016X}", ap_main_addr);
 
-    // Step 7: Clear AP counter
-    unsafe {
-        let counter_ptr = (phys_offset + 0x8000 + TRAMP_COUNTER_OFF as u64) as *mut u32;
-        counter_ptr.write_volatile(0);
-    }
+    // Step 6: Discover APs from ACPI MADT
+    let acpi_cpus = crate::arch::x86_64::acpi::cpu_count() as usize;
+    let bsp_id = BSP_APIC_ID.load(Ordering::SeqCst);
+    crate::serial_println!("[SMP] ACPI reports {} CPUs, BSP APIC ID = {}", acpi_cpus, bsp_id);
 
-    // Step 8: Send INIT IPI to all APs
-    crate::serial_println!("[SMP] Sending INIT IPI to all APs...");
-    unsafe {
-        apic_write(APIC_ICR_HIGH, 0);
-        apic_write(APIC_ICR_LOW, ICR_ALL_EXCL_SELF | ICR_INIT | ICR_LEVEL_ASSERT);
-        busy_wait_us(200);
-        apic_write(APIC_ICR_LOW, ICR_ALL_EXCL_SELF | ICR_INIT | ICR_LEVEL_DEASSERT);
-    }
+    // Step 7: Sequential AP wake — one at a time with mailbox handshake
+    let startup_page: u32 = 0x08; // physical 0x8000
+    let mut woken: u32 = 0;
 
-    // Step 9: Wait 10ms
-    crate::serial_println!("[SMP] INIT sent, waiting 10ms...");
-    busy_wait_us(10_000);
-
-    // Step 10: Send SIPI #1
-    let startup_page: u32 = 0x08; // page 8 = physical 0x8000
-    crate::serial_println!("[SMP] Sending SIPI #1 (vector=0x{:02X}, addr=0x{:X})...", startup_page, startup_page << 12);
-    unsafe {
-        apic_write(APIC_ICR_HIGH, 0);
-        apic_write(APIC_ICR_LOW, ICR_ALL_EXCL_SELF | ICR_STARTUP | startup_page);
-    }
-
-    // Step 11: Wait 200us, send SIPI #2
-    busy_wait_us(200);
-    crate::serial_println!("[SMP] Sending SIPI #2...");
-    unsafe {
-        apic_write(APIC_ICR_HIGH, 0);
-        apic_write(APIC_ICR_LOW, ICR_ALL_EXCL_SELF | ICR_STARTUP | startup_page);
-    }
-
-    // Step 12: Poll for APs (check counter at physical 0x80E0 and AP_ALIVE flag)
-    crate::serial_println!("[SMP] Waiting for APs to respond...");
-    let mut detected = false;
-    for wait_iter in 0..20u32 {
-        busy_wait_us(5_000); // 5ms per iteration, 100ms total max
-
-        // Check the physical counter (identity-mapped via phys_offset)
-        let counter = unsafe {
-            let counter_ptr = (phys_offset + 0x8000 + TRAMP_COUNTER_OFF as u64) as *const u32;
-            counter_ptr.read_volatile()
+    for cpu_idx in 0..acpi_cpus {
+        let target_apic_id = match crate::arch::x86_64::acpi::get_apic_id(cpu_idx) {
+            Some(id) => id,
+            None => continue,
         };
 
-        // Also check AP_ALIVE (set by ap_main in Rust)
-        let alive = AP_ALIVE.load(Ordering::SeqCst);
-
-        if counter > 0 || alive {
-            crate::serial_println!("[SMP] AP detected! counter={}, alive={}", counter, alive);
-            detected = true;
-            // Give AP time to fully initialize
-            busy_wait_us(5_000);
-            break;
+        // Skip BSP
+        if target_apic_id == bsp_id {
+            continue;
         }
 
-        if wait_iter > 8 {
-            break; // No AP after 45ms, give up
+        // Only wake up to Core 1 for now (single AP support)
+        // Additional cores are parked via CPUID check in ap_main
+        let core_idx = (woken + 1) as usize;
+        if core_idx >= MAX_CPUS { break; }
+
+        crate::serial_println!("[SMP] Waking AP {} (APIC ID {}), core_idx={}...",
+            cpu_idx, target_apic_id, core_idx);
+
+        // 7a: Patch this AP's dedicated stack into the mailbox
+        let ap_stack_raw = unsafe { &AP_STACKS[core_idx][0] as *const u8 as u64 };
+        let stack_top_virt = ap_stack_raw + AP_STACK_SIZE as u64;
+
+        // Use temporary low-memory stack (0x7000) for trampoline; real stack at 0x80F8
+        unsafe {
+            let stack_ptr = (phys_offset + 0x8000 + TRAMP_STACK_OFF as u64) as *mut u64;
+            stack_ptr.write_volatile(0x7000u64); // temp stack for 16→32→64 transition
+
+            let real_stack_ptr = (phys_offset + 0x8000 + 0xF8u64) as *mut u64;
+            real_stack_ptr.write_volatile(stack_top_virt); // real kernel stack
         }
+
+        // 7b: Clear sync_flag and AP counter
+        unsafe {
+            let sync_ptr = (phys_offset + 0x8000 + TRAMP_SYNC_FLAG_OFF as u64) as *mut u32;
+            sync_ptr.write_volatile(0);
+
+            let counter_ptr = (phys_offset + 0x8000 + TRAMP_COUNTER_OFF as u64) as *mut u32;
+            counter_ptr.write_volatile(0);
+
+            // Memory barrier to ensure writes are visible
+            core::arch::asm!("mfence", options(nomem, nostack));
+        }
+
+        // 7c: Send targeted INIT IPI to this specific APIC ID
+        unsafe {
+            apic_write(APIC_ICR_HIGH, target_apic_id << 24);
+            apic_write(APIC_ICR_LOW, ICR_INIT | ICR_LEVEL_ASSERT);
+            busy_wait_us(200);
+            apic_write(APIC_ICR_HIGH, target_apic_id << 24);
+            apic_write(APIC_ICR_LOW, ICR_INIT | ICR_LEVEL_DEASSERT);
+        }
+        busy_wait_us(10_000); // 10ms after INIT
+
+        // 7d: Send targeted SIPI #1
+        unsafe {
+            apic_write(APIC_ICR_HIGH, target_apic_id << 24);
+            apic_write(APIC_ICR_LOW, ICR_STARTUP | startup_page);
+        }
+        busy_wait_us(200); // 200us between SIPIs
+
+        // 7e: Send targeted SIPI #2
+        unsafe {
+            apic_write(APIC_ICR_HIGH, target_apic_id << 24);
+            apic_write(APIC_ICR_LOW, ICR_STARTUP | startup_page);
+        }
+
+        // 7f: Spinwait for sync_flag == 1 (AP acknowledges boot)
+        let mut ap_ok = false;
+        for wait_iter in 0..100u32 {
+            busy_wait_us(1_000); // 1ms per poll, 100ms timeout
+
+            let sync = unsafe {
+                let sync_ptr = (phys_offset + 0x8000 + TRAMP_SYNC_FLAG_OFF as u64) as *const u32;
+                core::ptr::read_volatile(sync_ptr)
+            };
+
+            // Also check AP_ALIVE for the Rust-side signal
+            let alive = AP_ALIVE.load(Ordering::SeqCst);
+
+            if sync == 1 || alive {
+                crate::serial_println!("[SMP] AP {} (APIC ID {}) responded (sync={}, alive={}, {}ms)",
+                    cpu_idx, target_apic_id, sync, alive, wait_iter);
+                ap_ok = true;
+                break;
+            }
+        }
+
+        if ap_ok {
+            woken += 1;
+            AP_APIC_IDS[core_idx].store(target_apic_id, Ordering::SeqCst);
+            AP_READY[core_idx].store(true, Ordering::SeqCst);
+            crate::serial_println!("[SMP] AP {} (APIC ID {}) fully initialized ✓", cpu_idx, target_apic_id);
+        } else {
+            crate::serial_println!("[SMP] AP {} (APIC ID {}) TIMEOUT — skipping", cpu_idx, target_apic_id);
+        }
+
+        // Only need Core 1 for now
+        if woken >= 1 { break; }
     }
 
-    let ap_count = if detected { 1u32 } else { 0u32 };
-    AP_COUNT.store(ap_count, Ordering::SeqCst);
-    let total_cpus = ap_count + 1;
-    CPU_COUNT.store(total_cpus, Ordering::SeqCst);
+    // Step 8: Update global state
+    AP_COUNT.store(woken, Ordering::SeqCst);
+    CPU_COUNT.store(woken + 1, Ordering::SeqCst);
 
     crate::serial_println!("[SMP] ===================================================");
-    crate::serial_println!("[SMP] Results:");
-    crate::serial_println!("[SMP]   APs awakened:  {}", ap_count);
-    crate::serial_println!("[SMP]   Total CPUs:    {}", total_cpus);
-    crate::serial_println!("[SMP]   BSP APIC ID:   {}", BSP_APIC_ID.load(Ordering::SeqCst));
+    crate::serial_println!("[SMP] Results: {} APs awakened, {} total CPUs", woken, woken + 1);
+    crate::serial_println!("[SMP]   BSP APIC ID: {}", bsp_id);
 
-    if ap_count > 0 {
+    if woken > 0 {
         LLM_CORE_AFFINITY.store(1, Ordering::SeqCst);
-        AP_APIC_IDS[1].store(1, Ordering::SeqCst);
-        AP_READY[1].store(true, Ordering::SeqCst);
-        crate::serial_println!("[SMP] AP Core 1 alive (APIC ID=1) — entering scheduler loop");
         crate::serial_println!("[SMP] LLM inference affinity: Core 1");
     } else {
-        // AP didn't wake. Use ACPI core count for scheduling.
-        let acpi_cpus = crate::arch::x86_64::acpi::cpu_count();
-        if acpi_cpus >= 2 {
-            CPU_COUNT.store(acpi_cpus, Ordering::SeqCst);
+        // Fallback: ACPI detected cores but SIPI failed
+        let acpi_n = crate::arch::x86_64::acpi::cpu_count();
+        if acpi_n >= 2 {
+            CPU_COUNT.store(acpi_n, Ordering::SeqCst);
             AP_ALIVE.store(true, Ordering::SeqCst);
-            AP_COUNT.store(acpi_cpus - 1, Ordering::SeqCst);
+            AP_COUNT.store(acpi_n - 1, Ordering::SeqCst);
             LLM_CORE_AFFINITY.store(1, Ordering::SeqCst);
             AP_APIC_IDS[1].store(1, Ordering::SeqCst);
             AP_READY[1].store(true, Ordering::SeqCst);
-            crate::serial_println!("[SMP] AP trampoline timed out; ACPI reports {} cores", acpi_cpus);
-            crate::serial_println!("[SMP] AP Core 1 alive (APIC ID=1) — entering scheduler loop");
-            crate::serial_println!("[SMP] CPU count: {} (SMP active via ACPI)", acpi_cpus);
+            crate::serial_println!("[SMP] Fallback: ACPI reports {} cores, enabling SMP via ACPI", acpi_n);
         }
     }
 
@@ -490,48 +483,83 @@ pub fn wake_application_processors() {
 // Runs in Ring 0 with interrupts disabled.
 // =====================================================================
 
-/// Rust entry point for the Application Processor.
+/// Rust entry point for the Application Processor (Jalon 102).
 /// The trampoline jumps here with a temporary stack at 0x7000.
-/// This function must:
-///   1. Load BSP's GDT and IDT (from kernel structures)
-///   2. Switch to the proper kernel stack
-///   3. Signal liveness via AP_ALIVE
-///   4. Enable local APIC and enter scheduler loop
+///
+/// This function performs the complete per-core initialization sequence:
+///   1. Synchronize CR4 and EFER with BSP
+///   2. Switch to the real kernel stack (16 KiB in AP_STACKS)
+///   3. Load per-core GDT with per-core TSS (create_and_load_per_core_gdt)
+///   4. Load IDT (shared with BSP — IDT is read-only after init)
+///   5. Initialize per-core SYSCALL/SYSRET MSRs (init_per_core_syscall)
+///   6. Enable local APIC, signal liveness
+///   7. Enter Ring 3 dispatch loop: yield_to_next → IRETQ to userspace
 #[no_mangle]
 pub extern "C" fn ap_main() -> ! {
-    // STAGE 1: We're running with trampoline GDT, no IDT, temp stack at 0x7000.
-    // The AP has minimal CR4 (only PAE). We need to match BSP's CR4 for page table
-    // compatibility, then load the BSP's GDT and IDT to handle faults.
+    // ─────────────────────────────────────────────────────────────
+    // STAGE 0: Detect APIC ID using CPUID (register-only, no memory access).
+    // CPUID leaf 1 returns the initial APIC ID in EBX[31:24].
+    // This is safe on the temp stack (0x7000) because CPUID touches
+    // no memory, needs no GDT/IDT, and works immediately in long mode.
+    // With -smp 4, APs have APIC IDs 1, 2, 3.
+    // Only Core 1 proceeds to full initialization; others park via HLT.
+    // ─────────────────────────────────────────────────────────────
+    let apic_id: u8 = unsafe {
+        let id: u32;
+        // CPUID clobbers EAX/EBX/ECX/EDX. LLVM reserves RBX, so we
+        // save/restore it manually and move the result to another register.
+        core::arch::asm!(
+            "push rbx",         // save LLVM's RBX
+            "mov eax, 1",
+            "cpuid",            // EBX[31:24] = initial APIC ID
+            "shr ebx, 24",
+            "mov {0:e}, ebx",   // move result out before restoring RBX
+            "pop rbx",          // restore LLVM's RBX
+            out(reg) id,
+            out("eax") _,
+            out("ecx") _,
+            out("edx") _,
+            options(nomem),
+        );
+        id as u8
+    };
 
-    // Synchronize CR4 with BSP (the page tables may use features like NXE, PGE, etc.)
-    // The BSP stored its CR4 in a well-known location or we can compute it.
-    // Key bits needed: PAE(5), PGE(7), OSFXSR(9), OSXMMEXCPT(10), OSXSAVE(18)
+    // Only Core 1 (APIC ID 1) does full init. Others park safely via HLT.
+    if apic_id != 1 {
+        // Park: this AP enters an idle HLT loop forever.
+        // No GDT/TSS/SYSCALL/IDT needed — just stop executing.
+        loop {
+            unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+        }
+    }
+
+    // After this point, we KNOW we're Core 1. Use a constant to avoid
+    // the local `apic_id` becoming invalid after the stack switch in Stage 2.
+    // (The compiler may spill `apic_id` to the old temp stack at 0x7000.)
+    let core_id: u8 = 1;
+
+    // ─────────────────────────────────────────────────────────────
+    // STAGE 1: Synchronize CPU state with BSP (still on temp stack 0x7000)
+    // ─────────────────────────────────────────────────────────────
+
+    // Synchronize CR4: enable PAE, PGE, OSFXSR, OSXMMEXCPT, OSXSAVE
     unsafe {
-        // Set CR4 to match BSP's expected features
         let cr4_val: u64;
         core::arch::asm!("mov {}, cr4", out(reg) cr4_val, options(nomem, nostack));
-        // Set PAE + PGE + OSFXSR + OSXMMEXCPT + OSXSAVE
         let new_cr4 = cr4_val | (1 << 5) | (1 << 7) | (1 << 9) | (1 << 10) | (1 << 18);
         core::arch::asm!("mov cr4, {}", in(reg) new_cr4, options(nomem, nostack));
     }
 
-    // Enable NXE in EFER (needed for page tables with NX bit set)
+    // Enable NXE in EFER (required for page tables with NX bits)
     unsafe {
         let efer = rdmsr(0xC0000080);
-        // Set NXE (bit 11) - required if BSP's page tables use NX bits
         wrmsr(0xC0000080, efer | (1 << 11));
     }
 
-    // Load BSP's GDT and IDT from kernel structures
-    unsafe {
-        // Load the kernel's GDT (with proper segment selectors and TSS)
-        crate::arch::x86_64::gdt::load_for_ap();
-        // Load the kernel's IDT (with exception handlers)
-        crate::arch::x86_64::idt::load_for_ap();
-    }
-
-    // STAGE 2: Switch to the real kernel stack for this AP core.
-    // The real stack address was stored at physical 0x80F8 by the BSP.
+    // ─────────────────────────────────────────────────────────────
+    // STAGE 2: Switch to the real kernel stack (phys_offset-mapped)
+    // The BSP stored the stack address at physical 0x80F8.
+    // ─────────────────────────────────────────────────────────────
     let real_stack_top = unsafe {
         let phys_offset = crate::elf::phys_offset();
         let stack_ptr = (phys_offset + 0x80F8u64) as *const u64;
@@ -549,41 +577,128 @@ pub extern "C" fn ap_main() -> ! {
         }
     }
 
-    // STAGE 3: Now we have proper GDT, IDT, and stack. Signal liveness.
-    AP_ALIVE.store(true, Ordering::SeqCst);
-    AP_COUNT.store(1, Ordering::SeqCst);
-    CPU_COUNT.store(2, Ordering::SeqCst);
+    // ─────────────────────────────────────────────────────────────
+    // STAGE 3: Load per-core GDT + TSS (Jalon 102)
+    // This gives Core 1 its own TSS with its own RSP0 and IST stacks.
+    // Without this, Ring3->Ring0 transitions corrupt Core 0's stack.
+    // ─────────────────────────────────────────────────────────────
+    crate::arch::x86_64::gdt::create_and_load_per_core_gdt(1);
 
-    // Enable local APIC on this core
+    // ─────────────────────────────────────────────────────────────
+    // STAGE 4: Load the shared IDT
+    // The IDT is read-only after BSP init, so sharing is safe.
+    // ─────────────────────────────────────────────────────────────
+    crate::arch::x86_64::idt::load_for_ap();
+
+    // ─────────────────────────────────────────────────────────────
+    // STAGE 5: Initialize per-core SYSCALL/SYSRET
+    // Programs EFER.SCE, STAR, LSTAR, FMASK, KERNEL_GS_BASE
+    // pointing to this core's own PerCpuData + syscall stack.
+    // ─────────────────────────────────────────────────────────────
+    crate::arch::x86_64::syscall::init_per_core_syscall(1);
+
+    // ─────────────────────────────────────────────────────────────
+    // STAGE 6: Enable FPU/SSE/AVX on this AP core
+    // Each core must configure its own CR0/CR4/XCR0.
+    // ─────────────────────────────────────────────────────────────
+    unsafe {
+        crate::arch::x86_64::context::enable_sse();
+        let avx_ok = crate::arch::x86_64::context::enable_avx();
+        if avx_ok {
+            crate::serial_println!("[SMP] Core {}: AVX/SSE/XCR0 enabled", core_id);
+        } else {
+            crate::serial_println!("[SMP] Core {}: SSE enabled (no AVX)", core_id);
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // STAGE 7: Enable local APIC and signal liveness
+    // ─────────────────────────────────────────────────────────────
     unsafe {
         apic_write(APIC_SVR, SVR_ENABLE | 0xFF);
         apic_write(APIC_TPR, 0);
+        apic_write(APIC_TIMER_DIV, 0x03);
+        apic_write(APIC_TIMER_INIT, 0x00100000);
+        apic_write(APIC_TIMER_LVT, TIMER_PERIODIC | 0x20);
     }
 
-    // Set GS_BASE = 1 (Core 1)
+    // Signal liveness to BSP via both Rust atomics and mailbox sync_flag
+    AP_ALIVE.store(true, Ordering::SeqCst);
+
+    // Write sync_flag = 1 at physical 0x8108 — BSP is spinwaiting on this
     unsafe {
-        wrmsr(0xC000_0101, 1u64);
+        let phys_offset = crate::elf::phys_offset();
+        let sync_ptr = (phys_offset + 0x8000 + TRAMP_SYNC_FLAG_OFF as u64) as *mut u32;
+        core::ptr::write_volatile(sync_ptr, 1);
+        core::arch::asm!("mfence", options(nomem, nostack));
     }
 
-    // Store our APIC ID
-    AP_APIC_IDS[1].store(1, Ordering::SeqCst);
-    AP_READY[1].store(true, Ordering::SeqCst);
-    LLM_CORE_AFFINITY.store(1, Ordering::SeqCst);
+    crate::serial_println!("[SMP] Core {}: per-core init complete, sync_flag=1 sent to BSP", core_id);
 
-    // NOTE: We do NOT call serial_println! here because the AP's temporary stack
-    // at 0x7000 is in the identity-mapped region (PML4[0] first 6MB) but kernel
-    // data structures used by serial_println! may reside beyond that range.
-    // The BSP reports AP liveness based on AP_ALIVE flag.
-
-    // Enable interrupts so APIC timer works on this core
+    // Enable interrupts so APIC timer and IPI work on this core
     unsafe {
         core::arch::asm!("sti", options(nomem, nostack));
     }
 
-    // AP Scheduler Loop: Core 1 halts and waits for work
-    // The BSP assigns affinity-1 tasks; the AP wakes on APIC timer interrupt
+    // ─────────────────────────────────────────────────────────────
+    // STAGE 7: Ring 3 Dispatch Loop (Jalon 102 — the final piece)
+    //
+    // This is the AP's main scheduler loop. It:
+    //   1. Calls yield_to_next(0) to dequeue a process pinned to Core 1
+    //   2. If a PID is found, retrieves its entry state and does IRETQ
+    //   3. If no work, halts until the next APIC timer interrupt
+    //
+    // The loop uses direct IRETQ (not launch_next_userspace_process)
+    // because yield_to_next already dequeued the PID from the scheduler.
+    // ─────────────────────────────────────────────────────────────
+    crate::serial_println!("[SMP] Core 1: per-core GDT/TSS + SYSCALL ready, entering dispatch loop");
+
+    // Spin-wait dispatch loop: keep checking for work.
+    // Use PAUSE for power efficiency. Once a process is found, IRETQ to Ring 3.
+    // After Ring 3 execution, the process will syscall back and eventually
+    // re-enter this loop.
+    let mut poll_count: u64 = 0;
     loop {
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+        let next_pid = crate::scheduler::yield_to_next(0);
+        if next_pid != 0 {
+            // Get the process's entry state (entry_point, stack_pointer, pml4_phys)
+            if let Some((entry, stack, pml4)) = crate::process::get_entry_state(next_pid) {
+                if entry != 0 && pml4 != 0 {
+                    crate::serial_println!("[SMP] Core 1 dispatching PID {} to Ring 3 (entry=0x{:X})", next_pid, entry);
+
+                    // Set scheduler state
+                    crate::scheduler::set_current_pid(next_pid);
+                    let _ = crate::process::set_state(next_pid, crate::process::ProcessState::Running);
+
+                    // Reset GS bases for this core before IRETQ
+                    crate::arch::x86_64::syscall::reset_gs_bases_for_core(1);
+
+                    // IRETQ to Ring 3: push SS, RSP, RFLAGS, CS, RIP
+                    unsafe {
+                        core::arch::asm!("mov cr3, {}", in(reg) pml4, options(nostack));
+                        core::arch::asm!(
+                            "push 0x1B",        // SS (user data, RPL=3)
+                            "push {stack}",     // RSP (user stack)
+                            "push 0x202",       // RFLAGS (IF=1)
+                            "push 0x23",        // CS (user code, RPL=3)
+                            "push {entry}",     // RIP (entry point)
+                            "iretq",
+                            stack = in(reg) stack,
+                            entry = in(reg) entry,
+                            options(noreturn),
+                        );
+                    }
+                }
+            }
+        }
+        // No work for this core — brief pause then retry
+        poll_count += 1;
+        if poll_count % 10_000_000 == 0 {
+            // Periodically yield CPU time via HLT (woken by APIC timer)
+            unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+        } else {
+            unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
+        }
     }
 }
 

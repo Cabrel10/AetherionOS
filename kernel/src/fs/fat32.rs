@@ -1070,15 +1070,7 @@ pub fn read_file_path_chunk(disk_path: &str, offset: u64, len: u64) -> Option<Ve
             return None;
         }
 
-        // Suppress per-read logging for performance
-        // crate::serial_println!("[FAT32] read_file_path_chunk: '{}' offset={} len={} file_size={}",
-        //     disk_path, offset, len, entry.file_size);
-
-        let result = fs.read_file_chunk(entry.first_cluster, entry.file_size, offset, len);
-        if let Some(ref _data) = result {
-            // crate::serial_println!("[FAT32] read_file_path_chunk: OK, returned {} bytes", data.len());
-        }
-        result
+        fs.read_file_chunk(entry.first_cluster, entry.file_size, offset, len)
     }
 }
 

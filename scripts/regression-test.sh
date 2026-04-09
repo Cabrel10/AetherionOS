@@ -68,13 +68,13 @@ else
     echo "[QEMU] No KVM — using software emulation (slower)"
 fi
 
-echo "[QEMU] Launching headless QEMU (timeout=${TIMEOUT}s, cpu=Haswell, smp=2, ram=512M)..."
+echo "[QEMU] Launching headless QEMU (timeout=${TIMEOUT}s, cpu=Haswell, smp=2, ram=1024M)..."
 cd "$PROJECT_DIR"
 timeout "$TIMEOUT" qemu-system-x86_64 \
     $ACCEL_FLAG \
     -drive format=raw,file="$BOOTIMAGE" \
     -drive file="$PROJECT_DIR/disk.img",format=raw,if=ide \
-    -m 512M -serial stdio -display none \
+    -m 1024M -serial stdio -display none \
     -cpu Haswell -smp 2 -no-reboot \
     -device virtio-net-pci,netdev=net0 -netdev user,id=net0 \
     -device qemu-xhci \

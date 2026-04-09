@@ -13,6 +13,35 @@ use core::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 
 use crate::process::{self, AgentRole};
 
+// ===== Per-Core Current PID Tracking (SMP-safe) =====
+const MAX_CORES: usize = 16;
+static CORE_CURRENT_PID: [AtomicU64; MAX_CORES] = {
+    const INIT: AtomicU64 = AtomicU64::new(0);
+    [INIT; MAX_CORES]
+};
+
+/// Get the APIC ID of the current core using CPUID leaf 1 (register-only, safe anywhere).
+#[inline]
+fn current_core_index() -> usize {
+    let id: u32;
+    unsafe {
+        core::arch::asm!(
+            "push rbx",
+            "mov eax, 1",
+            "cpuid",
+            "shr ebx, 24",
+            "mov {0:e}, ebx",
+            "pop rbx",
+            out(reg) id,
+            out("eax") _,
+            out("ecx") _,
+            out("edx") _,
+            options(nomem),
+        );
+    }
+    (id as usize) & (MAX_CORES - 1)
+}
+
 // ===== Priority Levels for Scheduler Queues =====
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -106,15 +135,75 @@ impl PriorityScheduler {
     ///   Pass 2: If no match, schedule ANY ready process (prevents starvation
     ///           when AP cores aren't fully running, e.g., QEMU single-thread)
     fn dequeue_next_for_core(&mut self, core_id: u32) -> Option<(u64, SchedPriority)> {
-        // Pass 1: Try to find a process matching this core's affinity
-        if core_id != 0xFF {
+        // Jalon 102: Strict SMP CPU affinity enforcement.
+        //
+        // When SMP is active (AP alive):
+        //   - Core 0 (BSP) runs: affinity==0 or affinity==0xFF (any-core)
+        //   - Core 1+ (AP)  runs: ONLY affinity matching that exact core
+        //     AP cores do NOT steal 0xFF tasks (BSP handles those)
+        //
+        // When single-core (core_id==0xFF): run everything (no affinity filter)
+        let smp_active = crate::arch::x86_64::apic::ap_is_alive();
+
+        // Pass 1: Affinity-aware dequeue
+        for idx in (0..5).rev() {
+            let mut i = 0;
+            while i < self.queues[idx].len() {
+                let pid = self.queues[idx][i];
+                if let Some(state) = process::get_state(pid) {
+                    if state == process::ProcessState::Terminated {
+                        self.queues[idx].remove(i); // Clean up dead process
+                        continue;
+                    }
+                    if state == process::ProcessState::Blocked {
+                        i += 1;
+                        continue;
+                    }
+                }
+                let affinity = process::get_cpu_affinity(pid);
+
+                let matches = if core_id == 0xFF {
+                    // Single-core fallback: run everything
+                    true
+                } else if core_id == 0 {
+                    // BSP (Core 0): run affinity==0 or affinity==0xFF
+                    // When SMP is active, do NOT steal affinity==1 tasks
+                    if smp_active {
+                        affinity == 0 || affinity == 0xFF
+                    } else {
+                        // No AP alive: BSP runs everything
+                        true
+                    }
+                } else {
+                    // AP core (Core 1+): ONLY run processes pinned to this exact core
+                    affinity == core_id as u8
+                };
+
+                if matches {
+                    let pid = self.queues[idx].remove(i).unwrap();
+                    let prio = match idx {
+                        4 => SchedPriority::Critical,
+                        3 => SchedPriority::High,
+                        2 => SchedPriority::Normal,
+                        1 => SchedPriority::Low,
+                        _ => SchedPriority::Idle,
+                    };
+                    return Some((pid, prio));
+                }
+                i += 1;
+            }
+        }
+
+        // Pass 2: Fallback — only when single-core or BSP with no AP alive.
+        // When SMP is active, do NOT use fallback (strict isolation).
+        if !smp_active || core_id == 0xFF {
             for idx in (0..5).rev() {
                 let mut i = 0;
                 while i < self.queues[idx].len() {
                     let pid = self.queues[idx][i];
                     if let Some(state) = process::get_state(pid) {
                         if state == process::ProcessState::Terminated {
-                            self.queues[idx].remove(i); // Clean up dead process
+                            self.queues[idx].remove(i);
                             continue;
                         }
                         if state == process::ProcessState::Blocked {
@@ -122,51 +211,16 @@ impl PriorityScheduler {
                             continue;
                         }
                     }
-                    let affinity = process::get_cpu_affinity(pid);
-                    // Match: affinity is this core, or process has no affinity preference
-                    if affinity == core_id as u8 || affinity == 0xFF {
-                        let pid = self.queues[idx].remove(i).unwrap();
-                        let prio = match idx {
-                            4 => SchedPriority::Critical,
-                            3 => SchedPriority::High,
-                            2 => SchedPriority::Normal,
-                            1 => SchedPriority::Low,
-                            _ => SchedPriority::Idle,
-                        };
-                        return Some((pid, prio));
-                    }
-                    i += 1;
+                    let pid = self.queues[idx].remove(i).unwrap();
+                    let prio = match idx {
+                        4 => SchedPriority::Critical,
+                        3 => SchedPriority::High,
+                        2 => SchedPriority::Normal,
+                        1 => SchedPriority::Low,
+                        _ => SchedPriority::Idle,
+                    };
+                    return Some((pid, prio));
                 }
-            }
-        }
-
-        // Pass 2: Fallback — schedule ANY ready process regardless of affinity.
-        // This prevents starvation when AP cores aren't active (QEMU single-thread mode).
-        // Also cleans up terminated processes from queues.
-        for idx in (0..5).rev() {
-            let mut i = 0;
-            while i < self.queues[idx].len() {
-                let pid = self.queues[idx][i];
-                if let Some(state) = process::get_state(pid) {
-                    if state == process::ProcessState::Terminated {
-                        self.queues[idx].remove(i); // Remove dead process
-                        continue; // Don't increment i
-                    }
-                    if state == process::ProcessState::Blocked {
-                        i += 1;
-                        continue; // Skip blocked, keep in queue
-                    }
-                }
-                // Ready or Running — schedule it
-                let pid = self.queues[idx].remove(i).unwrap();
-                let prio = match idx {
-                    4 => SchedPriority::Critical,
-                    3 => SchedPriority::High,
-                    2 => SchedPriority::Normal,
-                    1 => SchedPriority::Low,
-                    _ => SchedPriority::Idle,
-                };
-                return Some((pid, prio));
             }
         }
         None
@@ -482,14 +536,20 @@ pub fn tick_preemptive() -> Option<(u64, u64, u64, u64, u64, u64)> {
     Some((result.old_pid, result.new_pid, new_rip, new_rsp, new_rflags, new_pml4))
 }
 
-/// Get current running PID
+/// Get current running PID (SMP-safe: reads from per-core atomic array)
 pub fn current_pid() -> u64 {
-    SCHEDULER.try_lock().map(|s| s.current_pid).unwrap_or(0)
+    let core = current_core_index();
+    CORE_CURRENT_PID[core].load(Ordering::Relaxed)
 }
 
-/// Set the current PID (used when directly launching a Ring 3 process via IRETQ)
+/// Set the current PID (SMP-safe: writes to per-core atomic array)
 pub fn set_current_pid(pid: u64) {
-    SCHEDULER.lock().current_pid = pid;
+    let core = current_core_index();
+    CORE_CURRENT_PID[core].store(pid, Ordering::Relaxed);
+    // Also update global scheduler for compatibility with metrics/display
+    if let Some(mut s) = SCHEDULER.try_lock() {
+        s.current_pid = pid;
+    }
 }
 
 /// Get the aging boost count
