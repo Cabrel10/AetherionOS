@@ -537,20 +537,21 @@ unsafe fn create_user_pml4() -> Result<u64, ElfError> {
     // Zero the entire new PML4
     core::ptr::write_bytes(new_pml4_virt, 0, 512);
 
-    // Copy ALL kernel PML4 entries EXCEPT PML4[1] (user ELF region).
+    // Copy ALL kernel PML4 entries INCLUDING PML4[1].
     //
     // PML4[0]: kernel identity mapping (code, GDT, IDT, kernel stacks)
-    // PML4[1]: user ELF region (0x8000000000) — MUST NOT copy, built per-process
+    // PML4[1]: kernel BSS/data + user ELF region (0x8000000000)
+    //          Kernel statics (AP GDT, TSS, per-core stacks) live here.
+    //          map_user_page() deep-copies PML4[1]'s sub-tables to add
+    //          per-process user ELF pages without disturbing kernel entries.
     // PML4[2-135]: various bootloader/kernel mappings
     // PML4[136+]: physical memory offset mapping (bootloader 0.9.x)
     // PML4[256-511]: kernel upper half (physical memory, kernel heap)
     //
-    // Ring 3 code cannot access PML4[0] or PML4[256+] because those entries
-    // don't have the USER_ACCESSIBLE bit set — KPTI-lite protection.
-    // PML4[1] is created fresh for each process by map_user_page().
+    // Ring 3 code cannot access PML4[0], PML4[1] kernel pages, or PML4[256+]
+    // because those entries don't have the USER_ACCESSIBLE bit set — KPTI-lite.
     let mut copied = 0usize;
     for i in 0..512usize {
-        if i == 1 { continue; } // Skip user ELF region — built per-process
         let entry = core::ptr::read_volatile(current_pml4_virt.add(i));
         if entry & 0x01 != 0 {
             core::ptr::write_volatile(new_pml4_virt.add(i), entry);
@@ -559,7 +560,7 @@ unsafe fn create_user_pml4() -> Result<u64, ElfError> {
     }
 
     crate::serial_println!(
-        "[ELF] User PML4 created: phys=0x{:X} ({} kernel entries cloned, PML4[1] isolated)",
+        "[ELF] User PML4 created: phys=0x{:X} ({} kernel entries cloned, PML4[1] shared)",
         new_pml4_phys, copied
     );
 
@@ -725,6 +726,9 @@ pub struct ElfLoadResult {
     pub pml4_phys: u64,
     pub segments_loaded: usize,
     pub frames_used: usize,
+    /// Jalon 105: True if this ELF binary was detected as a Linux binary
+    /// (via EI_OSABI, PT_INTERP, or GNU PT_NOTE)
+    pub is_linux_abi: bool,
 }
 
 /// Load an ELF binary into a new per-process address space
@@ -745,9 +749,12 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
     let entry = hdr.e_entry;
     let phnum = hdr.e_phnum;
 
+    // Jalon 105: Detect Linux ABI for Linuxulator compatibility
+    let is_linux_abi = crate::compat::linux_abi::detect_linux_elf(elf_data);
+
     crate::serial_println!(
-        "[ELF] Header OK: entry=0x{:X}, phnum={}",
-        entry, phnum
+        "[ELF] Header OK: entry=0x{:X}, phnum={}, abi={}",
+        entry, phnum, if is_linux_abi { "Linux" } else { "AetherionOS" }
     );
 
     // Step 2: Parse program headers
@@ -959,6 +966,7 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
                 pml4_phys,
                 segments_loaded,
                 frames_used: frames_after - frames_before,
+                is_linux_abi,
             });
         }
 
@@ -1080,6 +1088,7 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
         pml4_phys,
         segments_loaded,
         frames_used: frames_after - frames_before,
+        is_linux_abi,
     })
 }
 

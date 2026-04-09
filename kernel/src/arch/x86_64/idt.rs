@@ -139,8 +139,24 @@ extern "x86-interrupt" fn bound_range_exceeded_handler(stack_frame: InterruptSta
 }
 
 extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
-    crate::serial_println!("[EXCEPTION] #UD Invalid opcode at {:?}", stack_frame.instruction_pointer);
-    panic!("Invalid opcode");
+    let cs = stack_frame.code_segment;
+    let is_ring3 = (cs & 0x3) == 3;
+    crate::serial_println!("[EXCEPTION] #UD Invalid opcode at {:?} ring3={}", stack_frame.instruction_pointer, is_ring3);
+    if is_ring3 {
+        let current_pid = crate::scheduler::current_pid();
+        crate::serial_println!("[#UD] Killing user PID {} (invalid opcode in Ring 3)", current_pid);
+        if current_pid != 0 {
+            // kill_user_and_switch never returns — it IRETQs to the next process
+            // or enters an idle HLT loop if no other process is ready.
+            kill_user_and_switch(current_pid, stack_frame.instruction_pointer.as_u64());
+        }
+        // If PID was 0 somehow, enter idle loop instead of panicking
+        crate::serial_println!("[#UD] No user PID to kill, entering idle loop");
+        crate::scheduler::set_current_pid(0);
+        loop { x86_64::instructions::hlt(); }
+    }
+    // Only panic for kernel-mode #UD (genuine kernel bug)
+    panic!("Invalid opcode (kernel mode)");
 }
 
 extern "x86-interrupt" fn device_not_available_handler(stack_frame: InterruptStackFrame) {
@@ -203,7 +219,7 @@ extern "x86-interrupt" fn general_protection_fault_handler(stack_frame: Interrup
 /// User stack demand-paging lower bound
 const USER_STACK_DEMAND_LOW: u64 = 0x7FFF_0000_0000;
 /// User stack demand-paging upper bound (exclusive)
-const USER_STACK_DEMAND_HIGH: u64 = 0x7FFF_FFFF_F000;
+const USER_STACK_DEMAND_HIGH: u64 = 0x8000_0000_0000; // Jalon 102: extended to cover guard page at 0x7FFFFFFFF000
 /// User heap demand-paging lower bound (sys_brk region)
 const USER_HEAP_DEMAND_LOW: u64  = 0x0000_3000_0000_0000;
 /// User heap demand-paging upper bound (8 GiB — Jalon 68)
@@ -520,58 +536,71 @@ extern "x86-interrupt" fn page_fault_handler(
         }
     }
 
-    // Kernel-mode page fault — fatal
-    // Use raw serial writes to avoid formatting issues when the stack frame is corrupted
-    crate::serial_write("[PF-FATAL] user_mode=");
-    if is_user_mode { crate::serial_write("YES"); } else { crate::serial_write("NO"); }
-    crate::serial_write(" CR2=0x");
-    {
-        let mut buf = [b'0'; 16];
-        let mut v = addr_raw;
-        for i in (0..16).rev() {
-            let d = (v & 0xF) as u8;
-            buf[i] = if d < 10 { b'0' + d } else { b'A' + d - 10 };
-            v >>= 4;
+    // Jalon 102: Kernel-mode page fault at user-visible address ranges
+    // can happen during IRETQ to Ring 3 or when the kernel copies data to user buffers.
+    // Try to demand-map the page instead of panicking.
+
+    // User stack region (including guard page area)
+    if !is_user_mode && addr_raw >= USER_STACK_DEMAND_LOW && addr_raw < USER_STACK_DEMAND_HIGH {
+        if try_demand_map_user_page(page_addr, false) {
+            return; // Resume IRETQ — user stack page now mapped
         }
-        unsafe { crate::serial_write(core::str::from_utf8_unchecked(&buf)); }
     }
-    crate::serial_write(" RIP=0x");
+
+    // ELF BSS/Data region — kernel may write to BSS during ELF loading
+    if !is_user_mode && addr_raw >= ELF_DEMAND_LOW && addr_raw < ELF_DEMAND_HIGH {
+        if try_demand_map_user_page(page_addr, false) {
+            return;
+        }
+    }
+
+    // User heap region — kernel may fault during sys_write copying to user buffer
+    if !is_user_mode && addr_raw >= USER_HEAP_DEMAND_LOW && addr_raw < USER_HEAP_DEMAND_HIGH {
+        if try_demand_map_user_page(page_addr, false) {
+            return;
+        }
+    }
+
+    // Kernel-mode page fault — fatal
+    // Jalon 105: Use a single atomic serial_write to prevent SMP interleaving
     {
         let rip_val = stack_frame.instruction_pointer.as_u64();
-        let mut buf = [b'0'; 16];
-        let mut v = rip_val;
-        for i in (0..16).rev() {
-            let d = (v & 0xF) as u8;
-            buf[i] = if d < 10 { b'0' + d } else { b'A' + d - 10 };
-            v >>= 4;
-        }
-        unsafe { crate::serial_write(core::str::from_utf8_unchecked(&buf)); }
-    }
-    crate::serial_write(" CS=0x");
-    {
         let cs_val = stack_frame.code_segment;
-        let mut buf = [b'0'; 4];
-        let mut v = cs_val as u64;
-        for i in (0..4).rev() {
-            let d = (v & 0xF) as u8;
-            buf[i] = if d < 10 { b'0' + d } else { b'A' + d - 10 };
-            v >>= 4;
-        }
-        unsafe { crate::serial_write(core::str::from_utf8_unchecked(&buf)); }
-    }
-    crate::serial_write(" ERR=0x");
-    {
         let err = error_code.bits();
-        let mut buf = [b'0'; 4];
-        let mut v = err;
-        for i in (0..4).rev() {
-            let d = (v & 0xF) as u8;
-            buf[i] = if d < 10 { b'0' + d } else { b'A' + d - 10 };
-            v >>= 4;
-        }
-        unsafe { crate::serial_write(core::str::from_utf8_unchecked(&buf)); }
+        let hex = b"0123456789ABCDEF";
+        let mut msg = [b' '; 128];
+        let prefix = b"\n[PF-FATAL] CR2=0x";
+        msg[..prefix.len()].copy_from_slice(prefix);
+        let mut pos = prefix.len();
+        // CR2 address (16 hex digits)
+        let mut v = addr_raw;
+        for i in (0..16).rev() { msg[pos + i] = hex[(v & 0xF) as usize]; v >>= 4; }
+        pos += 16;
+        let mid1 = b" RIP=0x";
+        msg[pos..pos+mid1.len()].copy_from_slice(mid1);
+        pos += mid1.len();
+        // RIP (16 hex digits)
+        v = rip_val;
+        for i in (0..16).rev() { msg[pos + i] = hex[(v & 0xF) as usize]; v >>= 4; }
+        pos += 16;
+        let mid2 = b" CS=0x";
+        msg[pos..pos+mid2.len()].copy_from_slice(mid2);
+        pos += mid2.len();
+        // CS (4 hex digits)
+        v = cs_val as u64;
+        for i in (0..4).rev() { msg[pos + i] = hex[(v & 0xF) as usize]; v >>= 4; }
+        pos += 4;
+        let mid3 = b" ERR=0x";
+        msg[pos..pos+mid3.len()].copy_from_slice(mid3);
+        pos += mid3.len();
+        // ERR (4 hex digits)
+        v = err;
+        for i in (0..4).rev() { msg[pos + i] = hex[(v & 0xF) as usize]; v >>= 4; }
+        pos += 4;
+        msg[pos] = b'\n';
+        pos += 1;
+        unsafe { crate::serial_write(core::str::from_utf8_unchecked(&msg[..pos])); }
     }
-    crate::serial_write("\n");
     panic!("Kernel page fault at 0x{:X}", addr_raw);
 }
 

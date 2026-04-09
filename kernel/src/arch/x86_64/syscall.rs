@@ -107,6 +107,45 @@ static mut PER_CPU: PerCpuData = PerCpuData {
     user_r10: 0,
 };
 
+// =====================================================================
+// Jalon 102: Per-Core SYSCALL State for SMP
+// Each AP core gets its own PerCpuData + syscall stack so that
+// SYSCALL/SYSRET on Core 1+ don't corrupt Core 0's state.
+// =====================================================================
+
+/// Maximum CPUs (must match apic.rs and gdt.rs)
+const MAX_CPUS: usize = 16;
+
+/// Per-core syscall stack size (256 KiB each — enough for VFS/FAT32/VirtIO chains)
+const AP_SYSCALL_STACK_SIZE: usize = 256 * 1024;
+
+/// Per-core syscall stacks (aligned to 16 bytes)
+#[repr(align(16))]
+struct ApSyscallStack([u8; AP_SYSCALL_STACK_SIZE]);
+
+static mut AP_SYSCALL_STACKS: [ApSyscallStack; MAX_CPUS] = {
+    const INIT: ApSyscallStack = ApSyscallStack([0; AP_SYSCALL_STACK_SIZE]);
+    [INIT; MAX_CPUS]
+};
+
+/// Per-core PerCpuData structures
+static mut AP_PER_CPU: [PerCpuData; MAX_CPUS] = {
+    const INIT: PerCpuData = PerCpuData {
+        kernel_rsp: 0,
+        user_rsp: 0,
+        user_rip: 0,
+        saved_kernel_rsp: 0,
+        user_r10: 0,
+    };
+    [INIT; MAX_CPUS]
+};
+
+/// Per-core initialization flags
+static AP_SYSCALL_READY: [core::sync::atomic::AtomicBool; MAX_CPUS] = {
+    const INIT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    [INIT; MAX_CPUS]
+};
+
 // ===== MSR helpers =====
 
 #[inline]
@@ -135,22 +174,37 @@ unsafe fn wrmsr(msr: u32, value: u64) {
 // ===== Helpers to get saved user state (for thread context save/restore) =====
 
 /// Return the user-mode RIP that was saved on SYSCALL entry (from RCX).
+/// SMP-safe: reads from the current core's per-CPU data via GS base.
 #[inline]
 fn saved_user_rip() -> u64 {
-    unsafe { PER_CPU.user_rip }
+    let val: u64;
+    unsafe {
+        asm!("mov {}, gs:[16]", out(reg) val, options(nomem, nostack));
+    }
+    val
 }
 
 /// Return the user-mode RSP that was saved on SYSCALL entry.
+/// SMP-safe: reads from the current core's per-CPU data via GS base.
 #[inline]
 fn saved_user_rsp() -> u64 {
-    unsafe { PER_CPU.user_rsp }
+    let val: u64;
+    unsafe {
+        asm!("mov {}, gs:[8]", out(reg) val, options(nomem, nostack));
+    }
+    val
 }
 
 /// Return the 4th syscall argument (R10 in Linux syscall ABI).
 /// Used by pread64, sendto, recvfrom, and other 4+ arg syscalls.
+/// SMP-safe: reads from the current core's per-CPU data via GS base.
 #[inline]
 fn saved_user_r10() -> u64 {
-    unsafe { PER_CPU.user_r10 }
+    let val: u64;
+    unsafe {
+        asm!("mov {}, gs:[32]", out(reg) val, options(nomem, nostack));
+    }
+    val
 }
 
 // ===== User pointer validation =====
@@ -221,14 +275,17 @@ unsafe extern "C" fn syscall_entry() {
         // Uses GS-relative access (gs:[24]) to avoid R_X86_64_32S relocations.
         "mov gs:[24], rsp",
 
-        // 4. Prepare arguments for Rust handler
-        //    syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64)
-        //    System V calling convention: rdi, rsi, rdx, rcx
-        //    From SYSCALL: rax=nr, rdi=a1, rsi=a2, rdx=a3
-        "mov rcx, rdx",    // 4th arg = a3 (rdx from user)
-        "mov rdx, rsi",    // 3rd arg = a2
-        "mov rsi, rdi",    // 2nd arg = a1
-        "mov rdi, rax",    // 1st arg = syscall number
+        // 4. Prepare arguments for Rust handler (6-arg ABI)
+        //    syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64)
+        //    System V calling convention: rdi, rsi, rdx, rcx, r8, r9
+        //    From SYSCALL: rax=nr, rdi=a1, rsi=a2, rdx=a3, r10=a4, r8=a5
+        //    Note: r8 still holds user's 5th arg, r10 was saved to gs:[32]
+        "mov r9, r8",      // 6th SysV arg = a5 (user R8) — MUST be before r8 is overwritten
+        "mov r8, r10",     // 5th SysV arg = a4 (user R10, still in register)
+        "mov rcx, rdx",    // 4th SysV arg = a3 (user RDX)
+        "mov rdx, rsi",    // 3rd SysV arg = a2 (user RSI)
+        "mov rsi, rdi",    // 2nd SysV arg = a1 (user RDI)
+        "mov rdi, rax",    // 1st SysV arg = nr (user RAX)
 
         // Align RSP to 16 bytes before calling Rust (ABI requirement)
         "mov r15, rsp",          // save current RSP in r15 (already pushed)
@@ -310,14 +367,31 @@ fn print_hex_raw(val: u64) {
 /// touches XMM/YMM registers.  User FPU state therefore survives every
 /// syscall automatically — no fxsave/fxrstor needed in the fast path.
 #[no_mangle]
-extern "C" fn syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
-    syscall_dispatch(nr, a1, a2, a3)
+extern "C" fn syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
+    syscall_dispatch(nr, a1, a2, a3, a4, a5)
 }
 
 /// Internal syscall dispatch (separated for FPU save/restore wrapper).
 /// Jalon 79: Linux x86_64 ABI numbers with musl-libc stubs.
+/// Jalon 105: Linux ABI compatibility layer — processes tagged with Abi::Linux
+/// get Linux-specific behavior for certain syscalls (uname, arch_prctl, etc.)
 /// Syscall numbers match Linux x86_64 ABI for POSIX compatibility.
-fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
+    // Jalon 105: Check if this process uses Linux ABI and route to Linux-specific handlers
+    let current_pid = crate::scheduler::current_pid();
+    if current_pid != 0 {
+        let is_linux = crate::process::with_process(current_pid, |p| {
+            p.abi == crate::compat::linux_abi::Abi::Linux
+        }).unwrap_or(false);
+
+        if is_linux {
+            if let Some(result) = crate::compat::linux_abi::linux_syscall_override(nr, a1, a2, a3, a4) {
+                return result;
+            }
+            // Fall through to standard dispatch for non-overridden syscalls
+        }
+    }
+
     match nr {
         // ── Core POSIX file I/O (Linux x86_64 ABI) ──
         // Reference: https://filippo.io/linux-syscall-table/
@@ -337,8 +411,8 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64) -> u64 {
         14 => sys_stub_rt_sigprocmask(a1, a2, a3),   // rt_sigprocmask [stub for musl/glibc]
         15 => 0,                                      // rt_sigreturn [stub — handled by kernel]
         16 => sys_stub_ioctl(a1 as u32, a2, a3),    // ioctl(fd, cmd, arg)  [stub → ENOTTY]
-        17 => sys_pread64(a1 as u32, a2, a3, saved_user_r10()),  // pread64(fd, buf, count, offset)
-        18 => sys_stub_pwrite64(a1 as u32, a2, a3, saved_user_r10()), // pwrite64 [stub]
+        17 => sys_pread64(a1 as u32, a2, a3, a4),  // pread64(fd, buf, count, offset=R10)
+        18 => sys_stub_pwrite64(a1 as u32, a2, a3, a4), // pwrite64 [stub] offset=R10
         19 => sys_stub_readv(a1 as u32, a2, a3),     // readv [stub]
         20 => sys_stub_writev(a1 as u32, a2, a3),    // writev(fd, iov, iovcnt)
         21 => sys_stub_access(a1, a2),               // access(path, mode) [stub]
@@ -2494,7 +2568,7 @@ fn sys_exit(code: u64) -> u64 {
 /// Launch the next ready userspace process (used by sys_exit and sys_wait).
 /// Handles both normal processes (IRETQ to entry_point) and forked children
 /// (sysretq to parent's saved RIP with RAX=0).
-fn launch_next_userspace_process(exclude_pid: u64) {
+pub fn launch_next_userspace_process(exclude_pid: u64) {
     let next_ready = crate::process::find_next_ready_userspace(exclude_pid);
     crate::serial_println!("[SYSCALL] Looking for next userspace process: {:?}", next_ready);
 
@@ -3209,6 +3283,78 @@ pub fn reset_gs_bases() {
             "[SYSCALL] GS bases reset: GS_BASE=0, KERNEL_GS_BASE=0x{:X}",
             per_cpu_addr
         );
+    }
+}
+
+// =====================================================================
+// Jalon 102: Per-Core SYSCALL Initialization for AP Cores
+// =====================================================================
+
+/// Initialize SYSCALL/SYSRET MSRs for an AP core.
+///
+/// Programs IA32_EFER (SCE), IA32_STAR, IA32_LSTAR, IA32_FMASK,
+/// and IA32_KERNEL_GS_BASE to point to the per-core PerCpuData.
+/// The per-core PerCpuData.kernel_rsp points to the per-core syscall stack.
+///
+/// Must be called from the AP core itself (after GDT/TSS is loaded).
+pub fn init_per_core_syscall(core_id: u8) {
+    let idx = core_id as usize;
+    if idx == 0 || idx >= MAX_CPUS {
+        return; // BSP uses init(), out-of-range ignored
+    }
+
+    unsafe {
+        // Set up per-core syscall stack
+        let stack_top = (&AP_SYSCALL_STACKS[idx].0 as *const u8 as u64)
+            + AP_SYSCALL_STACK_SIZE as u64;
+        AP_PER_CPU[idx].kernel_rsp = stack_top;
+        AP_PER_CPU[idx].user_rsp = 0;
+        AP_PER_CPU[idx].user_rip = 0;
+        AP_PER_CPU[idx].saved_kernel_rsp = 0;
+        AP_PER_CPU[idx].user_r10 = 0;
+
+        // Set KERNEL_GS_BASE to this core's PerCpuData
+        let per_cpu_addr = &AP_PER_CPU[idx] as *const PerCpuData as u64;
+        wrmsr(IA32_KERNEL_GS_BASE, per_cpu_addr);
+
+        // User GS base = 0 (no user TLS yet)
+        wrmsr(IA32_GS_BASE, 0);
+
+        // Enable SYSCALL extension (EFER.SCE)
+        let efer = rdmsr(IA32_EFER);
+        wrmsr(IA32_EFER, efer | EFER_SCE);
+
+        // STAR: kernel CS=0x08, kernel SS=0x10 (at bits 32-47)
+        //       user CS=0x20 (sysret adds +16=0x23 for user code, +8=0x1B for user data)
+        let star: u64 = (0x10u64 << 48) | (0x08u64 << 32);
+        wrmsr(IA32_STAR, star);
+
+        // LSTAR: syscall entry point (same handler for all cores)
+        let handler_addr = syscall_entry as *const () as u64;
+        wrmsr(IA32_LSTAR, handler_addr);
+
+        // SFMASK: mask IF, TF, DF on syscall entry
+        wrmsr(IA32_FMASK, SFMASK_VALUE);
+
+        AP_SYSCALL_READY[idx].store(true, core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Reset GS bases for a specific AP core before its first IRETQ to Ring 3.
+/// Sets KERNEL_GS_BASE to the per-core PerCpuData and GS_BASE to 0.
+pub fn reset_gs_bases_for_core(core_id: u8) {
+    let idx = core_id as usize;
+    unsafe {
+        if idx == 0 || idx >= MAX_CPUS {
+            // BSP: use the global PER_CPU
+            let per_cpu_addr = &PER_CPU as *const PerCpuData as u64;
+            wrmsr(IA32_KERNEL_GS_BASE, per_cpu_addr);
+        } else {
+            // AP: use the per-core PerCpuData
+            let per_cpu_addr = &AP_PER_CPU[idx] as *const PerCpuData as u64;
+            wrmsr(IA32_KERNEL_GS_BASE, per_cpu_addr);
+        }
+        wrmsr(IA32_GS_BASE, 0);
     }
 }
 
@@ -4604,7 +4750,7 @@ fn sys_sysinfo(buf_addr: u64) -> u64 {
 ///   a1 = fd (u32)
 ///   a2 = buf_addr (u64) — user buffer pointer
 ///   a3 = count (u64) — bytes to read
-///   a4 = offset (u64) — file offset (from R10, retrieved via saved_user_r10())
+///   a4 = offset (u64) — file offset (from R10, now passed as 4th arg)
 ///
 ///   Returns bytes read, capped at PREAD_MAX_CHUNK for kernel stack safety.
 fn sys_pread64(fd: u32, buf_addr: u64, count: u64, offset: u64) -> u64 {
@@ -4648,7 +4794,8 @@ fn sys_pread64(fd: u32, buf_addr: u64, count: u64, offset: u64) -> u64 {
         // FAT32 chunked read
         match crate::fs::fat32::read_file_path_chunk(disk_path, offset, PREAD_MAX_CHUNK as u64) {
             Some(chunk) => {
-                let to_copy = chunk.len();
+                // Clamp to the user's requested count to prevent buffer overflow
+                let to_copy = core::cmp::min(chunk.len(), actual_count);
                 if to_copy == 0 { return 0; } // EOF
                 unsafe {
                     let dst = buf_addr as *mut u8;
@@ -5151,4 +5298,20 @@ pub fn process_parallel_work_item() {
         // For now, mark work as processed (actual computation done in userspace).
         PARALLEL_WORK_QUEUE[item_idx as usize].store(0, AtomicOrdering::SeqCst);
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Jalon 105: Public API for Linux ABI Compatibility Layer
+// These thin wrappers expose internal functions to the compat module
+// without changing the original function signatures.
+// ═══════════════════════════════════════════════════════════════════
+
+/// Public wrapper for validate_user_ptr, used by compat::linux_abi
+pub fn validate_user_ptr_pub(addr: u64, len: u64) -> bool {
+    validate_user_ptr(addr, len)
+}
+
+/// Public wrapper for sys_brk, used by compat::linux_abi
+pub fn sys_brk_pub(new_break: u64) -> u64 {
+    sys_brk(new_break)
 }

@@ -2519,6 +2519,12 @@ pub extern "C" fn main() -> i64 {
     cmd_agi_test(&mut term);
     sys_write(1, b"[TERM] Jalon 96: agi_test complete\n");
 
+    // ── Jalon 103: Auto-run LLM end-to-end test with "bonjour" prompt ──
+    // This triggers: Terminal -> Orchestrator -> LLM (Core 1) -> Tokens -> Terminal
+    sys_write(1, b"[TERM] Jalon 103: Auto-running 'llm bonjour' (SMP End-to-End)\n");
+    cmd_llm(&mut term, b"bonjour");
+    sys_write(1, b"[TERM] Jalon 103: LLM auto-test complete\n");
+
     print_prompt(&mut term);
 
     let mut idle_count: u64 = 0;
