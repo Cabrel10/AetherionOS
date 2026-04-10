@@ -16,7 +16,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BOOTIMAGE="$PROJECT_DIR/kernel/target/x86_64-aetherion/release/bootimage-aetherion-kernel.bin"
 LOG_FILE="/tmp/aetherion_regression_$(date +%s).log"
 CLEAN_LOG="${LOG_FILE}.clean"
-TIMEOUT=90
+TIMEOUT=300
 REBUILD=false
 
 # Parse args

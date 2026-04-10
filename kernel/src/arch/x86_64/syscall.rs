@@ -3711,6 +3711,76 @@ fn kernel_mcp_execute(_payload: u64) {
     } else if action == b"ping" {
         crate::serial_println!("[MCP] Contract validated: action=ping");
         crate::serial_println!("[MCP] Execution success! Pong sent");
+    } else if action == b"run_linux_tool" {
+        // ═══════════════════════════════════════════════════════════
+        // Jalon 107: MCP run_linux_tool — Execute Linux binaries via BusyBox
+        // JSON: {"action":"run_linux_tool","params":{"tool":"busybox","args":"ls -l"}}
+        // ═══════════════════════════════════════════════════════════
+        let tool = kernel_json_extract_str(json, b"tool");
+        let args = kernel_json_extract_str(json, b"args");
+        crate::serial_println!("[MCP] Executing Linux Tool: tool={}, args={}",
+            core::str::from_utf8(tool).unwrap_or("?"),
+            core::str::from_utf8(args).unwrap_or("?")
+        );
+
+        // Resolve tool binary path
+        let tool_path = if tool == b"busybox" || tool.is_empty() {
+            b"/bin/busybox.elf"
+        } else {
+            b"/bin/busybox.elf" // fallback: all tools via busybox
+        };
+
+        // Look up the ELF binary in VFS
+        match crate::fs::vfs::file_read(core::str::from_utf8(tool_path).unwrap_or("/bin/busybox.elf")) {
+            Ok(elf_data) => {
+                crate::serial_println!("[MCP] Loading Linux tool binary: {} ({} bytes)",
+                    core::str::from_utf8(tool_path).unwrap_or("?"), elf_data.len());
+
+                // Construct argc/argv:
+                // argv[0] = "busybox"
+                // argv[1] = first arg (e.g., "ls")
+                // argv[2..] = remaining args (e.g., "-l")
+                let mut argc: u64 = 1; // argv[0] = tool name
+                if !args.is_empty() {
+                    // Count space-separated arguments
+                    argc += 1;
+                    for &b in args {
+                        if b == b' ' { argc += 1; }
+                    }
+                }
+                crate::serial_println!("[MCP] Linux tool: argc={}, argv[0]={}, args={}",
+                    argc,
+                    core::str::from_utf8(tool).unwrap_or("busybox"),
+                    core::str::from_utf8(args).unwrap_or(""));
+
+                // Load the ELF binary into a new process
+                match crate::elf::load_elf_binary(&elf_data) {
+                    Ok(result) => {
+                        let pid = crate::process::spawn_userspace(
+                            "/bin/busybox.elf", 0,
+                            result.entry_point, result.stack_pointer, result.pml4_phys
+                        ).unwrap_or(0);
+                        if pid != 0 {
+                            // Set Linux ABI
+                            crate::process::set_abi(pid, crate::compat::linux_abi::Abi::Linux);
+                            crate::process::set_cpu_affinity(pid, 0);
+                            crate::scheduler::enqueue_process(pid);
+                            crate::serial_println!("[MCP] Linux tool PID {} spawned on Core 0", pid);
+                            crate::serial_println!("[MCP] Execution success! Linux tool launched");
+                        } else {
+                            crate::serial_println!("[MCP] Failed to spawn Linux tool process");
+                        }
+                    }
+                    Err(_) => {
+                        crate::serial_println!("[MCP] Failed to load Linux tool ELF");
+                    }
+                }
+            }
+            Err(_) => {
+                crate::serial_println!("[MCP] Linux tool binary not found: {}",
+                    core::str::from_utf8(tool_path).unwrap_or("?"));
+            }
+        }
     } else {
         crate::serial_println!("[MCP] Unknown action, Execution success");
     }
@@ -5314,4 +5384,69 @@ pub fn validate_user_ptr_pub(addr: u64, len: u64) -> bool {
 /// Public wrapper for sys_brk, used by compat::linux_abi
 pub fn sys_brk_pub(new_break: u64) -> u64 {
     sys_brk(new_break)
+}
+
+/// Public wrapper for sys_write, used by compat::linux_abi
+pub fn sys_write_pub(fd: u64, buf: u64, len: u64) -> u64 {
+    sys_write(fd, buf, len)
+}
+
+/// Public wrapper for sys_read, used by compat::linux_abi
+pub fn sys_read_pub(fd: u32, buf: u64, len: u64) -> u64 {
+    sys_read(fd, buf, len)
+}
+
+/// Public wrapper for sys_mmap, used by compat::linux_abi
+pub fn sys_mmap_pub(addr: u64, len: u64, prot: u64) -> u64 {
+    sys_mmap(addr, len, prot)
+}
+
+/// Public wrapper for sys_getdents, used by compat::linux_abi
+pub fn sys_getdents_pub(fd: u32, buf: u64, len: u64) -> u64 {
+    sys_getdents(fd, buf, len)
+}
+
+/// Public wrapper for sys_pipe, used by compat::linux_abi
+pub fn sys_pipe_pub(pipefd: u64) -> u64 {
+    sys_pipe(pipefd)
+}
+
+/// Public wrapper for sys_dup2, used by compat::linux_abi
+pub fn sys_dup2_pub(oldfd: u32, newfd: u32) -> u64 {
+    sys_dup2(oldfd, newfd)
+}
+
+/// Public wrapper for sys_open, used by compat::linux_abi (openat)
+pub fn sys_open_pub(path_addr: u64, flags: u32) -> u64 {
+    sys_open(path_addr, flags)
+}
+
+/// Public wrapper for sys_mkdir, used by compat::linux_abi (mkdirat)
+pub fn sys_mkdir_pub(path_addr: u64, mode: u64) -> u64 {
+    sys_mkdir(path_addr, mode)
+}
+
+/// Public wrapper for sys_rmdir, used by compat::linux_abi (unlinkat AT_REMOVEDIR)
+pub fn sys_rmdir_pub(path_addr: u64) -> u64 {
+    sys_rmdir(path_addr)
+}
+
+/// Public wrapper for sys_unlink, used by compat::linux_abi (unlinkat)
+pub fn sys_unlink_pub(path_addr: u64) -> u64 {
+    sys_unlink(path_addr)
+}
+
+/// Public wrapper for sys_fork, used by compat::linux_abi (clone/fork)
+pub fn sys_fork_pub() -> u64 {
+    sys_fork()
+}
+
+/// Public wrapper for saved_user_rip, used by compat::linux_abi (clone thread)
+pub fn saved_user_rip_pub() -> u64 {
+    saved_user_rip()
+}
+
+/// Public wrapper for sys_exec, used by compat::linux_abi (MCP run_linux_tool)
+pub fn sys_exec_pub(path_addr: u64) -> u64 {
+    sys_exec(path_addr)
 }

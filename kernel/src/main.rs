@@ -65,12 +65,12 @@ mod codegen;
 mod compat;
 
 // ===== Configuration =====
-const KERNEL_VERSION: &str = "2.6.0-j105-linux-abi-real-inference";
+const KERNEL_VERSION: &str = "3.0.0-j107-108-mcp-linux-tool-cognitive-desktop";
 
 /// Jalon 103: Toggle security agents (MCP/Validator) at boot.
 /// Set to false during SMP LLM pipeline testing to unclog BSP (Core 0).
 /// MUST be set back to true for production/release builds.
-const ENABLE_SECURITY_AGENTS: bool = false;
+const ENABLE_SECURITY_AGENTS: bool = true;
 
 // ===== Embedded ELF binaries =====
 /// Minimal hello.elf - statically linked x86-64 ELF for Ring 3 test
@@ -192,6 +192,10 @@ static AGENT_MCP_ELF: &[u8] = include_bytes!("../../userspace/agent_mcp/target/x
 
 /// agent_validator - Immune System: JSON coherence validator (Ring 3)
 static AGENT_VALIDATOR_ELF: &[u8] = include_bytes!("../../userspace/agent_validator/target/x86_64-aetherion-user/release/agent_validator");
+
+/// Busybox 1.35.0 - statically linked x86_64 musl Linux binary
+/// Jalon 94-95: Native Linux binary execution via Linuxulator
+static BUSYBOX_ELF: &[u8] = include_bytes!("../../userspace/busybox.elf");
 
 // VGA text buffer
 const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
@@ -1582,6 +1586,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 ("agent_llama_core.elf", AGENT_LLAMA_CORE_ELF),
                 ("agent_mcp.elf", AGENT_MCP_ELF),
                 ("agent_validator.elf", AGENT_VALIDATOR_ELF),
+                ("busybox.elf", BUSYBOX_ELF),
             ];
             let mut mounted = 0u32;
             let mut root = crate::fs::vfs::lock_root();
@@ -2248,6 +2253,33 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             }
         } else {
             serial_write("  [J103] agent_validator.elf: SKIPPED (SMP diet mode)\n");
+        }
+
+        // ──────────────────────────────────────────────────────────
+        // STEP A6: Load busybox.elf as a QUEUED process (Jalon 94-95)
+        // Native Linux binary execution via Linuxulator ABI
+        // Busybox is a statically linked musl binary (OSABI=0)
+        // We force Linux ABI since it's a real Linux binary
+        // ──────────────────────────────────────────────────────────
+        match elf::load_elf_binary(BUSYBOX_ELF) {
+            Ok(bb_result) => {
+                let bb_pid = process::spawn_userspace(
+                    "/bin/busybox.elf", 0,
+                    bb_result.entry_point, bb_result.stack_pointer, bb_result.pml4_phys
+                ).unwrap_or(0);
+                if bb_pid != 0 {
+                    // Force Linux ABI — busybox is a real Linux binary
+                    process::set_abi(bb_pid, compat::linux_abi::Abi::Linux);
+                    compat::linux_abi::log_linux_abi_activation(bb_pid, "busybox.elf");
+                    // Pin to Core 0 (BSP) for stability
+                    process::set_cpu_affinity(bb_pid, 0);
+                    scheduler::enqueue_process(bb_pid);
+                    serial_println!("  [J94] busybox.elf: QUEUED on Core 0 (Linux ABI, {} bytes)", BUSYBOX_ELF.len());
+                }
+            }
+            Err(_e) => {
+                serial_write("  [J94] WARN: busybox.elf load failed\n");
+            }
         }
 
         // ──────────────────────────────────────────────────────────

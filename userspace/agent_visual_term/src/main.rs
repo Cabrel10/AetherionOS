@@ -2408,29 +2408,25 @@ fn cmd_orch_test(term: &mut Terminal) {
 // ═══════════════════════════════════════════════════
 fn cmd_agi_test(term: &mut Terminal) {
     term.put_char(b'\n', TEXT);
-    term.put_str(b"[AGI-TEST] === End-to-End AGI Pipeline Test ===\n", INFO_COL);
+    term.put_str(b"[AGI-TEST] === End-to-End AGI Pipeline Test (Jalon 107) ===\n", INFO_COL);
     sys_write(1, b"[TERM] agi_test: starting AGI end-to-end pipeline\n");
 
     // Step 1: Publish INTENT_USER_PROMPT with a network context hash
-    // Simulate: "Le prix du BTC est de 100k, genere un driver"
     sys_write(1, b"[TERM] agi_test: publishing INTENT_USER_PROMPT (network+gen_driver)\n");
     let mut hash: u64 = 5381;
     for &b in b"btc 100k gen_driver 1234:1111" {
         hash = hash.wrapping_mul(33).wrapping_add(b as u64);
     }
     sys_bus_publish(INTENT_USER_PROMPT, 2, hash);
-    term.put_str(b"[AGI] Step 1: INTENT_USER_PROMPT published (hash=0x", DIM);
-    term.put_str(b"...)\n", DIM);
+    term.put_str(b"[AGI] Step 1: INTENT_USER_PROMPT published\n", DIM);
 
     // Step 2: Let orchestrator + LLM process
     sys_write(1, b"[TERM] agi_test: yielding for Orchestrator routing\n");
     for _ in 0..200 { sys_yield(); }
 
-    // Step 3: Directly trigger MCP pipeline (gen_driver action)
-    // This simulates what the Validator would do after LLM JSON output
+    // Step 3: Trigger MCP gen_driver action first
     sys_write(1, b"[TERM] agi_test: triggering MCP gen_driver (vendor=0x1234, device=0x1111)\n");
     
-    // Write MCP contract JSON
     let contract = b"{\"action\":\"gen_driver\",\"params\":{\"vendor\":4660,\"device\":4369}}";
     let creat_fd = sys_creat(b"/tmp/mcp_contract.json\0", 0o644);
     if creat_fd > 0 {
@@ -2438,12 +2434,11 @@ fn cmd_agi_test(term: &mut Terminal) {
         sys_close(creat_fd as u32);
     }
 
-    // Step 4: Publish INTENT_MCP_EXECUTE to invoke MCP agent
     sys_bus_publish(INTENT_MCP_EXECUTE, 2, 0x12341111);
-    sys_write(1, b"[TERM] agi_test: INTENT_MCP_EXECUTE published (0x9002)\n");
-    term.put_str(b"[AGI] Step 2: MCP contract dispatched\n", DIM);
+    sys_write(1, b"[TERM] agi_test: INTENT_MCP_EXECUTE published (0x9002) for gen_driver\n");
+    term.put_str(b"[AGI] Step 2: MCP gen_driver dispatched\n", DIM);
 
-    // Step 5: Wait for MCP result
+    // Step 4: Wait for gen_driver MCP result
     sys_write(1, b"[TERM] agi_test: waiting for INTENT_MCP_RESULT (0x9003)\n");
     let mut result_buf = [0u64; 6];
     let mut got_result = false;
@@ -2456,15 +2451,47 @@ fn cmd_agi_test(term: &mut Terminal) {
     }
 
     if got_result {
-        term.put_str(b"[AGI] Step 3: MCP Execution SUCCESS!\n", INFO_COL);
-        sys_write(1, b"[TERM] agi_test: MCP responded OK - pipeline complete\n");
+        term.put_str(b"[AGI] Step 3: MCP gen_driver SUCCESS!\n", INFO_COL);
+        sys_write(1, b"[TERM] agi_test: MCP gen_driver responded OK\n");
     } else {
-        term.put_str(b"[AGI] Step 3: MCP timeout (pipeline partial)\n", ERR_COL);
-        sys_write(1, b"[TERM] agi_test: MCP timeout\n");
+        term.put_str(b"[AGI] Step 3: MCP gen_driver timeout\n", ERR_COL);
+        sys_write(1, b"[TERM] agi_test: MCP gen_driver timeout\n");
     }
 
-    term.put_str(b"[AGI-TEST] === Pipeline Complete ===\n", INFO_COL);
-    sys_write(1, b"[TERM] agi_test: AGI end-to-end pipeline complete\n");
+    // Step 5: Trigger MCP run_linux_tool action (Jalon 107)
+    sys_write(1, b"[TERM] agi_test: triggering MCP run_linux_tool (busybox ls -l)\n");
+    term.put_str(b"[AGI] Step 4: Sending run_linux_tool to MCP...\n", DIM);
+
+    let linux_contract = b"{\"action\":\"run_linux_tool\",\"params\":{\"tool\":\"busybox\",\"args\":\"ls -l\"}}";
+    let creat_fd2 = sys_creat(b"/tmp/mcp_contract.json\0", 0o644);
+    if creat_fd2 > 0 {
+        sys_write_fd(creat_fd2 as u32, linux_contract);
+        sys_close(creat_fd2 as u32);
+    }
+
+    sys_bus_publish(INTENT_MCP_EXECUTE, 2, 0xBB_0001);
+    sys_write(1, b"[TERM] agi_test: INTENT_MCP_EXECUTE published (0x9002) for run_linux_tool\n");
+
+    // Step 6: Wait for run_linux_tool MCP result
+    let mut got_linux_result = false;
+    for _ in 0..300 {
+        sys_yield();
+        if sys_bus_consume_intent(&mut result_buf, INTENT_MCP_RESULT) == 0 {
+            got_linux_result = true;
+            break;
+        }
+    }
+
+    if got_linux_result {
+        term.put_str(b"[AGI] Step 5: MCP run_linux_tool SUCCESS!\n", INFO_COL);
+        sys_write(1, b"[TERM] agi_test: MCP run_linux_tool responded OK\n");
+    } else {
+        term.put_str(b"[AGI] Step 5: MCP run_linux_tool timeout\n", ERR_COL);
+        sys_write(1, b"[TERM] agi_test: MCP run_linux_tool timeout\n");
+    }
+
+    term.put_str(b"[AGI-TEST] === Pipeline Complete (Jalon 107) ===\n", INFO_COL);
+    sys_write(1, b"[TERM] agi_test: AGI end-to-end pipeline complete (gen_driver + run_linux_tool)\n");
     term.put_char(b'\n', TEXT);
 }
 
