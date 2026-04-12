@@ -1427,7 +1427,7 @@ pub extern "C" fn main() -> i64 {
     }
 
     // Brief listen for INTENT_LLM_CHAT_INIT from orchestrator (non-blocking)
-    let mut msg_buf: [u64; 6] = [0; 6];
+    let mut msg_buf: [u64; 8] = [0; 8];
     let mut got_wakeup = false;
     for _wait in 0..500 {
         let r = sys_bus_consume_intent(&mut msg_buf, INTENT_LLM_CHAT_INIT);

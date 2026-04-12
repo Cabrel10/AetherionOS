@@ -1656,7 +1656,7 @@ fn run_streaming_inference(
 
     // Main event loop: wait for INTENT_USER_PROMPT (0x8001) from terminal.
     loop {
-        let mut bus_msg = [0u64; 6];
+        let mut bus_msg = [0u64; 8];
         if sys_bus_consume_intent(&mut bus_msg, INTENT_USER_PROMPT as u32) == 0 {
             let prompt: &[u8] = b"Bonjour";
             println("[LLM] Received INTENT_USER_PROMPT — generating response");

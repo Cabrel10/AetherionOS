@@ -203,7 +203,7 @@ pub extern "C" fn main() -> i64 {
     mode = SecurityMode::Strict;
 
     // ── Main Event Loop ──
-    let mut msg_buf: [u64; 6] = [0u64; 6]; // SDK expects [u64; 6]
+    let mut msg_buf: [u64; 8] = [0u64; 8]; // SDK expects [u64; 8] (J109 extended)
     let mut idle_loops: u64 = 0;
     let max_idle: u64 = 500_000;
 

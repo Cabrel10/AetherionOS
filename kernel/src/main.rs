@@ -65,7 +65,7 @@ mod codegen;
 mod compat;
 
 // ===== Configuration =====
-const KERNEL_VERSION: &str = "3.0.0-j107-108-mcp-linux-tool-cognitive-desktop";
+const KERNEL_VERSION: &str = "3.1.0-j109-112-enriched-bus-clock-sensor";
 
 /// Jalon 103: Toggle security agents (MCP/Validator) at boot.
 /// Set to false during SMP LLM pipeline testing to unclog BSP (Core 0).
@@ -192,6 +192,10 @@ static AGENT_MCP_ELF: &[u8] = include_bytes!("../../userspace/agent_mcp/target/x
 
 /// agent_validator - Immune System: JSON coherence validator (Ring 3)
 static AGENT_VALIDATOR_ELF: &[u8] = include_bytes!("../../userspace/agent_validator/target/x86_64-aetherion-user/release/agent_validator");
+
+/// agent_clock - Jalon 112a: Clock Sensor Agent (Ring 3)
+/// Publishes INTENT_TIMER_TICK (0x112A) every second for uptime tracking.
+static AGENT_CLOCK_ELF: &[u8] = include_bytes!("../../userspace/agent_clock/target/x86_64-aetherion-user/release/agent_clock");
 
 /// Busybox 1.35.0 - statically linked x86_64 musl Linux binary
 /// Jalon 94-95: Native Linux binary execution via Linuxulator
@@ -1586,6 +1590,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 ("agent_llama_core.elf", AGENT_LLAMA_CORE_ELF),
                 ("agent_mcp.elf", AGENT_MCP_ELF),
                 ("agent_validator.elf", AGENT_VALIDATOR_ELF),
+                ("agent_clock.elf", AGENT_CLOCK_ELF),
                 ("busybox.elf", BUSYBOX_ELF),
             ];
             let mut mounted = 0u32;
@@ -2283,6 +2288,28 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         }
 
         // ──────────────────────────────────────────────────────────
+        // STEP A7: Load agent_clock.elf (Jalon 112a - Clock Sensor Agent)
+        // Publishes INTENT_TIMER_TICK every second for uptime tracking.
+        // Assigned to Core 0 (lightweight sensor, minimal CPU usage).
+        // ──────────────────────────────────────────────────────────
+        match elf::load_elf_binary(AGENT_CLOCK_ELF) {
+            Ok(clock_result) => {
+                let clock_pid = process::spawn_userspace(
+                    "/bin/agent_clock.elf", 0,
+                    clock_result.entry_point, clock_result.stack_pointer, clock_result.pml4_phys
+                ).unwrap_or(0);
+                if clock_pid != 0 {
+                    process::set_cpu_affinity(clock_pid, 0);
+                    scheduler::enqueue_process(clock_pid);
+                    serial_println!("  [J112a] agent_clock.elf: QUEUED on Core 0 ({} bytes, Clock Sensor)", AGENT_CLOCK_ELF.len());
+                }
+            }
+            Err(_e) => {
+                serial_write("  [J112a] WARN: agent_clock.elf load failed\n");
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────
         // STEP B: Load and LAUNCH agent_visual_term.elf FIRST (Jalon 65)
         // Interactive terminal: displays UI, reads keyboard, shows prompt.
         // Launched first so user sees the interface immediately.
@@ -2337,31 +2364,65 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 
                 arch::x86_64::syscall::reset_gs_bases();
 
-                // CRITICAL: Switch to the syscall kernel stack before IRETQ.
-                // The boot stack is nearly exhausted after kernel_main's deep
-                // call chains (ELF loading, VFS, serial I/O). The push instructions
-                // in the IRETQ frame need a valid stack. We use the syscall stack
-                // (1 MiB) which is fresh and properly sized.
+                // CRITICAL Jalon 109b: Re-read values from the process table to
+                // guarantee correctness. The boot stack is nearly exhausted after
+                // kernel_main's deep call chains (ELF loading, VFS, serial I/O).
+                // Between the initial `let entry = result.entry_point` and here,
+                // ~15 function calls may overflow the stack and corrupt the spilled
+                // local variables. Re-reading from the process table gives us
+                // values that are stored in a heap-allocated HashMap, immune to
+                // boot-stack corruption.
+                let (launch_rip, launch_rsp, launch_cr3) = if pid != 0 {
+                    let ps = process::get_entry_state(pid);
+                    match ps {
+                        Some((e, s, c)) => (e, s, c),
+                        None => (entry, stack, pml4),
+                    }
+                } else {
+                    (entry, stack, pml4)
+                };
+
+                // Verify the values match what we expect (diagnostic)
+                if launch_rip != entry || launch_rsp != stack || launch_cr3 != pml4 {
+                    serial_println!(
+                        "  [J109b] WARNING: Boot-stack corruption detected! Corrected values:"
+                    );
+                    serial_println!(
+                        "    entry: 0x{:X}->0x{:X}, stack: 0x{:X}->0x{:X}, pml4: 0x{:X}->0x{:X}",
+                        entry, launch_rip, stack, launch_rsp, pml4, launch_cr3
+                    );
+                }
+
+                // Jalon 109c: FORCE explicit GPR allocation to prevent LLVM from
+                // coalescing registers. Hardcoded: r8=kstack, r9=cr3, r10=rsp, r11=rip
+                let final_rip = unsafe { core::ptr::read_volatile(&launch_rip) };
+                let final_rsp = unsafe { core::ptr::read_volatile(&launch_rsp) };
+                let final_cr3 = unsafe { core::ptr::read_volatile(&launch_cr3) };
                 let kernel_stack_top = arch::x86_64::syscall::get_kernel_stack_top();
+
+                serial_println!(
+                    "  [J109c] IRETQ regs: RIP=0x{:X} RSP=0x{:X} CR3=0x{:X} KSTACK=0x{:X}",
+                    final_rip, final_rsp, final_cr3, kernel_stack_top
+                );
 
                 unsafe {
                     core::arch::asm!(
                         "cli",
-                        // Switch to syscall kernel stack (boot stack is exhausted)
-                        "mov rsp, {kstack}",
-                        // Switch address space to the user process
-                        "mov cr3, {cr3_val}",
-                        // Build IRETQ stack frame
+                        // Switch to syscall kernel stack (r8 = kernel stack top)
+                        "mov rsp, r8",
+                        // Switch address space to the user process (r9 = PML4)
+                        "mov cr3, r9",
+                        // Build IRETQ stack frame with hardcoded registers
                         "push 0x1B",          // SS (User Data, RPL=3)
-                        "push {rsp_val}",     // RSP (user stack)
+                        "push r10",           // RSP (user stack, guaranteed in r10)
                         "push 0x202",         // RFLAGS (IF=1)
                         "push 0x23",          // CS (User Code, RPL=3)
-                        "push {rip_val}",     // RIP (entry point)
+                        "push r11",           // RIP (entry point, guaranteed in r11)
                         "iretq",
-                        kstack = in(reg) kernel_stack_top,
-                        cr3_val = in(reg) pml4,
-                        rsp_val = in(reg) stack,
-                        rip_val = in(reg) entry,
+                        in("r8") kernel_stack_top,
+                        in("r9") final_cr3,
+                        in("r10") final_rsp,
+                        in("r11") final_rip,
                         options(noreturn),
                     );
                 }

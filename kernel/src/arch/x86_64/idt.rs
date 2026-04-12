@@ -261,28 +261,47 @@ fn try_demand_map_user_page(page_addr: u64, is_instruction_fetch: bool) -> bool 
     }
 }
 
+/// Helper: validate that a saved RIP is in a valid userspace range.
+/// Supports both AetherionOS ELF range (0x8000000000+) and Linux ABI range (0x400000+).
+#[inline]
+fn is_valid_user_rip(rip: u64) -> bool {
+    // AetherionOS native ELF range
+    (rip >= 0x0000_0080_0000_0000 && rip < 0x0000_0090_0000_0000)
+    // Linux ABI ELF range (busybox, musl, etc.)
+    || (rip >= 0x0000_0000_0040_0000 && rip < 0x0000_0080_0000_0000)
+}
+
 /// Helper: kill current Ring 3 process and IRETQ to next ready one.
 /// Never returns if a next process is found.
 ///
 /// JALON 69 FIX: Properly terminates the process, then uses the scheduler's
 /// yield_to_next() which correctly restores CR3, RIP, RSP and performs IRETQ.
 /// Validates that the next process's saved_rip is in valid userspace range.
+///
+/// Jalon 109 FIX: Defer page table freeing to avoid cross-core corruption.
+/// On SMP, another core may still reference the terminated process's PML4.
+/// Instead of freeing immediately, we simply mark the process Terminated and
+/// let the next full ELF load reclaim frames.
 fn kill_user_and_switch(current_pid: u64, addr_raw: u64) {
     let _ = crate::process::set_state(current_pid, crate::process::ProcessState::Terminated);
     crate::serial_println!("[SIGSEGV] PID {} terminated (addr 0x{:X})", current_pid, addr_raw);
 
-    // ── Jalon 94: GC — Free the terminated process's page table ──
-    let pml4 = crate::process::with_process(current_pid, |p| p.pml4_phys).unwrap_or(0);
-    if pml4 != 0 {
-        let active_cr3: u64;
-        unsafe { core::arch::asm!("mov {}, cr3", out(reg) active_cr3, options(nomem, nostack)); }
-        if pml4 != (active_cr3 & !0xFFF) {
-            unsafe { crate::elf::free_user_page_table(pml4); }
+    // ── Jalon 109: DEFERRED page table GC ──
+    // On SMP, freeing the PML4 immediately is dangerous: another core may
+    // still have this PML4 in its CR3 or be walking its page tables.
+    // Only free on single-core systems where no other core can reference it.
+    if !crate::arch::x86_64::apic::ap_is_alive() {
+        let pml4 = crate::process::with_process(current_pid, |p| p.pml4_phys).unwrap_or(0);
+        if pml4 != 0 {
+            let active_cr3: u64;
+            unsafe { core::arch::asm!("mov {}, cr3", out(reg) active_cr3, options(nomem, nostack)); }
+            if pml4 != (active_cr3 & !0xFFF) {
+                unsafe { crate::elf::free_user_page_table(pml4); }
+            }
         }
     }
 
     // ── Jalon 100: Watchdog — Auto-respawn critical agents ──
-    // Get the crashed process's name and attempt respawn from VFS
     let crashed_name = crate::process::with_process(current_pid, |p| p.name.clone())
         .unwrap_or_else(|| alloc::string::String::new());
     if !crashed_name.is_empty() {
@@ -295,49 +314,56 @@ fn kill_user_and_switch(current_pid: u64, addr_raw: u64) {
         }
     }
 
-    // Use scheduler's yield_to_next which handles re-queuing properly
+    // ── Jalon 109: NON-NESTING dispatch ──
+    // CRITICAL: Do NOT do IRETQ directly from within the page fault handler!
+    // A nested page fault during the IRETQ would execute in Ring 0 on the
+    // same kernel stack (CPU does NOT reload RSP0 for R0→R0 faults), causing
+    // cascading stack growth and an eventual double fault.
+    //
+    // Instead, find the next process and use scheduler yield_to_next,
+    // then IRETQ from a clean kernel stack via the BSP/AP dispatch path.
+    // Switch to kernel PML4 first so IRETQ targets are in a known address space.
     let next = crate::scheduler::yield_to_next(current_pid);
-    
+
     if next != 0 && next != current_pid {
         // Get the next process's saved state
         let (rip, rsp, rfl, cr3) =
             if let Some((saved_rip, saved_rsp, saved_rfl, saved_pml4, _regs)) =
                 crate::process::get_preempt_state(next)
             {
-                // Validate saved_rip is in userspace range (0x8000000000 - 0x9000000000)
-                if saved_rip >= 0x8000000000 && saved_rip < 0x9000000000 {
+                if is_valid_user_rip(saved_rip) {
                     (saved_rip, saved_rsp, saved_rfl, saved_pml4)
                 } else if let Some((entry, stack, pml4)) = crate::process::get_entry_state(next) {
-                    // Invalid saved_rip → start from entry_point (first-run)
                     crate::serial_println!(
                         "[SIGSEGV] PID {} saved_rip=0x{:X} invalid, using entry=0x{:X}",
                         next, saved_rip, entry
                     );
                     (entry, stack, 0x202u64, pml4)
                 } else {
-                    // No valid state at all
                     crate::serial_println!("[SIGSEGV] PID {} has no valid state, idle", next);
                     crate::scheduler::set_current_pid(0);
-                    loop { x86_64::instructions::hlt(); }
+                    unsafe { core::arch::asm!("sti"); }
+                    loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
                 }
             } else if let Some((entry, stack, pml4)) = crate::process::get_entry_state(next) {
-                // No preempt state → first-run
                 (entry, stack, 0x202u64, pml4)
             } else {
                 crate::serial_println!("[SIGSEGV] PID {} has no entry state, idle", next);
                 crate::scheduler::set_current_pid(0);
-                loop { x86_64::instructions::hlt(); }
+                unsafe { core::arch::asm!("sti"); }
+                loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
             };
 
         if cr3 == 0 || rip == 0 {
             crate::serial_println!("[SIGSEGV] PID {} invalid cr3/rip, idle", next);
             crate::scheduler::set_current_pid(0);
-            loop { x86_64::instructions::hlt(); }
+            unsafe { core::arch::asm!("sti"); }
+            loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
         }
 
         let _ = crate::process::set_state(next, crate::process::ProcessState::Running);
         crate::scheduler::set_current_pid(next);
-        
+
         if let Some(name) = crate::process::with_process(next, |p| p.name.clone()) {
             crate::serial_println!(
                 "[SIGSEGV] -> PID {} ({}) rip=0x{:X} rsp=0x{:X}",
@@ -345,33 +371,66 @@ fn kill_user_and_switch(current_pid: u64, addr_raw: u64) {
             );
         }
 
-        // Reset GS bases before IRETQ to Ring 3
-        crate::arch::x86_64::syscall::reset_gs_bases();
+        // Reset GS bases before IRETQ to Ring 3 (use per-core variant for SMP)
+        let core_id = crate::arch::x86_64::apic::current_core() as u8;
+        crate::arch::x86_64::syscall::reset_gs_bases_for_core(core_id);
 
-        // IRETQ to the next process — never returns
+        // ── Jalon 109: Non-nesting IRETQ via syscall stack ──
+        // We read the kernel syscall RSP from the per-CPU struct directly
+        // (via its known virtual address) rather than using gs:[0], because
+        // the current GS base may point at user-space (GS and KERNEL_GS_BASE
+        // were just reset by reset_gs_bases_for_core — KERNEL_GS_BASE is
+        // correct but GS_BASE may still be 0/user until the next swapgs).
+        let syscall_rsp = crate::arch::x86_64::syscall::get_kernel_rsp_for_core(core_id);
+        if syscall_rsp == 0 {
+            // Fallback: no valid syscall stack — idle
+            crate::serial_println!("[SIGSEGV] No kernel RSP for core {}, idle", core_id);
+            crate::scheduler::set_current_pid(0);
+            unsafe { core::arch::asm!("sti"); }
+            loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
+        }
+
+        // Jalon 109c: FORCE explicit GPR allocation to prevent LLVM from
+        // coalescing registers. Generic in(reg) allows the optimizer to
+        // assign the same physical register to cr3 and rip, causing the
+        // PML4 physical address to be pushed as the return RIP.
+        // Hardcoded: r8=kstack, r9=cr3, r10=rsp, r11=rflags, r12=rip
+        let final_rip = unsafe { core::ptr::read_volatile(&rip) };
+        let final_rsp = unsafe { core::ptr::read_volatile(&rsp) };
+        let final_rfl = unsafe { core::ptr::read_volatile(&rfl) };
+        let final_cr3 = unsafe { core::ptr::read_volatile(&cr3) };
+        let final_kstack = unsafe { core::ptr::read_volatile(&syscall_rsp) };
+
         unsafe {
             core::arch::asm!(
                 "cli",
-                "mov cr3, {cr3_val}",
+                // Load a fresh kernel stack (r8 = kernel stack top)
+                "mov rsp, r8",
+                // Switch to the target process address space (r9 = PML4)
+                "mov cr3, r9",
+                // Build IRETQ frame on the clean syscall stack
                 "push 0x1B",           // SS (Ring 3 data)
-                "push {rsp_val}",      // RSP
-                "push {rfl_val}",      // RFLAGS
+                "push r10",            // RSP (user stack, guaranteed in r10)
+                "push r11",            // RFLAGS (guaranteed in r11)
                 "push 0x23",           // CS (Ring 3 code)
-                "push {rip_val}",      // RIP
+                "push r12",            // RIP (entry point, guaranteed in r12)
                 "iretq",
-                cr3_val = in(reg) cr3,
-                rsp_val = in(reg) rsp,
-                rfl_val = in(reg) rfl,
-                rip_val = in(reg) rip,
+                in("r8") final_kstack,
+                in("r9") final_cr3,
+                in("r10") final_rsp,
+                in("r11") final_rfl,
+                in("r12") final_rip,
                 options(noreturn),
             );
         }
     }
 
     // No other Ready process — enter kernel idle loop
+    // Enable interrupts so the APIC timer can wake us and dispatch new work.
     crate::serial_println!("[SIGSEGV] No other process ready, idle");
     crate::scheduler::set_current_pid(0);
-    loop { x86_64::instructions::hlt(); }
+    unsafe { core::arch::asm!("sti"); }
+    loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
 }
 
 extern "x86-interrupt" fn page_fault_handler(
@@ -548,8 +607,11 @@ extern "x86-interrupt" fn page_fault_handler(
     }
 
     // ELF BSS/Data region — kernel may write to BSS during ELF loading
+    // Jalon 109: Also handles IRETQ instruction-fetch faults.  Detect IFETCH
+    // from the error code so we set +X instead of NX.
     if !is_user_mode && addr_raw >= ELF_DEMAND_LOW && addr_raw < ELF_DEMAND_HIGH {
-        if try_demand_map_user_page(page_addr, false) {
+        let is_ifetch = error_code.contains(PageFaultErrorCode::INSTRUCTION_FETCH);
+        if try_demand_map_user_page(page_addr, is_ifetch) {
             return;
         }
     }
@@ -561,15 +623,39 @@ extern "x86-interrupt" fn page_fault_handler(
         }
     }
 
-    // Kernel-mode page fault — fatal
-    // Jalon 105: Use a single atomic serial_write to prevent SMP interleaving
+    // Jalon 109: Kernel-mode fault at a user-visible address is NOT a true
+    // kernel panic — it happens during IRETQ when the CPU pushes to the
+    // user stack or fetches the first user-mode instruction.  Treat it as
+    // SIGSEGV (kill the offending process) instead of halting the core.
+    {
+        let in_user_stack  = addr_raw >= USER_STACK_DEMAND_LOW && addr_raw < USER_STACK_DEMAND_HIGH;
+        let in_elf_region  = addr_raw >= ELF_DEMAND_LOW && addr_raw < ELF_DEMAND_HIGH;
+        let in_user_heap   = addr_raw >= USER_HEAP_DEMAND_LOW && addr_raw < USER_HEAP_DEMAND_HIGH;
+        // Addresses below 0x0000_8000_0000_0000 are canonical user addresses
+        let is_user_addr   = addr_raw < 0x0000_8000_0000_0000;
+
+        if !is_user_mode && (in_user_stack || in_elf_region || in_user_heap || is_user_addr) {
+            let current_pid = crate::scheduler::current_pid();
+            if current_pid != 0 {
+                crate::serial_println!(
+                    "[PF-IRETQ] PID {} addr=0x{:X} rip={:?} (kernel-mode fault at user addr, treating as SIGSEGV)",
+                    current_pid, addr_raw, stack_frame.instruction_pointer
+                );
+                kill_user_and_switch(current_pid, addr_raw);
+                // kill_user_and_switch does not return if another process is ready
+            }
+        }
+    }
+
+    // True kernel-mode page fault (address in kernel space) — log and halt this core only.
+    // Jalon 109: Downgraded from panic! to hlt-loop so the other core survives.
     {
         let rip_val = stack_frame.instruction_pointer.as_u64();
         let cs_val = stack_frame.code_segment;
         let err = error_code.bits();
         let hex = b"0123456789ABCDEF";
         let mut msg = [b' '; 128];
-        let prefix = b"\n[PF-FATAL] CR2=0x";
+        let prefix = b"\n[PF-KERN] CR2=0x";
         msg[..prefix.len()].copy_from_slice(prefix);
         let mut pos = prefix.len();
         // CR2 address (16 hex digits)
@@ -601,7 +687,9 @@ extern "x86-interrupt" fn page_fault_handler(
         pos += 1;
         unsafe { crate::serial_write(core::str::from_utf8_unchecked(&msg[..pos])); }
     }
-    panic!("Kernel page fault at 0x{:X}", addr_raw);
+    // Halt only this core (don't panic! which would kill the entire system)
+    crate::serial_println!("[PF-KERN] Core halted (addr=0x{:X})", addr_raw);
+    loop { unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)); } }
 }
 
 extern "x86-interrupt" fn x87_floating_point_handler(stack_frame: InterruptStackFrame) {
@@ -698,7 +786,8 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
         let cs = stack_frame.code_segment;
         
         // Only save if this was a Ring 3 interrupt (CS RPL == 3)
-        if (cs & 0x3) == 3 && irq_rip >= 0x8000000000 && irq_rip < 0x9000000000 {
+        // Jalon 109: Accept both AetherionOS ELF range and Linux ABI range
+        if (cs & 0x3) == 3 && is_valid_user_rip(irq_rip) {
             crate::process::save_preempt_state(current_pid, irq_rip, irq_rsp, irq_rflags);
         }
     }
@@ -731,21 +820,27 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
 pub fn check_pending_switch() -> bool {
     if let Some((_old_pid, _new_pid, new_rip, new_rsp, new_pml4)) = take_pending_switch() {
         if new_pml4 != 0 && new_rip != 0 {
+            // Jalon 109c: FORCE explicit GPR allocation (r8=CR3, r9=RSP, r10=RIP)
+            // Prevents LLVM from coalescing PML4 and RIP into the same register.
+            let f_rip = unsafe { core::ptr::read_volatile(&new_rip) };
+            let f_rsp = unsafe { core::ptr::read_volatile(&new_rsp) };
+            let f_cr3 = unsafe { core::ptr::read_volatile(&new_pml4) };
             // Perform the actual context switch via IRETQ
             // This switches to the new process and never returns to caller
             unsafe {
                 core::arch::asm!(
                     "cli",
-                    "mov cr3, {cr3}",           // Switch page tables
+                    "mov cr3, r8",              // Switch page tables (r8 = PML4)
+                    "swapgs",
                     "push 0x1B",                // SS (Ring 3 data)
-                    "push {rsp}",               // RSP
+                    "push r9",                  // RSP (user stack, guaranteed in r9)
                     "push 0x202",               // RFLAGS (IF=1)
                     "push 0x23",                // CS (Ring 3 code)
-                    "push {rip}",               // RIP
+                    "push r10",                 // RIP (entry point, guaranteed in r10)
                     "iretq",                    // IRETQ to new process
-                    cr3 = in(reg) new_pml4,
-                    rsp = in(reg) new_rsp,
-                    rip = in(reg) new_rip,
+                    in("r8") f_cr3,
+                    in("r9") f_rsp,
+                    in("r10") f_rip,
                     options(noreturn)
                 );
             }

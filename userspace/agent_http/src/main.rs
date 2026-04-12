@@ -399,7 +399,7 @@ pub extern "C" fn main() -> i64 {
         println(b"[HTTP] Published INTENT_API_RESPONSE (0xB001)");
 
         // ── Event loop: wait for Orchestrator HTTP requests ──
-        let mut bus_msg = [0u64; 6];
+        let mut bus_msg = [0u64; 8];
         let mut idle = 0u32;
         loop {
             let got = sys_bus_consume_intent(&mut bus_msg, INTENT_HTTP_REQUEST);

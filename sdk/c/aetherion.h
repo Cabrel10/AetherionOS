@@ -56,6 +56,17 @@ long getpid(void);
 /* AetherionOS-specific */
 void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t offset);
 long bus_publish(long intent, int priority, long data);
+
+/* Jalon 109: Extended bus publish with Session & Correlation IDs */
+long bus_publish_ext(long intent, int priority, long data,
+                     long session_id, long correlation_id);
+
+/* Jalon 109: Extended bus consume — fills 64-byte buffer (8 x long):
+ *   [0] source, [1] destination, [2] intent_id, [3] priority,
+ *   [4] payload, [5] timestamp, [6] session_id, [7] correlation_id */
+long bus_consume(long *buf);
+long bus_consume_intent(long *buf, long target_intent);
+
 long vga_write(int row, int col, long color_char);
 
 /* String utilities */

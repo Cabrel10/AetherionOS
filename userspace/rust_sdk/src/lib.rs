@@ -263,6 +263,29 @@ pub fn syscall4(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
     ret
 }
 
+/// Jalon 109: 5-argument syscall for extended Cognitive Bus publish
+/// with session_id and correlation_id.
+#[inline(always)]
+pub fn syscall5(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
+    let ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") nr => ret,
+            inlateout("rdi") a1 => _,
+            inlateout("rsi") a2 => _,
+            inlateout("rdx") a3 => _,
+            inlateout("r10") a4 => _,
+            inlateout("r8") a5 => _,
+            out("rcx") _,
+            out("r11") _,
+            out("r9") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
 // ============================================================
 // High-Level Syscall Wrappers
 // ============================================================
@@ -304,39 +327,54 @@ pub fn sys_yield() {
 }
 
 /// Publish an intent to the Cognitive Bus.
+/// Legacy signature (session_id=0, correlation_id=0).
 /// Returns 0 on success.
 pub fn sys_bus_publish(intent: u64, priority: u32, data: u64) -> i64 {
-    syscall3(SYS_BUS_PUBLISH, intent, priority as u64, data) as i64
+    syscall5(SYS_BUS_PUBLISH, intent, priority as u64, data, 0, 0) as i64
 }
 
-/// Consume a message from the Cognitive Bus (Jalon 71).
-/// msg_buf: pointer to a 48-byte buffer to receive the IntentMessage.
+/// Jalon 109: Extended Cognitive Bus publish with Session & Correlation IDs.
+/// session_id: session tracking (0 = no session / legacy)
+/// correlation_id: request/response chaining (0 = none)
+/// Returns 0 on success.
+pub fn sys_bus_publish_ext(
+    intent: u64, priority: u32, data: u64,
+    session_id: u64, correlation_id: u64,
+) -> i64 {
+    syscall5(SYS_BUS_PUBLISH, intent, priority as u64, data, session_id, correlation_id) as i64
+}
+
+/// Consume a message from the Cognitive Bus (Jalon 71, extended J109).
+/// msg_buf: pointer to a 64-byte buffer to receive the IntentMessage.
 /// 
-/// Buffer layout (C struct compatible):
+/// Buffer layout (C struct compatible, extended J109):
 ///   offset 0:  u32 source (ComponentId)
 ///   offset 4:  u32 destination (ComponentId)
 ///   offset 8:  u32 intent_id
 ///   offset 12: u32 priority
 ///   offset 16: u64 payload
 ///   offset 24: u64 timestamp
+///   offset 32: u64 session_id     (Jalon 109)
+///   offset 40: u64 correlation_id (Jalon 109)
 ///
 /// Returns:
 ///   0 on success (message copied to buffer)
 ///   -EAGAIN (-11) if bus is empty
 ///   -EFAULT (-14) if buffer address is invalid
-pub fn sys_bus_consume(msg_buf: &mut [u64; 6]) -> i64 {
+pub fn sys_bus_consume(msg_buf: &mut [u64; 8]) -> i64 {
     syscall1(SYS_BUS_CONSUME, msg_buf.as_mut_ptr() as u64) as i64
 }
 
 /// Intent-Based Routing: Consume only messages matching `target_intent`.
 /// Level 8 (ACHA §3.7.1) — Pub/Sub primitive for the Cognitive Bus.
+/// Extended J109: buffer is now 64 bytes (8 x u64) with session/correlation IDs.
 ///
 /// Each Ring 3 agent calls this with its own intent ID:
 ///   - MCP agent: sys_bus_consume_intent(buf, 0x9002)
 ///   - Terminal:  sys_bus_consume_intent(buf, 0x8063) for LLM tokens
 ///
 /// Messages for other intents are left untouched in the bus.
-pub fn sys_bus_consume_intent(msg_buf: &mut [u64; 6], target_intent: u32) -> i64 {
+pub fn sys_bus_consume_intent(msg_buf: &mut [u64; 8], target_intent: u32) -> i64 {
     syscall2(SYS_BUS_CONSUME_INTENT, msg_buf.as_mut_ptr() as u64, target_intent as u64) as i64
 }
 

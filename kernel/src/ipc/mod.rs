@@ -111,10 +111,17 @@ pub struct IntentMessage {
     pub payload: u64,
     /// Timestamp TSC pour tracabilite et benchmarks
     pub timestamp: u64,
+    /// Jalon 109: Session ID for multi-agent session tracking
+    /// 0 = no session (legacy / system messages)
+    pub session_id: u64,
+    /// Jalon 109: Correlation ID for request/response chaining
+    /// Allows tracing a request through multiple agents
+    pub correlation_id: u64,
 }
 
 impl IntentMessage {
     /// Cree un nouveau message avec timestamp automatique (TSC)
+    /// Legacy constructor: session_id=0, correlation_id=0
     pub fn new(
         source: ComponentId,
         destination: ComponentId,
@@ -129,6 +136,30 @@ impl IntentMessage {
             priority,
             payload,
             timestamp: crate::arch::x86_64::timer::read_tsc(),
+            session_id: 0,
+            correlation_id: 0,
+        }
+    }
+
+    /// Jalon 109: Extended constructor with Session & Correlation IDs
+    pub fn new_ext(
+        source: ComponentId,
+        destination: ComponentId,
+        intent_id: u32,
+        priority: Priority,
+        payload: u64,
+        session_id: u64,
+        correlation_id: u64,
+    ) -> Self {
+        Self {
+            source,
+            destination,
+            intent_id,
+            priority,
+            payload,
+            timestamp: crate::arch::x86_64::timer::read_tsc(),
+            session_id,
+            correlation_id,
         }
     }
 }
@@ -137,8 +168,9 @@ impl fmt::Display for IntentMessage {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
-            "[{} -> {}] Intent=0x{:04x} Priority={} Payload=0x{:016x}",
-            self.source, self.destination, self.intent_id, self.priority, self.payload
+            "[{} -> {}] Intent=0x{:04x} Priority={} Payload=0x{:016x} Session={} Corr={}",
+            self.source, self.destination, self.intent_id, self.priority, self.payload,
+            self.session_id, self.correlation_id
         )
     }
 }

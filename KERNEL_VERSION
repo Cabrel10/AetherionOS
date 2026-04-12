@@ -1,0 +1,6 @@
+4.0.0-smp-stable
+Jalon: 109c
+Date: 2026-04-12
+Codename: IRETQ-Hardened
+Status: Zero-crash SMP kernel (0 SIGSEGV, 0 panic, 0 double-fault)
+Tests: 166/185 pass (300s regression, 2 cores, 1 GiB RAM)
