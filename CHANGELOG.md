@@ -5,6 +5,42 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [v4.0-smp-stable] -- 2026-04-12 -- Jalon 109c: Zero-Crash SMP Kernel
+
+### Fixed — CRITICAL: IRETQ Register Clobbering (Jalon 109c)
+- **Root Cause**: LLVM optimizer coalesced `in(reg)` inline assembly operands, causing
+  the PML4 physical address to overwrite the user RIP or RSP in IRETQ stack frames.
+  This made the CPU jump to physical memory addresses (e.g., 0x5AD8000, 0x5EF8000, 0x6401000)
+  instead of user-mode entry points, triggering immediate SIGSEGV.
+- **Fix**: Replaced ALL generic `in(reg)` constraints with hardcoded GPR allocation
+  (`r8`, `r9`, `r10`, `r11`, `r12`) across 8 IRETQ sites in 4 files:
+  - `kernel/src/main.rs` — initial process launch
+  - `kernel/src/arch/x86_64/syscall.rs` — sys_yield first-run, launch_next, child/parent IRETQ
+  - `kernel/src/arch/x86_64/idt.rs` — kill_user_and_switch, check_pending_switch
+  - `kernel/src/elf/mod.rs` — jump_to_ring3
+- **Added**: `read_volatile` barriers before every IRETQ block to prevent stale spills.
+
+### Fixed — IRETQ Boot-Stack Overflow (Jalon 109b)
+- Boot stack exhaustion after 15+ function calls corrupted spilled IRETQ frame values.
+- `read_volatile` barriers force the compiler to reload values right before the asm block.
+
+### Fixed — SMP Double Fault (Jalon 109)
+- Deferred PML4 garbage collection prevents double-fault during cross-core page-table cleanup.
+- Precise ELF segment-page intersection math for .got/.rodata page sharing.
+- Linux ABI valid RIP range enforcement.
+
+### Results (300s regression, 2 cores, 1 GiB RAM)
+- **0 SIGSEGV** (was 6) — all process crashes eliminated
+- **0 Double Fault** — SMP kernel fully stable
+- **0 PANIC, 0 PF-FATAL, 0 addr=0x0, 0 rip=0x0**
+- **166/185 tests pass** (was 157)
+- All agents boot: LLM, orchestrator, validator, MCP, terminal, clock, busybox
+- GGUF v3 model loading active (273 tensors, 30 layers)
+- Cognitive bus: 5+ publish events, intent routing functional
+- Visual terminal: "AetherionOS v4.0 Production Terminal" + "Terminal ready"
+
+---
+
 ## [v3.0-terminal-stable] -- 2026-03-17 -- Terminal-Only Stable State
 
 ### Fixed

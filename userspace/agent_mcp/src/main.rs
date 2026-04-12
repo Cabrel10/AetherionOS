@@ -35,13 +35,13 @@ pub extern "C" fn main() -> i64 {
     sys_write(1, b"[MCP] Using sys_bus_consume_intent (Pub/Sub routing)\n");
 
     let mut contracts_processed: u32 = 0;
-    let mut msg_buf = [0u64; 6];
+    let mut msg_buf = [0u64; 8];
 
     // Daemon loop: MCP runs forever as a persistent Ring 3 service.
     // Uses Intent-Based Routing (syscall 204) to consume ONLY 0x9002 messages.
     // Other intents (LLM tokens, terminal events) are left on the bus untouched.
     //
-    // Bus buffer layout (as [u64; 6]):
+    // Bus buffer layout (as [u64; 8]):
     //   [0] = source(lo32) | destination(hi32)
     //   [1] = intent_id(lo32) | priority(hi32)
     //   [2] = payload (u64)

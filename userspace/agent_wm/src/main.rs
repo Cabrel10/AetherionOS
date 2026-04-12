@@ -55,6 +55,9 @@ const INTENT_WM_READY: u64 = 0xB069;
 const INTENT_WM_DESKTOP_STATE: u64 = 0xB070;
 const INTENT_WM_DESKTOP_J108: u64 = 0xB108;
 
+/// Jalon 112a: Timer tick intent from Clock Sensor Agent
+const INTENT_TIMER_TICK: u64 = 0x112A;
+
 // ═══════════════════════════════════════════════════
 // Window Descriptor with Z-Index
 // ═══════════════════════════════════════════════════
@@ -179,6 +182,8 @@ struct Desktop {
     frame: u32,
     /// Total HID events processed
     hid_events: u32,
+    /// Jalon 112a: Uptime in seconds from Clock Sensor Agent
+    uptime_seconds: u64,
 }
 
 impl Desktop {
@@ -193,8 +198,8 @@ impl Desktop {
                     title_color: WIN_TITLE,
                     visible: true,
                     content: &[
-                        b"AetherionOS v3.0 - Cognitive Desktop",
-                        b"Kernel: 3.0.0-j107-108-mcp-linux-tool",
+                        b"AetherionOS v3.1 - Enriched Cognitive Bus",
+                        b"Kernel: 3.1.0-j109-112-enriched-bus-clock",
                         b"",
                         b"$ uname -a",
                         b"Linux aetherion 6.1.0-aetherion x86_64",
@@ -230,7 +235,7 @@ impl Desktop {
                         b"GGUF Loader:    v3 Streaming     [OK]",
                         b"Q8_0 Dequant:   SIMD 32KB buf    [OK]",
                         b"PagedAttention: 64-block KV      [OK]",
-                        b"Cognitive Bus:  128-msg queue    [OK]",
+                        b"Cognitive Bus:  1024-msg (J109)  [OK]",
                         b"BusyBox:        Linux ABI exec   [OK]",
                         b"",
                         b"MCP Actions: gen_driver, ping,",
@@ -277,6 +282,7 @@ impl Desktop {
             prev_buttons: 0,
             frame: 0,
             hid_events: 0,
+            uptime_seconds: 0,
         }
     }
 
@@ -359,7 +365,7 @@ fn draw_background() {
     }
 
     // AetherionOS branding watermark (center)
-    sys_fb_draw_string(SCR_W / 2 - 120, TB_Y / 2 - 8, b"AetherionOS  J108 - Cognitive Desktop", TEXT_DIM);
+    sys_fb_draw_string(SCR_W / 2 - 120, TB_Y / 2 - 8, b"AetherionOS  J109 - Enriched Cognitive Bus", TEXT_DIM);
 }
 
 /// Draw the taskbar at the bottom of the screen
@@ -392,8 +398,33 @@ fn draw_taskbar(desktop: &Desktop) {
         tx += label_w + 4;
     }
 
-    // System tray (right side)
-    sys_fb_draw_string(SCR_W - 200, TB_Y + 8, b"J108 | v3.0 | WM", TEXT_DIM);
+    // System tray (right side) — Jalon 109/112: show uptime from Clock Agent
+    // Format uptime as "Up: XXXs"
+    let up_secs = desktop.uptime_seconds;
+    let mut up_buf = [0u8; 20];
+    up_buf[0] = b'U'; up_buf[1] = b'p'; up_buf[2] = b':'; up_buf[3] = b' ';
+    let mut pos = 4usize;
+    if up_secs == 0 {
+        up_buf[pos] = b'0'; pos += 1;
+    } else {
+        let mut digits = [0u8; 10];
+        let mut d = 0usize;
+        let mut v = up_secs;
+        while v > 0 && d < 10 {
+            digits[d] = b'0' + (v % 10) as u8;
+            v /= 10;
+            d += 1;
+        }
+        let mut i = d;
+        while i > 0 {
+            i -= 1;
+            up_buf[pos] = digits[i];
+            pos += 1;
+        }
+    }
+    up_buf[pos] = b's'; pos += 1;
+    sys_fb_draw_string(SCR_W - 300, TB_Y + 8, &up_buf[..pos], GREEN);
+    sys_fb_draw_string(SCR_W - 200, TB_Y + 8, b"J109 | v3.1 | WM", TEXT_DIM);
 
     // Status indicators
     sys_fb_fill_rect(SCR_W - 60, TB_Y + 12, 8, 8, GREEN);   // Network OK
@@ -791,6 +822,22 @@ pub extern "C" fn main() -> i64 {
         }
 
         desktop.frame += 1;
+
+        // Jalon 112a: Consume INTENT_TIMER_TICK from Clock Sensor Agent
+        // Update uptime counter and redraw taskbar periodically
+        {
+            let mut tick_buf = [0u64; 8];
+            if sys_bus_consume_intent(&mut tick_buf, INTENT_TIMER_TICK as u32) == 0 {
+                // tick_buf[2] = payload = uptime in seconds
+                let new_uptime = tick_buf[2];
+                if new_uptime != desktop.uptime_seconds {
+                    desktop.uptime_seconds = new_uptime;
+                    // Redraw taskbar to update uptime display
+                    draw_taskbar(&desktop);
+                    draw_cursor(desktop.cursor_x, desktop.cursor_y);
+                }
+            }
+        }
 
         // Periodic cursor blink (every ~10000 frames)
         if desktop.frame % 10000 == 0 {

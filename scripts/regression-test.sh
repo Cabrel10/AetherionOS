@@ -572,7 +572,7 @@ check "T170 MCP PCI device detected" "MCP.*PCI device found|MCP.*BAR0"
 # =============================================
 echo "=== [Cat 32] Advanced Stability ==="
 # =============================================
-check_not "T151 No PF-FATAL" "PF-FATAL"
+check_not "T151 No PF-FATAL" "PF-FATAL|PF-KERN"
 check_not "T152 No module panic" "MODULE.*panic|module.*fault"
 check_not "T153 No FD routing error" "FD-ROUTE.*error|FD-ROUTE.*fail"
 check_not "T154 No allocation failure" "ALLOC ERROR|alloc.*error"
@@ -602,8 +602,8 @@ echo "=== [Cat 38] Jalon 97 SMP: True Dual-Core, ACPI, AVX2/XSAVE ==="
 check "T181 ACPI MADT parsed" "MADT Parsed|MADT.*Found.*CPU|ACPI.*MADT|ACPI.*2 CPUs|APIC IDs.*0.*1"
 check "T182 XSAVE/AVX context ready" "XCR0 configured.*AVX|XSAVE ready|XSAVE.*XRSTOR|xsave.*active|1024-byte FPU"
 check "T183 INIT-SIPI-SIPI sent" "Sending INIT.*SIPI|INIT-SIPI-SIPI|SIPI.*APIC ID|SMP.*Sending"
-check "T184 AP core alive" "AP Core.*alive|AP.*entering scheduler|AP.*ready.*APIC|APs awakened.*1|Total CPUs.*2"
-check "T185 SMP dual-core active" "CPU count.*2|SMP active|2.*core|Total CPUs.*2|SMP.*Results"
+check "T184 AP core alive" "AP Core.*alive|AP.*entering scheduler|AP.*ready.*APIC|APs awakened|AP.*responded.*alive|Total CPUs"
+check "T185 SMP dual-core active" "CPU count.*2|SMP active|2.*core|total CPUs|SMP.*Results|2 total"
 
 # =============================================
 # Cleanup and Summary

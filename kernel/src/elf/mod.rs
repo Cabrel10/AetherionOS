@@ -859,26 +859,30 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
                 new_frame
             };
 
-            // Copy file data into the frame if applicable
-            let page_offset_in_segment = page_vaddr.saturating_sub(vaddr);
-            if page_offset_in_segment < filesz {
-                let file_offset = offset + page_offset_in_segment;
-                let copy_start_in_page = if page_vaddr < vaddr {
-                    (vaddr - page_vaddr) as usize
-                } else {
-                    0
-                };
-                let bytes_remaining = filesz.saturating_sub(page_offset_in_segment);
-                let copy_len = core::cmp::min(
-                    bytes_remaining as usize,
-                    PAGE_SIZE as usize - copy_start_in_page,
-                );
+            // Jalon 109: Copy file data using precise segment/page intersection math.
+            // This correctly handles segments that start mid-page (e.g. .got sharing
+            // a physical page with .rodata) by computing exact byte ranges.
+            {
+                let seg_start = vaddr;
+                let seg_end   = vaddr + filesz;  // end of file-backed data
 
-                if copy_len > 0 && (file_offset as usize + copy_len) <= elf_data.len() {
-                    unsafe {
-                        let dst = (phys_to_virt(frame_phys) as *mut u8).add(copy_start_in_page);
-                        let src = elf_data.as_ptr().add(file_offset as usize);
-                        core::ptr::copy_nonoverlapping(src, dst, copy_len);
+                let page_start_va = page_vaddr;
+                let page_end_va   = page_vaddr + PAGE_SIZE;
+
+                let copy_start = core::cmp::max(seg_start, page_start_va);
+                let copy_end   = core::cmp::min(seg_end,   page_end_va);
+
+                if copy_start < copy_end {
+                    let copy_len    = (copy_end - copy_start) as usize;
+                    let file_off    = offset + (copy_start - seg_start);
+                    let dest_offset = (copy_start - page_start_va) as usize;
+
+                    if copy_len > 0 && (file_off as usize + copy_len) <= elf_data.len() {
+                        unsafe {
+                            let dst = (phys_to_virt(frame_phys) as *mut u8).add(dest_offset);
+                            let src = elf_data.as_ptr().add(file_off as usize);
+                            core::ptr::copy_nonoverlapping(src, dst, copy_len);
+                        }
                     }
                 }
             }
@@ -1163,21 +1167,24 @@ pub fn load_elf(path: &str) -> Result<u64, ElfError> {
 /// The entry_point and stack_pointer must be mapped in the user address space.
 #[allow(unused)]
 pub unsafe fn jump_to_ring3(entry_point: u64, stack_pointer: u64) -> ! {
+    // Jalon 109c: hardcoded GPR allocation (r9=RSP, r10=RIP)
+    let f_rsp = core::ptr::read_volatile(&stack_pointer);
+    let f_rip = core::ptr::read_volatile(&entry_point);
     core::arch::asm!(
         // Push SS (User Data = 0x1B)
         "push 0x1B",
-        // Push RSP (user stack pointer)
-        "push {rsp_val}",
+        // Push RSP (user stack pointer, guaranteed in r9)
+        "push r9",
         // Push RFLAGS (IF=1, bit1=1 -> 0x202)
         "push 0x202",
         // Push CS (User Code = 0x23)
         "push 0x23",
-        // Push RIP (entry point)
-        "push {rip_val}",
+        // Push RIP (entry point, guaranteed in r10)
+        "push r10",
         // Execute IRETQ to switch to Ring 3
         "iretq",
-        rsp_val = in(reg) stack_pointer,
-        rip_val = in(reg) entry_point,
+        in("r9") f_rsp,
+        in("r10") f_rip,
         options(noreturn),
     );
 }

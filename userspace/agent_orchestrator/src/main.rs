@@ -326,8 +326,8 @@ pub extern "C" fn main() -> i64 {
     println("[ORCH]   - INTENT_API_RESPONSE (0xB001)");
     println("[ORCH]   - INTENT_LLM_OUTPUT   (0x8010)");
 
-    let mut msg_buf: [u64; 6] = [0; 6];
-    let mut api_buf: [u64; 6] = [0; 6];
+    let mut msg_buf: [u64; 8] = [0; 8];
+    let mut api_buf: [u64; 8] = [0; 8];
     let mut total_queries: u64 = 0;
     let mut reflex_hits: u64 = 0;
     let mut llm_routes: u64 = 0;

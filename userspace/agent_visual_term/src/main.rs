@@ -932,7 +932,7 @@ fn cmd_llm(term: &mut Terminal, prompt_bytes: &[u8]) {
 
     term.put_str(b"[LLM] ", LLM_COL);
     loop {
-        let mut bus_msg = [0u64; 6];
+        let mut bus_msg = [0u64; 8];
         let mut got_token = false;
         // Intent-Based Routing: only consume LLM token intents
         if sys_bus_consume_intent(&mut bus_msg, INTENT_TOKEN_GEN_CORE as u32) == 0 {
@@ -2343,7 +2343,7 @@ fn cmd_mcp_test(term: &mut Terminal) {
     term.put_str(b"[MCP-TEST] Waiting for MCP response (intent 0x9003)...\n", DIM);
     sys_write(1, b"[TERM] mcp_test: waiting for INTENT_MCP_RESULT (0x9003)\n");
 
-    let mut mcp_msg = [0u64; 6];
+    let mut mcp_msg = [0u64; 8];
     let mut got_response = false;
     for _wait in 0..10_000u32 {
         sys_yield();
@@ -2440,7 +2440,7 @@ fn cmd_agi_test(term: &mut Terminal) {
 
     // Step 4: Wait for gen_driver MCP result
     sys_write(1, b"[TERM] agi_test: waiting for INTENT_MCP_RESULT (0x9003)\n");
-    let mut result_buf = [0u64; 6];
+    let mut result_buf = [0u64; 8];
     let mut got_result = false;
     for _ in 0..300 {
         sys_yield();
@@ -2601,7 +2601,7 @@ pub extern "C" fn main() -> i64 {
         // Level 8: Only consume our own intents. MCP messages (0x9002) are
         // left on the bus for the MCP agent. No message stealing.
         if !term.llm_active {
-            let mut bus_msg = [0u64; 6];
+            let mut bus_msg = [0u64; 8];
             // Try agent_llama_core tokens (0x8063)
             if sys_bus_consume_intent(&mut bus_msg, INTENT_TOKEN_GEN_CORE as u32) == 0 {
                 let payload = bus_msg[2]; // payload is at buf[2]

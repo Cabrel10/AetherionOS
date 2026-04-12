@@ -494,7 +494,7 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         560 => sys_xhci_info(a1),
 
         // ── AetherionOS custom IPC ──
-        570 => sys_bus_publish(a1, a2 as u32, a3),
+        570 => sys_bus_publish(a1, a2 as u32, a3, a4, a5),
 
         // ── AetherionOS module loading ──
         580 => sys_load_module(a1, a2, a3),
@@ -1831,21 +1831,28 @@ fn sys_yield() -> u64 {
         if is_first_run {
             // First-run: use IRETQ which is proven to work for launching processes.
             // IRETQ pops: RIP, CS, RFLAGS, RSP, SS from the stack.
+            // Jalon 109c: FORCE explicit GPR allocation (r8=CR3, r9=RSP, r10=RIP)
+            // Generic in(reg) allows LLVM to coalesce registers, causing PML4 addr
+            // to overwrite RIP. Hardcoded registers eliminate this entirely.
+            let f_cr3 = core::ptr::read_volatile(&new_pml4);
+            let f_rsp = core::ptr::read_volatile(&new_rsp);
+            let f_rip = core::ptr::read_volatile(&new_rip);
             asm!(
                 "cli",
-                // Switch address space FIRST
-                "mov cr3, {cr3}",
+                // Switch address space FIRST (r8 = PML4 physical address)
+                "mov cr3, r8",
+                // SWAPGS before touching user stack frame
+                "swapgs",
                 // Build IRETQ frame on the kernel stack
                 "push 0x1B",    // SS (Ring 3 data, GDT entry 3 | RPL=3)
-                "push {rsp}",   // RSP (user stack)
+                "push r9",      // RSP (user stack, guaranteed in r9)
                 "push 0x202",   // RFLAGS (IF=1, reserved bit 1)
                 "push 0x23",    // CS (Ring 3 code, GDT entry 4 | RPL=3)
-                "push {rip}",   // RIP (entry point)
-                "swapgs",
+                "push r10",     // RIP (entry point, guaranteed in r10)
                 "iretq",
-                cr3 = in(reg) new_pml4,
-                rsp = in(reg) new_rsp,
-                rip = in(reg) new_rip,
+                in("r8") f_cr3,
+                in("r9") f_rsp,
+                in("r10") f_rip,
                 options(noreturn),
             );
         }
@@ -2291,18 +2298,24 @@ fn sys_exit(code: u64) -> u64 {
                 );
                 let _ = crate::process::set_state(next_child, crate::process::ProcessState::Running);
                 crate::scheduler::set_current_pid(next_child);
+                // Jalon 109c: hardcoded GPR allocation for child IRETQ
+                let f_pml4_c = unsafe { core::ptr::read_volatile(&child_pml4) };
+                let f_stack_c = unsafe { core::ptr::read_volatile(&child_stack) };
+                let f_entry_c = unsafe { core::ptr::read_volatile(&child_entry) };
                 unsafe {
-                    core::arch::asm!("mov cr3, {}", in(reg) child_pml4, options(nostack));
                     core::arch::asm!(
+                        "cli",
+                        "mov cr3, r8",      // r8 = child PML4
                         "swapgs",           // Restore user GS before Ring 3
                         "push 0x1B",        // SS
-                        "push {stack}",     // RSP
+                        "push r9",          // RSP (child stack, guaranteed in r9)
                         "push 0x202",       // RFLAGS
                         "push 0x23",        // CS
-                        "push {entry}",     // RIP
+                        "push r10",         // RIP (child entry, guaranteed in r10)
                         "iretq",
-                        stack = in(reg) child_stack,
-                        entry = in(reg) child_entry,
+                        in("r8") f_pml4_c,
+                        in("r9") f_stack_c,
+                        in("r10") f_entry_c,
                         options(noreturn),
                     );
                 }
@@ -2392,19 +2405,23 @@ fn sys_exit(code: u64) -> u64 {
                         "[SYSCALL] Fallback IRETQ to parent: RIP=0x{:X}, RSP=0x{:X}",
                         saved_rip, saved_rsp
                     );
+                    // Jalon 109c: hardcoded GPR allocation for parent IRETQ
+                    let f_result = unsafe { core::ptr::read_volatile(&wait_result) };
+                    let f_rsp_p = unsafe { core::ptr::read_volatile(&saved_rsp) };
+                    let f_rip_p = unsafe { core::ptr::read_volatile(&saved_rip) };
                     unsafe {
                         core::arch::asm!(
-                            "mov rax, {result}",
+                            "mov rax, r8",      // r8 = wait result
                             "swapgs",
                             "push 0x1B",
-                            "push {stack}",
+                            "push r9",          // r9 = parent RSP
                             "push 0x202",
                             "push 0x23",
-                            "push {entry}",
+                            "push r10",         // r10 = parent RIP
                             "iretq",
-                            result = in(reg) wait_result,
-                            stack = in(reg) saved_rsp,
-                            entry = in(reg) saved_rip,
+                            in("r8") f_result,
+                            in("r9") f_rsp_p,
+                            in("r10") f_rip_p,
                             options(noreturn),
                         );
                     }
@@ -2416,17 +2433,20 @@ fn sys_exit(code: u64) -> u64 {
                         "[SYSCALL] Fallback: restarting parent at entry=0x{:X}",
                         entry
                     );
+                    // Jalon 109c: hardcoded GPR allocation
+                    let f_stack_fb = unsafe { core::ptr::read_volatile(&stack) };
+                    let f_entry_fb = unsafe { core::ptr::read_volatile(&entry) };
                     unsafe {
                         core::arch::asm!(
                             "swapgs",           // Restore user GS before Ring 3
                             "push 0x1B",
-                            "push {stack}",
+                            "push r9",          // r9 = parent stack
                             "push 0x202",
                             "push 0x23",
-                            "push {entry}",
+                            "push r10",         // r10 = parent entry
                             "iretq",
-                            stack = in(reg) stack,
-                            entry = in(reg) entry,
+                            in("r9") f_stack_fb,
+                            in("r10") f_entry_fb,
                             options(noreturn),
                         );
                     }
@@ -2527,20 +2547,27 @@ fn sys_exit(code: u64) -> u64 {
                             parent_pid, saved_rip
                         );
 
+                        // Jalon 109c: hardcoded GPR for forked child exit IRETQ
+                        let f_pml4_fc = unsafe { core::ptr::read_volatile(&pml4) };
+                        let f_result_fc = unsafe { core::ptr::read_volatile(&wait_result) };
+                        let f_rsp_fc = unsafe { core::ptr::read_volatile(&saved_rsp) };
+                        let f_rip_fc = unsafe { core::ptr::read_volatile(&saved_rip) };
                         unsafe {
-                            core::arch::asm!("mov cr3, {}", in(reg) pml4, options(nostack));
                             core::arch::asm!(
-                                "mov rax, {result}",
+                                "cli",
+                                "mov cr3, r8",       // r8 = PML4
+                                "mov rax, r9",       // r9 = wait result
                                 "swapgs",
                                 "push 0x1B",
-                                "push {stack}",
+                                "push r10",          // r10 = parent RSP
                                 "push 0x202",
                                 "push 0x23",
-                                "push {entry}",
+                                "push r11",          // r11 = parent RIP
                                 "iretq",
-                                result = in(reg) wait_result,
-                                stack = in(reg) saved_rsp,
-                                entry = in(reg) saved_rip,
+                                in("r8") f_pml4_fc,
+                                in("r9") f_result_fc,
+                                in("r10") f_rsp_fc,
+                                in("r11") f_rip_fc,
                                 options(noreturn),
                             );
                         }
@@ -2639,18 +2666,24 @@ pub fn launch_next_userspace_process(exclude_pid: u64) {
         );
         crate::scheduler::set_current_pid(next_pid);
         let _ = crate::process::set_state(next_pid, crate::process::ProcessState::Running);
+        // Jalon 109c: FORCE explicit GPR allocation (r8=CR3, r9=RSP, r10=RIP)
+        let f_pml4 = unsafe { core::ptr::read_volatile(&pml4) };
+        let f_stack = unsafe { core::ptr::read_volatile(&stack) };
+        let f_entry = unsafe { core::ptr::read_volatile(&entry) };
         unsafe {
-            core::arch::asm!("mov cr3, {}", in(reg) pml4, options(nostack));
             core::arch::asm!(
+                "cli",
+                "mov cr3, r8",      // r8 = PML4 (hardcoded, cannot be coalesced)
                 "swapgs",           // Restore user GS before Ring 3
                 "push 0x1B",        // SS
-                "push {stack}",     // RSP
+                "push r9",          // RSP (user stack, guaranteed in r9)
                 "push 0x202",       // RFLAGS
                 "push 0x23",        // CS
-                "push {entry}",     // RIP
+                "push r10",         // RIP (entry point, guaranteed in r10)
                 "iretq",
-                stack = in(reg) stack,
-                entry = in(reg) entry,
+                in("r8") f_pml4,
+                in("r9") f_stack,
+                in("r10") f_entry,
                 options(noreturn),
             );
         }
@@ -3358,6 +3391,21 @@ pub fn reset_gs_bases_for_core(core_id: u8) {
     }
 }
 
+/// Get the kernel syscall stack RSP for a given core.
+/// This is used by the page-fault handler's kill_user_and_switch to load
+/// a clean stack without relying on GS-relative access (which may point at
+/// user-space GS rather than the kernel PER_CPU).
+pub fn get_kernel_rsp_for_core(core_id: u8) -> u64 {
+    let idx = core_id as usize;
+    unsafe {
+        if idx == 0 || idx >= MAX_CPUS {
+            PER_CPU.kernel_rsp
+        } else {
+            AP_PER_CPU[idx].kernel_rsp
+        }
+    }
+}
+
 // ===== sys_mmap(addr, len, prot) =====
 /// Simplified mmap: allocates anonymous memory pages at a fixed virtual address.
 /// Returns the virtual address of the mapped region, or ENOMEM on failure.
@@ -3492,12 +3540,14 @@ fn sys_mmap_fb(info_buf: u64) -> u64 {
     fb_vaddr
 }
 
-// ===== sys_bus_publish(intent, priority, data) =====
+// ===== sys_bus_publish(intent, priority, data, session_id, correlation_id) =====
 /// Publish a message to the Cognitive Bus from userspace.
 /// intent: 16-bit intent code
 /// priority: 0=Low, 1=Normal, 2=High, 3=Critical
 /// data: 64-bit payload
-fn sys_bus_publish(intent: u64, priority: u32, data: u64) -> u64 {
+/// session_id: Jalon 109 session tracking (0 = legacy)
+/// correlation_id: Jalon 109 request/response chaining (0 = none)
+fn sys_bus_publish(intent: u64, priority: u32, data: u64, session_id: u64, correlation_id: u64) -> u64 {
     use crate::ipc::{IntentMessage, ComponentId, Priority};
 
     let prio = match priority {
@@ -3507,12 +3557,14 @@ fn sys_bus_publish(intent: u64, priority: u32, data: u64) -> u64 {
         _ => Priority::Critical,
     };
 
-    let msg = IntentMessage::new(
+    let msg = IntentMessage::new_ext(
         ComponentId::Worker,
         ComponentId::Orchestrator,
         intent as u32,
         prio,
         data,
+        session_id,
+        correlation_id,
     );
 
     match crate::ipc::bus::publish(msg) {
@@ -3520,8 +3572,8 @@ fn sys_bus_publish(intent: u64, priority: u32, data: u64) -> u64 {
             let pc = BUS_PUB_COUNT.fetch_add(1, AtomicOrdering::Relaxed) + 1;
             if pc <= 20 || (pc <= 500 && pc % 50 == 0) || pc % 10000 == 0 {
                 crate::serial_println!(
-                    "[SYSCALL] bus_publish: intent=0x{:X}, prio={}, data=0x{:X} (#{pc})",
-                    intent, priority, data
+                    "[SYSCALL] bus_publish: intent=0x{:X}, prio={}, data=0x{:X}, sess={}, corr={} (#{pc})",
+                    intent, priority, data, session_id, correlation_id
                 );
             }
             0
@@ -3534,24 +3586,26 @@ fn sys_bus_publish(intent: u64, priority: u32, data: u64) -> u64 {
 }
 
 // ===== sys_bus_consume(buf_addr) =====
-/// Consume a message from the Cognitive Bus (Jalon 71).
-/// buf_addr: pointer to user buffer (48 bytes) to receive IntentMessage.
+/// Consume a message from the Cognitive Bus (Jalon 71, extended J109).
+/// buf_addr: pointer to user buffer (64 bytes) to receive IntentMessage.
 /// 
-/// Buffer layout (C struct compatible):
+/// Buffer layout (C struct compatible, Jalon 109 extended):
 ///   offset 0:  u32 source (ComponentId)
 ///   offset 4:  u32 destination (ComponentId)
 ///   offset 8:  u32 intent_id
 ///   offset 12: u32 priority
 ///   offset 16: u64 payload
 ///   offset 24: u64 timestamp
+///   offset 32: u64 session_id     (Jalon 109)
+///   offset 40: u64 correlation_id (Jalon 109)
 ///
 /// Returns:
 ///   0 on success (message copied to buffer)
 ///   -EAGAIN if bus is empty
 ///   -EFAULT if buffer address is invalid
 fn sys_bus_consume(buf_addr: u64) -> u64 {
-    // Validate user buffer (48 bytes for IntentMessage)
-    if !validate_user_ptr(buf_addr, 48) {
+    // Validate user buffer (64 bytes for extended IntentMessage with session/correlation IDs)
+    if !validate_user_ptr(buf_addr, 64) {
         return EFAULT;
     }
 
@@ -3575,6 +3629,10 @@ fn sys_bus_consume(buf_addr: u64) -> u64 {
                 core::ptr::write_volatile(ptr64.add(2), msg.payload);
                 // offset 24: timestamp (u64)
                 core::ptr::write_volatile(ptr64.add(3), msg.timestamp);
+                // offset 32: session_id (u64) — Jalon 109
+                core::ptr::write_volatile(ptr64.add(4), msg.session_id);
+                // offset 40: correlation_id (u64) — Jalon 109
+                core::ptr::write_volatile(ptr64.add(5), msg.correlation_id);
             }
             
             crate::serial_println!(
@@ -3842,7 +3900,7 @@ fn kernel_json_extract_num(json: &[u8], key: &[u8]) -> u64 {
 }
 
 // ===== sys_bus_consume_intent(buf_addr, target_intent) =====
-/// Intent-Based Routing syscall (Level 8, ACHA §3.7.1).
+/// Intent-Based Routing syscall (Level 8, ACHA §3.7.1, extended J109).
 ///
 /// Consumes ONLY messages matching `target_intent` from the Cognitive Bus.
 /// All other messages are left untouched for their intended recipients.
@@ -3850,12 +3908,12 @@ fn kernel_json_extract_num(json: &[u8], key: &[u8]) -> u64 {
 /// This is the Pub/Sub primitive: each Ring 3 agent subscribes to its own
 /// intent(s), preventing message stealing on the shared bus.
 ///
-/// buf_addr: pointer to user buffer (48 bytes)
+/// buf_addr: pointer to user buffer (64 bytes, extended J109)
 /// target_intent: the intent ID to filter for (e.g., 0x9002 for MCP)
 ///
 /// Returns: 0 on success, EAGAIN if no matching message, EFAULT if bad pointer
 fn sys_bus_consume_intent(buf_addr: u64, target_intent: u32) -> u64 {
-    if !validate_user_ptr(buf_addr, 48) {
+    if !validate_user_ptr(buf_addr, 64) {
         return EFAULT;
     }
 
@@ -3871,6 +3929,9 @@ fn sys_bus_consume_intent(buf_addr: u64, target_intent: u32) -> u64 {
                 let ptr64 = buf_addr as *mut u64;
                 core::ptr::write_volatile(ptr64.add(2), msg.payload);
                 core::ptr::write_volatile(ptr64.add(3), msg.timestamp);
+                // Jalon 109: write session and correlation IDs
+                core::ptr::write_volatile(ptr64.add(4), msg.session_id);
+                core::ptr::write_volatile(ptr64.add(5), msg.correlation_id);
             }
 
             let cc = BUS_CON_COUNT.fetch_add(1, AtomicOrdering::Relaxed) + 1;

@@ -78,6 +78,7 @@ agent_visual_term
 agent_weight_loader
 agent_wm
 agent_mcp
+agent_clock
 "
 
 BUILT=0
