@@ -1326,6 +1326,80 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
         }
 
         crate::process::FdType::File | crate::process::FdType::Pipe => {
+            // ═══ Jalon 110b: Dynamic /proc filesystem ═══
+            if path == "/proc/meminfo" {
+                let content = crate::compat::linux_abi::generate_proc_meminfo();
+                let bytes = content.as_bytes();
+                let start = offset as usize;
+                if start >= bytes.len() { return 0; }
+                let avail = bytes.len() - start;
+                let to_copy = core::cmp::min(avail, len as usize);
+                unsafe {
+                    let dst = buf_addr as *mut u8;
+                    for i in 0..to_copy {
+                        core::ptr::write_volatile(dst.add(i), bytes[start + i]);
+                    }
+                }
+                crate::process::with_fd_table_mut(current_pid, |fd_table| {
+                    if let Some(entry) = fd_table.get_mut(fd as usize) { entry.offset += to_copy as u64; }
+                });
+                return to_copy as u64;
+            }
+            if path == "/proc/cpuinfo" {
+                let content = crate::compat::linux_abi::generate_proc_cpuinfo();
+                let bytes = content.as_bytes();
+                let start = offset as usize;
+                if start >= bytes.len() { return 0; }
+                let avail = bytes.len() - start;
+                let to_copy = core::cmp::min(avail, len as usize);
+                unsafe {
+                    let dst = buf_addr as *mut u8;
+                    for i in 0..to_copy {
+                        core::ptr::write_volatile(dst.add(i), bytes[start + i]);
+                    }
+                }
+                crate::process::with_fd_table_mut(current_pid, |fd_table| {
+                    if let Some(entry) = fd_table.get_mut(fd as usize) { entry.offset += to_copy as u64; }
+                });
+                return to_copy as u64;
+            }
+            if path == "/proc/version" {
+                let content = crate::compat::linux_abi::generate_proc_version();
+                let bytes = content.as_bytes();
+                let start = offset as usize;
+                if start >= bytes.len() { return 0; }
+                let avail = bytes.len() - start;
+                let to_copy = core::cmp::min(avail, len as usize);
+                unsafe {
+                    let dst = buf_addr as *mut u8;
+                    for i in 0..to_copy {
+                        core::ptr::write_volatile(dst.add(i), bytes[start + i]);
+                    }
+                }
+                crate::process::with_fd_table_mut(current_pid, |fd_table| {
+                    if let Some(entry) = fd_table.get_mut(fd as usize) { entry.offset += to_copy as u64; }
+                });
+                return to_copy as u64;
+            }
+            if path == "/proc/self/status" {
+                let content = crate::compat::linux_abi::generate_proc_self_status();
+                let bytes = content.as_bytes();
+                let start = offset as usize;
+                if start >= bytes.len() { return 0; }
+                let avail = bytes.len() - start;
+                let to_copy = core::cmp::min(avail, len as usize);
+                unsafe {
+                    let dst = buf_addr as *mut u8;
+                    for i in 0..to_copy {
+                        core::ptr::write_volatile(dst.add(i), bytes[start + i]);
+                    }
+                }
+                crate::process::with_fd_table_mut(current_pid, |fd_table| {
+                    if let Some(entry) = fd_table.get_mut(fd as usize) { entry.offset += to_copy as u64; }
+                });
+                return to_copy as u64;
+            }
+
             // ═══ Linux ABI Pseudo-Device Intercepts (Jalon 93) ═══
             if path == "/dev/null" {
                 return 0; // EOF — /dev/null reads return 0 bytes

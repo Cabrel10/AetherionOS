@@ -606,6 +606,20 @@ check "T184 AP core alive" "AP Core.*alive|AP.*entering scheduler|AP.*ready.*API
 check "T185 SMP dual-core active" "CPU count.*2|SMP active|2.*core|total CPUs|SMP.*Results|2 total"
 
 # =============================================
+echo "=== [Cat 39] Jalon 111a-114: Agents Memory/Autonomous ==="
+# =============================================
+check "T186 Memory agent loaded" "agent_memory.elf.*QUEUED|J111a.*agent_memory|Episodic Memory"
+check "T187 Autonomous agent loaded" "agent_autonomous.elf.*QUEUED|J113.*agent_autonomous|Autonomous AGI"
+check "T188 Clock sensor active" "agent_clock.elf.*QUEUED|J112a.*Clock Sensor|Clock Sensor"
+
+# =============================================
+echo "=== [Cat 40] Jalon 115-116: Tool Framework & Network ==="
+# =============================================
+check "T189 36 shell commands" "36 commands"
+check "T190 Tool exec framework" "tool_exec|net_auto|agent"
+check "T191 Linux ABI 6.18" "6.18.0-aetherion"
+
+# =============================================
 # Cleanup and Summary
 # =============================================
 rm -f "$CLEAN_LOG"

@@ -1,15 +1,15 @@
-//! AetherionOS Jalon 108 - Cognitive Desktop Window Manager
+//! AetherionOS Jalon 111c - Cognitive Desktop Window Manager
 //!
 //! Full desktop compositor for AetherionOS with:
 //!   - Window struct: x, y, width, height, title, z_index
 //!   - Z-index ordered rendering (back to front)
 //!   - draw_desktop(): background + windows in z_index order
-//!   - HID queue integration via sys_poll_hid for mouse deltas (dx, dy)
+//!   - PS/2 mouse integration via sys_poll_hid for mouse deltas (dx, dy)
 //!   - 10x10 hardware mouse cursor rendered on top
-//!   - Window dragging via click+drag on title bar
+//!   - Window dragging via click+drag on title bar (Jalon 111c)
 //!   - Taskbar with window list and system tray
 //!   - Cognitive Bus intent publishing for desktop state
-//!   - Jalon 108: Grey background (0x222222), centered "AetherionOS Terminal" window
+//!   - Grey background (0x222222), centered "AetherionOS Terminal" window
 //!   - MCP integration via Cognitive Bus for Linux tool execution
 
 #![no_std]
@@ -198,16 +198,17 @@ impl Desktop {
                     title_color: WIN_TITLE,
                     visible: true,
                     content: &[
-                        b"AetherionOS v3.1 - Enriched Cognitive Bus",
-                        b"Kernel: 3.1.0-j109-112-enriched-bus-clock",
+                        b"AetherionOS v4.0 - AGI Chain Reaction",
+                        b"Kernel: 4.0.0-j111-agi-memory-mouse",
                         b"",
                         b"$ uname -a",
-                        b"Linux aetherion 6.1.0-aetherion x86_64",
+                        b"Linux aetherion 6.18.0-aetherion x86_64",
                         b"$ cat /proc/cpuinfo",
                         b"cpu: x86_64 AVX2+FMA (Haswell)",
                         b"$ ls /bin/",
                         b"busybox.elf  shell.elf  agent_wm.elf",
                         b"agent_llm_chat.elf  agent_mcp.elf",
+                        b"agent_memory.elf  agent_validator.elf",
                         b"$ free",
                         b"Mem: 1024M total, heap 6GiB ELF pool",
                         b"PagedAttention KV Cache: 64-block",
@@ -216,7 +217,7 @@ impl Desktop {
                         b" 1   kernel            Running",
                         b" 2   agent_wm          Running",
                         b" 3   busybox.elf       Ready (Linux ABI)",
-                        b" 4   agent_llm_chat    Ready",
+                        b" 4   agent_memory      Running",
                         b"$ _",
                     ],
                     content_color: GREEN,
@@ -365,7 +366,7 @@ fn draw_background() {
     }
 
     // AetherionOS branding watermark (center)
-    sys_fb_draw_string(SCR_W / 2 - 120, TB_Y / 2 - 8, b"AetherionOS  J109 - Enriched Cognitive Bus", TEXT_DIM);
+    sys_fb_draw_string(SCR_W / 2 - 120, TB_Y / 2 - 8, b"AetherionOS  J111 - AGI Chain Reaction", TEXT_DIM);
 }
 
 /// Draw the taskbar at the bottom of the screen

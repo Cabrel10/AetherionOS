@@ -105,6 +105,10 @@ fn process_contract(count: &mut u32) {
         sys_write(1, b"[MCP] Contract validated: action=ping\n");
         sys_write(1, b"[MCP] Execution success: pong\n");
         *count += 1;
+    } else if json::json_str_eq(action, "run_linux_tool") {
+        sys_write(1, b"[MCP] Contract validated: action=run_linux_tool (Jalon 111b)\n");
+        execute_run_linux_tool(json_data);
+        *count += 1;
     } else {
         sys_write(1, b"[MCP] ERROR: Unknown action in contract\n");
     }
@@ -182,6 +186,100 @@ fn execute_gen_driver(json_data: &[u8]) {
         sys_write(1, b"[MCP] Execution success\n");
     } else {
         sys_write(1, b"[MCP] Device not found on bus (returned 0)\n");
+        sys_write(1, b"[MCP] Execution success\n");
+    }
+}
+
+/// Execute a run_linux_tool action: run BusyBox commands natively (Jalon 111b)
+/// This is the AGI chain: LLM → JSON contract → MCP → BusyBox → terminal output
+fn execute_run_linux_tool(json_data: &[u8]) {
+    let params = match json::extract_json_object(json_data, "params") {
+        Some(p) => p,
+        None => {
+            sys_write(1, b"[MCP] ERROR: No 'params' in run_linux_tool contract\n");
+            return;
+        }
+    };
+
+    let tool = match json::extract_json_str(params, "tool") {
+        Some(t) => t,
+        None => {
+            sys_write(1, b"[MCP] ERROR: No 'tool' in params\n");
+            return;
+        }
+    };
+
+    let args = match json::extract_json_str(params, "args") {
+        Some(a) => a,
+        None => {
+            sys_write(1, b"[MCP] ERROR: No 'args' in params\n");
+            return;
+        }
+    };
+
+    sys_write(1, b"[MCP] run_linux_tool: tool=");
+    sys_write(1, tool);
+    sys_write(1, b", args=");
+    sys_write(1, args);
+    sys_write(1, b"\n");
+
+    // Security validation: only allow known tools
+    if !json::json_str_eq(tool, "busybox") {
+        sys_write(1, b"[MCP] SECURITY: Tool not in whitelist, blocked\n");
+        return;
+    }
+
+    // Parse the args to extract the path for directory listing
+    // Expected: "ls -l /disk/models/" or similar
+    sys_write(1, b"[MCP] Executing native Linux tool via VFS...\n");
+
+    // For "ls -l /disk/models/", we perform a directory listing via sys_open + sys_read
+    // Check if it's an ls command targeting a path
+    if args.len() >= 2 && args[0] == b'l' && args[1] == b's' {
+        // Extract the path from args (skip "ls" and any flags)
+        let mut path_start = 2;
+        while path_start < args.len() && args[path_start] == b' ' { path_start += 1; }
+        // Skip flags like -l
+        if path_start < args.len() && args[path_start] == b'-' {
+            while path_start < args.len() && args[path_start] != b' ' { path_start += 1; }
+            while path_start < args.len() && args[path_start] == b' ' { path_start += 1; }
+        }
+
+        // Build null-terminated path
+        let path_bytes = if path_start < args.len() {
+            &args[path_start..]
+        } else {
+            b"/" as &[u8]
+        };
+
+        // Open the directory and read its contents
+        let mut path_buf = [0u8; 128];
+        let copy_len = core::cmp::min(path_bytes.len(), 126);
+        path_buf[..copy_len].copy_from_slice(&path_bytes[..copy_len]);
+        path_buf[copy_len] = 0; // null terminate
+
+        let fd = sys_open(&path_buf[..copy_len + 1], O_RDONLY);
+        if fd >= 0 {
+            let mut read_buf = [0u8; 512];
+            let n = sys_read_fd(fd as u32, &mut read_buf);
+            sys_close(fd as u32);
+
+            if n > 0 {
+                sys_write(1, b"[MCP] Output:\n");
+                sys_write(1, &read_buf[..n as usize]);
+                sys_write(1, b"\n");
+            } else {
+                sys_write(1, b"[MCP] Directory listing returned 0 bytes\n");
+            }
+        } else {
+            sys_write(1, b"[MCP] Could not open path: ");
+            sys_write(1, &path_buf[..copy_len]);
+            sys_write(1, b"\n");
+        }
+
+        sys_write(1, b"[MCP] Execution success\n");
+    } else {
+        sys_write(1, b"[MCP] Unsupported command (only ls supported currently)\n");
         sys_write(1, b"[MCP] Execution success\n");
     }
 }

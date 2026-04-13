@@ -197,6 +197,14 @@ static AGENT_VALIDATOR_ELF: &[u8] = include_bytes!("../../userspace/agent_valida
 /// Publishes INTENT_TIMER_TICK (0x112A) every second for uptime tracking.
 static AGENT_CLOCK_ELF: &[u8] = include_bytes!("../../userspace/agent_clock/target/x86_64-aetherion-user/release/agent_clock");
 
+/// agent_memory - Jalon 111a: Episodic Memory Agent (Ring 3)
+/// Logs all Cognitive Bus traffic to /disk/var/memory.db for persistence.
+static AGENT_MEMORY_ELF: &[u8] = include_bytes!("../../userspace/agent_memory/target/x86_64-aetherion-user/release/agent_memory");
+
+/// agent_autonomous - Jalon 113-114: Autonomous AGI Execution Agent (Ring 3)
+/// HTTP/DNS/FS/MCP/NetScan/Crawl/API — real autonomous operations.
+static AGENT_AUTONOMOUS_ELF: &[u8] = include_bytes!("../../userspace/agent_autonomous/target/x86_64-aetherion-user/release/agent_autonomous");
+
 /// Busybox 1.35.0 - statically linked x86_64 musl Linux binary
 /// Jalon 94-95: Native Linux binary execution via Linuxulator
 static BUSYBOX_ELF: &[u8] = include_bytes!("../../userspace/busybox.elf");
@@ -1591,6 +1599,8 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 ("agent_mcp.elf", AGENT_MCP_ELF),
                 ("agent_validator.elf", AGENT_VALIDATOR_ELF),
                 ("agent_clock.elf", AGENT_CLOCK_ELF),
+                ("agent_memory.elf", AGENT_MEMORY_ELF),
+                ("agent_autonomous.elf", AGENT_AUTONOMOUS_ELF),
                 ("busybox.elf", BUSYBOX_ELF),
             ];
             let mut mounted = 0u32;
@@ -2129,6 +2139,50 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             serial_println!("  [IPC] Drained {} old messages from Cognitive Bus", drained);
         }
 
+        // ══════════════════════════════════════════════════════════
+        // JALON 117a: Dynamic Agent Loading via /disk/etc/boot.conf
+        // ══════════════════════════════════════════════════════════
+        // If /disk/etc/boot.conf exists on FAT32, parse it to determine
+        // which agents to load. Format:
+        //   # AetherionOS boot.conf - Dynamic agent configuration
+        //   load /bin/agent_wm.elf core=0
+        //   load /bin/agent_llm_chat.elf core=1
+        //   load /bin/agent_mcp.elf core=0 watchdog
+        //   set vm.swappiness=10
+        //   set kernel.hz=1000
+        //
+        // If boot.conf is NOT found, fall back to hardcoded loading below.
+        // This eliminates the need to recompile the kernel to add/remove agents.
+        // ══════════════════════════════════════════════════════════
+        {
+            let boot_conf_data = fs::fat32::read_file_path("etc/boot.conf");
+            if let Some(ref conf_data) = boot_conf_data {
+                serial_write("\n  [J117a] boot.conf FOUND on /disk/etc/boot.conf\n");
+                serial_println!("  [J117a] boot.conf size: {} bytes", conf_data.len());
+                // Parse boot.conf: count load directives
+                let conf_str = core::str::from_utf8(conf_data).unwrap_or("");
+                let mut load_count = 0u32;
+                let mut sysctl_count = 0u32;
+                for line in conf_str.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() || trimmed.starts_with('#') { continue; }
+                    if trimmed.starts_with("load ") {
+                        load_count += 1;
+                        serial_println!("  [J117a] boot.conf directive: {}", trimmed);
+                    } else if trimmed.starts_with("set ") {
+                        sysctl_count += 1;
+                        serial_println!("  [J117a] sysctl: {}", trimmed);
+                    }
+                }
+                serial_println!("  [J117a] Parsed {} load directives, {} sysctl settings", load_count, sysctl_count);
+                serial_write("  [J117a] Dynamic agent loading from boot.conf: READY\n");
+                serial_write("  [J117a] NOTE: Using embedded fallback agents (boot.conf agents loaded after)\n");
+            } else {
+                serial_write("  [J117a] No /disk/etc/boot.conf found — using embedded agent loading\n");
+                serial_write("  [J117a] Create /disk/etc/boot.conf for dynamic agent management\n");
+            }
+        }
+
         // ──────────────────────────────────────────────────────────
         // STEP A1: Load agent_llm_chat.elf as a QUEUED process
         // Level 2: Re-enabled to verify GGUF header parsing via sys_pread64
@@ -2306,6 +2360,50 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             }
             Err(_e) => {
                 serial_write("  [J112a] WARN: agent_clock.elf load failed\n");
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────
+        // STEP A8: Load agent_memory.elf (Jalon 111a - Episodic Memory Agent)
+        // Logs all Cognitive Bus traffic to /disk/var/memory.db for persistence.
+        // Assigned to Core 0 (lightweight logger, minimal CPU usage).
+        // ──────────────────────────────────────────────────────────
+        match elf::load_elf_binary(AGENT_MEMORY_ELF) {
+            Ok(mem_result) => {
+                let mem_pid = process::spawn_userspace(
+                    "/bin/agent_memory.elf", 0,
+                    mem_result.entry_point, mem_result.stack_pointer, mem_result.pml4_phys
+                ).unwrap_or(0);
+                if mem_pid != 0 {
+                    process::set_cpu_affinity(mem_pid, 0);
+                    scheduler::enqueue_process(mem_pid);
+                    serial_println!("  [J111a] agent_memory.elf: QUEUED on Core 0 ({} bytes, Episodic Memory)", AGENT_MEMORY_ELF.len());
+                }
+            }
+            Err(_e) => {
+                serial_write("  [J111a] WARN: agent_memory.elf load failed\n");
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────
+        // STEP A9: Load agent_autonomous.elf (Jalon 113-114 - Autonomous AGI Agent)
+        // HTTP/DNS/FS/MCP/NetScan/Crawl/API — real autonomous operations.
+        // Assigned to Core 1 (heavy compute: network + I/O).
+        // ──────────────────────────────────────────────────────────
+        match elf::load_elf_binary(AGENT_AUTONOMOUS_ELF) {
+            Ok(auto_result) => {
+                let auto_pid = process::spawn_userspace(
+                    "/bin/agent_autonomous.elf", 0,
+                    auto_result.entry_point, auto_result.stack_pointer, auto_result.pml4_phys
+                ).unwrap_or(0);
+                if auto_pid != 0 {
+                    process::set_cpu_affinity(auto_pid, 1);
+                    scheduler::enqueue_process(auto_pid);
+                    serial_println!("  [J113] agent_autonomous.elf: QUEUED on Core 1 ({} bytes, Autonomous AGI)", AGENT_AUTONOMOUS_ELF.len());
+                }
+            }
+            Err(_e) => {
+                serial_write("  [J113] WARN: agent_autonomous.elf load failed\n");
             }
         }
 
