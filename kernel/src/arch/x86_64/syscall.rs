@@ -1137,6 +1137,13 @@ fn sys_write(fd: u64, buf_addr: u64, len: u64) -> u64 {
                     }
                     asm!("sti", options(nomem, nostack));
                 }
+                // Jalon 118: Pipe Cognitif — capture child process stdout/stderr
+                // If this process is a child (PID > 10), publish output to Cognitive Bus
+                if current_pid > 10 && (fd == 1 || fd == 2) {
+                    crate::compat::linux_abi::cognitive_pipe_capture(
+                        current_pid, fd as u32, buf_addr, len
+                    );
+                }
             } else if n > 0 && validate_user_ptr(buf_addr, 1) {
                 let safe_len = core::cmp::min(n, 4096);
                 let ptr = buf_addr as *const u8;
@@ -2330,6 +2337,11 @@ fn sys_exit(code: u64) -> u64 {
     );
 
     if current != 0 {
+        // Jalon 118: Pipe Cognitif — notify Cognitive Bus of process exit
+        if current > 10 {
+            crate::compat::linux_abi::cognitive_pipe_exit(current, code as i32);
+        }
+
         crate::process::set_exit_code(current, code as i32);
         let _ = crate::process::set_state(
             current,
@@ -5584,4 +5596,14 @@ pub fn saved_user_rip_pub() -> u64 {
 /// Public wrapper for sys_exec, used by compat::linux_abi (MCP run_linux_tool)
 pub fn sys_exec_pub(path_addr: u64) -> u64 {
     sys_exec(path_addr)
+}
+
+/// Public wrapper for sys_close, used by compat::linux_abi (stat_vfs)
+pub fn sys_close_pub(fd: u32) -> u64 {
+    sys_close(fd)
+}
+
+/// Public wrapper for sys_seek (lseek), used by compat::linux_abi (stat_vfs, fstat_vfs)
+pub fn sys_lseek_pub(fd: u32, offset: i64, whence: u32) -> u64 {
+    sys_seek(fd, offset, whence)
 }

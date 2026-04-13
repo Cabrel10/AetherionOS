@@ -1348,7 +1348,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_write("       [OK] TPM stub + PCR0 + stack protector\n");
     security::kpti::init();
     serial_write("       [OK] KPTI-Lite: kernel/user page table isolation active\n");
-    serial_write("       [OK] Linuxulator: Linux ABI compatibility layer active (uname=Linux 6.1.0-aetherion)\n");
+    serial_write("       [OK] Linuxulator: Linux ABI compatibility layer active (uname=Linux 6.18.0-aetherion)\n");
 
     serial_write("\n[BOOT] Phase 2: Memory & Filesystem\n");
     serial_write("[BOOT] ──────────────────────────────────────\n");
@@ -1398,6 +1398,45 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 serial_write("       [OK] IPC pub/consume verified\n");
             }
         }
+
+        // Jalon 119: Register Reflex Rules
+        // Route INTENT_GET_UI_TREE (0xB119) directly to WM without LLM
+        ipc::bus::register_reflex(0xB119, ipc::bus::ReflexAction {
+            target: ComponentId::Worker,
+            emit_intent: 0xB119,
+            priority: Priority::High,
+            pass_through: false,
+        });
+        // Route INTENT_INTERACT_NODE (0xB11B) directly to WM
+        ipc::bus::register_reflex(0xB11B, ipc::bus::ReflexAction {
+            target: ComponentId::Worker,
+            emit_intent: 0xB11B,
+            priority: Priority::High,
+            pass_through: false,
+        });
+        // Route INTENT_TIMER_TICK (0x112A) directly to WM
+        ipc::bus::register_reflex(0x112A, ipc::bus::ReflexAction {
+            target: ComponentId::Worker,
+            emit_intent: 0x112A,
+            priority: Priority::Low,
+            pass_through: true,
+        });
+        // Jalon 118: Route INTENT_PROCESS_OUTPUT (0xC001) to Orchestrator for AI routing
+        ipc::bus::register_reflex(0xC001, ipc::bus::ReflexAction {
+            target: ComponentId::Orchestrator,
+            emit_intent: 0xC001,
+            priority: Priority::Normal,
+            pass_through: true,  // Also keep on bus for terminal display
+        });
+        // Jalon 118: Route INTENT_PROCESS_EXIT (0xC002) to Orchestrator
+        ipc::bus::register_reflex(0xC002, ipc::bus::ReflexAction {
+            target: ComponentId::Orchestrator,
+            emit_intent: 0xC002,
+            priority: Priority::High,
+            pass_through: true,
+        });
+        serial_println!("       [OK] Reflex Engine: {} rules registered (incl. Pipe Cognitif)",
+                         ipc::bus::reflex_rule_count());
     }
 
     // === Step 7: VFS (Couche 4) ===
@@ -2195,15 +2234,14 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     chat_result.entry_point, chat_result.stack_pointer, chat_result.pml4_phys
                 ).unwrap_or(0);
                 if chat_pid != 0 {
-                    // Jalon 102: Pin LLM chat agent to Core 1 for true SMP execution.
-                    process::set_cpu_affinity(chat_pid, 1);
+                    // Jalon 102: LLM chat agent shared across cores for fair scheduling.
                     // Jalon 105: Set ABI based on ELF detection
                     if chat_result.is_linux_abi {
                         process::set_abi(chat_pid, compat::linux_abi::Abi::Linux);
                         compat::linux_abi::log_linux_abi_activation(chat_pid, "agent_llm_chat.elf");
                     }
                     scheduler::enqueue_process(chat_pid);
-                    serial_write("  [J102] agent_llm_chat.elf: QUEUED on Core 1 (SMP Ring 3)\n");
+                    serial_write("  [J102] agent_llm_chat.elf: QUEUED (SMP Ring 3)\n");
                 }
             }
             Err(_e) => {
@@ -2250,10 +2288,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     llama_entry, llama_stack, llama_pml4
                 ).unwrap_or(0);
                 if llama_pid != 0 {
-                    // Jalon 102: Pin LLM core agent to Core 1 for true SMP execution.
-                    process::set_cpu_affinity(llama_pid, 1);
+                    // Jalon 102: LLM core agent shared across cores for fair scheduling.
+                    // Previously pinned to Core 1, but YIELD-SELF loops blocked other agents.
                     scheduler::enqueue_process(llama_pid);
-                    serial_write("  [J102] agent_llama_core.elf: QUEUED on Core 1 (SMP Ring 3)\n");
+                    serial_write("  [J102] agent_llama_core.elf: QUEUED (SMP Ring 3)\n");
                 }
             }
             Err(_e) => {
@@ -2315,31 +2353,12 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         }
 
         // ──────────────────────────────────────────────────────────
-        // STEP A6: Load busybox.elf as a QUEUED process (Jalon 94-95)
-        // Native Linux binary execution via Linuxulator ABI
-        // Busybox is a statically linked musl binary (OSABI=0)
-        // We force Linux ABI since it's a real Linux binary
+        // STEP A6: BusyBox Linux ABI binary (mounted only, not auto-launched)
+        // BusyBox is available at /bin/busybox.elf for on-demand execution
+        // via the terminal's 'run /disk/busybox.elf' command (fork+exec).
+        // Auto-launching caused stack overflow (#DF) due to musl init size.
         // ──────────────────────────────────────────────────────────
-        match elf::load_elf_binary(BUSYBOX_ELF) {
-            Ok(bb_result) => {
-                let bb_pid = process::spawn_userspace(
-                    "/bin/busybox.elf", 0,
-                    bb_result.entry_point, bb_result.stack_pointer, bb_result.pml4_phys
-                ).unwrap_or(0);
-                if bb_pid != 0 {
-                    // Force Linux ABI — busybox is a real Linux binary
-                    process::set_abi(bb_pid, compat::linux_abi::Abi::Linux);
-                    compat::linux_abi::log_linux_abi_activation(bb_pid, "busybox.elf");
-                    // Pin to Core 0 (BSP) for stability
-                    process::set_cpu_affinity(bb_pid, 0);
-                    scheduler::enqueue_process(bb_pid);
-                    serial_println!("  [J94] busybox.elf: QUEUED on Core 0 (Linux ABI, {} bytes)", BUSYBOX_ELF.len());
-                }
-            }
-            Err(_e) => {
-                serial_write("  [J94] WARN: busybox.elf load failed\n");
-            }
-        }
+        serial_println!("  [J94] busybox.elf: MOUNTED at /bin/ ({} bytes, on-demand via terminal)", BUSYBOX_ELF.len());
 
         // ──────────────────────────────────────────────────────────
         // STEP A7: Load agent_clock.elf (Jalon 112a - Clock Sensor Agent)
@@ -2397,9 +2416,8 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     auto_result.entry_point, auto_result.stack_pointer, auto_result.pml4_phys
                 ).unwrap_or(0);
                 if auto_pid != 0 {
-                    process::set_cpu_affinity(auto_pid, 1);
                     scheduler::enqueue_process(auto_pid);
-                    serial_println!("  [J113] agent_autonomous.elf: QUEUED on Core 1 ({} bytes, Autonomous AGI)", AGENT_AUTONOMOUS_ELF.len());
+                    serial_println!("  [J113] agent_autonomous.elf: QUEUED ({} bytes, Autonomous AGI)", AGENT_AUTONOMOUS_ELF.len());
                 }
             }
             Err(_e) => {

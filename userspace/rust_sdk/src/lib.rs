@@ -756,6 +756,12 @@ pub fn sys_exec(path: &[u8]) -> i64 {
     syscall1(SYS_EXEC, path.as_ptr() as u64) as i64
 }
 
+/// Execute a binary by path (null-terminated), replacing current process.
+/// Alias for sys_exec with explicit path parameter.
+pub fn sys_exec_path(path: &[u8]) -> i64 {
+    syscall1(SYS_EXEC, path.as_ptr() as u64) as i64
+}
+
 /// Fork the current process. Returns child PID to parent, 0 to child.
 pub fn sys_fork() -> i64 {
     syscall0(SYS_FORK) as i64

@@ -16,7 +16,7 @@
 //! Phase 1: Static binary support (busybox, coreutils)
 //!   - ~80 core syscalls implemented
 //!   - /proc/self/exe, /proc/self/maps stubs
-//!   - uname returns "Linux 6.1.0-aetherion"
+//!   - uname returns "Linux 6.18.0-aetherion"
 //!
 //! Phase 2: Dynamic binary support (glibc/musl)
 //!   - ld-linux-x86-64.so.2 interpreter loading

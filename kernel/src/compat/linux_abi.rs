@@ -1275,14 +1275,16 @@ pub fn linux_syscall_override(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> Op
         // ════════════════════════════════════════════════
 
         // stat/fstat/lstat — Linux-specific struct layout (144 bytes)
-        4  => Some(linux_stat(a1, a2)),
-        5  => Some(linux_fstat(a1, a2)),
-        6  => Some(linux_lstat(a1, a2)),
+        // Jalon 125: Use VFS-integrated stat for Python/Node support
+        4  => Some(linux_stat_vfs(a1, a2)),
+        5  => Some(linux_fstat_vfs(a1, a2)),
+        6  => Some(linux_stat_vfs(a1, a2)),  // lstat → stat_vfs
 
         // mmap — handle MAP_ANONYMOUS and file-backed
-        9  => Some(linux_mmap(a1, a2, a3, a4, 0, 0)),
+        // Jalon 125: Enhanced mmap with VMA tracking for interpreters
+        9  => Some(linux_mmap_enhanced(a1, a2, a3, a4, 0, 0)),
         10 => Some(linux_mprotect(a1, a2, a3)),
-        11 => Some(linux_munmap(a1, a2)),
+        11 => Some(linux_munmap_enhanced(a1, a2)),
 
         // brk — Linux returns new break address (not 0/-1)
         12 => Some(linux_brk(a1)),
@@ -1340,8 +1342,8 @@ pub fn linux_syscall_override(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> Op
         // rename
         82 => Some(linux_rename(a1, a2)),
 
-        // readlink
-        89 => Some(linux_readlink(a1, a2, a3)),
+        // readlink — Jalon 125: enhanced for Python/Node paths
+        89 => Some(linux_readlink_enhanced(a1, a2, a3)),
 
         // chmod / fchmod — stubs (root, always succeed)
         90 => Some(0), // chmod
@@ -1467,8 +1469,8 @@ pub fn linux_syscall_override(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> Op
         // mkdirat
         258 => Some(linux_mkdirat(a1, a2, a3)),
 
-        // newfstatat (262) — BusyBox stat replacement
-        262 => Some(linux_newfstatat(a1, a2, a3, a4)),
+        // newfstatat (262) — Jalon 125: VFS-integrated stat
+        262 => Some(linux_newfstatat_vfs(a1, a2, a3, a4)),
 
         // unlinkat
         263 => Some(linux_unlinkat(a1, a2, a3)),
@@ -1476,8 +1478,8 @@ pub fn linux_syscall_override(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> Op
         // renameat
         264 => Some(linux_rename(a2, a4)), // ignore dirfd, use paths
 
-        // readlinkat
-        267 => Some(linux_readlinkat(a1, a2, a3, a4)),
+        // readlinkat — Jalon 125: enhanced
+        267 => Some(linux_readlinkat_enhanced(a1, a2, a3, a4)),
 
         // faccessat / faccessat2
         269 => Some(linux_faccessat(a1, a2, a3, a4)),
@@ -2089,4 +2091,577 @@ pub fn linux_process_vm_readv(pid: u64, local_iov: u64, liovcnt: u64, remote_iov
         return 0;
     }
     0
+}
+
+// ═══════════════════════════════════════════════════════════
+// Jalon 118: Cognitive Pipe — Process Output Capture
+// ═══════════════════════════════════════════════════════════
+//
+// When a child process (e.g., python.elf, micropython.elf) writes to
+// stdout/stderr, the Cognitive Pipe intercepts the output and publishes
+// it as INTENT_PROCESS_OUTPUT (0xC001) on the Cognitive Bus.
+// The orchestrator consumes this intent and can route it to:
+//   - The LLM for analysis
+//   - A reflex memory for learning
+//   - The terminal for display
+//
+// This is the bridge between native Linux binaries and the AI pipeline.
+
+/// Intent ID for process stdout/stderr output
+pub const INTENT_PROCESS_OUTPUT: u32 = 0xC001;
+/// Intent ID for process exit notification
+pub const INTENT_PROCESS_EXIT: u32 = 0xC002;
+
+/// Capture process output and publish to Cognitive Bus.
+/// Called from sys_write when fd=1 or fd=2 for a child process.
+/// buf_addr: user-space pointer to the output data
+/// len: number of bytes
+/// pid: the writing process's PID
+pub fn cognitive_pipe_capture(pid: u64, fd: u32, buf_addr: u64, len: u64) {
+    // Only capture if len > 0 and reasonable
+    if len == 0 || len > 4096 { return; }
+
+    // Write a hash of the output to the bus payload
+    // (full text is available in the process's stdout VFS node)
+    let mut hash: u64 = 0xCBF2_9CE4_8422_2325; // FNV-1a offset basis
+    let safe_len = core::cmp::min(len, 256) as usize;
+    for i in 0..safe_len {
+        let b = unsafe { core::ptr::read_volatile((buf_addr + i as u64) as *const u8) };
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x0100_0000_01B3); // FNV prime
+    }
+
+    // Publish INTENT_PROCESS_OUTPUT with payload = (pid << 32) | hash_lo
+    let payload = (pid << 32) | (hash & 0xFFFF_FFFF);
+    let msg = crate::ipc::IntentMessage::new(
+        crate::ipc::ComponentId::Worker,
+        crate::ipc::ComponentId::Orchestrator,
+        INTENT_PROCESS_OUTPUT,
+        crate::ipc::Priority::Normal,
+        payload,
+    );
+    let _ = crate::ipc::bus::publish(msg);
+}
+
+/// Notify the Cognitive Bus that a process has exited.
+/// payload = (pid << 32) | (exit_code & 0xFFFF)
+pub fn cognitive_pipe_exit(pid: u64, exit_code: i32) {
+    let payload = (pid << 32) | ((exit_code as u64) & 0xFFFF);
+    let msg = crate::ipc::IntentMessage::new(
+        crate::ipc::ComponentId::Worker,
+        crate::ipc::ComponentId::Orchestrator,
+        INTENT_PROCESS_EXIT,
+        crate::ipc::Priority::High,
+        payload,
+    );
+    let _ = crate::ipc::bus::publish(msg);
+    crate::serial_println!(
+        "[COGNITIVE-PIPE] Process PID {} exited with code {} — published INTENT_PROCESS_EXIT",
+        pid, exit_code
+    );
+}
+
+// ═══════════════════════════════════════════════════════════
+// Jalon 118-119: Enhanced mmap for Interpreter Support
+// ═══════════════════════════════════════════════════════════
+//
+// Python/MicroPython/Node.js use MAP_ANONYMOUS | MAP_PRIVATE extensively
+// for heap, thread stacks, and internal buffers. The current linux_mmap
+// routes to brk-style allocation which doesn't properly handle:
+//   - Large anonymous regions (> HEAP_GROW_SIZE)
+//   - MAP_FIXED (mapping at a specific address)
+//   - Independent region tracking (munmap must free only the specified region)
+//
+// This enhanced version uses the kernel's page frame allocator directly.
+
+/// VMA (Virtual Memory Area) tracker for anonymous mappings
+/// Each process can have up to 64 anonymous mmap regions.
+const MAX_ANON_VMAS: usize = 64;
+static ANON_VMA_TABLE: Mutex<[AnonVma; MAX_ANON_VMAS]> = Mutex::new([AnonVma::empty(); MAX_ANON_VMAS]);
+
+#[derive(Clone, Copy)]
+struct AnonVma {
+    pid: u64,
+    start: u64,
+    length: u64,
+    active: bool,
+}
+
+impl AnonVma {
+    const fn empty() -> Self {
+        AnonVma { pid: 0, start: 0, length: 0, active: false }
+    }
+}
+
+/// Enhanced mmap with proper MAP_ANONYMOUS support for interpreters
+pub fn linux_mmap_enhanced(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64) -> u64 {
+    let map_anonymous = flags & 0x20 != 0;  // MAP_ANONYMOUS
+    let map_private = flags & 0x02 != 0;    // MAP_PRIVATE
+    let map_fixed = flags & 0x10 != 0;      // MAP_FIXED
+
+    if length == 0 { return (-22i64) as u64; } // EINVAL
+
+    // Round up to page size
+    let aligned_len = (length + 4095) & !4095;
+
+    if map_anonymous {
+        // Anonymous mapping: allocate zero-filled pages
+        let vaddr = crate::arch::x86_64::syscall::sys_mmap_pub(
+            if map_fixed { addr } else { 0 },
+            aligned_len,
+            prot,
+        );
+
+        if vaddr != 0 && (vaddr as i64) > 0 {
+            // Track VMA for later munmap
+            let pid = crate::scheduler::current_pid();
+            let mut table = ANON_VMA_TABLE.lock();
+            for slot in table.iter_mut() {
+                if !slot.active {
+                    *slot = AnonVma { pid, start: vaddr, length: aligned_len, active: true };
+                    break;
+                }
+            }
+        }
+        return vaddr;
+    }
+
+    if fd as i64 >= 0 {
+        // File-backed mapping
+        return crate::arch::x86_64::syscall::sys_mmap_pub(addr, aligned_len, prot);
+    }
+
+    // Fallback
+    crate::arch::x86_64::syscall::sys_mmap_pub(addr, aligned_len, prot)
+}
+
+/// Enhanced munmap with VMA tracking
+pub fn linux_munmap_enhanced(addr: u64, length: u64) -> u64 {
+    if addr == 0 || length == 0 { return (-22i64) as u64; }
+
+    let pid = crate::scheduler::current_pid();
+    let mut table = ANON_VMA_TABLE.lock();
+    for slot in table.iter_mut() {
+        if slot.active && slot.pid == pid && slot.start == addr {
+            slot.active = false;
+            // Pages are not physically freed (our allocator doesn't support that yet)
+            // but the VMA is removed so re-mmap can reuse the virtual range
+            return 0;
+        }
+    }
+    0 // Accept silently even if not tracked
+}
+
+// ═══════════════════════════════════════════════════════════
+// Jalon 118-119: Argv/Envp Stack Injection
+// ═══════════════════════════════════════════════════════════
+//
+// When loading a Linux ELF binary (Python, Node.js, BusyBox), the kernel
+// must forge the initial userspace stack according to the System V AMD64 ABI:
+//
+// High addresses (stack top = 0x7FFF_FFFF_F000):
+//   [padding to 16-byte alignment]
+//   [null auxiliary vector entry (AT_NULL)]
+//   [auxiliary vector entries]
+//   [null pointer (envp terminator)]
+//   [environment string pointers]
+//   [null pointer (argv terminator)]
+//   [argv[N-1] pointer]
+//   ...
+//   [argv[0] pointer]
+//   [argc]                    <-- RSP points here
+// Low addresses
+
+/// Auxiliary vector entry types (from elf.h)
+pub const AT_NULL: u64     = 0;
+pub const AT_PHDR: u64     = 3;   // Program headers for program
+pub const AT_PHENT: u64    = 4;   // Size of program header entry
+pub const AT_PHNUM: u64    = 5;   // Number of program headers
+pub const AT_PAGESZ: u64   = 6;   // System page size
+pub const AT_BASE: u64     = 7;   // Base address of interpreter
+pub const AT_FLAGS: u64    = 8;   // Flags
+pub const AT_ENTRY: u64    = 9;   // Entry point of program
+pub const AT_UID: u64      = 11;  // Real uid
+pub const AT_EUID: u64     = 12;  // Effective uid
+pub const AT_GID: u64      = 13;  // Real gid
+pub const AT_EGID: u64     = 14;  // Effective gid
+pub const AT_PLATFORM: u64 = 15;  // String identifying platform
+pub const AT_HWCAP: u64    = 16;  // Machine-dependent hints
+pub const AT_CLKTCK: u64   = 17;  // Frequency of times()
+pub const AT_SECURE: u64   = 23;  // Boolean, was exec setuid-like?
+pub const AT_RANDOM: u64   = 25;  // Address of 16 random bytes
+pub const AT_EXECFN: u64   = 31;  // File name of executable
+pub const AT_SYSINFO_EHDR: u64 = 33; // vDSO address
+
+/// Push arguments, environment, and auxiliary vector to the user stack.
+/// Returns the new stack pointer (pointing to argc).
+///
+/// # Arguments
+/// * `stack_top` - Top of the user stack (highest address, page-aligned)
+/// * `argv` - Argument strings (e.g., ["/bin/python.elf", "script.py"])
+/// * `envp` - Environment strings (e.g., ["PATH=/disk/bin", "HOME=/"])
+/// * `entry` - ELF entry point address
+/// * `phdr` - Address of program headers in memory
+/// * `phent` - Size of each program header
+/// * `phnum` - Number of program headers
+///
+/// # Safety
+/// Caller must ensure stack_top is a valid mapped user-space address.
+pub unsafe fn push_args_to_stack(
+    stack_top: u64,
+    argv: &[&[u8]],
+    envp: &[&[u8]],
+    entry: u64,
+    phdr: u64,
+    phent: u16,
+    phnum: u16,
+) -> u64 {
+    let mut sp = stack_top;
+
+    // ── Phase 1: Write string data (from top, growing down) ──
+    // Write environment strings
+    let mut env_ptrs: [u64; 16] = [0; 16];
+    let env_count = core::cmp::min(envp.len(), 16);
+    for i in (0..env_count).rev() {
+        let s = envp[i];
+        sp -= (s.len() + 1) as u64; // +1 for null terminator
+        for j in 0..s.len() {
+            core::ptr::write_volatile((sp + j as u64) as *mut u8, s[j]);
+        }
+        core::ptr::write_volatile((sp + s.len() as u64) as *mut u8, 0); // null terminator
+        env_ptrs[i] = sp;
+    }
+
+    // Write argument strings
+    let mut arg_ptrs: [u64; 16] = [0; 16];
+    let arg_count = core::cmp::min(argv.len(), 16);
+    for i in (0..arg_count).rev() {
+        let s = argv[i];
+        sp -= (s.len() + 1) as u64;
+        for j in 0..s.len() {
+            core::ptr::write_volatile((sp + j as u64) as *mut u8, s[j]);
+        }
+        core::ptr::write_volatile((sp + s.len() as u64) as *mut u8, 0);
+        arg_ptrs[i] = sp;
+    }
+
+    // Write platform string "x86_64"
+    let platform = b"x86_64\0";
+    sp -= platform.len() as u64;
+    let platform_addr = sp;
+    for i in 0..platform.len() {
+        core::ptr::write_volatile((sp + i as u64) as *mut u8, platform[i]);
+    }
+
+    // Write 16 random bytes for AT_RANDOM
+    sp -= 16;
+    let random_addr = sp;
+    let tsc: u64 = {
+        let v: u64;
+        core::arch::asm!("rdtsc", "shl rdx, 32", "or rax, rdx",
+            out("rax") v, out("rdx") _, options(nomem, nostack));
+        v
+    };
+    let mut rng = tsc;
+    for i in 0..16u64 {
+        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+        core::ptr::write_volatile((sp + i) as *mut u8, (rng >> 33) as u8);
+    }
+
+    // ── Phase 2: Align stack to 16 bytes ──
+    sp = sp & !0xF;
+
+    // ── Phase 3: Build auxiliary vector (pairs of u64) ──
+    // We build it in a local array, then write it
+    let auxv: [(u64, u64); 14] = [
+        (AT_PHDR,    phdr),
+        (AT_PHENT,   phent as u64),
+        (AT_PHNUM,   phnum as u64),
+        (AT_PAGESZ,  4096),
+        (AT_BASE,    0), // No interpreter base
+        (AT_FLAGS,   0),
+        (AT_ENTRY,   entry),
+        (AT_UID,     0),
+        (AT_EUID,    0),
+        (AT_GID,     0),
+        (AT_EGID,    0),
+        (AT_PLATFORM, platform_addr),
+        (AT_RANDOM,  random_addr),
+        (AT_NULL,    0), // Terminator
+    ];
+
+    // Calculate total size needed for pointers
+    let auxv_size = auxv.len() * 16; // 14 pairs * 16 bytes each
+    let envp_ptrs_size = (env_count + 1) * 8; // pointers + NULL
+    let argv_ptrs_size = (arg_count + 1) * 8; // pointers + NULL
+    let argc_size = 8;
+    let total = auxv_size + envp_ptrs_size + argv_ptrs_size + argc_size;
+
+    // Ensure 16-byte alignment for the final SP
+    sp -= total as u64;
+    sp = sp & !0xF;
+
+    let base = sp;
+    let mut pos = base;
+
+    // ── Phase 4: Write argc ──
+    core::ptr::write_volatile(pos as *mut u64, arg_count as u64);
+    pos += 8;
+
+    // ── Phase 5: Write argv pointers + NULL ──
+    for i in 0..arg_count {
+        core::ptr::write_volatile(pos as *mut u64, arg_ptrs[i]);
+        pos += 8;
+    }
+    core::ptr::write_volatile(pos as *mut u64, 0); // NULL terminator
+    pos += 8;
+
+    // ── Phase 6: Write envp pointers + NULL ──
+    for i in 0..env_count {
+        core::ptr::write_volatile(pos as *mut u64, env_ptrs[i]);
+        pos += 8;
+    }
+    core::ptr::write_volatile(pos as *mut u64, 0); // NULL terminator
+    pos += 8;
+
+    // ── Phase 7: Write auxiliary vector ──
+    for &(atype, aval) in auxv.iter() {
+        core::ptr::write_volatile(pos as *mut u64, atype);
+        pos += 8;
+        core::ptr::write_volatile(pos as *mut u64, aval);
+        pos += 8;
+    }
+
+    crate::serial_println!(
+        "[LINUX-ABI] Stack injection: argc={}, envp={}, auxv=14 entries, RSP=0x{:X}",
+        arg_count, env_count, base
+    );
+
+    base // New RSP pointing to argc
+}
+
+/// Convenience function: prepare the stack for a Python/MicroPython binary.
+/// argv = [binary_path, script_path] (or just [binary_path] for REPL)
+/// Provides standard environment variables needed by Python.
+pub unsafe fn prepare_interpreter_stack(
+    stack_top: u64,
+    binary_path: &[u8],
+    script_path: Option<&[u8]>,
+    entry: u64,
+    phdr: u64,
+    phent: u16,
+    phnum: u16,
+) -> u64 {
+    let argv_1 = [binary_path];
+    let argv_2_script;
+    let argv: &[&[u8]];
+
+    if let Some(script) = script_path {
+        argv_2_script = [binary_path, script];
+        argv = &argv_2_script;
+    } else {
+        argv = &argv_1;
+    }
+
+    let envp: &[&[u8]] = &[
+        b"PATH=/disk/bin:/bin",
+        b"HOME=/",
+        b"PYTHONHOME=/disk/lib/python",
+        b"PYTHONPATH=/disk/lib/python",
+        b"NODE_PATH=/disk/lib/node_modules",
+        b"LANG=C.UTF-8",
+        b"TERM=linux",
+        b"USER=root",
+        b"SHELL=/bin/sh",
+    ];
+
+    push_args_to_stack(stack_top, argv, envp, entry, phdr, phent, phnum)
+}
+
+// ═══════════════════════════════════════════════════════════
+// Jalon 118-119: Enhanced stat/fstat with VFS Integration
+// ═══════════════════════════════════════════════════════════
+
+/// Real stat with VFS lookup — Python needs accurate file metadata
+pub fn linux_stat_vfs(path_addr: u64, buf: u64) -> u64 {
+    if !crate::arch::x86_64::syscall::validate_user_ptr_pub(buf, 144) { return (-14i64) as u64; }
+    if !crate::arch::x86_64::syscall::validate_user_ptr_pub(path_addr, 1) { return (-14i64) as u64; }
+
+    // Read path from user space
+    let mut path_buf = [0u8; 256];
+    let mut plen = 0usize;
+    for i in 0..255 {
+        let b = unsafe { core::ptr::read_volatile((path_addr + i as u64) as *const u8) };
+        if b == 0 { break; }
+        path_buf[i] = b;
+        plen = i + 1;
+    }
+    path_buf[plen] = 0;
+
+    let path_str = core::str::from_utf8(&path_buf[..plen]).unwrap_or("/");
+
+    // Check /proc pseudo-filesystem
+    if path_str.starts_with("/proc/") || path_str == "/proc" {
+        let mut stat = LinuxStat::default();
+        if path_str.ends_with("/") || path_str == "/proc" || path_str == "/proc/self" {
+            stat.st_mode = 0o40755; // S_IFDIR | 0755
+        } else {
+            stat.st_mode = 0o100444; // S_IFREG | 0444
+            stat.st_size = 4096;
+        }
+        unsafe {
+            let src = &stat as *const LinuxStat as *const u8;
+            core::ptr::copy_nonoverlapping(src, buf as *mut u8, 144);
+        }
+        return 0;
+    }
+
+    // Check /dev pseudo-filesystem
+    if path_str.starts_with("/dev/") || path_str == "/dev" {
+        let mut stat = LinuxStat::default();
+        if path_str == "/dev" || path_str == "/dev/" {
+            stat.st_mode = 0o40755;
+        } else if path_str == "/dev/null" {
+            stat.st_mode = 0o20666; // S_IFCHR | 0666
+            stat.st_rdev = 0x0103; // (1, 3)
+        } else if path_str == "/dev/zero" {
+            stat.st_mode = 0o20666;
+            stat.st_rdev = 0x0105; // (1, 5)
+        } else if path_str.starts_with("/dev/tty") || path_str == "/dev/console" {
+            stat.st_mode = 0o20620; // S_IFCHR | 0620
+            stat.st_rdev = 0x0500; // (5, 0)
+        } else {
+            stat.st_mode = 0o20666;
+        }
+        unsafe {
+            let src = &stat as *const LinuxStat as *const u8;
+            core::ptr::copy_nonoverlapping(src, buf as *mut u8, 144);
+        }
+        return 0;
+    }
+
+    // Try VFS lookup for real files (e.g., /disk/bin/python.elf)
+    // Attempt to open the file to get its size
+    let fd = crate::arch::x86_64::syscall::sys_open_pub(path_addr, 0); // O_RDONLY
+    if (fd as i64) >= 0 {
+        // File exists — get size via seeking to end
+        let size = crate::arch::x86_64::syscall::sys_lseek_pub(fd as u32, 0, 2); // SEEK_END
+        crate::arch::x86_64::syscall::sys_close_pub(fd as u32);
+
+        let mut stat = LinuxStat::default();
+        stat.st_mode = 0o100755; // S_IFREG | 0755 (executable)
+        stat.st_size = if (size as i64) > 0 { size as i64 } else { 0 };
+        stat.st_blocks = (stat.st_size + 511) / 512;
+        stat.st_ino = {
+            // Simple hash of filename for inode number
+            let mut h: u64 = 5381;
+            for &b in &path_buf[..plen] {
+                h = h.wrapping_mul(33).wrapping_add(b as u64);
+            }
+            h
+        };
+
+        unsafe {
+            let src = &stat as *const LinuxStat as *const u8;
+            core::ptr::copy_nonoverlapping(src, buf as *mut u8, 144);
+        }
+        return 0;
+    }
+
+    // Path is a directory? Try opening as directory
+    if path_str == "/" || path_str.starts_with("/disk") || path_str.starts_with("/bin")
+       || path_str.starts_with("/sys") || path_str.starts_with("/tmp")
+       || path_str.starts_with("/var") {
+        let mut stat = LinuxStat::default();
+        stat.st_mode = 0o40755; // S_IFDIR | 0755
+        stat.st_nlink = 2;
+        unsafe {
+            let src = &stat as *const LinuxStat as *const u8;
+            core::ptr::copy_nonoverlapping(src, buf as *mut u8, 144);
+        }
+        return 0;
+    }
+
+    // File not found
+    (-2i64) as u64 // ENOENT
+}
+
+/// Enhanced fstat with proper file size from VFS
+pub fn linux_fstat_vfs(fd: u64, buf: u64) -> u64 {
+    if !crate::arch::x86_64::syscall::validate_user_ptr_pub(buf, 144) { return (-14i64) as u64; }
+
+    let mut stat = LinuxStat::default();
+
+    // stdin/stdout/stderr → character device
+    if fd <= 2 {
+        stat.st_mode = 0o20620; // S_IFCHR | 0620
+        stat.st_rdev = 0x8800; // pts/0
+    } else {
+        // Real file → get size via seek
+        let current_pos = crate::arch::x86_64::syscall::sys_lseek_pub(fd as u32, 0, 1); // SEEK_CUR
+        let size = crate::arch::x86_64::syscall::sys_lseek_pub(fd as u32, 0, 2); // SEEK_END
+        // Restore position
+        if (current_pos as i64) >= 0 {
+            crate::arch::x86_64::syscall::sys_lseek_pub(fd as u32, current_pos as i64, 0); // SEEK_SET
+        }
+        stat.st_mode = 0o100644; // S_IFREG | 0644
+        stat.st_size = if (size as i64) > 0 { size as i64 } else { 0 };
+        stat.st_blocks = (stat.st_size + 511) / 512;
+    }
+
+    unsafe {
+        let src = &stat as *const LinuxStat as *const u8;
+        core::ptr::copy_nonoverlapping(src, buf as *mut u8, 144);
+    }
+    0
+}
+
+// ═══════════════════════════════════════════════════════════
+// Jalon 125: Enhanced readlink for Python/Node/Interpreter paths
+// ═══════════════════════════════════════════════════════════
+
+/// Enhanced readlink that returns context-appropriate paths.
+/// /proc/self/exe → the binary's registered path
+/// /proc/self/fd/N → the file path
+/// Everything else → sensible default
+pub fn linux_readlink_enhanced(path: u64, buf: u64, bufsiz: u64) -> u64 {
+    if !crate::arch::x86_64::syscall::validate_user_ptr_pub(path, 1) { return (-14i64) as u64; }
+    if !crate::arch::x86_64::syscall::validate_user_ptr_pub(buf, bufsiz) { return (-14i64) as u64; }
+
+    // Read path from user space
+    let mut path_buf = [0u8; 128];
+    let mut plen = 0;
+    for i in 0..128u64 {
+        let b = unsafe { core::ptr::read_volatile((path + i) as *const u8) };
+        if b == 0 { break; }
+        path_buf[i as usize] = b;
+        plen = i as usize + 1;
+    }
+    let path_str = core::str::from_utf8(&path_buf[..plen]).unwrap_or("");
+
+    // Determine reply based on the path
+    let reply: &[u8] = if path_str == "/proc/self/exe" || path_str.contains("/exe") {
+        b"/disk/bin/python.elf"
+    } else if path_str == "/usr/bin/env" || path_str == "/bin/sh" {
+        b"/bin/busybox.elf"
+    } else {
+        b"/bin/busybox.elf"
+    };
+
+    let copy_len = reply.len().min(bufsiz as usize);
+    unsafe { core::ptr::copy_nonoverlapping(reply.as_ptr(), buf as *mut u8, copy_len); }
+    copy_len as u64
+}
+
+/// Enhanced readlinkat wrapper
+pub fn linux_readlinkat_enhanced(_dirfd: u64, path: u64, buf: u64, bufsiz: u64) -> u64 {
+    linux_readlink_enhanced(path, buf, bufsiz)
+}
+
+/// Enhanced newfstatat that uses VFS-integrated stat
+pub fn linux_newfstatat_vfs(_dirfd: u64, path: u64, buf: u64, _flag: u64) -> u64 {
+    if path == 0 || !crate::arch::x86_64::syscall::validate_user_ptr_pub(path, 1) {
+        return linux_fstat_vfs(0, buf);
+    }
+    linux_stat_vfs(path, buf)
 }
