@@ -190,163 +190,205 @@ fn process_command(cmd: &[u8], len: usize, cx: u32, cy: &mut u32) {
 
 #[no_mangle]
 pub extern "C" fn main() -> i64 {
-    println("[J125] ========================================");
-    println("[J125] Interactive Terminal - Python Ready");
-    println("[J125] ========================================");
-
-    let mut tests_passed: u32 = 0;
-    let total_tests: u32 = 5;
+    println("========================================");
+    println("[TERM] AetherionOS v4.0 Interactive Terminal");
+    println("[TERM] Jalon 125+ - Bulletproof Edition");
+    println("========================================");
 
     // ───────────────────────────────────────────
-    // Step 1: Draw background + taskbar
+    // Step 1: Draw desktop background + taskbar
     // ───────────────────────────────────────────
-    print("[J125] Step 1/5: Desktop background ... ");
+    println("[TERM] Drawing desktop...");
     sys_fb_fill_rect(0, 0, SCR_W, SCR_H, BG);
     let tb_y = SCR_H - 32;
     sys_fb_fill_rect(0, tb_y, SCR_W, 32, TASKBAR);
     sys_fb_fill_rect(0, tb_y, SCR_W, 1, TB_LINE);
-    sys_fb_draw_string(12, tb_y + 8, b"AetherionOS v4.0", ACCENT);
-    sys_fb_draw_string(SCR_W - 220, tb_y + 8, b"[J125] Python Terminal", GREEN);
-    println("OK");
-    tests_passed += 1;
+    sys_fb_draw_string(12, tb_y + 8, b"AetherionOS v4.0 | Cognitive Desktop", ACCENT);
+    sys_fb_draw_string(SCR_W - 160, tb_y + 8, b"[Terminal Ready]", GREEN);
 
     // ───────────────────────────────────────────
-    // Step 2: Draw terminal window frame
+    // Step 2: Draw terminal window
     // ───────────────────────────────────────────
-    print("[J125] Step 2/5: Terminal window ... ");
+    println("[TERM] Drawing terminal window...");
     sys_fb_fill_rect(TERM_X - 1, TERM_Y - 1, TERM_W + 2, TERM_H + 2, WIN_BORDER);
     sys_fb_fill_rect(TERM_X, TERM_Y, TERM_W, TITLE_H, WIN_TITLE);
-    sys_fb_draw_string(TERM_X + 10, TERM_Y + 6, b"Terminal - aetherion@AetherionOS:~$", TEXT);
-    sys_fb_fill_rect(TERM_X + TERM_W - 24, TERM_Y + 6, 16, 16, 0x00F85149);
-    sys_fb_fill_rect(TERM_X + TERM_W - 46, TERM_Y + 6, 16, 16, 0x00D29922);
-    sys_fb_fill_rect(TERM_X + TERM_W - 68, TERM_Y + 6, 16, 16, 0x003FB950);
+    sys_fb_draw_string(TERM_X + 10, TERM_Y + 6, b"Terminal - aetherion@AetherionOS", TEXT);
+    // Window control buttons
+    sys_fb_fill_rect(TERM_X + TERM_W - 24, TERM_Y + 6, 16, 16, 0x00F85149); // close
+    sys_fb_fill_rect(TERM_X + TERM_W - 46, TERM_Y + 6, 16, 16, 0x00D29922); // minimize
+    sys_fb_fill_rect(TERM_X + TERM_W - 68, TERM_Y + 6, 16, 16, 0x003FB950); // maximize
+    // Terminal body
     sys_fb_fill_rect(TERM_X, TERM_Y + TITLE_H, TERM_W, TERM_H - TITLE_H, WIN_BG);
-    println("OK");
-    tests_passed += 1;
 
     // ───────────────────────────────────────────
-    // Step 3: Write initial terminal content
+    // Step 3: Initial terminal content
     // ───────────────────────────────────────────
-    print("[J125] Step 3/5: Terminal content ... ");
     let cx = TERM_X + MARGIN;
     let mut cy = TERM_Y + TITLE_H + MARGIN;
 
     sys_fb_draw_string(cx, cy, b"AetherionOS v4.0 - Cognitive Operating System", GREEN);
     cy += CHAR_H;
-    sys_fb_draw_string(cx, cy, b"Jalon 125: Python Ready | Pipe Cognitif", DIM);
-    cy += CHAR_H;
-    sys_fb_draw_string(cx, cy, b"Type 'help' for commands, 'python <script>' to run", TEXT);
+    sys_fb_draw_string(cx, cy, b"Type 'help' for commands. AI LLM connected.", DIM);
     cy += CHAR_H + 4;
 
-    sys_fb_draw_string(cx, cy, b"$ uname -a", GREEN);
-    cy += CHAR_H;
-    sys_fb_draw_string(cx, cy, b"Linux aetherion 6.18.0-aetherion x86_64", TEXT);
-    cy += CHAR_H;
-    sys_fb_draw_string(cx, cy, b"$ python --version", GREEN);
-    cy += CHAR_H;
-    sys_fb_draw_string(cx, cy, b"Python 3.12 (MicroPython) - Linuxulator ABI", YELLOW);
-    cy += CHAR_H;
-    sys_fb_draw_string(cx, cy, b"$ cat /proc/cpuinfo | head -3", GREEN);
-    cy += CHAR_H;
-    sys_fb_draw_string(cx, cy, b"cpu: x86_64 AVX2+FMA (Haswell) 2-core SMP", TEXT);
-    cy += CHAR_H + 4;
+    // ───────────────────────────────────────────
+    // Step 4: Auto-send "bonjour" to LLM after 500 yields
+    // This proves the Terminal -> Bus -> LLM pipeline
+    // ───────────────────────────────────────────
+    println("[TERM] Waiting for LLM agent to be ready...");
 
-    // Input prompt
+    // Wait for LLM_READY signal on the bus
+    let mut llm_ready = false;
+    let mut bus_msg = [0u64; 8];
+    for wait in 0..2000u32 {
+        if sys_bus_consume_intent(&mut bus_msg, 0x8004) == 0 { // INTENT_LLM_READY
+            println("[TERM] Received INTENT_LLM_READY from LLM agent!");
+            llm_ready = true;
+            break;
+        }
+        sys_yield();
+        if wait % 500 == 0 && wait > 0 {
+            print("[TERM] Still waiting for LLM... yield #");
+            print_u64(wait as u64);
+            println("");
+        }
+    }
+
+    if llm_ready {
+        // Send "bonjour" prompt to LLM via Cognitive Bus
+        println("[TERM] >>> Sending prompt 'bonjour' to LLM <<<");
+        sys_fb_draw_string(cx, cy, b"$ bonjour", GREEN);
+        cy += CHAR_H;
+        sys_fb_draw_string(cx, cy, b"[Sending to AI agent...]", YELLOW);
+        cy += CHAR_H;
+
+        // Publish INTENT_USER_PROMPT (0x8001) with hash of "bonjour"
+        sys_bus_publish(INTENT_USER_PROMPT, 2, djb2_hash(b"bonjour"));
+        println("[TERM] Published INTENT_USER_PROMPT to bus");
+
+        // Wait for response tokens (INTENT_TOKEN_GENERATED = 0x8002)
+        let mut got_tokens: u32 = 0;
+        let mut response_buf = [0u8; 128];
+        let mut resp_pos: usize = 0;
+
+        for _ in 0..5000u32 {
+            let mut tok_msg = [0u64; 8];
+            if sys_bus_consume_intent(&mut tok_msg, 0x8002) == 0 {
+                // Extract character from token payload
+                let ch = (tok_msg[2] & 0xFF) as u8; // payload low byte = char
+                if ch >= 0x20 && ch <= 0x7E && resp_pos < 120 {
+                    response_buf[resp_pos] = ch;
+                    resp_pos += 1;
+                }
+                got_tokens += 1;
+            }
+            // Check for generation complete
+            let mut done_msg = [0u64; 8];
+            if sys_bus_consume_intent(&mut done_msg, 0x8003) == 0 {
+                println("[TERM] Received INTENT_GENERATION_DONE");
+                break;
+            }
+            sys_yield();
+        }
+
+        // Display the response
+        if got_tokens > 0 {
+            sys_fb_draw_string(cx, cy, b"AI> ", ACCENT);
+            if resp_pos > 0 {
+                sys_fb_draw_string(cx + 4 * CHAR_W, cy, &response_buf[..resp_pos], TEXT);
+            }
+            cy += CHAR_H;
+            print("[TERM] LLM generated ");
+            print_u64(got_tokens as u64);
+            println(" tokens!");
+        } else {
+            sys_fb_draw_string(cx, cy, b"[LLM loading, no response yet]", DIM);
+            cy += CHAR_H;
+            println("[TERM] No tokens received (LLM still loading weights)");
+        }
+    } else {
+        sys_fb_draw_string(cx, cy, b"[LLM agent not detected]", DIM);
+        cy += CHAR_H;
+        println("[TERM] LLM agent did not publish READY in time");
+    }
+
+    // ───────────────────────────────────────────
+    // Step 5: Enter persistent interactive loop
+    // Read keyboard via sys_read(0) + display on screen
+    // ───────────────────────────────────────────
+    cy += 4;
     sys_fb_draw_string(cx, cy, b"aetherion@os:~$ ", GREEN);
-    let prompt_end_x = cx + 16 * CHAR_W;
+    let mut char_x = cx + 16 * CHAR_W;
     let input_y = cy;
-
-    println("OK");
-    tests_passed += 1;
-
-    // ───────────────────────────────────────────
-    // Step 4: HID polling + command execution
-    // ───────────────────────────────────────────
-    print("[J125] Step 4/5: HID keyboard polling ... ");
-    let mut key_count: u32 = 0;
-    let mut char_x = prompt_end_x;
     let mut input_buf = [0u8; 64];
     let mut buf_pos: usize = 0;
-    let mut cmd_cy = input_y + CHAR_H + 4;
+    let mut cmd_cy = cy + CHAR_H + 4;
 
-    // Poll HID events (up to 100 iterations)
-    for _ in 0..100u32 {
-        let evt = sys_poll_hid();
-        if evt == 0 { continue; }
+    // Draw cursor
+    sys_fb_fill_rect(char_x, input_y, 2, CHAR_H - 2, CURSOR);
 
-        let bytes = evt.to_le_bytes();
-        let evt_type = bytes[0];
-        let scancode = bytes[6];
+    println("[TERM] Entering interactive loop (sys_read blocking)...");
+    sys_bus_publish(0xB042, 2, 1); // Terminal ready signal
 
-        if evt_type == HID_KEY_PRESS && scancode != 0 {
-            let ascii = scancode_to_ascii(scancode);
-            if ascii == b'\n' && buf_pos > 0 {
-                // Execute command
+    // Persistent event loop — reads keyboard via sys_read(0)
+    let mut read_buf = [0u8; 1];
+    let mut loop_count: u64 = 0;
+    loop {
+        let n = sys_read(0, &mut read_buf);
+        if n > 0 {
+            let ch = read_buf[0];
+
+            if ch == b'\n' && buf_pos > 0 {
+                // Erase cursor
+                sys_fb_fill_rect(char_x, input_y, 2, CHAR_H - 2, WIN_BG);
+                // Process command
                 process_command(&input_buf, buf_pos, cx, &mut cmd_cy);
-                // Reset input
+                // Also send to LLM
+                sys_bus_publish(INTENT_USER_PROMPT, 2, djb2_hash(&input_buf[..buf_pos]));
+                // Reset
                 buf_pos = 0;
                 // New prompt
                 if cmd_cy + CHAR_H * 2 < TERM_Y + TERM_H {
                     sys_fb_draw_string(cx, cmd_cy, b"aetherion@os:~$ ", GREEN);
                     char_x = cx + 16 * CHAR_W;
+                } else {
+                    // Scroll: clear terminal body and reset
+                    sys_fb_fill_rect(TERM_X, TERM_Y + TITLE_H, TERM_W, TERM_H - TITLE_H, WIN_BG);
+                    cmd_cy = TERM_Y + TITLE_H + MARGIN;
+                    sys_fb_draw_string(cx, cmd_cy, b"aetherion@os:~$ ", GREEN);
+                    char_x = cx + 16 * CHAR_W;
                     cmd_cy += CHAR_H;
                 }
-                key_count += 1;
-            } else if ascii == 8 && buf_pos > 0 {
+                // Draw cursor
+                sys_fb_fill_rect(char_x, input_y, 2, CHAR_H - 2, CURSOR);
+            } else if ch == 8 && buf_pos > 0 {
                 // Backspace
+                sys_fb_fill_rect(char_x, input_y, 2, CHAR_H - 2, WIN_BG); // erase cursor
                 buf_pos -= 1;
                 char_x -= CHAR_W;
                 sys_fb_fill_rect(char_x, input_y, CHAR_W, CHAR_H, WIN_BG);
-                key_count += 1;
-            } else if ascii != 0 && ascii != 8 && ascii != b'\n' && buf_pos < 60 {
-                let ch_buf = [ascii];
+                sys_fb_fill_rect(char_x, input_y, 2, CHAR_H - 2, CURSOR);
+            } else if ch >= 0x20 && ch <= 0x7E && buf_pos < 60 {
+                // Erase old cursor, draw char, advance cursor
+                sys_fb_fill_rect(char_x, input_y, 2, CHAR_H - 2, WIN_BG);
+                let ch_buf = [ch];
                 sys_fb_draw_string(char_x, input_y, &ch_buf, TEXT);
                 char_x += CHAR_W;
-                input_buf[buf_pos] = ascii;
+                input_buf[buf_pos] = ch;
                 buf_pos += 1;
-                key_count += 1;
+                sys_fb_fill_rect(char_x, input_y, 2, CHAR_H - 2, CURSOR);
             }
         }
+
+        // Cooperative yield
+        sys_yield();
+        loop_count += 1;
+
+        // Periodic heartbeat to serial (every 10000 loops)
+        if loop_count % 10000 == 0 {
+            print("[TERM] heartbeat #");
+            print_u64(loop_count / 10000);
+            println("");
+        }
     }
-
-    // Draw cursor at current position
-    sys_fb_fill_rect(char_x, input_y, 2, CHAR_H - 2, CURSOR);
-
-    print("OK (");
-    print_u64(key_count as u64);
-    println(" keystrokes captured)");
-    tests_passed += 1;
-
-    // ───────────────────────────────────────────
-    // Step 5: Cognitive Bus publish
-    // ───────────────────────────────────────────
-    print("[J125] Step 5/5: Bus publish ... ");
-    let status = ((key_count as u64) << 32) | (buf_pos as u64);
-    let r = sys_bus_publish(0xB042, 2, status);
-    if r == 0 {
-        println("OK (intent=0xB042)");
-        tests_passed += 1;
-    } else {
-        println("FAIL");
-    }
-
-    // ───────────────────────────────────────────
-    // Summary
-    // ───────────────────────────────────────────
-    println("[J125] ========================================");
-    print("[J125] Terminal Agent: ");
-    print_u64(tests_passed as u64);
-    print("/");
-    print_u64(total_tests as u64);
-    println(" steps completed");
-
-    if tests_passed == total_tests {
-        println("[J125-OK] Terminal with Python support COMPLETE");
-        println("[J125-OK] Commands: python, micropython, node, help");
-        println("[J125-OK] Pipe Cognitif: stdout -> INTENT_PROCESS_OUTPUT");
-        println("[J125-OK] ALL STEPS PASSED");
-    }
-    println("[J125] ========================================");
-
-    0
 }

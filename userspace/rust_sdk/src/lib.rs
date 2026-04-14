@@ -978,13 +978,31 @@ impl AetherionAllocator {
     }
 
     /// Grow the heap by requesting more memory from the kernel.
+    /// Jalon 125+: OOM detection — if sys_brk returns the same address,
+    /// the kernel REFUSED the allocation. We now print a FATAL OOM message
+    /// to stderr instead of dying silently.
     fn grow_heap(&self, min_size: usize) -> bool {
         let grow = if min_size > HEAP_GROW_SIZE { min_size } else { HEAP_GROW_SIZE };
         // Align grow to page size
         let grow_aligned = (grow + 4095) & !4095;
         let current_end = self.heap_end.load(Ordering::Acquire) as u64;
-        let new_end = sys_brk(current_end + grow_aligned as u64);
+        let requested = current_end + grow_aligned as u64;
+        let new_end = sys_brk(requested);
         if new_end <= current_end {
+            // === FATAL OOM: kernel refused sys_brk expansion ===
+            sys_write(2, b"\n[FATAL-OOM] sys_brk REFUSED! Requested: ");
+            print_u64_to_fd(2, requested);
+            sys_write(2, b" bytes, got: ");
+            print_u64_to_fd(2, new_end);
+            sys_write(2, b" (current_end: ");
+            print_u64_to_fd(2, current_end);
+            sys_write(2, b")\n");
+            sys_write(2, b"[FATAL-OOM] grow_heap needed ");
+            print_u64_to_fd(2, grow_aligned as u64);
+            sys_write(2, b" bytes (min_size=");
+            print_u64_to_fd(2, min_size as u64);
+            sys_write(2, b")\n");
+            sys_write(2, b"[FATAL-OOM] Process will likely crash. Increase QEMU RAM or reduce model size.\n");
             return false;
         }
         let actual_grow = (new_end - current_end) as usize;
@@ -992,6 +1010,12 @@ impl AetherionAllocator {
             self.heap.lock().extend(actual_grow);
         }
         self.heap_end.store(new_end as usize, Ordering::Release);
+        // Log successful heap growth
+        sys_write(1, b"[HEAP] Grew by ");
+        print_u64_to_fd(1, actual_grow as u64);
+        sys_write(1, b" bytes (total: ");
+        print_u64_to_fd(1, new_end);
+        sys_write(1, b")\n");
         true
     }
 }

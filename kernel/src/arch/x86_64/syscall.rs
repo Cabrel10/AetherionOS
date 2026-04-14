@@ -1295,18 +1295,30 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
             let mut temp_buf = [0u8; 256];
             let max_read = core::cmp::min(len as usize, temp_buf.len());
 
-            // Non-blocking direct read — terminal loop yields between calls
-            let n = crate::process::kbd_read(&mut temp_buf, max_read);
-            if n > 0 {
-                unsafe {
-                    let dst = buf_addr as *mut u8;
-                    for i in 0..n {
-                        core::ptr::write_volatile(dst.add(i), temp_buf[i]);
+            // Jalon 125+: Semi-blocking read with bounded yield loop.
+            // Try to read immediately; if empty, yield up to 200 times
+            // (allowing keyboard IRQs to fire and fill kbd_buffer).
+            // This prevents the terminal from busy-spinning in a tight
+            // sys_read -> sys_yield -> sys_read loop that starves the keyboard.
+            let mut attempts: u32 = 0;
+            loop {
+                let n = crate::process::kbd_read(&mut temp_buf, max_read);
+                if n > 0 {
+                    unsafe {
+                        let dst = buf_addr as *mut u8;
+                        for i in 0..n {
+                            core::ptr::write_volatile(dst.add(i), temp_buf[i]);
+                        }
                     }
+                    return n as u64;
                 }
-                return n as u64;
+                attempts += 1;
+                if attempts > 200 {
+                    return 0; // Timeout — return EAGAIN-like 0
+                }
+                // Yield to let keyboard IRQs fire + other processes run
+                sys_yield();
             }
-            0
         }
 
         crate::process::FdType::Socket => {
@@ -4586,7 +4598,15 @@ fn sys_brk(new_break: u64) -> u64 {
                         }
                     }
                     None => {
-                        crate::serial_println!("[SYSCALL] brk: out of frames at page {}", i);
+                        let (pool_used, pool_max) = crate::elf::pool_stats();
+                        crate::serial_println!(
+                            "[SYSCALL] brk: *** OOM *** out of frames at page {}/{} for PID {} (pool {}/{} used)",
+                            i, pages_needed, current, pool_used, pool_max
+                        );
+                        crate::serial_println!(
+                            "[SYSCALL] brk: requested 0x{:X} -> 0x{:X} ({} KB), REFUSING",
+                            old_break, new_break, (new_break - old_break) / 1024
+                        );
                         return old_break;
                     }
                 }

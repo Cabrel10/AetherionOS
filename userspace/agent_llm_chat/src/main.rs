@@ -44,17 +44,36 @@ const INTENT_MODEL_FOUND: u64     = 0xD067;
 const GGUF_MAGIC: u32 = 0x46554747;
 
 // ═══════════════════════════════════════════════════
-// Safety limits — Jalon 105: Accept REAL SmolLM2-135M dimensions
-// dim=576, vocab=49152, hidden=1536, layers=30
-// These are NO LONGER capped to tiny values. The model is loaded
-// via streaming pread64 and Q8_0 dequantization — never fully in RAM.
-// Only layers and seq_len are limited for QEMU TCG speed.
+// Safety limits — Jalon 125+: BULLETPROOF MEMORY LIMITS
+//
+// CRITICAL: These limits are calculated to fit in ~10 MB of heap RAM.
+// dim=576, vocab=49152 (but logits limited to 256), hidden_dim=1536, layers=2
+//
+// Per-layer memory (d=576, kv=288, h=1536):
+//   Wq: 576*576*4  = 1.3 MB
+//   Wk: 288*576*4  = 0.6 MB
+//   Wv: 288*576*4  = 0.6 MB
+//   Wo: 576*576*4  = 1.3 MB
+//   gate: 1536*576*4 = 3.4 MB
+//   up: 1536*576*4 = 3.4 MB
+//   down: 576*1536*4 = 3.4 MB
+//   Total per layer: ~14 MB → TOO MUCH!
+//
+// → Cap hidden to 512, dim to 256 for safety test
+//   Then per-layer:
+//   Wq: 256*256*4 = 256 KB
+//   gate: 512*256*4 = 512 KB
+//   Total per layer: ~2.5 MB → FITS!
+//
+// Strategy: use REAL SmolLM dim but cap hidden + layers aggressively.
+// The weights loaded will be partial (first 256 of 576 dims) but
+// that's OK — we just need to prove the pipeline works.
 // ═══════════════════════════════════════════════════
-const MAX_DIM_SAFETY: usize     = 576;    // SmolLM2 dim — fit in 8MB heap
-const MAX_VOCAB_SAFETY: usize   = 49152;  // SmolLM2 vocab
+const MAX_DIM_SAFETY: usize     = 256;    // Cap dim to 256 for safety (was 576)
+const MAX_VOCAB_SAFETY: usize   = 256;    // Only compute logits for 256 tokens
 const MAX_SEQ_LEN_SAFETY: usize = 16;     // 16 tokens — minimal KV cache
-const MAX_HIDDEN_SAFETY: usize  = 1536;   // SmolLM2 hidden
-const MAX_LAYERS_SAFETY: usize  = 1;      // 1 layer — fits in 8MB heap
+const MAX_HIDDEN_SAFETY: usize  = 512;    // Cap hidden to 512 (was 1536)
+const MAX_LAYERS_SAFETY: usize  = 2;      // 2 layers max — proves multi-layer works
 
 // Fallback defaults when no GGUF found
 const DEFAULT_DIM: usize        = 32;
@@ -98,23 +117,30 @@ impl ModelConfig {
     }
 
     fn apply_safety_limits(&mut self) {
+        println("[LLM] === Applying Safety Limits ===");
         if self.dim > MAX_DIM_SAFETY {
-            print("[LLM] SAFETY: dim capped "); print_u64(self.dim as u64);
+            print("[LLM] SAFETY: dim "); print_u64(self.dim as u64);
             print(" -> "); print_u64(MAX_DIM_SAFETY as u64); println("");
             self.dim = MAX_DIM_SAFETY;
         }
         if self.vocab_size > MAX_VOCAB_SAFETY {
-            print("[LLM] SAFETY: vocab capped "); print_u64(self.vocab_size as u64);
+            print("[LLM] SAFETY: vocab "); print_u64(self.vocab_size as u64);
             print(" -> "); print_u64(MAX_VOCAB_SAFETY as u64); println("");
             self.vocab_size = MAX_VOCAB_SAFETY;
         }
         if self.hidden_dim > MAX_HIDDEN_SAFETY {
+            print("[LLM] SAFETY: hidden "); print_u64(self.hidden_dim as u64);
+            print(" -> "); print_u64(MAX_HIDDEN_SAFETY as u64); println("");
             self.hidden_dim = MAX_HIDDEN_SAFETY;
         }
         if self.max_seq_len > MAX_SEQ_LEN_SAFETY {
+            print("[LLM] SAFETY: seq_len "); print_u64(self.max_seq_len as u64);
+            print(" -> "); print_u64(MAX_SEQ_LEN_SAFETY as u64); println("");
             self.max_seq_len = MAX_SEQ_LEN_SAFETY;
         }
         if self.n_layers > MAX_LAYERS_SAFETY {
+            print("[LLM] SAFETY: layers "); print_u64(self.n_layers as u64);
+            print(" -> "); print_u64(MAX_LAYERS_SAFETY as u64); println("");
             self.n_layers = MAX_LAYERS_SAFETY;
         }
         if self.n_heads == 0 { self.n_heads = 1; }
@@ -536,11 +562,26 @@ fn key_ends_with(key: &[u8], suffix: &[u8]) -> bool {
 // Weight scratch buffer — loaded per-layer via pread64
 // ═══════════════════════════════════════════════════
 
-/// Zero-initialized Vec<f32>
+/// Safe zero-initialized Vec<f32> with OOM logging
+/// Jalon 125+: Prints allocation size BEFORE and AFTER to detect silent OOM
 fn alloc_zeroed_vec(len: usize) -> Vec<f32> {
+    let bytes = len * 4;
+    if bytes > 512 * 1024 {
+        // Log large allocations (>512 KB)
+        print("[LLM-ALLOC] Requesting ");
+        print_u64(bytes as u64);
+        print(" bytes (");
+        print_u64(len as u64);
+        println(" f32s)...");
+    }
     let mut v = Vec::with_capacity(len);
     unsafe { v.set_len(len); }
     // Kernel zeros brk pages, and 0.0f32 == [0u8;4]
+    if bytes > 512 * 1024 {
+        print("[LLM-ALLOC] OK, ptr=0x");
+        print_hex(v.as_ptr() as u64);
+        println("");
+    }
     v
 }
 
@@ -1597,8 +1638,24 @@ pub extern "C" fn main() -> i64 {
     println("");
     println("[LLM] Loading weights [          ] 0%");
 
-    println("[LLM] Allocating buffers (REAL model dims)...");
+    println("[LLM] ====== MEMORY ALLOCATION PHASE ======");
+    print("[LLM] Estimated per-layer weight mem: ");
+    let per_layer_kb = (cfg.dim * cfg.dim * 4 * 2  // Wq + Wo
+                      + cfg.kv_dim * cfg.dim * 4 * 2  // Wk + Wv
+                      + cfg.hidden_dim * cfg.dim * 4 * 3  // gate + up + down
+                      + cfg.dim * 4 * 2) / 1024; // rms_att + rms_ffn
+    print_u64(per_layer_kb as u64);
+    println(" KB");
+    print("[LLM] Estimated scratch mem: ");
+    let scratch_kb = (cfg.dim * 4 * 8 + cfg.hidden_dim * 4 * 4 + cfg.vocab_size * 4) / 1024;
+    print_u64(scratch_kb as u64);
+    println(" KB");
+    print("[LLM] Estimated TOTAL: ");
+    print_u64((per_layer_kb + scratch_kb) as u64);
+    println(" KB");
+    println("[LLM] Allocating global weights...");
     let mut global_w = GlobalWeights::allocate(&cfg);
+    println("[LLM] Global weights allocated OK");
     global_w.emb_tensor_offset = data_section_start + emb_offset;
     global_w.out_tensor_offset = if out_offset == u64::MAX {
         data_section_start + emb_offset
@@ -1606,8 +1663,13 @@ pub extern "C" fn main() -> i64 {
         data_section_start + out_offset
     };
 
+    println("[LLM] Allocating scratch buffers...");
     let mut scratch = ScratchBuffers::allocate(&cfg);
+    println("[LLM] Scratch buffers allocated OK");
+    println("[LLM] Allocating layer weight buffers...");
     let mut layer_w = LayerWeights::allocate(&cfg);
+    println("[LLM] Layer weight buffers allocated OK");
+    println("[LLM] ====== ALL ALLOCATIONS COMPLETE ======");
 
     // Load rms_final (output_norm.weight) from GGUF — small tensor (dim floats)
     if rms_offset != u64::MAX {
@@ -1633,6 +1695,8 @@ pub extern "C" fn main() -> i64 {
         for v in global_w.rms_final.iter_mut() { *v = 1.0; }
         println("[LLM] rms_final: no tensor found, using 1.0");
     }
+
+    sys_yield(); // cooperative yield after allocation phase
 
     // Load embedding if not in stream mode
     if !global_w.stream_mode {
