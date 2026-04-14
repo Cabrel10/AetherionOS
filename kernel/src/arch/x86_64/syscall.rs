@@ -1307,31 +1307,26 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
                 return bytes_read as u64;
             }
 
-            // No data: register as waiter, block, and yield
-            // The keyboard IRQ will push data + call kbd_wake_blocked()
-            // which sets our state back to Ready.
+            // No data: register as waiter, block once, yield, return 0
+            // Terminal loop handles retrying with its own yield
             let current_pid = crate::scheduler::current_pid();
             if current_pid != 0 {
-                // Loop: yield until data arrives
-                // Each iteration: register waiter, block, yield, check
-                for _ in 0..4096 {
-                    crate::process::kbd_set_waiter(current_pid);
-                    let _ = crate::process::set_state(
-                        current_pid,
-                        crate::process::ProcessState::Blocked,
-                    );
-                    sys_yield();
-                    // After waking (IRQ set us Ready), try to read
-                    let n = crate::process::kbd_read(&mut temp_buf, max_read);
-                    if n > 0 {
-                        unsafe {
-                            let dst = buf_addr as *mut u8;
-                            for i in 0..n {
-                                core::ptr::write_volatile(dst.add(i), temp_buf[i]);
-                            }
+                crate::process::kbd_set_waiter(current_pid);
+                let _ = crate::process::set_state(
+                    current_pid,
+                    crate::process::ProcessState::Blocked,
+                );
+                sys_yield();
+                // One retry after waking
+                let n = crate::process::kbd_read(&mut temp_buf, max_read);
+                if n > 0 {
+                    unsafe {
+                        let dst = buf_addr as *mut u8;
+                        for i in 0..n {
+                            core::ptr::write_volatile(dst.add(i), temp_buf[i]);
                         }
-                        return n as u64;
                     }
+                    return n as u64;
                 }
             }
             0

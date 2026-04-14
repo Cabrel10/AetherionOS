@@ -937,7 +937,7 @@ fn cmd_llm(term: &mut Terminal, prompt_bytes: &[u8]) {
     // Listen for token stream with timeout (real bus messages)
     let mut token_count: u32 = 0;
     let mut idle_ticks: u32 = 0;
-    let max_idle = 50_000u32; // timeout after ~50K yield cycles (patient for QEMU without KVM)
+    let max_idle = 500u32; // timeout after ~500 yield cycles
 
     term.put_str(b"[LLM] ", LLM_COL);
     loop {
@@ -3073,10 +3073,18 @@ pub extern "C" fn main() -> i64 {
     sys_write(1, b"[TERM] Jalon 96: agi_test complete\n");
 
     // ── Jalon 103: Auto-run LLM end-to-end test with "bonjour" prompt ──
-    // This triggers: Terminal -> Orchestrator -> LLM (Core 1) -> Tokens -> Terminal
-    sys_write(1, b"[TERM] Jalon 103: Auto-running 'llm bonjour' (SMP End-to-End)\n");
-    cmd_llm(&mut term, b"bonjour");
-    sys_write(1, b"[TERM] Jalon 103: LLM auto-test complete\n");
+    // Only run if LLM agent is actually loaded (check bus for INTENT_LLM_READY)
+    {
+        let mut bus_msg = [0u64; 8];
+        let llm_ready = sys_bus_consume_intent(&mut bus_msg, 0x8004u32) == 0; // INTENT_LLM_READY
+        if llm_ready {
+            sys_write(1, b"[TERM] Jalon 103: Auto-running 'llm bonjour' (SMP End-to-End)\n");
+            cmd_llm(&mut term, b"bonjour");
+            sys_write(1, b"[TERM] Jalon 103: LLM auto-test complete\n");
+        } else {
+            sys_write(1, b"[TERM] Jalon 103: LLM not loaded - skipping auto-test\n");
+        }
+    }
 
     print_prompt(&mut term);
 
