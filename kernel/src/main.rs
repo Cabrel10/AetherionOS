@@ -2193,34 +2193,114 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         // If boot.conf is NOT found, fall back to hardcoded loading below.
         // This eliminates the need to recompile the kernel to add/remove agents.
         // ══════════════════════════════════════════════════════════
+        // ══════════════════════════════════════════════════════════
+        // JALON 118: Dynamic Init System via /disk/etc/boot.conf
+        // Parse boot.conf and spawn each listed agent from embedded ELF
+        // ══════════════════════════════════════════════════════════
+        let mut boot_conf_loaded = false;
         {
             let boot_conf_data = fs::fat32::read_file_path("etc/boot.conf");
             if let Some(ref conf_data) = boot_conf_data {
-                serial_write("\n  [J117a] boot.conf FOUND on /disk/etc/boot.conf\n");
-                serial_println!("  [J117a] boot.conf size: {} bytes", conf_data.len());
-                // Parse boot.conf: count load directives
+                serial_write("\n  [J118] ══════════════════════════════════════\n");
+                serial_write("  [J118] Dynamic Init System — boot.conf FOUND\n");
+                serial_println!("  [J118] boot.conf size: {} bytes", conf_data.len());
                 let conf_str = core::str::from_utf8(conf_data).unwrap_or("");
                 let mut load_count = 0u32;
+                let mut spawn_count = 0u32;
                 let mut sysctl_count = 0u32;
+
                 for line in conf_str.lines() {
                     let trimmed = line.trim();
                     if trimmed.is_empty() || trimmed.starts_with('#') { continue; }
+
                     if trimmed.starts_with("load ") {
                         load_count += 1;
-                        serial_println!("  [J117a] boot.conf directive: {}", trimmed);
+                        // Parse: "load /bin/agent_name.elf [core=N] [watchdog]"
+                        let rest = &trimmed[5..];
+                        let mut parts = rest.split_whitespace();
+                        let elf_path = parts.next().unwrap_or("");
+                        let mut target_core: Option<u8> = None;
+                        let mut watchdog = false;
+                        for opt in parts {
+                            if opt.starts_with("core=") {
+                                target_core = opt[5..].parse().ok();
+                            } else if opt == "watchdog" {
+                                watchdog = true;
+                            }
+                        }
+
+                        serial_println!("  [J118] Loading: {} (core={:?}, watchdog={})", elf_path, target_core, watchdog);
+
+                        // Match embedded ELF by path name
+                        let elf_data: Option<&[u8]> = match elf_path {
+                            "/bin/agent_orchestrator.elf" => Some(AGENT_ORCHESTRATOR_ELF),
+                            "/bin/agent_mcp.elf" => Some(AGENT_MCP_ELF),
+                            "/bin/agent_llama_core.elf" => Some(AGENT_LLAMA_CORE_ELF),
+                            "/bin/agent_llm_chat.elf" => Some(AGENT_LLM_CHAT_ELF),
+                            "/bin/agent_visual_term.elf" => Some(AGENT_VISUAL_TERM_ELF),
+                            "/bin/agent_wm.elf" => Some(AGENT_WM_ELF),
+                            "/bin/agent_clock.elf" => Some(AGENT_CLOCK_ELF),
+                            "/bin/agent_memory.elf" => Some(AGENT_MEMORY_ELF),
+                            "/bin/agent_autonomous.elf" => Some(AGENT_AUTONOMOUS_ELF),
+                            "/bin/agent_validator.elf" => Some(AGENT_VALIDATOR_ELF),
+                            "/bin/agent_terminal.elf" => Some(AGENT_TERMINAL_ELF),
+                            "/bin/agent_net.elf" => Some(AGENT_NET_ELF),
+                            "/bin/agent_input.elf" => Some(AGENT_INPUT_ELF),
+                            "/bin/agent_sysinfo.elf" => Some(AGENT_SYSINFO_ELF),
+                            _ => {
+                                serial_println!("  [J118] WARN: Unknown ELF '{}' — skipping", elf_path);
+                                None
+                            }
+                        };
+
+                        if let Some(binary) = elf_data {
+                            match elf::load_elf_binary(binary) {
+                                Ok(result) => {
+                                    let pid = process::spawn_userspace(
+                                        elf_path, 0,
+                                        result.entry_point, result.stack_pointer, result.pml4_phys
+                                    ).unwrap_or(0);
+                                    if pid != 0 {
+                                        if result.is_linux_abi {
+                                            process::set_abi(pid, compat::linux_abi::Abi::Linux);
+                                            compat::linux_abi::log_linux_abi_activation(pid, elf_path);
+                                        }
+                                        if let Some(core_id) = target_core {
+                                            process::set_cpu_affinity(pid, core_id);
+                                        }
+                                        scheduler::enqueue_process(pid);
+                                        if watchdog {
+                                            process::watchdog_register(elf_path, target_core.unwrap_or(0));
+                                        }
+                                        spawn_count += 1;
+                                        serial_println!("  [J118] OK {} PID={} QUEUED", elf_path, pid);
+                                    }
+                                }
+                                Err(_e) => {
+                                    serial_println!("  [J118] FAIL {} load error", elf_path);
+                                }
+                            }
+                        }
                     } else if trimmed.starts_with("set ") {
                         sysctl_count += 1;
-                        serial_println!("  [J117a] sysctl: {}", trimmed);
+                        serial_println!("  [J118] sysctl: {}", trimmed);
                     }
                 }
-                serial_println!("  [J117a] Parsed {} load directives, {} sysctl settings", load_count, sysctl_count);
-                serial_write("  [J117a] Dynamic agent loading from boot.conf: READY\n");
-                serial_write("  [J117a] NOTE: Using embedded fallback agents (boot.conf agents loaded after)\n");
+
+                serial_println!("  [J118] Dynamic Init: {} directives, {} spawned, {} sysctl",
+                    load_count, spawn_count, sysctl_count);
+                serial_write("  [J118] ══════════════════════════════════════\n");
+                boot_conf_loaded = spawn_count > 0;
             } else {
-                serial_write("  [J117a] No /disk/etc/boot.conf found — using embedded agent loading\n");
-                serial_write("  [J117a] Create /disk/etc/boot.conf for dynamic agent management\n");
+                serial_write("  [J118] No /disk/etc/boot.conf — using embedded agent loading\n");
             }
         }
+
+        // ──────────────────────────────────────────────────────────
+        // Fallback: Hardcoded agent loading (only if boot.conf didn't load)
+        // ──────────────────────────────────────────────────────────
+        if !boot_conf_loaded {
+        serial_write("  [J118] Fallback: loading embedded agents (no boot.conf agents)\n");
 
         // ──────────────────────────────────────────────────────────
         // STEP A1: Load agent_llm_chat.elf as a QUEUED process
@@ -2425,10 +2505,12 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             }
         }
 
+        } // end if !boot_conf_loaded (hardcoded agent fallback)
+
         // ──────────────────────────────────────────────────────────
-        // STEP B: Load and LAUNCH agent_visual_term.elf FIRST (Jalon 65)
+        // STEP B: Load and LAUNCH agent_visual_term.elf ALWAYS (Jalon 65)
         // Interactive terminal: displays UI, reads keyboard, shows prompt.
-        // Launched first so user sees the interface immediately.
+        // Always loaded — it's the primary user interface.
         // ──────────────────────────────────────────────────────────
         let elf_binary = AGENT_VISUAL_TERM_ELF;
         let elf_name = "/bin/agent_visual_term.elf";

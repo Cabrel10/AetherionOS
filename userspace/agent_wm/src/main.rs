@@ -1228,6 +1228,14 @@ pub extern "C" fn main() -> i64 {
             desktop.hid_events += 1;
             let hid = decode_hid_event(evt);
 
+            // ESC key detection (scancode 0x01 = ESC in PS/2 Set 1)
+            if hid.event_type == HID_TYPE_KEYBOARD && hid.scancode == 0x01 {
+                println("[J108] ESC pressed - exiting Window Manager");
+                sys_bus_publish(INTENT_WM_DESKTOP_STATE, 1, 0);  // Notify WM exit
+                sys_write(1, b"[WM] ESC exit - returning to terminal\n");
+                return 0;  // Exit WM, return to terminal
+            }
+
             if hid.event_type == HID_TYPE_MOUSE {
                 // Erase old cursor
                 erase_cursor(desktop.cursor_x, desktop.cursor_y);

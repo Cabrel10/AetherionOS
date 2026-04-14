@@ -61,7 +61,8 @@ const KNOWN_CMDS: &[&[u8]] = &[b"help", b"clear", b"ls", b"cat", b"ps", b"mem", 
     b"run", b"llm", b"version", b"wget", b"shutdown", b"exit", b"whoami", b"uname",
     b"gen_driver", b"mkdir", b"touch", b"rm", b"ping", b"netstat", b"curl",
     b"kill", b"top", b"write", b"cp", b"echo", b"env", b"uptime", b"df", b"history",
-    b"mcp_test", b"orch_test", b"agi_test", b"pkg", b"tool_exec", b"net_auto", b"agent"];
+    b"mcp_test", b"orch_test", b"agi_test", b"pkg", b"tool_exec", b"net_auto", b"agent",
+    b"desktop", b"startx"];
 
 const INTENT_GEN_DRIVER: u64 = 0x9001;
 const INTENT_MCP_EXECUTE: u64 = 0x9002;
@@ -520,6 +521,9 @@ fn cmd_help(term: &mut Terminal) {
     term.put_str(b"  tool_exec <tool>   Execute native tool (claude_code/hermes/etc)\n", TEXT);
     term.put_str(b"  net_auto [mode]    Autonomous network operations\n", TEXT);
     term.put_str(b"  agent              Show active agent status\n", TEXT);
+    term.put_str(b" Desktop:\n", PROMPT);
+    term.put_str(b"  desktop            Launch Window Manager (GUI)\n", TEXT);
+    term.put_str(b"  startx             Alias for desktop\n", TEXT);
     term.put_str(b" Other:\n", PROMPT);
     term.put_str(b"  help  clear  shutdown  exit\n", TEXT);
     term.put_str(b"\n  Keys: Ctrl+C | Ctrl+L | Up/Down | Tab\n", DIM);
@@ -1356,6 +1360,8 @@ fn process_command(term: &mut Terminal) {
         cmd_agent_status(term);
     } else if bytes_eq(first_word, b"exec") {
         cmd_run(term, args);
+    } else if bytes_eq(first_word, b"desktop") || bytes_eq(first_word, b"startx") {
+        cmd_desktop(term);
     } else if bytes_eq(first_word, b"exit") || bytes_eq(first_word, b"quit") {
         term.put_char(b'\n', TEXT);
         term.put_str(b"Goodbye!\n", PROMPT);
@@ -2657,7 +2663,8 @@ fn cmd_pkg_install(term: &mut Terminal, url_bytes: &[u8]) {
 
     let rc = sys_tcp_connect(sock_fd as u32, ip, port);
     if rc < 0 {
-        term.put_str(b"[PKG] ERROR: TCP connect failed\n", ERR_COL);
+        term.put_str(b"[PKG] ERROR: TCP connect failed (timeout/refused)\n", ERR_COL);
+        sys_close(sock_fd as u32);  // Fix: close socket on connect failure
         term.put_char(b'\n', TEXT);
         return;
     }
@@ -2685,10 +2692,17 @@ fn cmd_pkg_install(term: &mut Terminal, url_bytes: &[u8]) {
 
     sys_tcp_send(sock_fd as u32, &req_buf[..rpos]);
 
-    // Read response
+    // Read response with retry and timeout protection
     let mut data_buf = [0u8; 4096];
-    let n = sys_tcp_read(sock_fd as u32, &mut data_buf);
+    let mut n: i64 = 0;
+    for _attempt in 0..30u32 {
+        for _ in 0..20 { sys_yield(); }
+        n = sys_tcp_read(sock_fd as u32, &mut data_buf);
+        if n > 0 { break; }
+        if n < -1 { break; }  // Hard error (e.g. -110 ETIMEDOUT)
+    }
     sys_tcp_shutdown(sock_fd as u32);
+    sys_close(sock_fd as u32);  // Fix: always close socket
 
     if n <= 0 {
         term.put_str(b"[PKG] ERROR: No response from server\n", ERR_COL);
@@ -2948,6 +2962,56 @@ fn cmd_agent_status(term: &mut Terminal) {
     term.put_str(b"    All tools dispatched via MCP JSON contracts\n", DIM);
     term.put_char(b'\n', TEXT);
     sys_write(1, b"[TERM] agent: status displayed\n");
+}
+
+// ═══════════════════════════════════════════════════
+// Desktop / Window Manager launcher
+// ═══════════════════════════════════════════════════
+
+fn cmd_desktop(term: &mut Terminal) {
+    term.put_char(b'\n', TEXT);
+    term.put_str(b"[DESKTOP] Launching Window Manager...\n", INFO_COL);
+    sys_write(1, b"[TERM] desktop: launching /bin/agent_wm.elf via fork+exec\n");
+
+    // Fork a child process to run the WM
+    let child_pid = sys_fork();
+    if child_pid < 0 {
+        term.put_str(b"[DESKTOP] ERROR: fork() failed\n", ERR_COL);
+        return;
+    }
+
+    if child_pid == 0 {
+        // Child: exec the window manager
+        sys_exec(b"/bin/agent_wm.elf\0");
+        // If exec fails, exit the child
+        sys_exit(1);
+    }
+
+    // Parent: wait for WM to exit (user pressed ESC)
+    term.put_str(b"[DESKTOP] Window Manager PID=", DIM);
+    // Print PID
+    let mut pbuf = [0u8; 20];
+    let mut pi = 20usize;
+    let mut pv = child_pid as u64;
+    if pv == 0 { pi -= 1; pbuf[pi] = b'0'; }
+    while pv > 0 && pi > 0 { pi -= 1; pbuf[pi] = b'0' + (pv % 10) as u8; pv /= 10; }
+    term.put_str(&pbuf[pi..20], DIM);
+    term.put_str(b" started (ESC to return)\n", DIM);
+    term.put_str(b"[DESKTOP] Waiting for WM exit...\n", DIM);
+
+    // Wait for child to exit
+    let _status = sys_wait(child_pid as u64);
+
+    // Redraw terminal chrome after WM exits
+    term.put_str(b"\n[DESKTOP] Window Manager exited, restoring terminal\n", INFO_COL);
+    sys_write(1, b"[TERM] desktop: WM exited, restoring terminal\n");
+
+    // Re-draw the terminal chrome and clear screen for fresh display
+    draw_chrome();
+    term.clear_screen();
+    term.put_str(b"AetherionOS v4.0 - Production Terminal\n", TEXT);
+    term.put_str(b"[DESKTOP] Returned from Window Manager.\n", INFO_COL);
+    term.put_char(b'\n', TEXT);
 }
 
 // ═══════════════════════════════════════════════════

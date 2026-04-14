@@ -11,6 +11,7 @@ set -uo pipefail
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BIN_CACHE="$PROJECT_DIR/bin_cache"
 SDK_DIR="$PROJECT_DIR/userspace/rust_sdk"
+SHARED_TARGET="$PROJECT_DIR/.agent_target"
 TARGET="x86_64-aetherion-user"
 TOTAL=0
 SUCCESS=0
@@ -65,23 +66,28 @@ for agent_dir in $AGENTS; do
     
     cd "$agent_dir"
     
-    # Build with single job, pointing to project root for target JSON
+    # Build with single job, shared target dir (caches core/alloc/SDK)
     BUILD_OUTPUT=$(RUST_TARGET_PATH="$PROJECT_DIR" CARGO_BUILD_JOBS=1 \
+        CARGO_TARGET_DIR="$SHARED_TARGET" \
         cargo build --release --target "$TARGET" 2>&1)
     BUILD_EXIT=$?
     
     if [ $BUILD_EXIT -eq 0 ]; then
-        # Find the binary
-        BINARY="$agent_dir/target/$TARGET/release/$agent_name"
+        # Find the binary (shared target dir)
+        BINARY="$SHARED_TARGET/$TARGET/release/$agent_name"
         if [ -f "$BINARY" ]; then
             SIZE=$(stat -c%s "$BINARY" 2>/dev/null || echo 0)
             cp "$BINARY" "$BIN_CACHE/$agent_name"
+            # Also copy to legacy location for kernel include_bytes!
+            LEGACY_DIR="$agent_dir/target/$TARGET/release"
+            mkdir -p "$LEGACY_DIR"
+            cp "$BINARY" "$LEGACY_DIR/$agent_name" 2>/dev/null
             echo "  [OK] $agent_name ($SIZE bytes) -> bin_cache/"
             SUCCESS=$((SUCCESS + 1))
         else
             echo "  [WARN] Built OK but binary not found at expected path"
-            # Try to find it
-            FOUND=$(find "$agent_dir/target" -name "$agent_name" -type f ! -name "*.d" ! -name "*.json" 2>/dev/null | head -1)
+            # Try to find it in shared target
+            FOUND=$(find "$SHARED_TARGET" -name "$agent_name" -type f ! -name "*.d" ! -name "*.json" 2>/dev/null | head -1)
             if [ -n "$FOUND" ]; then
                 SIZE=$(stat -c%s "$FOUND" 2>/dev/null || echo 0)
                 cp "$FOUND" "$BIN_CACHE/$agent_name"
@@ -100,9 +106,8 @@ for agent_dir in $AGENTS; do
         FAIL_LIST="$FAIL_LIST\n    - $agent_name (compile error)"
     fi
     
-    # Clean to free memory for next agent (keep bin_cache copy)
-    cd "$agent_dir"
-    cargo clean 2>/dev/null
+    # No clean needed — shared target dir caches SDK/core
+    # Memory freed naturally as each build completes
     echo ""
 done
 
