@@ -1894,7 +1894,7 @@ fn sys_yield() -> u64 {
 
     // Yield counter + periodic logging (sparse to avoid serial flood)
     let yc = YIELD_COUNT.fetch_add(1, AtomicOrdering::Relaxed) + 1;
-    if yc <= 20 || (yc <= 1000 && yc % 100 == 0) || yc % 100000 == 0 {
+    if yc <= 20 || yc % 100000 == 0 {
         crate::serial_write("[YIELD] ");
         print_u64_raw(current); crate::serial_write("->"); print_u64_raw(next);
         crate::serial_write(" #"); print_u64_raw(yc);
@@ -3726,10 +3726,7 @@ fn sys_bus_consume(buf_addr: u64) -> u64 {
                 core::ptr::write_volatile(ptr64.add(5), msg.correlation_id);
             }
             
-            crate::serial_println!(
-                "[SYSCALL] bus_consume: intent=0x{:X}, payload=0x{:X}",
-                msg.intent_id, msg.payload
-            );
+            // Silent — high-frequency path, no serial log
             let _cc = BUS_CON_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
             0
         }
@@ -4027,10 +4024,11 @@ fn sys_bus_consume_intent(buf_addr: u64, target_intent: u32) -> u64 {
 
             let cc = BUS_CON_COUNT.fetch_add(1, AtomicOrdering::Relaxed) + 1;
             let consume_pid = crate::scheduler::current_pid();
-            if cc <= 30 || cc % 100 == 0 {
+            // Log only first 5 and every 10000 to avoid serial flood
+            if cc <= 5 || cc % 10000 == 0 {
                 crate::serial_println!(
-                    "[SYSCALL] bus_consume_intent: PID={}, target=0x{:X}, matched intent=0x{:X}, payload=0x{:X}",
-                    consume_pid, target_intent, msg.intent_id, msg.payload
+                    "[SYSCALL] bus_consume_intent: PID={}, target=0x{:X}, #{}",
+                    consume_pid, target_intent, cc
                 );
             }
             // Level 8 Kernel-Mediated MCP Execution (ACHA §3.7.2).
@@ -4489,7 +4487,7 @@ fn sys_creat(path_addr: u64, _mode: u64) -> u64 {
         return EINVAL;
     }
 
-    crate::serial_println!("[SYSCALL] creat: '{}'", path_str);
+    // Silent — no log for creat (high-frequency from agent_memory)
 
     if path_str.starts_with("/disk/") {
         let disk_path = &path_str[6..];
@@ -4508,10 +4506,7 @@ fn sys_creat(path_addr: u64, _mode: u64) -> u64 {
         fd_table.alloc_fd(&path_str, flags)
     }).flatten();
     match fd_opt {
-        Some(fd) => {
-            crate::serial_println!("[SYSCALL] creat('{}') = FD {}", path_str, fd);
-            fd as u64
-        }
+        Some(fd) => fd as u64,
         None => ENOMEM,
     }
 }

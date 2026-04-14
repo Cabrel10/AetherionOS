@@ -365,17 +365,19 @@ fn handle_process_output(payload: u64, proc_output_count: &mut u64) {
     let hash_lo = payload & 0xFFFF_FFFF;
     *proc_output_count += 1;
 
-    print("[PIPE-COGNITIF] Process PID ");
-    print_u64(child_pid);
-    print(" output #");
-    print_u64(*proc_output_count);
-    print(" (hash=0x");
-    print_u64(hash_lo);
-    println(")");
+    // Log only every 500 events to avoid serial flood
+    if *proc_output_count % 500 == 1 {
+        print("[PIPE-COGNITIF] PID=");
+        print_u64(child_pid);
+        print(" events=");
+        print_u64(*proc_output_count);
+        print(" hash=0x");
+        print_u64(hash_lo);
+        println("");
+    }
 
     // Route to LLM for analysis if this is a substantial output
     if *proc_output_count <= 3 {
-        println("[PIPE-COGNITIF] Routing output to LLM for analysis");
         sys_bus_publish(INTENT_LLM_WAKEUP, 2, payload);
     }
 }
