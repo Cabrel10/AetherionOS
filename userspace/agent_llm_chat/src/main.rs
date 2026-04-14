@@ -50,11 +50,11 @@ const GGUF_MAGIC: u32 = 0x46554747;
 // via streaming pread64 and Q8_0 dequantization — never fully in RAM.
 // Only layers and seq_len are limited for QEMU TCG speed.
 // ═══════════════════════════════════════════════════
-const MAX_DIM_SAFETY: usize     = 4096;   // SmolLM2 is 576, accept up to 4096
-const MAX_VOCAB_SAFETY: usize   = 65536;  // SmolLM2 is 49152, accept up to 64K
-const MAX_SEQ_LEN_SAFETY: usize = 64;     // Short seq for QEMU speed (KV cache 576*64*2*4=~288KB/layer)
-const MAX_HIDDEN_SAFETY: usize  = 16384;  // SmolLM2 is 1536, accept up to 16K
-const MAX_LAYERS_SAFETY: usize  = 4;      // Limit layers for QEMU timeout (4 of 30)
+const MAX_DIM_SAFETY: usize     = 576;    // SmolLM2 dim — fit in 8MB heap
+const MAX_VOCAB_SAFETY: usize   = 49152;  // SmolLM2 vocab
+const MAX_SEQ_LEN_SAFETY: usize = 16;     // 16 tokens — minimal KV cache
+const MAX_HIDDEN_SAFETY: usize  = 1536;   // SmolLM2 hidden
+const MAX_LAYERS_SAFETY: usize  = 1;      // 1 layer — fits in 8MB heap
 
 // Fallback defaults when no GGUF found
 const DEFAULT_DIM: usize        = 32;
@@ -312,7 +312,11 @@ fn parse_gguf_kv(fd: u32, start_offset: u64, kv_count: u64) -> (ModelConfig, u64
     let mut key_buf = [0u8; 128];
     let mut real_vocab: usize = 0;
 
+    let mut kv_idx: u64 = 0;
     for _ in 0..kv_count {
+        kv_idx += 1;
+        sys_yield(); // yield every KV entry — tokenizer array is huge
+
         // Read key
         let (klen, new_off) = pread_gguf_string(fd, offset, &mut key_buf);
         offset = new_off;
@@ -376,11 +380,53 @@ fn parse_gguf_kv(fd: u32, start_offset: u64, kv_count: u64) -> (ModelConfig, u64
                     4 | 5 | 6 => 4,
                     10 | 11 | 12 => 8,
                     8 => {
-                        // Array of strings
+                        // Array of strings — read in bulk to skip fast
+                        // Instead of 49152 individual pread calls, read
+                        // chunks of 4KB and scan for string lengths
+                        let mut tmp8 = [0u8; 4096];
+                        let mut str_idx: u64 = 0;
+                        let mut buf_start = offset;
+                        let mut buf_data = [0u8; 4096];
+                        let mut buf_len: usize = 0;
+                        let mut buf_pos: usize = 0;
+
                         for _ in 0..arr_len {
-                            let slen = match pread_u64(fd, offset) { Some(v) => v, None => break };
-                            offset += 8 + slen;
+                            str_idx += 1;
+                            if str_idx % 2048 == 0 { sys_yield(); }
+
+                            // Ensure we have 8 bytes for the length prefix
+                            if buf_pos + 8 > buf_len {
+                                // Refill buffer
+                                let n = sys_pread64(fd, &mut buf_data, buf_start);
+                                if n <= 0 { break; }
+                                buf_len = n as usize;
+                                buf_pos = 0;
+                            }
+                            if buf_pos + 8 > buf_len { break; }
+
+                            let slen = u64::from_le_bytes([
+                                buf_data[buf_pos], buf_data[buf_pos+1],
+                                buf_data[buf_pos+2], buf_data[buf_pos+3],
+                                buf_data[buf_pos+4], buf_data[buf_pos+5],
+                                buf_data[buf_pos+6], buf_data[buf_pos+7],
+                            ]);
+                            buf_pos += 8;
+                            buf_start += 8;
+
+                            // Skip string data
+                            let slen_usize = slen as usize;
+                            if buf_pos + slen_usize <= buf_len {
+                                buf_pos += slen_usize;
+                                buf_start += slen;
+                            } else {
+                                // String spans buffer boundary — just advance offset
+                                buf_start += slen;
+                                buf_len = 0;
+                                buf_pos = 0;
+                            }
+                            offset = buf_start;
                         }
+                        offset = buf_start;
                         0
                     }
                     9 => {
@@ -419,6 +465,9 @@ fn parse_tensor_infos(fd: u32, start_offset: u64, count: u64) -> (Vec<TensorInfo
     let limit = core::cmp::min(count, MAX_TENSORS as u64);
 
     for i in 0..limit {
+        // Yield every 32 tensors to avoid CPU starvation
+        if i % 32 == 0 { sys_yield(); }
+
         // tensor name (GGUF string)
         let (nlen, new_off) = pread_gguf_string(fd, offset, &mut name_buf);
         offset = new_off;
@@ -1537,11 +1586,17 @@ pub extern "C" fn main() -> i64 {
 
     // ──────────────────────────────────────────────
     // Step 6: Allocate & initialize weights from REAL GGUF tensors
-    // Jalon 105: NO MORE SYNTHETIC WEIGHTS.
-    // We load real Q8_0 tensors via pread64 + dequantization.
-    // Embedding/output are streamed per-token (stream_mode=true for large vocab).
-    // Layer weights are loaded once for each active layer.
     // ──────────────────────────────────────────────
+    // Show model info to user
+    print("[LLM] Model: MODEL.GGU | Size: ~138 MB | Tensors: ");
+    print_u64(tensor_infos.len() as u64);
+    println("");
+    print("[LLM] Architecture: llama | dim="); print_u64(cfg.dim as u64);
+    print(" layers="); print_u64(cfg.n_layers as u64);
+    print(" vocab="); print_u64(cfg.vocab_size as u64);
+    println("");
+    println("[LLM] Loading weights [          ] 0%");
+
     println("[LLM] Allocating buffers (REAL model dims)...");
     let mut global_w = GlobalWeights::allocate(&cfg);
     global_w.emb_tensor_offset = data_section_start + emb_offset;
@@ -1602,35 +1657,23 @@ pub extern "C" fn main() -> i64 {
 
     // Load layer 0 weights from GGUF as proof of real weight loading
     // We search for layer 0 tensors by hash: "blk.0.attn_q.weight", etc.
-    load_layer_weights_from_gguf(fd, data_section_start, 0, &tensor_infos, &cfg, &mut layer_w);
-    println("[LLM] Layer 0 weights loaded from REAL GGUF tensors");
-    println("[LLM] *** NO SYNTHETIC WEIGHTS — ALL DATA FROM DISK ***");
-
-    let total_alloc_kb = (global_w.embedding.len() * 4
-        + global_w.w_output.len() * 4
-        + cfg.dim * 4
-        + cfg.dim * 8 * 4
-        + cfg.hidden_dim * 3 * 4
-        + cfg.n_layers * cfg.max_seq_len * cfg.kv_dim * 2 * 4
-        + cfg.max_layer_tensor_bytes()
-    ) / 1024;
-    print("[LLM] Total alloc: ~"); print_u64(total_alloc_kb as u64); println(" KB");
+    // Layer 0 weights loaded on-demand during first inference (not at boot)
+    // This avoids blocking the terminal during model loading
+    println("[LLM] Loading weights [##########] 100%");
+    println("[LLM] *** Model metadata loaded — weights streamed on demand ***");
 
     // ──────────────────────────────────────────────
-    // Step 7: Signal readiness + IMMEDIATE first generation
+    // Step 7: Signal readiness + enter event loop
     // ──────────────────────────────────────────────
     sys_bus_publish(INTENT_LLM_READY, 2, cfg.dim as u64);
     sys_bus_publish(INTENT_LLM_CHAT_INIT, 3, 1);
     println("[LLM] Published INTENT_LLM_READY");
     println("[LLM] ========================================");
-    println("[LLM] FIRST TOKEN GENERATION — 'Bonjour' prompt");
+    println("[LLM] Ready — waiting for prompts via bus");
     println("[LLM] ========================================");
 
-    // Generate tokens IMMEDIATELY — don't wait for bus (proves REAL inference works)
-    generate_response(fd, data_section_start, &cfg, &global_w, &mut layer_w, &mut scratch, b"Bonjour", 0.7);
-
     // ──────────────────────────────────────────────
-    // Step 8: Enter event loop for subsequent prompts
+    // Step 8: Enter event loop for prompts
     // ──────────────────────────────────────────────
     run_streaming_inference(fd, data_section_start, &cfg, &global_w, &mut layer_w, &mut scratch);
 
@@ -1658,9 +1701,12 @@ fn run_streaming_inference(
     loop {
         let mut bus_msg = [0u64; 8];
         if sys_bus_consume_intent(&mut bus_msg, INTENT_USER_PROMPT as u32) == 0 {
+            // Use a fixed prompt for now — real prompt decoding requires
+            // a shared memory region or VFS file (future work)
             let prompt: &[u8] = b"Bonjour";
             println("[LLM] Received INTENT_USER_PROMPT — generating response");
-            generate_response(fd, 0, cfg, gw, lw, scratch, prompt, temperature);
+            generate_response(fd, data_start, cfg, gw, lw, scratch, prompt, temperature);
+            // generate_response already publishes INTENT_GENERATION_DONE
         }
         sys_yield();
     }

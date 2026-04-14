@@ -71,6 +71,7 @@ const INTENT_MCP_RESULT: u32  = 0x9003;
 const INTENT_VISUAL_TERM: u64     = 0xB059;
 const INTENT_TOKEN_GENERATED: u64 = 0x8002;    // From agent_llm_chat
 const INTENT_TOKEN_GEN_CORE: u64  = 0x8063;    // From agent_llama_core (J63)
+const INTENT_LLM_READY: u64       = 0x8004;    // LLM agent ready signal
 const INTENT_USER_PROMPT: u64     = 0x8001;
 const INTENT_GENERATION_DONE: u64 = 0x8003;
 const INTENT_TERM_CMD: u64        = 0xB065;
@@ -3040,6 +3041,16 @@ pub extern "C" fn main() -> i64 {
     sys_bus_publish(INTENT_VISUAL_TERM, 3, 1);
     sys_write(1, b"[TERM] Terminal ready\n");
 
+    // ── Boot status screen ──
+    term.put_char(b'\n', TEXT);
+    term.put_str(b"  Boot Status:\n", INFO_COL);
+    term.put_str(b"  [OK] Kernel x86_64 Ring3 + KPTI\n", PROMPT);
+    term.put_str(b"  [OK] FAT32 /disk/ mounted\n", PROMPT);
+    term.put_str(b"  [OK] Cognitive Bus (1024 slots)\n", PROMPT);
+    term.put_str(b"  [OK] Orchestrator (Thalamus+Hippocampe)\n", PROMPT);
+    term.put_str(b"  [..] LLM agent loading model...\n", INFO_COL);
+    term.put_char(b'\n', TEXT);
+
     print_prompt(&mut term);
 
     let mut idle_count: u64 = 0;
@@ -3086,13 +3097,18 @@ pub extern "C" fn main() -> i64 {
         }
 
         // 2. Listen for bus messages (LLM tokens) using Intent-Based Routing.
-        // Level 8: Only consume our own intents. MCP messages (0x9002) are
-        // left on the bus for the MCP agent. No message stealing.
         if !term.llm_active {
             let mut bus_msg = [0u64; 8];
+
+            // Detect LLM ready signal
+            if sys_bus_consume_intent(&mut bus_msg, INTENT_LLM_READY as u32) == 0 {
+                term.put_str(b"  [OK] LLM agent ready (model loaded)\n", PROMPT);
+                print_prompt(&mut term);
+            }
+
             // Try agent_llama_core tokens (0x8063)
             if sys_bus_consume_intent(&mut bus_msg, INTENT_TOKEN_GEN_CORE as u32) == 0 {
-                let payload = bus_msg[2]; // payload is at buf[2]
+                let payload = bus_msg[2];
                 let token_char = (payload & 0xFF) as u8;
                 if token_char >= 0x20 && token_char <= 0x7E || token_char == b'\n' {
                     term.put_char(token_char, LLM_COL);

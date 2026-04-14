@@ -1295,39 +1295,16 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
             let mut temp_buf = [0u8; 256];
             let max_read = core::cmp::min(len as usize, temp_buf.len());
 
-            // Try immediate read first
-            let bytes_read = crate::process::kbd_read(&mut temp_buf, max_read);
-            if bytes_read > 0 {
+            // Non-blocking direct read — terminal loop yields between calls
+            let n = crate::process::kbd_read(&mut temp_buf, max_read);
+            if n > 0 {
                 unsafe {
                     let dst = buf_addr as *mut u8;
-                    for i in 0..bytes_read {
+                    for i in 0..n {
                         core::ptr::write_volatile(dst.add(i), temp_buf[i]);
                     }
                 }
-                return bytes_read as u64;
-            }
-
-            // No data: register as waiter, block once, yield, return 0
-            // Terminal loop handles retrying with its own yield
-            let current_pid = crate::scheduler::current_pid();
-            if current_pid != 0 {
-                crate::process::kbd_set_waiter(current_pid);
-                let _ = crate::process::set_state(
-                    current_pid,
-                    crate::process::ProcessState::Blocked,
-                );
-                sys_yield();
-                // One retry after waking
-                let n = crate::process::kbd_read(&mut temp_buf, max_read);
-                if n > 0 {
-                    unsafe {
-                        let dst = buf_addr as *mut u8;
-                        for i in 0..n {
-                            core::ptr::write_volatile(dst.add(i), temp_buf[i]);
-                        }
-                    }
-                    return n as u64;
-                }
+                return n as u64;
             }
             0
         }
