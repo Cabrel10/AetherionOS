@@ -1228,6 +1228,14 @@ pub extern "C" fn main() -> i64 {
             desktop.hid_events += 1;
             let hid = decode_hid_event(evt);
 
+            // Debug: log keyboard events
+            if hid.event_type == HID_TYPE_KEYBOARD {
+                sys_write(1, b"[WM-KBD] sc=");
+                let sc = hid.scancode;
+                sys_write(1, &[b'0' + (sc >> 4), b'0' + (sc & 0xF)]);
+                sys_write(1, b"\n");
+            }
+
             // ESC key detection (scancode 0x01 = ESC in PS/2 Set 1)
             if hid.event_type == HID_TYPE_KEYBOARD && hid.scancode == 0x01 {
                 println("[J108] ESC pressed - exiting Window Manager");

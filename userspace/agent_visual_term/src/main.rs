@@ -937,7 +937,7 @@ fn cmd_llm(term: &mut Terminal, prompt_bytes: &[u8]) {
     // Listen for token stream with timeout (real bus messages)
     let mut token_count: u32 = 0;
     let mut idle_ticks: u32 = 0;
-    let max_idle = 500u32; // timeout after ~500 yield cycles
+    let max_idle = 5000u32; // timeout after ~5000 yield cycles
 
     term.put_str(b"[LLM] ", LLM_COL);
     loop {
@@ -3039,52 +3039,6 @@ pub extern "C" fn main() -> i64 {
 
     sys_bus_publish(INTENT_VISUAL_TERM, 3, 1);
     sys_write(1, b"[TERM] Terminal ready\n");
-
-    // ── Level 7: Auto-run gen_driver at boot to validate codegen pipeline ──
-    sys_write(1, b"[TERM] Level 7: Auto-running gen_driver 1234:1111 (VGA probe)\n");
-    cmd_gen_driver(&mut term, b"1234:1111");
-    sys_write(1, b"[TERM] Level 7: gen_driver auto-test complete\n");
-
-    // ── Level 8: Auto-run mcp_test at boot to validate MCP pipeline ──
-    // Brief yield to let MCP agent initialize (it starts after terminal)
-    sys_write(1, b"[TERM] Level 8: Brief yield for MCP init...\n");
-    for _warmup in 0..30u32 { sys_yield(); }
-    sys_write(1, b"[TERM] Level 8: Auto-running mcp_test (MCP JSON contract validation)\n");
-    cmd_mcp_test(&mut term);
-    sys_write(1, b"[TERM] Level 8: mcp_test auto-test complete\n");
-
-    // ── Jalon 85: Auto-run orch_test at boot to validate Orchestrator pipeline ──
-    // Brief yield for orchestrator reflex memory load
-    sys_write(1, b"[TERM] Jalon 85: Brief yield for Orchestrator init...\n");
-    for _warmup in 0..20u32 { sys_yield(); }
-    sys_write(1, b"[TERM] Jalon 85: Auto-running orch_test (Thalamus + Hippocampe)\n");
-    cmd_orch_test(&mut term);
-    sys_write(1, b"[TERM] Jalon 85: orch_test auto-test complete\n");
-
-    // ── Jalon 95: BusyBox available on-demand (skip auto-launch to avoid stack overflow) ──
-    sys_write(1, b"[TERM] Jalon 95: busybox.elf available via 'run /disk/busybox.elf' (on-demand)\n");
-    sys_write(1, b"[TERM] Jalon 95: Linux ABI auto-test complete\n");
-
-    // ── Jalon 96: Auto-run AGI end-to-end pipeline test ──
-    // Brief yield for MCP to process previous contracts
-    for _warmup in 0..20u32 { sys_yield(); }
-    sys_write(1, b"[TERM] Jalon 96: Auto-running agi_test (End-to-End AGI Pipeline)\n");
-    cmd_agi_test(&mut term);
-    sys_write(1, b"[TERM] Jalon 96: agi_test complete\n");
-
-    // ── Jalon 103: Auto-run LLM end-to-end test with "bonjour" prompt ──
-    // Only run if LLM agent is actually loaded (check bus for INTENT_LLM_READY)
-    {
-        let mut bus_msg = [0u64; 8];
-        let llm_ready = sys_bus_consume_intent(&mut bus_msg, 0x8004u32) == 0; // INTENT_LLM_READY
-        if llm_ready {
-            sys_write(1, b"[TERM] Jalon 103: Auto-running 'llm bonjour' (SMP End-to-End)\n");
-            cmd_llm(&mut term, b"bonjour");
-            sys_write(1, b"[TERM] Jalon 103: LLM auto-test complete\n");
-        } else {
-            sys_write(1, b"[TERM] Jalon 103: LLM not loaded - skipping auto-test\n");
-        }
-    }
 
     print_prompt(&mut term);
 
