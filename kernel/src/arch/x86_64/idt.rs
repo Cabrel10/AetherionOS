@@ -899,6 +899,8 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     }
     // Ignore all other release codes (bit 7 set) — no logging
     if scancode & 0x80 != 0 {
+        // Push release event to HID ring for WM
+        crate::drivers::mouse::push_key_event(scancode & 0x7F, true);
         unsafe { super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET + 1); }
         return;
     }
@@ -908,6 +910,8 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
     if ascii != 0 {
         crate::process::kbd_push_byte(ascii);
     }
+    // Also push raw scancode to HID ring for WM/sys_poll_hid
+    crate::drivers::mouse::push_key_event(scancode, false);
 
     // EOI always sent
     unsafe { super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET + 1); }

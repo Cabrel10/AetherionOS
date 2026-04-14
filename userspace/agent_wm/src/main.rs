@@ -52,7 +52,7 @@ const TITLE_BAR_H: u32 = 28;  // Window title bar height
 
 // HID event type masks (from sys_poll_hid packed format)
 const HID_TYPE_MOUSE: u8 = 1;
-const HID_TYPE_KEYBOARD: u8 = 2;
+const HID_TYPE_KEYBOARD: u8 = 3;  // KeyPress = 3 (matches kernel HidEventType)
 
 // Maximum number of managed windows
 const MAX_WINDOWS: usize = 8;
