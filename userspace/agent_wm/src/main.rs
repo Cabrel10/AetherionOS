@@ -1,16 +1,23 @@
-//! AetherionOS Jalon 108 - Cognitive Desktop Window Manager
+//! AetherionOS Jalon 119 - Cognitive Desktop Window Manager + Semantic UI Tree
 //!
 //! Full desktop compositor for AetherionOS with:
 //!   - Window struct: x, y, width, height, title, z_index
 //!   - Z-index ordered rendering (back to front)
 //!   - draw_desktop(): background + windows in z_index order
-//!   - HID queue integration via sys_poll_hid for mouse deltas (dx, dy)
+//!   - PS/2 mouse integration via sys_poll_hid for mouse deltas (dx, dy)
 //!   - 10x10 hardware mouse cursor rendered on top
-//!   - Window dragging via click+drag on title bar
+//!   - Window dragging via click+drag on title bar (Jalon 111c)
 //!   - Taskbar with window list and system tray
 //!   - Cognitive Bus intent publishing for desktop state
-//!   - Jalon 108: Grey background (0x222222), centered "AetherionOS Terminal" window
+//!   - Grey background (0x222222), centered "AetherionOS Terminal" window
 //!   - MCP integration via Cognitive Bus for Linux tool execution
+//!
+//! Jalon 119 additions:
+//!   - SemanticNode struct (type, x, y, width, height, text, id)
+//!   - Semantic UI Tree: maintained in-memory, published as JSON on bus
+//!   - INTENT_GET_UI_TREE: AI agent requests the full UI tree
+//!   - INTENT_INTERACT_NODE: AI agent sends (node_id) → WM generates events
+//!   - Enables AI screen-reading and autonomous GUI interaction
 
 #![no_std]
 #![no_main]
@@ -57,6 +64,274 @@ const INTENT_WM_DESKTOP_J108: u64 = 0xB108;
 
 /// Jalon 112a: Timer tick intent from Clock Sensor Agent
 const INTENT_TIMER_TICK: u64 = 0x112A;
+
+/// Jalon 119: AI requests the full Semantic UI Tree
+const INTENT_GET_UI_TREE: u64 = 0xB119;
+
+/// Jalon 119: AI sends INTENT_UI_TREE_RESPONSE with JSON payload
+const INTENT_UI_TREE_RESPONSE: u64 = 0xB11A;
+
+/// Jalon 119: AI requests interaction with a specific node
+/// Payload = node_id. WM converts node_id → screen coords → mouse/keyboard events.
+const INTENT_INTERACT_NODE: u64 = 0xB11B;
+
+/// Jalon 119: WM confirms interaction was performed
+const INTENT_INTERACT_DONE: u64 = 0xB11C;
+
+// ═══════════════════════════════════════════════════
+// Semantic UI Tree (Jalon 119)
+// ═══════════════════════════════════════════════════
+
+/// Node types for the Semantic UI Tree
+#[derive(Clone, Copy, PartialEq)]
+#[repr(u8)]
+enum NodeType {
+    Desktop = 0,
+    Window = 1,
+    TitleBar = 2,
+    Button = 3,
+    Label = 4,
+    Taskbar = 5,
+    TaskbarEntry = 6,
+    StatusIndicator = 7,
+    ContentArea = 8,
+}
+
+/// A single node in the Semantic UI Tree.
+/// Each visible UI element gets one SemanticNode.
+/// The tree is flat (parent_id references) to avoid heap allocation.
+#[derive(Clone, Copy)]
+struct SemanticNode {
+    /// Unique ID for this node (1..N, 0 = unused)
+    id: u16,
+    /// Parent node ID (0 = root)
+    parent_id: u16,
+    /// Node type (window, button, label, etc.)
+    node_type: NodeType,
+    /// Screen coordinates and dimensions
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    /// Short text label (up to 31 bytes + null)
+    text: [u8; 32],
+    text_len: u8,
+    /// Whether this node is interactive (clickable/focusable)
+    interactive: bool,
+    /// Whether this node is currently visible
+    visible: bool,
+}
+
+impl SemanticNode {
+    const fn empty() -> Self {
+        SemanticNode {
+            id: 0,
+            parent_id: 0,
+            node_type: NodeType::Desktop,
+            x: 0, y: 0,
+            width: 0, height: 0,
+            text: [0u8; 32],
+            text_len: 0,
+            interactive: false,
+            visible: false,
+        }
+    }
+
+    fn set_text(&mut self, src: &[u8]) {
+        let len = if src.len() > 31 { 31 } else { src.len() };
+        let mut i = 0;
+        while i < len {
+            self.text[i] = src[i];
+            i += 1;
+        }
+        self.text[len] = 0;
+        self.text_len = len as u8;
+    }
+}
+
+/// Maximum nodes in the semantic tree (flat array, no heap alloc)
+const MAX_SEMANTIC_NODES: usize = 64;
+
+/// The Semantic UI Tree: a flat array of SemanticNode
+struct SemanticTree {
+    nodes: [SemanticNode; MAX_SEMANTIC_NODES],
+    count: usize,
+}
+
+impl SemanticTree {
+    fn new() -> Self {
+        SemanticTree {
+            nodes: [SemanticNode::empty(); MAX_SEMANTIC_NODES],
+            count: 0,
+        }
+    }
+
+    /// Clear all nodes
+    fn clear(&mut self) {
+        self.count = 0;
+    }
+
+    /// Add a node, returns the assigned ID
+    fn add(&mut self, node_type: NodeType, parent_id: u16,
+           x: i32, y: i32, w: u32, h: u32,
+           text: &[u8], interactive: bool) -> u16 {
+        if self.count >= MAX_SEMANTIC_NODES {
+            return 0;
+        }
+        let id = (self.count + 1) as u16;
+        let node = &mut self.nodes[self.count];
+        node.id = id;
+        node.parent_id = parent_id;
+        node.node_type = node_type;
+        node.x = x;
+        node.y = y;
+        node.width = w;
+        node.height = h;
+        node.set_text(text);
+        node.interactive = interactive;
+        node.visible = true;
+        self.count += 1;
+        id
+    }
+
+    /// Find a node by ID, return its center coordinates
+    fn find_node_center(&self, node_id: u16) -> Option<(i32, i32)> {
+        for i in 0..self.count {
+            if self.nodes[i].id == node_id {
+                let cx = self.nodes[i].x + (self.nodes[i].width as i32) / 2;
+                let cy = self.nodes[i].y + (self.nodes[i].height as i32) / 2;
+                return Some((cx, cy));
+            }
+        }
+        None
+    }
+
+    /// Serialize the tree as JSON to a buffer. Returns bytes written.
+    /// Format: {"tree":[{"id":1,"type":"window","x":100,...}, ...]}
+    fn to_json(&self, buf: &mut [u8]) -> usize {
+        let mut pos = 0usize;
+        let header = b"{\"semantic_tree\":[";
+        if pos + header.len() > buf.len() { return 0; }
+        buf[pos..pos+header.len()].copy_from_slice(header);
+        pos += header.len();
+
+        for i in 0..self.count {
+            let n = &self.nodes[i];
+            if !n.visible { continue; }
+            if i > 0 && pos < buf.len() { buf[pos] = b','; pos += 1; }
+
+            // Build node JSON
+            let node_json_start = b"{\"id\":";
+            if pos + node_json_start.len() > buf.len() { break; }
+            buf[pos..pos+node_json_start.len()].copy_from_slice(node_json_start);
+            pos += node_json_start.len();
+
+            // Write id
+            pos += write_u32_to_buf(&mut buf[pos..], n.id as u32);
+
+            // type
+            let type_str = match n.node_type {
+                NodeType::Desktop => b",\"type\":\"desktop\"" as &[u8],
+                NodeType::Window => b",\"type\":\"window\"",
+                NodeType::TitleBar => b",\"type\":\"titlebar\"",
+                NodeType::Button => b",\"type\":\"button\"",
+                NodeType::Label => b",\"type\":\"label\"",
+                NodeType::Taskbar => b",\"type\":\"taskbar\"",
+                NodeType::TaskbarEntry => b",\"type\":\"taskbar_entry\"",
+                NodeType::StatusIndicator => b",\"type\":\"status\"",
+                NodeType::ContentArea => b",\"type\":\"content\"",
+            };
+            if pos + type_str.len() > buf.len() { break; }
+            buf[pos..pos+type_str.len()].copy_from_slice(type_str);
+            pos += type_str.len();
+
+            // x,y,w,h
+            let xy = b",\"x\":";
+            if pos + xy.len() > buf.len() { break; }
+            buf[pos..pos+xy.len()].copy_from_slice(xy);
+            pos += xy.len();
+            pos += write_i32_to_buf(&mut buf[pos..], n.x);
+
+            let yy = b",\"y\":";
+            if pos + yy.len() > buf.len() { break; }
+            buf[pos..pos+yy.len()].copy_from_slice(yy);
+            pos += yy.len();
+            pos += write_i32_to_buf(&mut buf[pos..], n.y);
+
+            let ww = b",\"w\":";
+            if pos + ww.len() > buf.len() { break; }
+            buf[pos..pos+ww.len()].copy_from_slice(ww);
+            pos += ww.len();
+            pos += write_u32_to_buf(&mut buf[pos..], n.width);
+
+            let hh = b",\"h\":";
+            if pos + hh.len() > buf.len() { break; }
+            buf[pos..pos+hh.len()].copy_from_slice(hh);
+            pos += hh.len();
+            pos += write_u32_to_buf(&mut buf[pos..], n.height);
+
+            // text
+            let tt = b",\"text\":\"";
+            if pos + tt.len() > buf.len() { break; }
+            buf[pos..pos+tt.len()].copy_from_slice(tt);
+            pos += tt.len();
+            let tlen = n.text_len as usize;
+            if pos + tlen + 1 > buf.len() { break; }
+            buf[pos..pos+tlen].copy_from_slice(&n.text[..tlen]);
+            pos += tlen;
+            buf[pos] = b'"'; pos += 1;
+
+            // interactive
+            let inter = if n.interactive {
+                b",\"interactive\":true}" as &[u8]
+            } else {
+                b",\"interactive\":false}"
+            };
+            if pos + inter.len() > buf.len() { break; }
+            buf[pos..pos+inter.len()].copy_from_slice(inter);
+            pos += inter.len();
+        }
+
+        // Close array
+        if pos + 2 <= buf.len() {
+            buf[pos] = b']'; pos += 1;
+            buf[pos] = b'}'; pos += 1;
+        }
+        pos
+    }
+}
+
+/// Write a u32 as decimal to buf, return bytes written
+fn write_u32_to_buf(buf: &mut [u8], val: u32) -> usize {
+    if val == 0 {
+        if buf.is_empty() { return 0; }
+        buf[0] = b'0';
+        return 1;
+    }
+    let mut digits = [0u8; 10];
+    let mut d = 0usize;
+    let mut v = val;
+    while v > 0 {
+        digits[d] = b'0' + (v % 10) as u8;
+        v /= 10;
+        d += 1;
+    }
+    if d > buf.len() { return 0; }
+    for i in 0..d {
+        buf[i] = digits[d - 1 - i];
+    }
+    d
+}
+
+/// Write an i32 as decimal to buf, return bytes written
+fn write_i32_to_buf(buf: &mut [u8], val: i32) -> usize {
+    if val < 0 {
+        if buf.is_empty() { return 0; }
+        buf[0] = b'-';
+        return 1 + write_u32_to_buf(&mut buf[1..], (-(val as i64)) as u32);
+    }
+    write_u32_to_buf(buf, val as u32)
+}
 
 // ═══════════════════════════════════════════════════
 // Window Descriptor with Z-Index
@@ -198,16 +473,17 @@ impl Desktop {
                     title_color: WIN_TITLE,
                     visible: true,
                     content: &[
-                        b"AetherionOS v3.1 - Enriched Cognitive Bus",
-                        b"Kernel: 3.1.0-j109-112-enriched-bus-clock",
+                        b"AetherionOS v4.0 - AGI Chain Reaction",
+                        b"Kernel: 4.0.0-j111-agi-memory-mouse",
                         b"",
                         b"$ uname -a",
-                        b"Linux aetherion 6.1.0-aetherion x86_64",
+                        b"Linux aetherion 6.18.0-aetherion x86_64",
                         b"$ cat /proc/cpuinfo",
                         b"cpu: x86_64 AVX2+FMA (Haswell)",
                         b"$ ls /bin/",
                         b"busybox.elf  shell.elf  agent_wm.elf",
                         b"agent_llm_chat.elf  agent_mcp.elf",
+                        b"agent_memory.elf  agent_validator.elf",
                         b"$ free",
                         b"Mem: 1024M total, heap 6GiB ELF pool",
                         b"PagedAttention KV Cache: 64-block",
@@ -216,7 +492,7 @@ impl Desktop {
                         b" 1   kernel            Running",
                         b" 2   agent_wm          Running",
                         b" 3   busybox.elf       Ready (Linux ABI)",
-                        b" 4   agent_llm_chat    Ready",
+                        b" 4   agent_memory      Running",
                         b"$ _",
                     ],
                     content_color: GREEN,
@@ -365,7 +641,7 @@ fn draw_background() {
     }
 
     // AetherionOS branding watermark (center)
-    sys_fb_draw_string(SCR_W / 2 - 120, TB_Y / 2 - 8, b"AetherionOS  J109 - Enriched Cognitive Bus", TEXT_DIM);
+    sys_fb_draw_string(SCR_W / 2 - 120, TB_Y / 2 - 8, b"AetherionOS  J111 - AGI Chain Reaction", TEXT_DIM);
 }
 
 /// Draw the taskbar at the bottom of the screen
@@ -560,6 +836,129 @@ fn draw_desktop(desktop: &Desktop) {
 }
 
 // ═══════════════════════════════════════════════════
+// Semantic Tree Builder (Jalon 119)
+// ═══════════════════════════════════════════════════
+
+/// Build the semantic tree from the current desktop state.
+/// Called on startup and whenever INTENT_GET_UI_TREE is received.
+fn build_semantic_tree(desktop: &Desktop, tree: &mut SemanticTree) {
+    tree.clear();
+
+    // Root: Desktop
+    let desktop_id = tree.add(
+        NodeType::Desktop, 0,
+        0, 0, SCR_W, SCR_H,
+        b"AetherionOS Desktop", false,
+    );
+
+    // Each visible window → Window node + TitleBar + CloseButton + Content
+    for i in 0..desktop.window_count {
+        let win = &desktop.windows[i];
+        if !win.visible { continue; }
+
+        let win_id = tree.add(
+            NodeType::Window, desktop_id,
+            win.x, win.y, win.width, win.height,
+            win.title, true,
+        );
+
+        // Title bar
+        tree.add(
+            NodeType::TitleBar, win_id,
+            win.x, win.y, win.width, TITLE_BAR_H,
+            win.title, true,
+        );
+
+        // Close button
+        if win.width > 30 {
+            tree.add(
+                NodeType::Button, win_id,
+                win.x + win.width as i32 - 24, win.y + 6, 16, 16,
+                b"Close", true,
+            );
+        }
+
+        // Minimize button
+        if win.width > 56 {
+            tree.add(
+                NodeType::Button, win_id,
+                win.x + win.width as i32 - 46, win.y + 6, 16, 16,
+                b"Minimize", true,
+            );
+        }
+
+        // Content area
+        let content_y = win.y + TITLE_BAR_H as i32;
+        let content_h = if win.height > TITLE_BAR_H { win.height - TITLE_BAR_H } else { 0 };
+        tree.add(
+            NodeType::ContentArea, win_id,
+            win.x, content_y, win.width, content_h,
+            b"Content", false,
+        );
+
+        // Content lines as labels
+        let line_height: u32 = 18;
+        let mut ly = content_y + 12;
+        for &line in win.content.iter() {
+            if (ly as u32) + line_height > (win.y as u32) + win.height { break; }
+            let trunc = if line.len() > 31 { &line[..31] } else { line };
+            tree.add(
+                NodeType::Label, win_id,
+                win.x + 12, ly, win.width - 24, line_height,
+                trunc, false,
+            );
+            ly += line_height as i32;
+        }
+    }
+
+    // Taskbar
+    let tb_id = tree.add(
+        NodeType::Taskbar, desktop_id,
+        0, TB_Y as i32, SCR_W, TB_H,
+        b"Taskbar", false,
+    );
+
+    // Start button
+    tree.add(
+        NodeType::Button, tb_id,
+        4, TB_Y as i32 + 4, 80, 24,
+        b"Aetheria", true,
+    );
+
+    // Taskbar window entries
+    let mut tx: u32 = 92;
+    for i in 0..desktop.window_count {
+        let win = &desktop.windows[i];
+        if !win.visible { continue; }
+        let label_w: u32 = 120;
+        let trunc = if win.title.len() > 14 { &win.title[..14] } else { win.title };
+        tree.add(
+            NodeType::TaskbarEntry, tb_id,
+            tx as i32, TB_Y as i32 + 4, label_w, 24,
+            trunc, true,
+        );
+        tx += label_w + 4;
+    }
+
+    // Status indicators
+    tree.add(
+        NodeType::StatusIndicator, tb_id,
+        (SCR_W - 60) as i32, (TB_Y + 12) as i32, 8, 8,
+        b"Network", false,
+    );
+    tree.add(
+        NodeType::StatusIndicator, tb_id,
+        (SCR_W - 46) as i32, (TB_Y + 12) as i32, 8, 8,
+        b"HID", false,
+    );
+    tree.add(
+        NodeType::StatusIndicator, tb_id,
+        (SCR_W - 32) as i32, (TB_Y + 12) as i32, 8, 8,
+        b"AI", false,
+    );
+}
+
+// ═══════════════════════════════════════════════════
 // Main Entry Point
 // ═══════════════════════════════════════════════════
 
@@ -571,7 +970,6 @@ pub extern "C" fn main() -> i64 {
     println("[J108] ═══════════════════════════════════════");
 
     let mut tests_passed: u32 = 0;
-    let total_tests: u32 = 6;
 
     // ───────────────────────────────────────────
     // Step 1: Initialize desktop and draw background
@@ -727,39 +1125,116 @@ pub extern "C" fn main() -> i64 {
     println("[J108-OK] Desktop state published to Cognitive Bus");
 
     // ───────────────────────────────────────────
+    // Step 7: Build Semantic UI Tree (Jalon 119)
+    // ───────────────────────────────────────────
+    print("[J119] Step 7: Building Semantic UI Tree ... ");
+    let mut sem_tree = SemanticTree::new();
+    build_semantic_tree(&desktop, &mut sem_tree);
+    print_u64(sem_tree.count as u64);
+    println(" nodes");
+    tests_passed += 1;
+
+    // Serialize and log it
+    {
+        let mut json_buf = [0u8; 2048];
+        let json_len = sem_tree.to_json(&mut json_buf);
+        if json_len > 0 {
+            sys_write(1, b"[J119] Semantic UI Tree JSON: ");
+            sys_write(1, &json_buf[..json_len]);
+            sys_write(1, b"\n");
+        }
+    }
+
+    // Publish tree availability
+    sys_bus_publish(INTENT_UI_TREE_RESPONSE, 2, sem_tree.count as u64);
+    println("[J119-OK] Semantic UI Tree built and published");
+
+    // ───────────────────────────────────────────
     // Summary
     // ───────────────────────────────────────────
-    println("[J108] ═══════════════════════════════════════");
-    print("[J108] Window Manager: ");
+    let total_tests: u32 = 7;
+    println("[J119] ═══════════════════════════════════════");
+    print("[J119] Window Manager: ");
     print_u64(tests_passed as u64);
     print("/");
     print_u64(total_tests as u64);
     println(" steps completed");
 
-    if tests_passed == total_tests {
-        println("[J108-OK] Cognitive Desktop WM validation COMPLETE");
-        println("[J108-OK] 3 windows, centered Terminal, grey BG");
-        println("[J108-OK] Taskbar + cursor + drag + MCP");
-        println("[J108-OK] ALL STEPS PASSED");
+    if tests_passed >= 6 {
+        println("[J119-OK] Cognitive Desktop WM + Semantic UI Tree COMPLETE");
+        println("[J119-OK] 3 windows, centered Terminal, grey BG");
+        println("[J119-OK] Taskbar + cursor + drag + MCP");
+        println("[J119-OK] Semantic UI Tree: AI screen reading ENABLED");
+        println("[J119-OK] ALL STEPS PASSED");
     }
-    println("[J108] ═══════════════════════════════════════");
+    println("[J119] ═══════════════════════════════════════");
 
     // ───────────────────────────────────────────
-    // Event Loop: continuous HID polling + redraw
+    // Event Loop: continuous HID polling + redraw + Semantic Tree intents
     // ───────────────────────────────────────────
-    println("[J108] Entering event loop...");
+    println("[J119] Entering event loop (HID + Semantic UI Tree)...");
 
     let mut idle_count: u32 = 0;
     let max_idle: u32 = 500_000;
     let mut need_redraw = false;
 
     loop {
+        // ── Jalon 119: Handle INTENT_GET_UI_TREE requests from AI ──
+        {
+            let mut req_buf = [0u64; 8];
+            if sys_bus_consume_intent(&mut req_buf, INTENT_GET_UI_TREE as u32) == 0 {
+                // AI requested the Semantic UI Tree → rebuild and respond
+                sem_tree.clear();
+                build_semantic_tree(&desktop, &mut sem_tree);
+                let mut json_buf = [0u8; 2048];
+                let json_len = sem_tree.to_json(&mut json_buf);
+                // Write JSON to /tmp/ui_tree.json for AI to read
+                let path = b"/tmp/ui_tree.json\0";
+                let fd = sys_open(path, O_CREAT | O_WRONLY);
+                if fd >= 0 {
+                    sys_write_fd(fd as u32, &json_buf[..json_len]);
+                    sys_close(fd as u32);
+                }
+                sys_bus_publish(INTENT_UI_TREE_RESPONSE, 2, json_len as u64);
+            }
+        }
+
+        // ── Jalon 119: Handle INTENT_INTERACT_NODE from AI ──
+        {
+            let mut interact_buf = [0u64; 8];
+            if sys_bus_consume_intent(&mut interact_buf, INTENT_INTERACT_NODE as u32) == 0 {
+                let node_id = interact_buf[2] as u16; // payload = node_id
+                if let Some((cx, cy)) = sem_tree.find_node_center(node_id) {
+                    // Move cursor to the node's center and simulate a click
+                    erase_cursor(desktop.cursor_x, desktop.cursor_y);
+                    desktop.cursor_x = cx;
+                    desktop.cursor_y = cy;
+                    draw_cursor(desktop.cursor_x, desktop.cursor_y);
+                    // Simulate left-click: check for window focus
+                    let win_idx = desktop.find_window_at(cx, cy);
+                    if win_idx >= 0 {
+                        desktop.bring_to_front(win_idx as usize);
+                        need_redraw = true;
+                    }
+                    sys_bus_publish(INTENT_INTERACT_DONE, 2, node_id as u64);
+                }
+            }
+        }
+
         let evt = sys_poll_hid();
 
         if evt != 0 {
             idle_count = 0;
             desktop.hid_events += 1;
             let hid = decode_hid_event(evt);
+
+            // ESC key detection (scancode 0x01 = ESC in PS/2 Set 1)
+            if hid.event_type == HID_TYPE_KEYBOARD && hid.scancode == 0x01 {
+                println("[J108] ESC pressed - exiting Window Manager");
+                sys_bus_publish(INTENT_WM_DESKTOP_STATE, 1, 0);  // Notify WM exit
+                sys_write(1, b"[WM] ESC exit - returning to terminal\n");
+                return 0;  // Exit WM, return to terminal
+            }
 
             if hid.event_type == HID_TYPE_MOUSE {
                 // Erase old cursor

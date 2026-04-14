@@ -55,3 +55,13 @@ userspace/agent_mcp/target/
 userspace/agent_validator/target/
 userspace/agent_mcp/target/
 userspace/agent_validator/target/
+
+# Shared agent build target (compiled std libs)
+.agent_target/
+
+# Binary cache (agent ELFs)
+bin_cache/
+
+disk.img
+models/
+/tmp/

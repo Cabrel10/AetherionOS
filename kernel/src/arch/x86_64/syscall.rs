@@ -463,6 +463,11 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         231 => sys_stub_exit_group(a1),               // exit_group = exit
         257 => sys_stub_openat(a1, a2, a3),           // openat [routed to sys_open]
         262 => sys_stub_newfstatat(a1, a2, a3),       // newfstatat [stub]
+        220 => 0,                                      // semtimedop [stub — IPC semaphore]
+        221 => 0,                                      // fadvise64 [stub — posix_fadvise]
+        270 => 0,                                      // pselect6 [stub — synchronous I/O mux]
+        271 => 0,                                      // ppoll [stub — poll variant]
+        272 => 0,                                      // unshare [stub — namespace]
         273 => 0,                                      // set_robust_list [stub — musl init]
         302 => sys_stub_prlimit64(a1, a2, a3),        // prlimit64 [stub]
         318 => sys_stub_getrandom(a1, a2, a3),        // getrandom
@@ -1137,6 +1142,13 @@ fn sys_write(fd: u64, buf_addr: u64, len: u64) -> u64 {
                     }
                     asm!("sti", options(nomem, nostack));
                 }
+                // Jalon 118: Pipe Cognitif — capture child process stdout/stderr
+                // If this process is a child (PID > 10), publish output to Cognitive Bus
+                if current_pid > 10 && (fd == 1 || fd == 2) {
+                    crate::compat::linux_abi::cognitive_pipe_capture(
+                        current_pid, fd as u32, buf_addr, len
+                    );
+                }
             } else if n > 0 && validate_user_ptr(buf_addr, 1) {
                 let safe_len = core::cmp::min(n, 4096);
                 let ptr = buf_addr as *const u8;
@@ -1326,6 +1338,80 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
         }
 
         crate::process::FdType::File | crate::process::FdType::Pipe => {
+            // ═══ Jalon 110b: Dynamic /proc filesystem ═══
+            if path == "/proc/meminfo" {
+                let content = crate::compat::linux_abi::generate_proc_meminfo();
+                let bytes = content.as_bytes();
+                let start = offset as usize;
+                if start >= bytes.len() { return 0; }
+                let avail = bytes.len() - start;
+                let to_copy = core::cmp::min(avail, len as usize);
+                unsafe {
+                    let dst = buf_addr as *mut u8;
+                    for i in 0..to_copy {
+                        core::ptr::write_volatile(dst.add(i), bytes[start + i]);
+                    }
+                }
+                crate::process::with_fd_table_mut(current_pid, |fd_table| {
+                    if let Some(entry) = fd_table.get_mut(fd as usize) { entry.offset += to_copy as u64; }
+                });
+                return to_copy as u64;
+            }
+            if path == "/proc/cpuinfo" {
+                let content = crate::compat::linux_abi::generate_proc_cpuinfo();
+                let bytes = content.as_bytes();
+                let start = offset as usize;
+                if start >= bytes.len() { return 0; }
+                let avail = bytes.len() - start;
+                let to_copy = core::cmp::min(avail, len as usize);
+                unsafe {
+                    let dst = buf_addr as *mut u8;
+                    for i in 0..to_copy {
+                        core::ptr::write_volatile(dst.add(i), bytes[start + i]);
+                    }
+                }
+                crate::process::with_fd_table_mut(current_pid, |fd_table| {
+                    if let Some(entry) = fd_table.get_mut(fd as usize) { entry.offset += to_copy as u64; }
+                });
+                return to_copy as u64;
+            }
+            if path == "/proc/version" {
+                let content = crate::compat::linux_abi::generate_proc_version();
+                let bytes = content.as_bytes();
+                let start = offset as usize;
+                if start >= bytes.len() { return 0; }
+                let avail = bytes.len() - start;
+                let to_copy = core::cmp::min(avail, len as usize);
+                unsafe {
+                    let dst = buf_addr as *mut u8;
+                    for i in 0..to_copy {
+                        core::ptr::write_volatile(dst.add(i), bytes[start + i]);
+                    }
+                }
+                crate::process::with_fd_table_mut(current_pid, |fd_table| {
+                    if let Some(entry) = fd_table.get_mut(fd as usize) { entry.offset += to_copy as u64; }
+                });
+                return to_copy as u64;
+            }
+            if path == "/proc/self/status" {
+                let content = crate::compat::linux_abi::generate_proc_self_status();
+                let bytes = content.as_bytes();
+                let start = offset as usize;
+                if start >= bytes.len() { return 0; }
+                let avail = bytes.len() - start;
+                let to_copy = core::cmp::min(avail, len as usize);
+                unsafe {
+                    let dst = buf_addr as *mut u8;
+                    for i in 0..to_copy {
+                        core::ptr::write_volatile(dst.add(i), bytes[start + i]);
+                    }
+                }
+                crate::process::with_fd_table_mut(current_pid, |fd_table| {
+                    if let Some(entry) = fd_table.get_mut(fd as usize) { entry.offset += to_copy as u64; }
+                });
+                return to_copy as u64;
+            }
+
             // ═══ Linux ABI Pseudo-Device Intercepts (Jalon 93) ═══
             if path == "/dev/null" {
                 return 0; // EOF — /dev/null reads return 0 bytes
@@ -2256,6 +2342,11 @@ fn sys_exit(code: u64) -> u64 {
     );
 
     if current != 0 {
+        // Jalon 118: Pipe Cognitif — notify Cognitive Bus of process exit
+        if current > 10 {
+            crate::compat::linux_abi::cognitive_pipe_exit(current, code as i32);
+        }
+
         crate::process::set_exit_code(current, code as i32);
         let _ = crate::process::set_state(
             current,
@@ -3067,7 +3158,7 @@ fn sys_dup2(oldfd: u32, newfd: u32) -> u64 {
 /// Writes entries as newline-separated filenames into buf.
 /// Returns total bytes written on success.
 fn sys_getdents(fd: u32, buf_ptr: u64, buf_size: u64) -> u64 {
-    crate::serial_println!("[SYSCALL] sys_getdents(fd={}, buf=0x{:X}, size={})", fd, buf_ptr, buf_size);
+    // Silenced: getdents is called frequently by ls/shell (reduce serial spam)
     
     if buf_ptr == 0 || buf_ptr >= USER_ADDR_LIMIT || buf_size == 0 {
         return EINVAL;
@@ -3082,7 +3173,7 @@ fn sys_getdents(fd: u32, buf_ptr: u64, buf_size: u64) -> u64 {
         None => return EBADF,
     };
     
-    crate::serial_println!("[SYSCALL] getdents: listing directory '{}'", dir_path);
+    // Silenced: directory listing path (reduce serial spam)
     
     // Handle /disk/ paths via FAT32 real directory listing
     let is_disk = dir_path.starts_with("/disk/") || dir_path == "/disk";
@@ -3133,7 +3224,7 @@ fn sys_getdents(fd: u32, buf_ptr: u64, buf_size: u64) -> u64 {
                 core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_ptr as *mut u8, to_copy);
             }
         }
-        crate::serial_println!("[SYSCALL] getdents: returned {} bytes ({} FAT32 entries)", to_copy, entries.len());
+        // Silenced: FAT32 getdents result (reduce serial spam)
         return to_copy as u64;
     }
     
@@ -3195,7 +3286,7 @@ fn sys_getdents(fd: u32, buf_ptr: u64, buf_size: u64) -> u64 {
         }
     }
     
-    crate::serial_println!("[SYSCALL] getdents: returned {} bytes ({} VFS entries)", to_copy, entries.len());
+    // Silenced: VFS getdents result (reduce serial spam)
     to_copy as u64
 }
 
@@ -5510,4 +5601,14 @@ pub fn saved_user_rip_pub() -> u64 {
 /// Public wrapper for sys_exec, used by compat::linux_abi (MCP run_linux_tool)
 pub fn sys_exec_pub(path_addr: u64) -> u64 {
     sys_exec(path_addr)
+}
+
+/// Public wrapper for sys_close, used by compat::linux_abi (stat_vfs)
+pub fn sys_close_pub(fd: u32) -> u64 {
+    sys_close(fd)
+}
+
+/// Public wrapper for sys_seek (lseek), used by compat::linux_abi (stat_vfs, fstat_vfs)
+pub fn sys_lseek_pub(fd: u32, offset: i64, whence: u32) -> u64 {
+    sys_seek(fd, offset, whence)
 }

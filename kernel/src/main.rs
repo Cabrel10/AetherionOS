@@ -197,6 +197,14 @@ static AGENT_VALIDATOR_ELF: &[u8] = include_bytes!("../../userspace/agent_valida
 /// Publishes INTENT_TIMER_TICK (0x112A) every second for uptime tracking.
 static AGENT_CLOCK_ELF: &[u8] = include_bytes!("../../userspace/agent_clock/target/x86_64-aetherion-user/release/agent_clock");
 
+/// agent_memory - Jalon 111a: Episodic Memory Agent (Ring 3)
+/// Logs all Cognitive Bus traffic to /disk/var/memory.db for persistence.
+static AGENT_MEMORY_ELF: &[u8] = include_bytes!("../../userspace/agent_memory/target/x86_64-aetherion-user/release/agent_memory");
+
+/// agent_autonomous - Jalon 113-114: Autonomous AGI Execution Agent (Ring 3)
+/// HTTP/DNS/FS/MCP/NetScan/Crawl/API — real autonomous operations.
+static AGENT_AUTONOMOUS_ELF: &[u8] = include_bytes!("../../userspace/agent_autonomous/target/x86_64-aetherion-user/release/agent_autonomous");
+
 /// Busybox 1.35.0 - statically linked x86_64 musl Linux binary
 /// Jalon 94-95: Native Linux binary execution via Linuxulator
 static BUSYBOX_ELF: &[u8] = include_bytes!("../../userspace/busybox.elf");
@@ -1340,7 +1348,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_write("       [OK] TPM stub + PCR0 + stack protector\n");
     security::kpti::init();
     serial_write("       [OK] KPTI-Lite: kernel/user page table isolation active\n");
-    serial_write("       [OK] Linuxulator: Linux ABI compatibility layer active (uname=Linux 6.1.0-aetherion)\n");
+    serial_write("       [OK] Linuxulator: Linux ABI compatibility layer active (uname=Linux 6.18.0-aetherion)\n");
 
     serial_write("\n[BOOT] Phase 2: Memory & Filesystem\n");
     serial_write("[BOOT] ──────────────────────────────────────\n");
@@ -1390,6 +1398,45 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 serial_write("       [OK] IPC pub/consume verified\n");
             }
         }
+
+        // Jalon 119: Register Reflex Rules
+        // Route INTENT_GET_UI_TREE (0xB119) directly to WM without LLM
+        ipc::bus::register_reflex(0xB119, ipc::bus::ReflexAction {
+            target: ComponentId::Worker,
+            emit_intent: 0xB119,
+            priority: Priority::High,
+            pass_through: false,
+        });
+        // Route INTENT_INTERACT_NODE (0xB11B) directly to WM
+        ipc::bus::register_reflex(0xB11B, ipc::bus::ReflexAction {
+            target: ComponentId::Worker,
+            emit_intent: 0xB11B,
+            priority: Priority::High,
+            pass_through: false,
+        });
+        // Route INTENT_TIMER_TICK (0x112A) directly to WM
+        ipc::bus::register_reflex(0x112A, ipc::bus::ReflexAction {
+            target: ComponentId::Worker,
+            emit_intent: 0x112A,
+            priority: Priority::Low,
+            pass_through: true,
+        });
+        // Jalon 118: Route INTENT_PROCESS_OUTPUT (0xC001) to Orchestrator for AI routing
+        ipc::bus::register_reflex(0xC001, ipc::bus::ReflexAction {
+            target: ComponentId::Orchestrator,
+            emit_intent: 0xC001,
+            priority: Priority::Normal,
+            pass_through: true,  // Also keep on bus for terminal display
+        });
+        // Jalon 118: Route INTENT_PROCESS_EXIT (0xC002) to Orchestrator
+        ipc::bus::register_reflex(0xC002, ipc::bus::ReflexAction {
+            target: ComponentId::Orchestrator,
+            emit_intent: 0xC002,
+            priority: Priority::High,
+            pass_through: true,
+        });
+        serial_println!("       [OK] Reflex Engine: {} rules registered (incl. Pipe Cognitif)",
+                         ipc::bus::reflex_rule_count());
     }
 
     // === Step 7: VFS (Couche 4) ===
@@ -1591,6 +1638,8 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 ("agent_mcp.elf", AGENT_MCP_ELF),
                 ("agent_validator.elf", AGENT_VALIDATOR_ELF),
                 ("agent_clock.elf", AGENT_CLOCK_ELF),
+                ("agent_memory.elf", AGENT_MEMORY_ELF),
+                ("agent_autonomous.elf", AGENT_AUTONOMOUS_ELF),
                 ("busybox.elf", BUSYBOX_ELF),
             ];
             let mut mounted = 0u32;
@@ -2129,6 +2178,130 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             serial_println!("  [IPC] Drained {} old messages from Cognitive Bus", drained);
         }
 
+        // ══════════════════════════════════════════════════════════
+        // JALON 117a: Dynamic Agent Loading via /disk/etc/boot.conf
+        // ══════════════════════════════════════════════════════════
+        // If /disk/etc/boot.conf exists on FAT32, parse it to determine
+        // which agents to load. Format:
+        //   # AetherionOS boot.conf - Dynamic agent configuration
+        //   load /bin/agent_wm.elf core=0
+        //   load /bin/agent_llm_chat.elf core=1
+        //   load /bin/agent_mcp.elf core=0 watchdog
+        //   set vm.swappiness=10
+        //   set kernel.hz=1000
+        //
+        // If boot.conf is NOT found, fall back to hardcoded loading below.
+        // This eliminates the need to recompile the kernel to add/remove agents.
+        // ══════════════════════════════════════════════════════════
+        // ══════════════════════════════════════════════════════════
+        // JALON 118: Dynamic Init System via /disk/etc/boot.conf
+        // Parse boot.conf and spawn each listed agent from embedded ELF
+        // ══════════════════════════════════════════════════════════
+        let mut boot_conf_loaded = false;
+        {
+            let boot_conf_data = fs::fat32::read_file_path("etc/boot.conf");
+            if let Some(ref conf_data) = boot_conf_data {
+                serial_write("\n  [J118] ══════════════════════════════════════\n");
+                serial_write("  [J118] Dynamic Init System — boot.conf FOUND\n");
+                serial_println!("  [J118] boot.conf size: {} bytes", conf_data.len());
+                let conf_str = core::str::from_utf8(conf_data).unwrap_or("");
+                let mut load_count = 0u32;
+                let mut spawn_count = 0u32;
+                let mut sysctl_count = 0u32;
+
+                for line in conf_str.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() || trimmed.starts_with('#') { continue; }
+
+                    if trimmed.starts_with("load ") {
+                        load_count += 1;
+                        // Parse: "load /bin/agent_name.elf [core=N] [watchdog]"
+                        let rest = &trimmed[5..];
+                        let mut parts = rest.split_whitespace();
+                        let elf_path = parts.next().unwrap_or("");
+                        let mut target_core: Option<u8> = None;
+                        let mut watchdog = false;
+                        for opt in parts {
+                            if opt.starts_with("core=") {
+                                target_core = opt[5..].parse().ok();
+                            } else if opt == "watchdog" {
+                                watchdog = true;
+                            }
+                        }
+
+                        serial_println!("  [J118] Loading: {} (core={:?}, watchdog={})", elf_path, target_core, watchdog);
+
+                        // Match embedded ELF by path name
+                        let elf_data: Option<&[u8]> = match elf_path {
+                            "/bin/agent_orchestrator.elf" => Some(AGENT_ORCHESTRATOR_ELF),
+                            "/bin/agent_mcp.elf" => Some(AGENT_MCP_ELF),
+                            "/bin/agent_llama_core.elf" => Some(AGENT_LLAMA_CORE_ELF),
+                            "/bin/agent_llm_chat.elf" => Some(AGENT_LLM_CHAT_ELF),
+                            "/bin/agent_visual_term.elf" => Some(AGENT_VISUAL_TERM_ELF),
+                            "/bin/agent_wm.elf" => Some(AGENT_WM_ELF),
+                            "/bin/agent_clock.elf" => Some(AGENT_CLOCK_ELF),
+                            "/bin/agent_memory.elf" => Some(AGENT_MEMORY_ELF),
+                            "/bin/agent_autonomous.elf" => Some(AGENT_AUTONOMOUS_ELF),
+                            "/bin/agent_validator.elf" => Some(AGENT_VALIDATOR_ELF),
+                            "/bin/agent_terminal.elf" => Some(AGENT_TERMINAL_ELF),
+                            "/bin/agent_net.elf" => Some(AGENT_NET_ELF),
+                            "/bin/agent_input.elf" => Some(AGENT_INPUT_ELF),
+                            "/bin/agent_sysinfo.elf" => Some(AGENT_SYSINFO_ELF),
+                            _ => {
+                                serial_println!("  [J118] WARN: Unknown ELF '{}' — skipping", elf_path);
+                                None
+                            }
+                        };
+
+                        if let Some(binary) = elf_data {
+                            match elf::load_elf_binary(binary) {
+                                Ok(result) => {
+                                    let pid = process::spawn_userspace(
+                                        elf_path, 0,
+                                        result.entry_point, result.stack_pointer, result.pml4_phys
+                                    ).unwrap_or(0);
+                                    if pid != 0 {
+                                        if result.is_linux_abi {
+                                            process::set_abi(pid, compat::linux_abi::Abi::Linux);
+                                            compat::linux_abi::log_linux_abi_activation(pid, elf_path);
+                                        }
+                                        if let Some(core_id) = target_core {
+                                            process::set_cpu_affinity(pid, core_id);
+                                        }
+                                        scheduler::enqueue_process(pid);
+                                        if watchdog {
+                                            process::watchdog_register(elf_path, target_core.unwrap_or(0));
+                                        }
+                                        spawn_count += 1;
+                                        serial_println!("  [J118] OK {} PID={} QUEUED", elf_path, pid);
+                                    }
+                                }
+                                Err(_e) => {
+                                    serial_println!("  [J118] FAIL {} load error", elf_path);
+                                }
+                            }
+                        }
+                    } else if trimmed.starts_with("set ") {
+                        sysctl_count += 1;
+                        serial_println!("  [J118] sysctl: {}", trimmed);
+                    }
+                }
+
+                serial_println!("  [J118] Dynamic Init: {} directives, {} spawned, {} sysctl",
+                    load_count, spawn_count, sysctl_count);
+                serial_write("  [J118] ══════════════════════════════════════\n");
+                boot_conf_loaded = spawn_count > 0;
+            } else {
+                serial_write("  [J118] No /disk/etc/boot.conf — using embedded agent loading\n");
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────
+        // Fallback: Hardcoded agent loading (only if boot.conf didn't load)
+        // ──────────────────────────────────────────────────────────
+        if !boot_conf_loaded {
+        serial_write("  [J118] Fallback: loading embedded agents (no boot.conf agents)\n");
+
         // ──────────────────────────────────────────────────────────
         // STEP A1: Load agent_llm_chat.elf as a QUEUED process
         // Level 2: Re-enabled to verify GGUF header parsing via sys_pread64
@@ -2141,15 +2314,14 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     chat_result.entry_point, chat_result.stack_pointer, chat_result.pml4_phys
                 ).unwrap_or(0);
                 if chat_pid != 0 {
-                    // Jalon 102: Pin LLM chat agent to Core 1 for true SMP execution.
-                    process::set_cpu_affinity(chat_pid, 1);
+                    // Jalon 102: LLM chat agent shared across cores for fair scheduling.
                     // Jalon 105: Set ABI based on ELF detection
                     if chat_result.is_linux_abi {
                         process::set_abi(chat_pid, compat::linux_abi::Abi::Linux);
                         compat::linux_abi::log_linux_abi_activation(chat_pid, "agent_llm_chat.elf");
                     }
                     scheduler::enqueue_process(chat_pid);
-                    serial_write("  [J102] agent_llm_chat.elf: QUEUED on Core 1 (SMP Ring 3)\n");
+                    serial_write("  [J102] agent_llm_chat.elf: QUEUED (SMP Ring 3)\n");
                 }
             }
             Err(_e) => {
@@ -2196,10 +2368,10 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     llama_entry, llama_stack, llama_pml4
                 ).unwrap_or(0);
                 if llama_pid != 0 {
-                    // Jalon 102: Pin LLM core agent to Core 1 for true SMP execution.
-                    process::set_cpu_affinity(llama_pid, 1);
+                    // Jalon 102: LLM core agent shared across cores for fair scheduling.
+                    // Previously pinned to Core 1, but YIELD-SELF loops blocked other agents.
                     scheduler::enqueue_process(llama_pid);
-                    serial_write("  [J102] agent_llama_core.elf: QUEUED on Core 1 (SMP Ring 3)\n");
+                    serial_write("  [J102] agent_llama_core.elf: QUEUED (SMP Ring 3)\n");
                 }
             }
             Err(_e) => {
@@ -2261,31 +2433,12 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         }
 
         // ──────────────────────────────────────────────────────────
-        // STEP A6: Load busybox.elf as a QUEUED process (Jalon 94-95)
-        // Native Linux binary execution via Linuxulator ABI
-        // Busybox is a statically linked musl binary (OSABI=0)
-        // We force Linux ABI since it's a real Linux binary
+        // STEP A6: BusyBox Linux ABI binary (mounted only, not auto-launched)
+        // BusyBox is available at /bin/busybox.elf for on-demand execution
+        // via the terminal's 'run /disk/busybox.elf' command (fork+exec).
+        // Auto-launching caused stack overflow (#DF) due to musl init size.
         // ──────────────────────────────────────────────────────────
-        match elf::load_elf_binary(BUSYBOX_ELF) {
-            Ok(bb_result) => {
-                let bb_pid = process::spawn_userspace(
-                    "/bin/busybox.elf", 0,
-                    bb_result.entry_point, bb_result.stack_pointer, bb_result.pml4_phys
-                ).unwrap_or(0);
-                if bb_pid != 0 {
-                    // Force Linux ABI — busybox is a real Linux binary
-                    process::set_abi(bb_pid, compat::linux_abi::Abi::Linux);
-                    compat::linux_abi::log_linux_abi_activation(bb_pid, "busybox.elf");
-                    // Pin to Core 0 (BSP) for stability
-                    process::set_cpu_affinity(bb_pid, 0);
-                    scheduler::enqueue_process(bb_pid);
-                    serial_println!("  [J94] busybox.elf: QUEUED on Core 0 (Linux ABI, {} bytes)", BUSYBOX_ELF.len());
-                }
-            }
-            Err(_e) => {
-                serial_write("  [J94] WARN: busybox.elf load failed\n");
-            }
-        }
+        serial_println!("  [J94] busybox.elf: MOUNTED at /bin/ ({} bytes, on-demand via terminal)", BUSYBOX_ELF.len());
 
         // ──────────────────────────────────────────────────────────
         // STEP A7: Load agent_clock.elf (Jalon 112a - Clock Sensor Agent)
@@ -2310,9 +2463,54 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         }
 
         // ──────────────────────────────────────────────────────────
-        // STEP B: Load and LAUNCH agent_visual_term.elf FIRST (Jalon 65)
+        // STEP A8: Load agent_memory.elf (Jalon 111a - Episodic Memory Agent)
+        // Logs all Cognitive Bus traffic to /disk/var/memory.db for persistence.
+        // Assigned to Core 0 (lightweight logger, minimal CPU usage).
+        // ──────────────────────────────────────────────────────────
+        match elf::load_elf_binary(AGENT_MEMORY_ELF) {
+            Ok(mem_result) => {
+                let mem_pid = process::spawn_userspace(
+                    "/bin/agent_memory.elf", 0,
+                    mem_result.entry_point, mem_result.stack_pointer, mem_result.pml4_phys
+                ).unwrap_or(0);
+                if mem_pid != 0 {
+                    process::set_cpu_affinity(mem_pid, 0);
+                    scheduler::enqueue_process(mem_pid);
+                    serial_println!("  [J111a] agent_memory.elf: QUEUED on Core 0 ({} bytes, Episodic Memory)", AGENT_MEMORY_ELF.len());
+                }
+            }
+            Err(_e) => {
+                serial_write("  [J111a] WARN: agent_memory.elf load failed\n");
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────
+        // STEP A9: Load agent_autonomous.elf (Jalon 113-114 - Autonomous AGI Agent)
+        // HTTP/DNS/FS/MCP/NetScan/Crawl/API — real autonomous operations.
+        // Assigned to Core 1 (heavy compute: network + I/O).
+        // ──────────────────────────────────────────────────────────
+        match elf::load_elf_binary(AGENT_AUTONOMOUS_ELF) {
+            Ok(auto_result) => {
+                let auto_pid = process::spawn_userspace(
+                    "/bin/agent_autonomous.elf", 0,
+                    auto_result.entry_point, auto_result.stack_pointer, auto_result.pml4_phys
+                ).unwrap_or(0);
+                if auto_pid != 0 {
+                    scheduler::enqueue_process(auto_pid);
+                    serial_println!("  [J113] agent_autonomous.elf: QUEUED ({} bytes, Autonomous AGI)", AGENT_AUTONOMOUS_ELF.len());
+                }
+            }
+            Err(_e) => {
+                serial_write("  [J113] WARN: agent_autonomous.elf load failed\n");
+            }
+        }
+
+        } // end if !boot_conf_loaded (hardcoded agent fallback)
+
+        // ──────────────────────────────────────────────────────────
+        // STEP B: Load and LAUNCH agent_visual_term.elf ALWAYS (Jalon 65)
         // Interactive terminal: displays UI, reads keyboard, shows prompt.
-        // Launched first so user sees the interface immediately.
+        // Always loaded — it's the primary user interface.
         // ──────────────────────────────────────────────────────────
         let elf_binary = AGENT_VISUAL_TERM_ELF;
         let elf_name = "/bin/agent_visual_term.elf";

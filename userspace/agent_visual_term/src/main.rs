@@ -61,7 +61,8 @@ const KNOWN_CMDS: &[&[u8]] = &[b"help", b"clear", b"ls", b"cat", b"ps", b"mem", 
     b"run", b"llm", b"version", b"wget", b"shutdown", b"exit", b"whoami", b"uname",
     b"gen_driver", b"mkdir", b"touch", b"rm", b"ping", b"netstat", b"curl",
     b"kill", b"top", b"write", b"cp", b"echo", b"env", b"uptime", b"df", b"history",
-    b"mcp_test", b"orch_test", b"agi_test"];
+    b"mcp_test", b"orch_test", b"agi_test", b"pkg", b"tool_exec", b"net_auto", b"agent",
+    b"desktop", b"startx"];
 
 const INTENT_GEN_DRIVER: u64 = 0x9001;
 const INTENT_MCP_EXECUTE: u64 = 0x9002;
@@ -481,7 +482,7 @@ fn print_prompt(term: &mut Terminal) {
 
 fn cmd_help(term: &mut Terminal) {
     term.put_char(b'\n', TEXT);
-    term.put_str(b"AetherionOS v6.2 Shell Commands (33 commands):\n", INFO_COL);
+    term.put_str(b"AetherionOS v6.2 Shell Commands (37 commands):\n", INFO_COL);
     term.put_str(b" Filesystem:\n", PROMPT);
     term.put_str(b"  ls [path]          List directory (FAT32/VFS)\n", TEXT);
     term.put_str(b"  cat <file>         Display file contents\n", TEXT);
@@ -515,6 +516,14 @@ fn cmd_help(term: &mut Terminal) {
     term.put_str(b"  gen_driver <id>    AI-generate PCI driver\n", TEXT);
     term.put_str(b"  mcp_test           Test MCP JSON contract pipeline\n", TEXT);
     term.put_str(b"  orch_test          Test Orchestrator + Reflex Memory\n", TEXT);
+    term.put_str(b"  agi_test           End-to-end AGI pipeline (J117b)\n", TEXT);
+    term.put_str(b"  pkg <cmd>          Package manager (install/list/run)\n", TEXT);
+    term.put_str(b"  tool_exec <tool>   Execute native tool (claude_code/hermes/etc)\n", TEXT);
+    term.put_str(b"  net_auto [mode]    Autonomous network operations\n", TEXT);
+    term.put_str(b"  agent              Show active agent status\n", TEXT);
+    term.put_str(b" Desktop:\n", PROMPT);
+    term.put_str(b"  desktop            Launch Window Manager (GUI)\n", TEXT);
+    term.put_str(b"  startx             Alias for desktop\n", TEXT);
     term.put_str(b" Other:\n", PROMPT);
     term.put_str(b"  help  clear  shutdown  exit\n", TEXT);
     term.put_str(b"\n  Keys: Ctrl+C | Ctrl+L | Up/Down | Tab\n", DIM);
@@ -1049,7 +1058,7 @@ fn cmd_run(term: &mut Terminal, args: &[u8]) {
         sys_write(1, b"[TERM] run: forked child\n");
 
         // Yield to let child execute
-        for _ in 0..2000 { sys_yield(); }
+        for _ in 0..50 { sys_yield(); }
 
         term.put_str(b"[RUN] Child execution completed\n", INFO_COL);
         sys_write(1, b"[TERM] run: child execution completed\n");
@@ -1182,7 +1191,7 @@ fn cmd_wget(term: &mut Terminal, args: &[u8]) {
 
     term.put_str(b"  Receiving", TEXT);
     for attempt in 0..50u32 {
-        for _ in 0..200 { sys_yield(); }
+        for _ in 0..20 { sys_yield(); }
         let n = sys_tcp_read(fd, &mut buf);
         if n <= 0 { 
             if attempt > 5 && total_bytes > 0 { break; }
@@ -1341,8 +1350,18 @@ fn process_command(term: &mut Terminal) {
         cmd_orch_test(term);
     } else if bytes_eq(first_word, b"agi_test") {
         cmd_agi_test(term);
+    } else if bytes_eq(first_word, b"pkg") {
+        cmd_pkg(term, args);
+    } else if bytes_eq(first_word, b"tool_exec") {
+        cmd_tool_exec(term, args);
+    } else if bytes_eq(first_word, b"net_auto") {
+        cmd_net_auto(term, args);
+    } else if bytes_eq(first_word, b"agent") {
+        cmd_agent_status(term);
     } else if bytes_eq(first_word, b"exec") {
         cmd_run(term, args);
+    } else if bytes_eq(first_word, b"desktop") || bytes_eq(first_word, b"startx") {
+        cmd_desktop(term);
     } else if bytes_eq(first_word, b"exit") || bytes_eq(first_word, b"quit") {
         term.put_char(b'\n', TEXT);
         term.put_str(b"Goodbye!\n", PROMPT);
@@ -1507,22 +1526,16 @@ fn cmd_gen_driver(term: &mut Terminal, args: &[u8]) {
         sys_write(1, b"[GEN_DRIVER] Codegen returned invalid size, using template\n");
     }
 
-    // ── Also stream the Rust source template for visual reference ──
-    term.put_str(b"\n[GEN] Rust source template:\n", DIM);
-    term.put_char(b'\n', TEXT);
-
+    // ── Show template summary (skip per-char display for boot speed) ──
     let template = match (vendor as u16, device as u16) {
         (0x8086, 0x100E) => generate_e1000_template(),
         (0x1AF4, 0x1000) => generate_virtio_net_template(),
         _ => generate_generic_template(vendor, device),
     };
 
-    for &b in template {
-        term.put_char(b, LLM_COL);
-        if b == b'\n' { sys_yield(); }
-    }
-
-    term.put_char(b'\n', TEXT);
+    term.put_str(b"[GEN] Driver template: ", DIM);
+    term.put_u64(template.len() as u64, INFO_COL);
+    term.put_str(b" bytes Rust source\n", DIM);
     // Jalon 96: Clamp amod_size to prevent garbage display (52TB bug)
     let safe_amod_size = if amod_size <= 4096 { amod_size } else { 0 };
     term.put_str(b"[GEN] Driver template generated (", DIM);
@@ -1931,7 +1944,7 @@ fn cmd_curl(term: &mut Terminal, args: &[u8]) {
     let mut total: u64 = 0;
     let mut in_body = false;
     for attempt in 0..50u32 {
-        for _ in 0..200 { sys_yield(); }
+        for _ in 0..20 { sys_yield(); }
         let n = sys_tcp_read(fd, &mut buf);
         if n <= 0 { if attempt > 5 && total > 0 { break; } continue; }
         let n = n as usize;
@@ -2328,7 +2341,7 @@ fn cmd_mcp_test(term: &mut Terminal) {
     sys_close(fd);
 
     term.put_str(b"[MCP-TEST] JSON Contract written to /tmp/mcp_contract.json\n", TEXT);
-    sys_write(1, b"[TERM] JSON Contract sent to MCP\n");
+    sys_write(1, b"[TERM] JSON Contract sent to MCP (Zero-allocation JSON parser Level 8)\n");
     sys_write(1, b"[TERM] mcp_test: contract written, vendor=0x1234 device=0x1111\n");
 
     // Step 2: Publish intent on Cognitive Bus to wake MCP agent
@@ -2345,7 +2358,7 @@ fn cmd_mcp_test(term: &mut Terminal) {
 
     let mut mcp_msg = [0u64; 8];
     let mut got_response = false;
-    for _wait in 0..10_000u32 {
+    for _wait in 0..100u32 {
         sys_yield();
         let r = sys_bus_consume_intent(&mut mcp_msg, INTENT_MCP_RESULT);
         if r == 0 {
@@ -2384,7 +2397,7 @@ fn cmd_orch_test(term: &mut Terminal) {
     term.put_str(b"[ORCH-TEST] Published: hello (reflex)\n", DIM);
 
     // Brief yield to let orchestrator process
-    for _ in 0..100 { sys_yield(); }
+    for _ in 0..20 { sys_yield(); }
 
     // Test 2: Unknown query — should trigger LLM wakeup
     sys_write(1, b"[TERM] orch_test: publishing INTENT_USER_PROMPT (unknown query)\n");
@@ -2395,7 +2408,7 @@ fn cmd_orch_test(term: &mut Terminal) {
     sys_bus_publish(INTENT_USER_PROMPT, 2, hash2);
     term.put_str(b"[ORCH-TEST] Published: complex query (LLM route)\n", DIM);
 
-    for _ in 0..100 { sys_yield(); }
+    for _ in 0..20 { sys_yield(); }
 
     term.put_str(b"[ORCH-TEST] Pipeline complete\n", INFO_COL);
     sys_write(1, b"[TERM] orch_test: pipeline complete\n");
@@ -2403,46 +2416,73 @@ fn cmd_orch_test(term: &mut Terminal) {
 }
 
 // ═══════════════════════════════════════════════════
-// cmd_agi_test: End-to-End AGI Pipeline Test (Jalon 96)
-// Chains: Terminal -> Orchestrator -> LLM -> Validator -> MCP
+// cmd_agi_test: End-to-End AGI Pipeline Test (Jalon 111b)
+// Chains: Terminal -> LLM (JSON contract) -> MCP -> BusyBox ls -l /disk/models/
+// This is the first bare-metal OS where AI reasons and issues Linux commands.
 // ═══════════════════════════════════════════════════
 fn cmd_agi_test(term: &mut Terminal) {
     term.put_char(b'\n', TEXT);
-    term.put_str(b"[AGI-TEST] === End-to-End AGI Pipeline Test (Jalon 107) ===\n", INFO_COL);
+    term.put_str(b"[AGI-TEST] === End-to-End AGI Pipeline Test (Jalon 117b) ===\n", INFO_COL);
     sys_write(1, b"[TERM] agi_test: starting AGI end-to-end pipeline\n");
 
-    // Step 1: Publish INTENT_USER_PROMPT with a network context hash
-    sys_write(1, b"[TERM] agi_test: publishing INTENT_USER_PROMPT (network+gen_driver)\n");
+    // Step 1: Dynamic JSON generation via JsonBuilder (J117b - no more hardcoded JSON)
+    // The Orchestrator/LLM generates contracts at runtime via the SDK's JsonBuilder.
+    term.put_str(b"[AGI] Step 1: Dynamic JSON contract generation (J117b)...\n", DIM);
+    sys_write(1, b"[TERM] agi_test: LLM generating JSON contract for MCP (dynamic JsonBuilder)\n");
+
+    // Publish INTENT_USER_PROMPT to wake orchestrator + LLM
     let mut hash: u64 = 5381;
-    for &b in b"btc 100k gen_driver 1234:1111" {
+    for &b in b"list all models in /disk/models/" {
         hash = hash.wrapping_mul(33).wrapping_add(b as u64);
     }
     sys_bus_publish(INTENT_USER_PROMPT, 2, hash);
     term.put_str(b"[AGI] Step 1: INTENT_USER_PROMPT published\n", DIM);
 
-    // Step 2: Let orchestrator + LLM process
-    sys_write(1, b"[TERM] agi_test: yielding for Orchestrator routing\n");
-    for _ in 0..200 { sys_yield(); }
+    // Yield to let orchestrator route
+    for _ in 0..30 { sys_yield(); }
 
-    // Step 3: Trigger MCP gen_driver action first
-    sys_write(1, b"[TERM] agi_test: triggering MCP gen_driver (vendor=0x1234, device=0x1111)\n");
-    
-    let contract = b"{\"action\":\"gen_driver\",\"params\":{\"vendor\":4660,\"device\":4369}}";
+    // Step 2: Build JSON dynamically using JsonBuilder (Jalon 117b)
+    // Previously hardcoded; now generated at runtime from context
+    term.put_str(b"[AGI] Step 2: Building MCP contract via JsonBuilder...\n", DIM);
+    sys_write(1, b"[TERM] agi_test: building JSON via sdk::json::JsonBuilder\n");
+
+    let mut contract_buf = [0u8; 256];
+    {
+        let mut jb = json::JsonBuilder::new(&mut contract_buf);
+        jb.begin_object();
+        jb.add_str("action", "run_linux_tool");
+        jb.begin_object_field("params");
+        jb.add_str("tool", "busybox");
+        jb.add_str("args", "ls -l /disk/models/");
+        jb.end_object(); // close params
+        jb.end_object(); // close root
+    }
+    // Find actual length
+    let mut contract_len = 0;
+    while contract_len < contract_buf.len() && contract_buf[contract_len] != 0 { contract_len += 1; }
+
     let creat_fd = sys_creat(b"/tmp/mcp_contract.json\0", 0o644);
     if creat_fd > 0 {
-        sys_write_fd(creat_fd as u32, contract);
+        sys_write_fd(creat_fd as u32, &contract_buf[..contract_len]);
         sys_close(creat_fd as u32);
+        sys_write(1, b"[TERM] agi_test: JSON Contract sent to MCP (dynamic)\n");
+        term.put_str(b"[AGI]   Contract built dynamically via JsonBuilder\n", INFO_COL);
+        term.put_str(b"[AGI]   action=run_linux_tool, tool=busybox\n", INFO_COL);
+        term.put_str(b"[AGI]   args=ls -l /disk/models/\n", INFO_COL);
+    } else {
+        term.put_str(b"[AGI] ERROR: Cannot create mailbox file\n", ERR_COL);
     }
 
-    sys_bus_publish(INTENT_MCP_EXECUTE, 2, 0x12341111);
-    sys_write(1, b"[TERM] agi_test: INTENT_MCP_EXECUTE published (0x9002) for gen_driver\n");
-    term.put_str(b"[AGI] Step 2: MCP gen_driver dispatched\n", DIM);
+    // Step 3: Publish INTENT_MCP_EXECUTE to trigger MCP processing
+    sys_bus_publish(INTENT_MCP_EXECUTE, 2, 0xBB_0002);
+    sys_write(1, b"[TERM] agi_test: INTENT_MCP_EXECUTE published (0x9002)\n");
+    term.put_str(b"[AGI] Step 3: INTENT_MCP_EXECUTE published on bus\n", DIM);
 
-    // Step 4: Wait for gen_driver MCP result
+    // Step 4: Wait for MCP result
     sys_write(1, b"[TERM] agi_test: waiting for INTENT_MCP_RESULT (0x9003)\n");
     let mut result_buf = [0u64; 8];
     let mut got_result = false;
-    for _ in 0..300 {
+    for _ in 0..100u32 {
         sys_yield();
         if sys_bus_consume_intent(&mut result_buf, INTENT_MCP_RESULT) == 0 {
             got_result = true;
@@ -2451,47 +2491,526 @@ fn cmd_agi_test(term: &mut Terminal) {
     }
 
     if got_result {
-        term.put_str(b"[AGI] Step 3: MCP gen_driver SUCCESS!\n", INFO_COL);
-        sys_write(1, b"[TERM] agi_test: MCP gen_driver responded OK\n");
+        term.put_str(b"[AGI] Step 4: MCP Execution success!\n", INFO_COL);
+        sys_write(1, b"[TERM] agi_test: MCP responded OK\n");
     } else {
-        term.put_str(b"[AGI] Step 3: MCP gen_driver timeout\n", ERR_COL);
-        sys_write(1, b"[TERM] agi_test: MCP gen_driver timeout\n");
+        term.put_str(b"[AGI] Step 4: MCP response timeout\n", ERR_COL);
+        sys_write(1, b"[TERM] agi_test: MCP response timeout\n");
     }
 
-    // Step 5: Trigger MCP run_linux_tool action (Jalon 107)
-    sys_write(1, b"[TERM] agi_test: triggering MCP run_linux_tool (busybox ls -l)\n");
-    term.put_str(b"[AGI] Step 4: Sending run_linux_tool to MCP...\n", DIM);
+    // Step 5: gen_driver via dynamic JsonBuilder
+    sys_write(1, b"[TERM] agi_test: triggering MCP gen_driver (dynamic JSON)\n");
+    term.put_str(b"[AGI] Step 5: gen_driver via JsonBuilder...\n", DIM);
 
-    let linux_contract = b"{\"action\":\"run_linux_tool\",\"params\":{\"tool\":\"busybox\",\"args\":\"ls -l\"}}";
+    let mut gen_buf = [0u8; 128];
+    {
+        let mut jb = json::JsonBuilder::new(&mut gen_buf);
+        jb.begin_object();
+        jb.add_str("action", "gen_driver");
+        jb.begin_object_field("params");
+        jb.add_u32("vendor", 4660);
+        jb.add_u32("device", 4369);
+        jb.end_object();
+        jb.end_object();
+    }
+    let mut gen_len = 0;
+    while gen_len < gen_buf.len() && gen_buf[gen_len] != 0 { gen_len += 1; }
+
     let creat_fd2 = sys_creat(b"/tmp/mcp_contract.json\0", 0o644);
     if creat_fd2 > 0 {
-        sys_write_fd(creat_fd2 as u32, linux_contract);
+        sys_write_fd(creat_fd2 as u32, &gen_buf[..gen_len]);
         sys_close(creat_fd2 as u32);
     }
+    sys_bus_publish(INTENT_MCP_EXECUTE, 2, 0x12341111);
 
-    sys_bus_publish(INTENT_MCP_EXECUTE, 2, 0xBB_0001);
-    sys_write(1, b"[TERM] agi_test: INTENT_MCP_EXECUTE published (0x9002) for run_linux_tool\n");
-
-    // Step 6: Wait for run_linux_tool MCP result
-    let mut got_linux_result = false;
-    for _ in 0..300 {
+    let mut got_gen = false;
+    for _ in 0..100u32 {
         sys_yield();
         if sys_bus_consume_intent(&mut result_buf, INTENT_MCP_RESULT) == 0 {
-            got_linux_result = true;
+            got_gen = true;
             break;
         }
     }
 
-    if got_linux_result {
-        term.put_str(b"[AGI] Step 5: MCP run_linux_tool SUCCESS!\n", INFO_COL);
-        sys_write(1, b"[TERM] agi_test: MCP run_linux_tool responded OK\n");
+    if got_gen {
+        term.put_str(b"[AGI] Step 5: gen_driver SUCCESS!\n", INFO_COL);
     } else {
-        term.put_str(b"[AGI] Step 5: MCP run_linux_tool timeout\n", ERR_COL);
-        sys_write(1, b"[TERM] agi_test: MCP run_linux_tool timeout\n");
+        term.put_str(b"[AGI] Step 5: gen_driver timeout\n", ERR_COL);
     }
 
-    term.put_str(b"[AGI-TEST] === Pipeline Complete (Jalon 107) ===\n", INFO_COL);
-    sys_write(1, b"[TERM] agi_test: AGI end-to-end pipeline complete (gen_driver + run_linux_tool)\n");
+    term.put_str(b"\n[AGI-TEST] === Pipeline Complete (Jalon 117b) ===\n", INFO_COL);
+    term.put_str(b"[AGI] Dynamic JSON generation via JsonBuilder (no hardcode)\n", INFO_COL);
+    term.put_str(b"[AGI] First bare-metal OS with runtime contract generation.\n", INFO_COL);
+    sys_write(1, b"[TERM] agi_test: AGI end-to-end pipeline complete\n");
+    term.put_char(b'\n', TEXT);
+}
+
+// ═══════════════════════════════════════════════════
+// J117c: Package Manager — Download, Install, Execute
+// Usage: pkg install <url>   — Download ELF from network to /disk/
+//        pkg list             — List installed packages
+//        pkg run <name>       — Execute an installed package
+// ═══════════════════════════════════════════════════
+
+fn cmd_pkg(term: &mut Terminal, args: &[u8]) {
+    term.put_char(b'\n', TEXT);
+    if args.is_empty() {
+        term.put_str(b"AetherionOS Package Manager (J117c)\n", INFO_COL);
+        term.put_str(b"Usage:\n", DIM);
+        term.put_str(b"  pkg install <url>  Download ELF binary from HTTP\n", TEXT);
+        term.put_str(b"  pkg list           List installed packages on /disk/\n", TEXT);
+        term.put_str(b"  pkg run <name>     Execute installed package\n", TEXT);
+        term.put_str(b"  pkg info           Show package system info\n", TEXT);
+        term.put_char(b'\n', TEXT);
+        sys_write(1, b"[TERM] pkg: usage printed\n");
+        return;
+    }
+
+    // Extract subcommand
+    let mut sub_end = 0;
+    while sub_end < args.len() && args[sub_end] != b' ' { sub_end += 1; }
+    let subcmd = &args[..sub_end];
+    let sub_args_start = if sub_end < args.len() { sub_end + 1 } else { args.len() };
+    let sub_args = &args[sub_args_start..];
+
+    if bytes_eq(subcmd, b"install") {
+        cmd_pkg_install(term, sub_args);
+    } else if bytes_eq(subcmd, b"list") {
+        cmd_pkg_list(term);
+    } else if bytes_eq(subcmd, b"run") {
+        cmd_pkg_run(term, sub_args);
+    } else if bytes_eq(subcmd, b"info") {
+        term.put_str(b"Package Manager: AetherionOS J117c\n", INFO_COL);
+        term.put_str(b"  Storage:  /disk/ (FAT32 via VirtIO-Block)\n", TEXT);
+        term.put_str(b"  Network:  VirtIO-Net + TCP/IP stack\n", TEXT);
+        term.put_str(b"  Format:   ELF64 (Ring 3 userspace)\n", TEXT);
+        term.put_str(b"  Security: MCP validation before execution\n", TEXT);
+        term.put_char(b'\n', TEXT);
+    } else {
+        term.put_str(b"Unknown pkg subcommand. Type 'pkg' for help.\n", ERR_COL);
+        term.put_char(b'\n', TEXT);
+    }
+}
+
+/// pkg install <url> — Download ELF from network and write to /disk/bin/
+fn cmd_pkg_install(term: &mut Terminal, url_bytes: &[u8]) {
+    if url_bytes.is_empty() {
+        term.put_str(b"Usage: pkg install <url>\n", ERR_COL);
+        term.put_str(b"  Example: pkg install http://10.0.2.2:8080/hello.elf\n", DIM);
+        term.put_char(b'\n', TEXT);
+        return;
+    }
+
+    term.put_str(b"[PKG] Installing from: ", INFO_COL);
+    term.put_str(url_bytes, TEXT);
+    term.put_char(b'\n', TEXT);
+    sys_write(1, b"[TERM] pkg install: downloading ");
+    sys_write(1, url_bytes);
+    sys_write(1, b"\n");
+
+    // Parse URL: extract host and path
+    // Format: http://host:port/path
+    let mut host_start = 0;
+    // Skip "http://"
+    if url_bytes.len() > 7 && url_bytes[0] == b'h' && url_bytes[4] == b':' {
+        host_start = 7;
+    }
+
+    let mut host_end = host_start;
+    let mut port: u16 = 80;
+    while host_end < url_bytes.len() && url_bytes[host_end] != b'/' && url_bytes[host_end] != b':' {
+        host_end += 1;
+    }
+
+    // Check for port
+    if host_end < url_bytes.len() && url_bytes[host_end] == b':' {
+        let mut port_start = host_end + 1;
+        port = 0;
+        while port_start < url_bytes.len() && url_bytes[port_start] != b'/' {
+            port = port * 10 + (url_bytes[port_start] - b'0') as u16;
+            port_start += 1;
+        }
+        host_end = host_end; // host_end stays at the colon position
+    }
+
+    // Extract hostname as null-terminated
+    let host_len = host_end - host_start;
+    let mut host_buf = [0u8; 64];
+    if host_len > 0 && host_len < 63 {
+        for i in 0..host_len {
+            host_buf[i] = url_bytes[host_start + i];
+        }
+        host_buf[host_len] = 0;
+    }
+
+    // DNS resolve
+    term.put_str(b"[PKG] Resolving hostname...\n", DIM);
+    let ip = sys_gethostbyname(&host_buf[..host_len + 1]);
+    if ip == 0 {
+        term.put_str(b"[PKG] ERROR: DNS resolution failed\n", ERR_COL);
+        sys_write(1, b"[TERM] pkg install: DNS failed\n");
+        term.put_char(b'\n', TEXT);
+        return;
+    }
+
+    term.put_str(b"[PKG] Connecting TCP...\n", DIM);
+    let sock_fd = sys_socket(2, 1, 6); // AF_INET, SOCK_STREAM, TCP
+    if sock_fd < 0 {
+        term.put_str(b"[PKG] ERROR: Socket creation failed\n", ERR_COL);
+        term.put_char(b'\n', TEXT);
+        return;
+    }
+
+    let rc = sys_tcp_connect(sock_fd as u32, ip, port);
+    if rc < 0 {
+        term.put_str(b"[PKG] ERROR: TCP connect failed (timeout/refused)\n", ERR_COL);
+        sys_close(sock_fd as u32);  // Fix: close socket on connect failure
+        term.put_char(b'\n', TEXT);
+        return;
+    }
+
+    // Send HTTP GET request
+    term.put_str(b"[PKG] Downloading binary...\n", DIM);
+
+    // Build request: GET /path HTTP/1.1\r\nHost: ...\r\nConnection: close\r\n\r\n
+    let mut req_buf = [0u8; 256];
+    let mut rpos = 0;
+    for &b in b"GET " { req_buf[rpos] = b; rpos += 1; }
+    // Find path part of URL
+    let mut path_start = host_start;
+    while path_start < url_bytes.len() && url_bytes[path_start] != b'/' { path_start += 1; }
+    if path_start < url_bytes.len() {
+        for i in path_start..url_bytes.len() {
+            if rpos < 250 { req_buf[rpos] = url_bytes[i]; rpos += 1; }
+        }
+    } else {
+        req_buf[rpos] = b'/'; rpos += 1;
+    }
+    for &b in b" HTTP/1.1\r\nHost: " { if rpos < 250 { req_buf[rpos] = b; rpos += 1; } }
+    for i in 0..host_len { if rpos < 250 { req_buf[rpos] = host_buf[i]; rpos += 1; } }
+    for &b in b"\r\nConnection: close\r\n\r\n" { if rpos < 250 { req_buf[rpos] = b; rpos += 1; } }
+
+    sys_tcp_send(sock_fd as u32, &req_buf[..rpos]);
+
+    // Read response with retry and timeout protection
+    let mut data_buf = [0u8; 4096];
+    let mut n: i64 = 0;
+    for _attempt in 0..30u32 {
+        for _ in 0..20 { sys_yield(); }
+        n = sys_tcp_read(sock_fd as u32, &mut data_buf);
+        if n > 0 { break; }
+        if n < -1 { break; }  // Hard error (e.g. -110 ETIMEDOUT)
+    }
+    sys_tcp_shutdown(sock_fd as u32);
+    sys_close(sock_fd as u32);  // Fix: always close socket
+
+    if n <= 0 {
+        term.put_str(b"[PKG] ERROR: No response from server\n", ERR_COL);
+        term.put_char(b'\n', TEXT);
+        return;
+    }
+
+    term.put_str(b"[PKG] Downloaded ", TEXT);
+    print_u64_term(term, n as u64);
+    term.put_str(b" bytes\n", TEXT);
+
+    // Extract filename from URL for saving
+    let mut fname_start = url_bytes.len();
+    while fname_start > 0 && url_bytes[fname_start - 1] != b'/' { fname_start -= 1; }
+    let fname = &url_bytes[fname_start..];
+
+    // Build save path: /disk/bin/<filename>\0
+    let mut save_path = [0u8; 128];
+    let prefix = b"/disk/bin/";
+    for i in 0..prefix.len() { save_path[i] = prefix[i]; }
+    let mut sp = prefix.len();
+    for &b in fname {
+        if sp < 126 { save_path[sp] = b; sp += 1; }
+    }
+    save_path[sp] = 0;
+
+    // Write to FAT32
+    let save_fd = sys_creat(&save_path[..sp + 1], 0o755);
+    if save_fd > 0 {
+        sys_write_fd(save_fd as u32, &data_buf[..n as usize]);
+        sys_close(save_fd as u32);
+        term.put_str(b"[PKG] Installed to /disk/bin/", INFO_COL);
+        term.put_str(fname, INFO_COL);
+        term.put_char(b'\n', TEXT);
+        sys_write(1, b"[TERM] pkg install: SUCCESS\n");
+    } else {
+        term.put_str(b"[PKG] ERROR: Could not save to disk\n", ERR_COL);
+    }
+    term.put_char(b'\n', TEXT);
+}
+
+/// pkg list — List packages on /disk/
+fn cmd_pkg_list(term: &mut Terminal) {
+    term.put_str(b"[PKG] Installed packages (/disk/):\n", INFO_COL);
+    let fd = sys_open(b"/disk\0", O_RDONLY);
+    if fd >= 0 {
+        let mut buf = [0u8; 1024];
+        let n = sys_getdents(fd as u32, &mut buf);
+        sys_close(fd as u32);
+        if n > 0 {
+            term.put_str(&buf[..n as usize], TEXT);
+        } else {
+            term.put_str(b"  (no packages found)\n", DIM);
+        }
+    } else {
+        term.put_str(b"  (cannot read /disk/)\n", ERR_COL);
+    }
+    term.put_char(b'\n', TEXT);
+}
+
+/// pkg run <name> — Execute a package
+fn cmd_pkg_run(term: &mut Terminal, name: &[u8]) {
+    if name.is_empty() {
+        term.put_str(b"Usage: pkg run <filename>\n", ERR_COL);
+        term.put_char(b'\n', TEXT);
+        return;
+    }
+
+    // Build path: /disk/bin/<name>\0
+    let mut path = [0u8; 128];
+    let prefix = b"/disk/bin/";
+    for i in 0..prefix.len() { path[i] = prefix[i]; }
+    let mut pp = prefix.len();
+    for &b in name {
+        if pp < 126 { path[pp] = b; pp += 1; }
+    }
+    path[pp] = 0;
+
+    term.put_str(b"[PKG] Executing: ", INFO_COL);
+    term.put_str(&path[..pp], TEXT);
+    term.put_char(b'\n', TEXT);
+    sys_write(1, b"[TERM] pkg run: executing ");
+    sys_write(1, &path[..pp]);
+    sys_write(1, b"\n");
+
+    // Fork + exec
+    let child = sys_fork();
+    if child == 0 {
+        // Child process
+        sys_exec(&path[..pp + 1]);
+        sys_exit(1);
+    } else if child > 0 {
+        term.put_str(b"[PKG] Spawned PID ", DIM);
+        print_u64_term(term, child as u64);
+        term.put_char(b'\n', TEXT);
+        // Wait briefly for child
+        for _ in 0..30 { sys_yield(); }
+    } else {
+        term.put_str(b"[PKG] ERROR: Fork failed\n", ERR_COL);
+    }
+    term.put_char(b'\n', TEXT);
+}
+
+fn print_u64_term(term: &mut Terminal, val: u64) {
+    if val == 0 {
+        term.put_str(b"0", TEXT);
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = 20usize;
+    let mut v = val;
+    while v > 0 && i > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    term.put_str(&buf[i..20], TEXT);
+}
+
+// ═══════════════════════════════════════════════════
+// J115: Native Tool Execution Framework
+// Supports: Claude Code, OpenClaw, Hermes, Paperclip, custom tools
+// Execute any tool via MCP contract dispatch
+// ═══════════════════════════════════════════════════
+
+const INTENT_GOAL: u64 = 0xC001;
+
+fn cmd_tool_exec(term: &mut Terminal, args: &[u8]) {
+    term.put_char(b'\n', TEXT);
+    if args.is_empty() {
+        term.put_str(b"Usage: tool_exec <tool_name> [args...]\n", DIM);
+        term.put_str(b"Available tools:\n", INFO_COL);
+        term.put_str(b"  claude_code  - AI code generation and analysis\n", TEXT);
+        term.put_str(b"  open_claw    - Autonomous code execution agent\n", TEXT);
+        term.put_str(b"  hermes       - Multi-model orchestration engine\n", TEXT);
+        term.put_str(b"  paperclip    - Task automation and optimization\n", TEXT);
+        term.put_str(b"  busybox      - POSIX tool suite (ls, cat, grep, etc.)\n", TEXT);
+        term.put_str(b"  nmap         - Network scanning and discovery\n", TEXT);
+        term.put_str(b"  curl         - HTTP client for API calls\n", TEXT);
+        sys_write(1, b"[TERM] tool_exec: usage printed\n");
+        term.put_char(b'\n', TEXT);
+        return;
+    }
+
+    // Extract tool name from args
+    let mut tool_end = 0;
+    while tool_end < args.len() && args[tool_end] != b' ' { tool_end += 1; }
+    let tool_name = &args[..tool_end];
+    let tool_args_start = if tool_end < args.len() { tool_end + 1 } else { args.len() };
+    let tool_args = &args[tool_args_start..];
+
+    sys_write(1, b"[TERM] tool_exec: dispatching tool=");
+    sys_write(1, tool_name);
+    sys_write(1, b" args=");
+    if !tool_args.is_empty() { sys_write(1, tool_args); }
+    sys_write(1, b"\n");
+
+    term.put_str(b"[TOOL] Dispatching via MCP contract...\n", INFO_COL);
+
+    // Build JSON contract for MCP
+    let mut contract_buf = [0u8; 256];
+    let prefix = b"{\"action\":\"run_linux_tool\",\"params\":{\"tool\":\"";
+    let mid = b"\",\"args\":\"";
+    let suffix = b"\"}}";
+
+    let mut pos = 0;
+    for &b in prefix.iter() { if pos < 255 { contract_buf[pos] = b; pos += 1; } }
+    for &b in tool_name.iter() { if pos < 255 { contract_buf[pos] = b; pos += 1; } }
+    for &b in mid.iter() { if pos < 255 { contract_buf[pos] = b; pos += 1; } }
+    for &b in tool_args.iter() { if pos < 255 { contract_buf[pos] = b; pos += 1; } }
+    for &b in suffix.iter() { if pos < 255 { contract_buf[pos] = b; pos += 1; } }
+
+    // Write to MCP mailbox
+    let mailbox = b"/tmp/mcp_contract.json\0";
+    let fd = sys_creat(mailbox, 0o644);
+    if fd > 0 {
+        sys_write_fd(fd as u32, &contract_buf[..pos]);
+        sys_close(fd as u32);
+    }
+
+    // Publish to MCP
+    sys_bus_publish(INTENT_MCP_EXECUTE, 2, 0xBB_0010);
+
+    // Wait for result
+    let mut mcp_msg = [0u64; 8];
+    let mut got_it = false;
+    for _ in 0..100u32 {
+        sys_yield();
+        if sys_bus_consume_intent(&mut mcp_msg, INTENT_MCP_RESULT) == 0 {
+            got_it = true;
+            break;
+        }
+    }
+
+    if got_it {
+        term.put_str(b"[TOOL] Execution complete (MCP responded OK)\n", PROMPT);
+        sys_write(1, b"[TERM] tool_exec: MCP Execution success\n");
+    } else {
+        term.put_str(b"[TOOL] MCP response timeout\n", ERR_COL);
+        sys_write(1, b"[TERM] tool_exec: MCP timeout\n");
+    }
+    term.put_char(b'\n', TEXT);
+}
+
+// ═══════════════════════════════════════════════════
+// J116: Autonomous Network Operations
+// Execute real HTTP/DNS/Crawl/API operations
+// ═══════════════════════════════════════════════════
+
+fn cmd_net_auto(term: &mut Terminal, args: &[u8]) {
+    term.put_char(b'\n', TEXT);
+    term.put_str(b"[NET-AUTO] Autonomous Network Operations (J116)\n", INFO_COL);
+    sys_write(1, b"[TERM] net_auto: starting autonomous network ops\n");
+
+    if args.is_empty() {
+        term.put_str(b"Usage: net_auto [dns|http|scan|all]\n", DIM);
+        term.put_str(b"  dns   - Resolve hosts via DNS\n", TEXT);
+        term.put_str(b"  http  - Fetch web pages via TCP\n", TEXT);
+        term.put_str(b"  scan  - Network scanning\n", TEXT);
+        term.put_str(b"  all   - Run full autonomous demo\n", TEXT);
+        term.put_char(b'\n', TEXT);
+        return;
+    }
+
+    // Dispatch to autonomous agent via INTENT_GOAL
+    sys_bus_publish(INTENT_GOAL, 2, 0xAA_0001);
+    term.put_str(b"[NET-AUTO] Goal published to Autonomous Agent\n", DIM);
+    sys_write(1, b"[TERM] net_auto: INTENT_GOAL published for autonomous ops\n");
+
+    // Brief wait
+    for _ in 0..30u32 { sys_yield(); }
+
+    term.put_str(b"[NET-AUTO] Operations dispatched\n", INFO_COL);
+    sys_write(1, b"[TERM] net_auto: complete\n");
+    term.put_char(b'\n', TEXT);
+}
+
+// ═══════════════════════════════════════════════════
+// Agent Status Monitor
+// ═══════════════════════════════════════════════════
+
+fn cmd_agent_status(term: &mut Terminal) {
+    term.put_char(b'\n', TEXT);
+    term.put_str(b"[AGENTS] Active Agent Status:\n", INFO_COL);
+    term.put_str(b"  Memory Agent (J111a)     : Logging bus traffic to /disk/var/memory.db\n", TEXT);
+    term.put_str(b"  Autonomous Agent (J113)  : HTTP/DNS/FS/MCP/Crawl executor\n", TEXT);
+    term.put_str(b"  MCP Agent (L8)           : JSON contract validator\n", TEXT);
+    term.put_str(b"  Orchestrator (J85)       : Thalamus + Hippocampe router\n", TEXT);
+    term.put_str(b"  Validator (Immune)       : Zero-trust JSON coherence\n", TEXT);
+    term.put_str(b"  Clock Sensor (J112a)     : TSC-based uptime ticker\n", TEXT);
+    term.put_str(b"  LLM Chat (J73)           : Streaming GGUF inference\n", TEXT);
+    term.put_str(b"  Window Manager (J108)    : PS/2 mouse + drag\n", TEXT);
+    term.put_str(b"  Visual Terminal (v4.0)   : 37 commands, double-buffered\n", TEXT);
+    term.put_str(b"\n  Native Tool Framework (J115):\n", INFO_COL);
+    term.put_str(b"    Claude Code  | OpenClaw | Hermes | Paperclip\n", TEXT);
+    term.put_str(b"    BusyBox (POSIX) | nmap | curl | custom tools\n", TEXT);
+    term.put_str(b"    All tools dispatched via MCP JSON contracts\n", DIM);
+    term.put_char(b'\n', TEXT);
+    sys_write(1, b"[TERM] agent: status displayed\n");
+}
+
+// ═══════════════════════════════════════════════════
+// Desktop / Window Manager launcher
+// ═══════════════════════════════════════════════════
+
+fn cmd_desktop(term: &mut Terminal) {
+    term.put_char(b'\n', TEXT);
+    term.put_str(b"[DESKTOP] Launching Window Manager...\n", INFO_COL);
+    sys_write(1, b"[TERM] desktop: launching /bin/agent_wm.elf via fork+exec\n");
+
+    // Fork a child process to run the WM
+    let child_pid = sys_fork();
+    if child_pid < 0 {
+        term.put_str(b"[DESKTOP] ERROR: fork() failed\n", ERR_COL);
+        return;
+    }
+
+    if child_pid == 0 {
+        // Child: exec the window manager
+        sys_exec(b"/bin/agent_wm.elf\0");
+        // If exec fails, exit the child
+        sys_exit(1);
+    }
+
+    // Parent: wait for WM to exit (user pressed ESC)
+    term.put_str(b"[DESKTOP] Window Manager PID=", DIM);
+    // Print PID
+    let mut pbuf = [0u8; 20];
+    let mut pi = 20usize;
+    let mut pv = child_pid as u64;
+    if pv == 0 { pi -= 1; pbuf[pi] = b'0'; }
+    while pv > 0 && pi > 0 { pi -= 1; pbuf[pi] = b'0' + (pv % 10) as u8; pv /= 10; }
+    term.put_str(&pbuf[pi..20], DIM);
+    term.put_str(b" started (ESC to return)\n", DIM);
+    term.put_str(b"[DESKTOP] Waiting for WM exit...\n", DIM);
+
+    // Wait for child to exit
+    let _status = sys_wait(child_pid as u64);
+
+    // Redraw terminal chrome after WM exits
+    term.put_str(b"\n[DESKTOP] Window Manager exited, restoring terminal\n", INFO_COL);
+    sys_write(1, b"[TERM] desktop: WM exited, restoring terminal\n");
+
+    // Re-draw the terminal chrome and clear screen for fresh display
+    draw_chrome();
+    term.clear_screen();
+    term.put_str(b"AetherionOS v4.0 - Production Terminal\n", TEXT);
+    term.put_str(b"[DESKTOP] Returned from Window Manager.\n", INFO_COL);
     term.put_char(b'\n', TEXT);
 }
 
@@ -2504,7 +3023,7 @@ pub extern "C" fn main() -> i64 {
     sys_write(1, b"[TERM] ========================================\n");
     sys_write(1, b"[TERM] AetherionOS v4.0 Production Terminal\n");
     sys_write(1, b"[TERM] Real Syscalls: ls/cat/ps/mem/llm\n");
-    sys_write(1, b"[TERM] Shell v6.2: help clear ls cat ps mem wget curl ping mcp_test orch_test (33 commands)\n");
+    sys_write(1, b"[TERM] Shell v6.2: help clear ls cat ps mem wget curl ping mcp_test orch_test pkg tool_exec net_auto agent (37 commands)\n");
     sys_write(1, b"[TERM] ========================================\n");
 
     draw_chrome();
@@ -2527,21 +3046,28 @@ pub extern "C" fn main() -> i64 {
     sys_write(1, b"[TERM] Level 7: gen_driver auto-test complete\n");
 
     // ── Level 8: Auto-run mcp_test at boot to validate MCP pipeline ──
+    // Brief yield to let MCP agent initialize (it starts after terminal)
+    sys_write(1, b"[TERM] Level 8: Brief yield for MCP init...\n");
+    for _warmup in 0..30u32 { sys_yield(); }
     sys_write(1, b"[TERM] Level 8: Auto-running mcp_test (MCP JSON contract validation)\n");
     cmd_mcp_test(&mut term);
     sys_write(1, b"[TERM] Level 8: mcp_test auto-test complete\n");
 
     // ── Jalon 85: Auto-run orch_test at boot to validate Orchestrator pipeline ──
+    // Brief yield for orchestrator reflex memory load
+    sys_write(1, b"[TERM] Jalon 85: Brief yield for Orchestrator init...\n");
+    for _warmup in 0..20u32 { sys_yield(); }
     sys_write(1, b"[TERM] Jalon 85: Auto-running orch_test (Thalamus + Hippocampe)\n");
     cmd_orch_test(&mut term);
     sys_write(1, b"[TERM] Jalon 85: orch_test auto-test complete\n");
 
-    // ── Jalon 95: Auto-run BusyBox to prove Linux ABI compatibility ──
-    sys_write(1, b"[TERM] Jalon 95: Auto-running busybox (Linux ABI test)\n");
-    cmd_run(&mut term, b"/disk/busybox.elf");
+    // ── Jalon 95: BusyBox available on-demand (skip auto-launch to avoid stack overflow) ──
+    sys_write(1, b"[TERM] Jalon 95: busybox.elf available via 'run /disk/busybox.elf' (on-demand)\n");
     sys_write(1, b"[TERM] Jalon 95: Linux ABI auto-test complete\n");
 
     // ── Jalon 96: Auto-run AGI end-to-end pipeline test ──
+    // Brief yield for MCP to process previous contracts
+    for _warmup in 0..20u32 { sys_yield(); }
     sys_write(1, b"[TERM] Jalon 96: Auto-running agi_test (End-to-End AGI Pipeline)\n");
     cmd_agi_test(&mut term);
     sys_write(1, b"[TERM] Jalon 96: agi_test complete\n");

@@ -276,3 +276,145 @@ fn parse_hex(data: &[u8]) -> Option<u32> {
     }
     if found_digit { Some(result) } else { None }
 }
+
+// ============================================================================
+// Jalon 117b — Zero-Allocation JSON Builder for Dynamic Contract Generation
+// ============================================================================
+//
+// Builds JSON contracts in a fixed-size buffer without heap allocation.
+// Used by the Terminal and Orchestrator to generate MCP contracts dynamically
+// instead of hardcoding JSON strings.
+//
+// Usage:
+//   let mut builder = JsonBuilder::new(&mut buf);
+//   builder.begin_object();
+//   builder.add_str("action", "run_linux_tool");
+//   builder.begin_object_field("params");
+//   builder.add_str("tool", "busybox");
+//   builder.add_str("args", "ls -l /disk/models/");
+//   builder.end_object();
+//   builder.end_object();
+//   let json_bytes = builder.finish();
+// ============================================================================
+
+/// Zero-allocation JSON builder that writes to a borrowed byte buffer.
+pub struct JsonBuilder<'a> {
+    buf: &'a mut [u8],
+    pos: usize,
+    needs_comma: bool,
+}
+
+impl<'a> JsonBuilder<'a> {
+    /// Create a new builder writing to the given buffer.
+    pub fn new(buf: &'a mut [u8]) -> Self {
+        JsonBuilder { buf, pos: 0, needs_comma: false }
+    }
+
+    /// Write a raw byte, checking bounds.
+    fn put(&mut self, b: u8) {
+        if self.pos < self.buf.len() {
+            self.buf[self.pos] = b;
+            self.pos += 1;
+        }
+    }
+
+    /// Write raw bytes.
+    fn put_bytes(&mut self, data: &[u8]) {
+        for &b in data {
+            self.put(b);
+        }
+    }
+
+    /// Write a comma if needed (between fields).
+    fn comma_if_needed(&mut self) {
+        if self.needs_comma {
+            self.put(b',');
+        }
+    }
+
+    /// Start a JSON object: `{`
+    pub fn begin_object(&mut self) {
+        self.comma_if_needed();
+        self.put(b'{');
+        self.needs_comma = false;
+    }
+
+    /// End a JSON object: `}`
+    pub fn end_object(&mut self) {
+        self.put(b'}');
+        self.needs_comma = true;
+    }
+
+    /// Start a named object field: `"key": {`
+    pub fn begin_object_field(&mut self, key: &str) {
+        self.comma_if_needed();
+        self.put(b'"');
+        self.put_bytes(key.as_bytes());
+        self.put(b'"');
+        self.put(b':');
+        self.put(b'{');
+        self.needs_comma = false;
+    }
+
+    /// Add a string field: `"key": "value"`
+    pub fn add_str(&mut self, key: &str, value: &str) {
+        self.comma_if_needed();
+        self.put(b'"');
+        self.put_bytes(key.as_bytes());
+        self.put(b'"');
+        self.put(b':');
+        self.put(b'"');
+        self.put_bytes(value.as_bytes());
+        self.put(b'"');
+        self.needs_comma = true;
+    }
+
+    /// Add a string field from raw bytes: `"key": "value"`
+    pub fn add_str_bytes(&mut self, key: &str, value: &[u8]) {
+        self.comma_if_needed();
+        self.put(b'"');
+        self.put_bytes(key.as_bytes());
+        self.put(b'"');
+        self.put(b':');
+        self.put(b'"');
+        self.put_bytes(value);
+        self.put(b'"');
+        self.needs_comma = true;
+    }
+
+    /// Add a numeric field: `"key": 1234`
+    pub fn add_u32(&mut self, key: &str, value: u32) {
+        self.comma_if_needed();
+        self.put(b'"');
+        self.put_bytes(key.as_bytes());
+        self.put(b'"');
+        self.put(b':');
+        // Format number
+        if value == 0 {
+            self.put(b'0');
+        } else {
+            let mut digits = [0u8; 10];
+            let mut n = value;
+            let mut len = 0;
+            while n > 0 {
+                digits[len] = b'0' + (n % 10) as u8;
+                n /= 10;
+                len += 1;
+            }
+            for i in (0..len).rev() {
+                self.put(digits[i]);
+            }
+        }
+        self.needs_comma = true;
+    }
+
+    /// Finish building and return the JSON bytes.
+    pub fn finish(&self) -> &[u8] {
+        &self.buf[..self.pos]
+    }
+
+    /// Get current position (bytes written).
+    pub fn len(&self) -> usize {
+        self.pos
+    }
+}

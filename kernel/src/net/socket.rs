@@ -26,8 +26,10 @@ pub const IPPROTO_ICMP: u32 = 1;
 pub const IPPROTO_TCP: u32 = 6;
 pub const IPPROTO_UDP: u32 = 17;
 
-/// Address family
+/// Address families
 pub const AF_INET: u32 = 2;
+pub const AF_PACKET: u32 = 17;
+pub const AF_NETLINK: u32 = 16;
 
 /// Maximum pending received packets per socket
 const MAX_RECV_QUEUE: usize = 16;
@@ -68,15 +70,25 @@ static NEXT_SOCKET_FD: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomi
 /// Create a new socket
 /// Returns socket fd or negative error
 pub fn sys_socket(domain: u32, sock_type: u32, protocol: u32) -> u64 {
-    if domain != AF_INET {
-        return (-22i64) as u64; // EINVAL
-    }
-
-    match sock_type {
-        SOCK_RAW if protocol == IPPROTO_ICMP => {},
-        SOCK_DGRAM if protocol == IPPROTO_UDP || protocol == 0 => {},
-        SOCK_STREAM if protocol == IPPROTO_TCP || protocol == 6 => {},
-        _ => return (-22i64) as u64, // EINVAL
+    // Jalon 110d: Support AF_PACKET and AF_NETLINK for nmap/raw socket tools
+    match domain {
+        AF_INET => {
+            match sock_type & 0xF { // mask out SOCK_NONBLOCK/SOCK_CLOEXEC flags
+                1 => {}, // SOCK_STREAM (TCP)
+                2 => {}, // SOCK_DGRAM (UDP)
+                3 => {}, // SOCK_RAW (ICMP/raw)
+                _ => return (-22i64) as u64, // EINVAL
+            }
+        }
+        AF_PACKET => {
+            // Raw packet access (nmap, tcpdump, Wireshark)
+            crate::serial_println!("[SOCKET] AF_PACKET socket requested (type={}, proto={})", sock_type, protocol);
+        }
+        AF_NETLINK => {
+            // Netlink socket (ip, ss commands)
+            crate::serial_println!("[SOCKET] AF_NETLINK socket requested (type={}, proto={})", sock_type, protocol);
+        }
+        _ => return (-93i64) as u64, // EPROTONOSUPPORT
     }
 
     let fd = NEXT_SOCKET_FD.fetch_add(1, core::sync::atomic::Ordering::SeqCst);

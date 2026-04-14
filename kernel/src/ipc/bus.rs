@@ -10,8 +10,9 @@
 // Trade-off: O(log n) publish/consume vs O(1) for lock-free ArrayQueue,
 // but priority ordering is essential for interrupt-driven orchestration.
 
-use super::{IntentMessage, BusError};
+use super::{IntentMessage, BusError, ComponentId, Priority};
 use alloc::vec::Vec;
+use alloc::collections::BTreeMap;
 use spin::Mutex;
 use lazy_static::lazy_static;
 
@@ -152,15 +153,91 @@ impl CognitiveBus {
     }
 }
 
+// ═══════════════════════════════════════════════════
+// Reflex Engine (Jalon 119)
+// ═══════════════════════════════════════════════════
+//
+// The Reflex Engine provides fast, O(1) routing for known intent patterns.
+// When an intent matches a registered reflex rule, it is directly routed
+// to the target component (e.g., Window Manager) without waking the full
+// AI pipeline (LLM agent). This is analogous to biological reflexes:
+// simple stimulus → immediate response, bypassing the "brain".
+//
+// Rules are stored in a BTreeMap<u32, ReflexAction> keyed by intent_id.
+// On publish(), the engine checks if the intent has a matching reflex.
+// If so, it generates a new routed message and publishes it immediately.
+
+/// Action to take when a reflex matches.
+#[derive(Debug, Clone, Copy)]
+pub struct ReflexAction {
+    /// Target component to route to
+    pub target: ComponentId,
+    /// Intent to generate (can differ from trigger intent)
+    pub emit_intent: u32,
+    /// Priority of the emitted message
+    pub priority: Priority,
+    /// Whether to also keep the original message in the bus
+    pub pass_through: bool,
+}
+
+/// The Reflex Routing Table
+struct ReflexEngine {
+    rules: BTreeMap<u32, ReflexAction>,
+    /// Total number of reflexes fired since boot
+    fire_count: u64,
+}
+
+impl ReflexEngine {
+    fn new() -> Self {
+        Self {
+            rules: BTreeMap::new(),
+            fire_count: 0,
+        }
+    }
+
+    /// Register a reflex rule: when `trigger_intent` is published,
+    /// automatically route to `action.target` with `action.emit_intent`.
+    fn register(&mut self, trigger_intent: u32, action: ReflexAction) {
+        self.rules.insert(trigger_intent, action);
+    }
+
+    /// Check if an intent has a matching reflex. If so, return the action.
+    fn check(&self, intent_id: u32) -> Option<&ReflexAction> {
+        self.rules.get(&intent_id)
+    }
+
+    /// Increment the fire counter
+    fn fired(&mut self) {
+        self.fire_count += 1;
+    }
+
+    /// Get number of registered rules
+    fn rule_count(&self) -> usize {
+        self.rules.len()
+    }
+
+    /// Get total fire count
+    fn total_fires(&self) -> u64 {
+        self.fire_count
+    }
+}
+
 lazy_static! {
     /// Global Cognitive Bus instance (spin-lock protected).
     static ref COGNITIVE_BUS: Mutex<CognitiveBus> = Mutex::new(CognitiveBus::new());
+    /// Global Reflex Engine (Jalon 119)
+    static ref REFLEX_ENGINE: Mutex<ReflexEngine> = Mutex::new(ReflexEngine::new());
 }
 
 /// Publish a message to the Cognitive Bus (priority-aware).
 ///
 /// Messages are ordered by priority: Critical > High > Normal > Low.
 /// Within the same priority level, earlier messages are consumed first.
+///
+/// Jalon 119: Before inserting, the Reflex Engine checks if this intent
+/// matches a registered reflex rule. If so, a routed message is auto-
+/// generated and published alongside the original (or instead of it,
+/// depending on `pass_through`).
 ///
 /// # Returns
 /// * `Ok(())` if the message was published successfully
@@ -169,6 +246,33 @@ lazy_static! {
 /// # Performance
 /// O(log n) with spin-lock (n = current message count)
 pub fn publish(msg: IntentMessage) -> Result<(), BusError> {
+    // Jalon 119: Check Reflex Engine
+    let reflex_action = {
+        let engine = REFLEX_ENGINE.lock();
+        engine.check(msg.intent_id).copied()
+    };
+
+    if let Some(action) = reflex_action {
+        // Fire the reflex: generate a routed message
+        let routed = IntentMessage {
+            source: msg.source,
+            destination: action.target,
+            intent_id: action.emit_intent,
+            priority: action.priority,
+            payload: msg.payload,
+            timestamp: msg.timestamp,
+            session_id: msg.session_id,
+            correlation_id: msg.correlation_id,
+        };
+        COGNITIVE_BUS.lock().push(routed)?;
+        REFLEX_ENGINE.lock().fired();
+
+        if !action.pass_through {
+            // Reflex consumed the intent — don't keep original
+            return Ok(());
+        }
+    }
+
     COGNITIVE_BUS.lock().push(msg)
 }
 
@@ -236,4 +340,38 @@ pub fn is_empty() -> bool {
 /// Returns the maximum capacity of the bus
 pub fn capacity() -> usize {
     BUS_CAPACITY
+}
+
+// ═══════════════════════════════════════════════════
+// Reflex Engine Public API (Jalon 119)
+// ═══════════════════════════════════════════════════
+
+/// Register a reflex rule: when `trigger_intent` is seen on the bus,
+/// automatically route a message to the specified target component.
+///
+/// This allows the WM (or any fast-path agent) to receive certain intents
+/// directly without the LLM agent having to process and re-route them.
+///
+/// # Example
+/// ```
+/// // Route INTENT_GET_UI_TREE (0xB119) directly to the WM (Worker component)
+/// register_reflex(0xB119, ReflexAction {
+///     target: ComponentId::Worker,
+///     emit_intent: 0xB119,
+///     priority: Priority::High,
+///     pass_through: false,
+/// });
+/// ```
+pub fn register_reflex(trigger_intent: u32, action: ReflexAction) {
+    REFLEX_ENGINE.lock().register(trigger_intent, action);
+}
+
+/// Get the number of registered reflex rules.
+pub fn reflex_rule_count() -> usize {
+    REFLEX_ENGINE.lock().rule_count()
+}
+
+/// Get the total number of reflexes fired since boot.
+pub fn reflex_fire_count() -> u64 {
+    REFLEX_ENGINE.lock().total_fires()
 }
