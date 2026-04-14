@@ -1291,12 +1291,11 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
 
     match fd_type {
         crate::process::FdType::Tty => {
-            // Jalon 96: Blocking I/O for keyboard (FD 0)
-            // Instead of returning 0 immediately, block the process until
-            // a key is pressed (IRQ 1 wakes us up via kbd_wake_blocked).
             if fd != 0 { return 0; } // stdout/stderr can't be read
             let mut temp_buf = [0u8; 256];
             let max_read = core::cmp::min(len as usize, temp_buf.len());
+
+            // Try immediate read first
             let bytes_read = crate::process::kbd_read(&mut temp_buf, max_read);
             if bytes_read > 0 {
                 unsafe {
@@ -1307,28 +1306,35 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
                 }
                 return bytes_read as u64;
             }
-            // No data: block this process and yield to let others run
-            // The keyboard IRQ handler will wake us via kbd_set_waiter/kbd_wake_blocked
+
+            // No data: register as waiter, block, and yield
+            // The keyboard IRQ will push data + call kbd_wake_blocked()
+            // which sets our state back to Ready.
             let current_pid = crate::scheduler::current_pid();
             if current_pid != 0 {
-                crate::process::kbd_set_waiter(current_pid);
-                let _ = crate::process::set_state(current_pid,
-                    crate::process::ProcessState::Blocked);
-                // Yield — the scheduler will skip us until IRQ 1 wakes us
-                sys_yield();
-                // After waking: re-read keyboard buffer
-                let bytes_read2 = crate::process::kbd_read(&mut temp_buf, max_read);
-                if bytes_read2 > 0 {
-                    unsafe {
-                        let dst = buf_addr as *mut u8;
-                        for i in 0..bytes_read2 {
-                            core::ptr::write_volatile(dst.add(i), temp_buf[i]);
+                // Loop: yield until data arrives
+                // Each iteration: register waiter, block, yield, check
+                for _ in 0..4096 {
+                    crate::process::kbd_set_waiter(current_pid);
+                    let _ = crate::process::set_state(
+                        current_pid,
+                        crate::process::ProcessState::Blocked,
+                    );
+                    sys_yield();
+                    // After waking (IRQ set us Ready), try to read
+                    let n = crate::process::kbd_read(&mut temp_buf, max_read);
+                    if n > 0 {
+                        unsafe {
+                            let dst = buf_addr as *mut u8;
+                            for i in 0..n {
+                                core::ptr::write_volatile(dst.add(i), temp_buf[i]);
+                            }
                         }
+                        return n as u64;
                     }
-                    return bytes_read2 as u64;
                 }
             }
-            0 // Fallback
+            0
         }
 
         crate::process::FdType::Socket => {

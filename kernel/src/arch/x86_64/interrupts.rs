@@ -153,7 +153,7 @@ pub extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: Interrupt
     // the keyboard IRQ handler retrieves the pending scancode byte.
     let scancode: u8 = unsafe { port.read() };
 
-    crate::serial_println!("[KEYBOARD] Scancode: 0x{:02x}", scancode);
+    // Silent — stub handler, real handler is in idt.rs
 
     // Notifier fin d'interruption
     // SAFETY: Sends EOI to PIC for keyboard IRQ. Required to re-enable
