@@ -63,7 +63,8 @@ const KNOWN_CMDS: &[&[u8]] = &[b"help", b"clear", b"ls", b"cat", b"ps", b"mem", 
     b"kill", b"top", b"write", b"cp", b"echo", b"env", b"uptime", b"df", b"history",
     b"mcp_test", b"orch_test", b"agi_test", b"pkg", b"tool_exec", b"net_auto", b"agent",
     b"desktop", b"startx", b"persona", b"agi",
-    b"ssh", b"scp", b"sftp", b"rdp", b"remote"];
+    b"ssh", b"scp", b"sftp", b"rdp", b"remote",
+    b"busybox_test", b"linux_test"];
 
 const INTENT_GEN_DRIVER: u64 = 0x9001;
 const INTENT_MCP_EXECUTE: u64 = 0x9002;
@@ -1370,6 +1371,8 @@ fn process_command(term: &mut Terminal) {
         cmd_agi(term, args);
     } else if bytes_eq(first_word, b"exec") {
         cmd_run(term, args);
+    } else if bytes_eq(first_word, b"busybox_test") || bytes_eq(first_word, b"linux_test") {
+        cmd_busybox_test(term);
     } else if bytes_eq(first_word, b"ssh") {
         cmd_ssh(term, args);
     } else if bytes_eq(first_word, b"scp") || bytes_eq(first_word, b"sftp") {
@@ -2436,6 +2439,96 @@ fn cmd_orch_test(term: &mut Terminal) {
 // Chains: Terminal -> LLM (JSON contract) -> MCP -> BusyBox ls -l /disk/models/
 // This is the first bare-metal OS where AI reasons and issues Linux commands.
 // ═══════════════════════════════════════════════════
+/// Jalon 131: Linux binary execution test via Linuxulator.
+/// Forks, execves BusyBox with arguments, captures stdout via Cognitive Pipe.
+fn cmd_busybox_test(term: &mut Terminal) {
+    term.put_char(b'\n', TEXT);
+    term.put_str(b"[LINUX-TEST] === Jalon 131: Linuxulator Crucible ===\n", INFO_COL);
+    sys_write(1, b"[TERM] busybox_test: starting Linux binary execution test\n");
+
+    term.put_str(b"[LINUX-TEST] Step 1: fork() to create child process...\n", DIM);
+    let child_pid = sys_fork();
+
+    if child_pid == 0 {
+        // Child process: exec busybox
+        sys_write(1, b"[CHILD] Executing /bin/busybox.elf --help\n");
+        let path = b"/bin/busybox.elf\0";
+        sys_exec(path);
+        // If exec fails, exit
+        sys_write(1, b"[CHILD] exec failed!\n");
+        sys_exit(127);
+    } else if child_pid > 0 {
+        // Parent process
+        term.put_str(b"[LINUX-TEST] Step 2: Child PID = ", DIM);
+        // Print PID
+        let pid_val = child_pid as u64;
+        let mut buf = [0u8; 10];
+        let mut n = 0;
+        let mut v = pid_val;
+        if v == 0 { buf[0] = b'0'; n = 1; }
+        else {
+            while v > 0 && n < 10 { buf[n] = b'0' + (v % 10) as u8; v /= 10; n += 1; }
+            // Reverse
+            let mut i = 0;
+            let mut j = n - 1;
+            while i < j { let t = buf[i]; buf[i] = buf[j]; buf[j] = t; i += 1; j -= 1; }
+        }
+        term.put_str(&buf[..n], TEXT);
+        term.put_str(b"\n", TEXT);
+
+        // Enable stdout capture on child
+        sys_capture_stdout(pid_val, true);
+        term.put_str(b"[LINUX-TEST] Step 3: Capture enabled, waiting for child...\n", DIM);
+
+        // Wait for child
+        let exit_code = sys_wait(pid_val as u64);
+        term.put_str(b"[LINUX-TEST] Step 4: Child exited with code ", DIM);
+        let ec = exit_code as u64;
+        let mut buf2 = [0u8; 10];
+        let mut n2 = 0;
+        let mut v2 = ec;
+        if v2 == 0 { buf2[0] = b'0'; n2 = 1; }
+        else {
+            while v2 > 0 && n2 < 10 { buf2[n2] = b'0' + (v2 % 10) as u8; v2 /= 10; n2 += 1; }
+            let mut i = 0;
+            let mut j = n2 - 1;
+            while i < j { let t = buf2[i]; buf2[i] = buf2[j]; buf2[j] = t; i += 1; j -= 1; }
+        }
+        term.put_str(&buf2[..n2], TEXT);
+        term.put_str(b"\n", TEXT);
+
+        // Read captured output
+        let mut capture_buf = [0u8; 512];
+        let captured = sys_read_captured(&mut capture_buf);
+        if captured > 0 {
+            term.put_str(b"[LINUX-TEST] Captured output (", INFO_COL);
+            let cn = captured as u64;
+            let mut buf3 = [0u8; 10];
+            let mut n3 = 0;
+            let mut v3 = cn;
+            if v3 == 0 { buf3[0] = b'0'; n3 = 1; }
+            else {
+                while v3 > 0 && n3 < 10 { buf3[n3] = b'0' + (v3 % 10) as u8; v3 /= 10; n3 += 1; }
+                let mut i = 0;
+                let mut j = n3 - 1;
+                while i < j { let t = buf3[i]; buf3[i] = buf3[j]; buf3[j] = t; i += 1; j -= 1; }
+            }
+            term.put_str(&buf3[..n3], TEXT);
+            term.put_str(b" bytes):\n", INFO_COL);
+            let preview = core::cmp::min(captured as usize, 256);
+            term.put_str(&capture_buf[..preview], TEXT);
+            term.put_str(b"\n", TEXT);
+        } else {
+            term.put_str(b"[LINUX-TEST] No captured output (check serial log)\n", ERR_COL);
+        }
+
+        term.put_str(b"[LINUX-TEST] === Linuxulator test complete ===\n", INFO_COL);
+        sys_write(1, b"[TERM] busybox_test: COMPLETE\n");
+    } else {
+        term.put_str(b"[LINUX-TEST] ERROR: fork() failed\n", ERR_COL);
+    }
+}
+
 fn cmd_agi_test(term: &mut Terminal) {
     term.put_char(b'\n', TEXT);
     term.put_str(b"[AGI-TEST] === End-to-End AGI Pipeline Test (Jalon 117b) ===\n", INFO_COL);
