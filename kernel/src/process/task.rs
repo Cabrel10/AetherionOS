@@ -319,6 +319,13 @@ pub struct Process {
     pub signal_mask: u64,
     /// Jalon 127: Saved argv strings for this process (e.g., for /proc/self/cmdline).
     pub argv: Vec<String>,
+    /// Jalon 131: FS segment base address (MSR 0xC0000100) for TLS support.
+    /// Must be saved/restored on context switch for musl/glibc thread-local storage.
+    pub fs_base: u64,
+    /// Jalon 131: GS segment base address (MSR 0xC0000101).
+    pub gs_base: u64,
+    /// Jalon 131: Robust futex list head pointer (for musl thread cleanup).
+    pub robust_list_head: u64,
 }
 
 /// Virtual Memory Area — describes a file-backed memory mapping
@@ -382,6 +389,9 @@ impl Process {
             signal_handlers: [0u64; 32],
             signal_mask: 0,
             argv: Vec::new(),
+            fs_base: 0,
+            gs_base: 0,
+            robust_list_head: 0,
         }
     }
 

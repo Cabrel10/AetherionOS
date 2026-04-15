@@ -128,13 +128,13 @@ fn find_rsdp(phys_offset: u64) -> Option<u64> {
 
     let mut addr = start;
     while addr < end {
-        let sig = unsafe { core::ptr::read_volatile(addr as *const [u8; 8]) };
+        let sig = unsafe { core::ptr::read_unaligned(addr as *const [u8; 8]) };
         if sig == RSDP_SIGNATURE {
             // Verify checksum (sum of first 20 bytes must be 0 mod 256)
             let mut sum: u8 = 0;
             for i in 0..20u64 {
                 sum = sum.wrapping_add(unsafe {
-                    core::ptr::read_volatile((addr + i) as *const u8)
+                    core::ptr::read_unaligned((addr + i) as *const u8)
                 });
             }
             if sum == 0 {
@@ -146,18 +146,18 @@ fn find_rsdp(phys_offset: u64) -> Option<u64> {
 
     // Also search EBDA (first KiB)
     let ebda_seg_ptr = (phys_offset + 0x40E) as *const u16;
-    let ebda_seg = unsafe { core::ptr::read_volatile(ebda_seg_ptr) } as u64;
+    let ebda_seg = unsafe { core::ptr::read_unaligned(ebda_seg_ptr) } as u64;
     if ebda_seg != 0 {
         let ebda_base = phys_offset + (ebda_seg << 4);
         let ebda_end = ebda_base + 1024;
         let mut addr = ebda_base;
         while addr < ebda_end {
-            let sig = unsafe { core::ptr::read_volatile(addr as *const [u8; 8]) };
+            let sig = unsafe { core::ptr::read_unaligned(addr as *const [u8; 8]) };
             if sig == RSDP_SIGNATURE {
                 let mut sum: u8 = 0;
                 for i in 0..20u64 {
                     sum = sum.wrapping_add(unsafe {
-                        core::ptr::read_volatile((addr + i) as *const u8)
+                        core::ptr::read_unaligned((addr + i) as *const u8)
                     });
                 }
                 if sum == 0 {
@@ -173,9 +173,9 @@ fn find_rsdp(phys_offset: u64) -> Option<u64> {
 
 /// Parse the RSDP and walk RSDT/XSDT entries
 fn parse_rsdp(rsdp_virt: u64, phys_offset: u64) {
-    let rsdp = unsafe { &*(rsdp_virt as *const Rsdp) };
-    let revision = rsdp.revision;
-    let rsdt_phys = rsdp.rsdt_address;
+    // Read packed RSDP fields safely with read_unaligned
+    let revision = unsafe { core::ptr::read_unaligned((rsdp_virt + 15) as *const u8) };
+    let rsdt_phys = unsafe { core::ptr::read_unaligned((rsdp_virt + 16) as *const u32) };
 
     crate::serial_println!("[ACPI] RSDP revision: {} ({})",
         revision,
@@ -183,8 +183,7 @@ fn parse_rsdp(rsdp_virt: u64, phys_offset: u64) {
     );
 
     if revision >= 2 {
-        let rsdp2 = unsafe { &*(rsdp_virt as *const Rsdp2) };
-        let xsdt_phys = rsdp2.xsdt_address;
+        let xsdt_phys = unsafe { core::ptr::read_unaligned((rsdp_virt + 24) as *const u64) };
         if xsdt_phys != 0 {
             crate::serial_println!("[ACPI] XSDT at physical 0x{:X}", xsdt_phys);
             parse_xsdt(phys_offset + xsdt_phys, phys_offset);
@@ -200,8 +199,10 @@ fn parse_rsdp(rsdp_virt: u64, phys_offset: u64) {
 
 /// Parse the RSDT (Root System Description Table) — 32-bit pointers
 fn parse_rsdt(rsdt_virt: u64, phys_offset: u64) {
-    let header = unsafe { &*(rsdt_virt as *const AcpiSdtHeader) };
-    let total_len = header.length as u64;
+    // Use read_unaligned to avoid alignment panics on ACPI tables
+    let total_len = unsafe {
+        core::ptr::read_unaligned((rsdt_virt + 4) as *const u32)
+    } as u64;
     let header_size = core::mem::size_of::<AcpiSdtHeader>() as u64;
 
     if total_len <= header_size || total_len > 0x10000 {
@@ -215,7 +216,7 @@ fn parse_rsdt(rsdt_virt: u64, phys_offset: u64) {
     let entries_base = rsdt_virt + header_size;
     for i in 0..num_entries {
         let entry_phys = unsafe {
-            core::ptr::read_volatile((entries_base + i * 4) as *const u32)
+            core::ptr::read_unaligned((entries_base + i * 4) as *const u32)
         } as u64;
         if entry_phys != 0 {
             parse_sdt(phys_offset + entry_phys, phys_offset);
@@ -225,8 +226,10 @@ fn parse_rsdt(rsdt_virt: u64, phys_offset: u64) {
 
 /// Parse the XSDT (Extended System Description Table) — 64-bit pointers
 fn parse_xsdt(xsdt_virt: u64, phys_offset: u64) {
-    let header = unsafe { &*(xsdt_virt as *const AcpiSdtHeader) };
-    let total_len = header.length as u64;
+    // Use read_unaligned to avoid alignment panics on ACPI tables
+    let total_len = unsafe {
+        core::ptr::read_unaligned((xsdt_virt + 4) as *const u32)
+    } as u64;
     let header_size = core::mem::size_of::<AcpiSdtHeader>() as u64;
 
     if total_len <= header_size || total_len > 0x10000 {
@@ -240,7 +243,7 @@ fn parse_xsdt(xsdt_virt: u64, phys_offset: u64) {
     let entries_base = xsdt_virt + header_size;
     for i in 0..num_entries {
         let entry_phys = unsafe {
-            core::ptr::read_volatile((entries_base + i * 8) as *const u64)
+            core::ptr::read_unaligned((entries_base + i * 8) as *const u64)
         };
         if entry_phys != 0 {
             parse_sdt(phys_offset + entry_phys, phys_offset);
@@ -250,8 +253,11 @@ fn parse_xsdt(xsdt_virt: u64, phys_offset: u64) {
 
 /// Dispatch parsing based on SDT signature
 fn parse_sdt(sdt_virt: u64, phys_offset: u64) {
-    let header = unsafe { &*(sdt_virt as *const AcpiSdtHeader) };
-    let sig = header.signature;
+    // Use read_unaligned: ACPI tables may not be naturally aligned
+    let mut sig = [0u8; 4];
+    for j in 0..4 {
+        sig[j] = unsafe { core::ptr::read_unaligned((sdt_virt + j as u64) as *const u8) };
+    }
 
     if sig == MADT_SIGNATURE {
         parse_madt(sdt_virt, phys_offset);
@@ -265,8 +271,10 @@ fn parse_sdt(sdt_virt: u64, phys_offset: u64) {
 /// Parse the MADT (Multiple APIC Description Table)
 /// Enumerates Local APIC entries to count CPUs and collect APIC IDs.
 fn parse_madt(madt_virt: u64, _phys_offset: u64) {
-    let header = unsafe { &*(madt_virt as *const AcpiSdtHeader) };
-    let total_len = header.length as u64;
+    // Use read_unaligned for all ACPI fields
+    let total_len = unsafe {
+        core::ptr::read_unaligned((madt_virt + 4) as *const u32)
+    } as u64;
     let header_size = core::mem::size_of::<AcpiSdtHeader>() as u64;
 
     // MADT has 8 extra bytes after the standard header:
@@ -279,7 +287,7 @@ fn parse_madt(madt_virt: u64, _phys_offset: u64) {
     }
 
     let local_apic_addr = unsafe {
-        core::ptr::read_volatile((madt_virt + header_size) as *const u32)
+        core::ptr::read_unaligned((madt_virt + header_size) as *const u32)
     };
     crate::serial_println!("[ACPI] MADT: Local APIC address = 0x{:08X}", local_apic_addr);
 
@@ -291,10 +299,10 @@ fn parse_madt(madt_virt: u64, _phys_offset: u64) {
 
     while offset + 2 <= total_len {
         let entry_type = unsafe {
-            core::ptr::read_volatile((madt_virt + offset) as *const u8)
+            core::ptr::read_unaligned((madt_virt + offset) as *const u8)
         };
         let entry_len = unsafe {
-            core::ptr::read_volatile((madt_virt + offset + 1) as *const u8)
+            core::ptr::read_unaligned((madt_virt + offset + 1) as *const u8)
         };
 
         if entry_len < 2 {
@@ -304,11 +312,13 @@ fn parse_madt(madt_virt: u64, _phys_offset: u64) {
         match entry_type {
             MADT_LOCAL_APIC => {
                 if entry_len >= 8 {
-                    let entry = unsafe {
-                        &*((madt_virt + offset) as *const MadtLocalApic)
+                    // Read packed fields safely with byte-level access
+                    let apic_id = unsafe {
+                        core::ptr::read_unaligned((madt_virt + offset + 3) as *const u8)
                     };
-                    let flags = entry.flags;
-                    let apic_id = entry.apic_id;
+                    let flags = unsafe {
+                        core::ptr::read_unaligned((madt_virt + offset + 4) as *const u32)
+                    };
                     // Bit 0: Processor Enabled, Bit 1: Online Capable
                     if (flags & 0x01) != 0 || (flags & 0x02) != 0 {
                         if (cpu_count as usize) < 16 {
