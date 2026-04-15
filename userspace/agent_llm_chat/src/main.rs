@@ -39,6 +39,95 @@ const INTENT_GENERATION_DONE: u64  = 0x8003;
 const INTENT_LLM_READY: u64       = 0x8004;
 const INTENT_LLM_CHAT_INIT: u64   = 0xD064;
 const INTENT_MODEL_FOUND: u64     = 0xD067;
+const INTENT_LLM_RESPONSE: u64    = 0x8131;  // Jalon 131: decoded token string
+const INTENT_LLM_WORD: u64        = 0x8132;  // Jalon 131: full word decoded
+
+// ═══════════════════════════════════════════════════
+// Jalon 131: Toy Vocabulary for Token-to-String Decode
+// ═══════════════════════════════════════════════════
+// Maps token IDs to French/English words for Cognitive Bus publication.
+// In production, the tokenizer.ggml.tokens array from GGUF would be used.
+// This proves the decode pipeline: token_id -> string -> bus publish.
+
+struct VocabEntry {
+    token_id: usize,
+    word: &'static [u8],
+}
+
+const TOY_VOCAB: &[VocabEntry] = &[
+    VocabEntry { token_id: 0, word: b"<unk>" },
+    VocabEntry { token_id: 1, word: b"<s>" },
+    VocabEntry { token_id: 2, word: b"</s>" },
+    VocabEntry { token_id: 10, word: b"\n" },
+    VocabEntry { token_id: 32, word: b" " },
+    VocabEntry { token_id: 65, word: b"A" },
+    VocabEntry { token_id: 66, word: b"B" },
+    VocabEntry { token_id: 72, word: b"H" },
+    VocabEntry { token_id: 97, word: b"a" },
+    VocabEntry { token_id: 101, word: b"e" },
+    VocabEntry { token_id: 108, word: b"l" },
+    VocabEntry { token_id: 111, word: b"o" },
+    VocabEntry { token_id: 114, word: b"r" },
+    VocabEntry { token_id: 256, word: b"the" },
+    VocabEntry { token_id: 257, word: b"is" },
+    VocabEntry { token_id: 258, word: b"of" },
+    VocabEntry { token_id: 512, word: b"Paris" },
+    VocabEntry { token_id: 513, word: b"France" },
+    VocabEntry { token_id: 514, word: b"Berlin" },
+    VocabEntry { token_id: 515, word: b"Germany" },
+    VocabEntry { token_id: 768, word: b"hello" },
+    VocabEntry { token_id: 769, word: b"world" },
+    VocabEntry { token_id: 1024, word: b"AI" },
+    VocabEntry { token_id: 1025, word: b"agent" },
+    VocabEntry { token_id: 1026, word: b"model" },
+    VocabEntry { token_id: 1452, word: b"Bonjour" },
+    VocabEntry { token_id: 1453, word: b"merci" },
+    VocabEntry { token_id: 1454, word: b"oui" },
+    VocabEntry { token_id: 1455, word: b"non" },
+    VocabEntry { token_id: 1500, word: b"capital" },
+    VocabEntry { token_id: 1501, word: b"est" },
+    VocabEntry { token_id: 1502, word: b"la" },
+    VocabEntry { token_id: 1503, word: b"de" },
+    VocabEntry { token_id: 2048, word: b"AetherionOS" },
+    VocabEntry { token_id: 2049, word: b"kernel" },
+    VocabEntry { token_id: 2050, word: b"syscall" },
+];
+
+/// Decode a token ID to its string representation.
+/// Returns the word bytes if found, otherwise a fallback ASCII char.
+fn decode_token(token_id: usize) -> &'static [u8] {
+    for entry in TOY_VOCAB.iter() {
+        if entry.token_id == token_id {
+            return entry.word;
+        }
+    }
+    // Fallback: printable ASCII
+    if token_id >= 0x20 && token_id <= 0x7E {
+        return b".";
+    }
+    b"?"
+}
+
+/// Publish decoded token string on Cognitive Bus (Jalon 131)
+fn publish_decoded_token(token_id: usize, pos: usize) {
+    let word = decode_token(token_id);
+    // Pack: first 4 bytes of word + token_id in high bits
+    let mut packed: u64 = 0;
+    let len = core::cmp::min(word.len(), 7);
+    for i in 0..len {
+        packed |= (word[i] as u64) << (i * 8);
+    }
+    // Publish the word intent
+    sys_bus_publish(INTENT_LLM_WORD, 2, packed);
+    // Log
+    sys_write(1, b"[LLM-DECODE] token=");
+    print_u64(token_id as u64);
+    sys_write(1, b" -> \"");
+    sys_write(1, word);
+    sys_write(1, b"\" pos=");
+    print_u64(pos as u64);
+    sys_write(1, b"\n");
+}
 
 // GGUF v3 magic
 const GGUF_MAGIC: u32 = 0x46554747;
@@ -1890,12 +1979,17 @@ fn generate_response(
         if pos >= cfg.max_seq_len { break; }
 
         let safe_tok = cur_token % cfg.vocab_size;
+
+        // Jalon 131: Decode token to string via vocabulary lookup
+        let decoded_word = decode_token(safe_tok);
+        sys_write(1, decoded_word);
+        publish_decoded_token(safe_tok, pos);
+
         let ch = if safe_tok >= 0x20 && safe_tok <= 0x7E {
             valid += 1;
             safe_tok as u8
         } else if safe_tok == 0x0A { b'\n' }
         else { b'.' };
-        sys_write(1, &[ch]);
         sys_bus_publish(INTENT_TOKEN_GENERATED, 2, ((pos as u64) << 8) | (ch as u64));
 
         // Embed current token
