@@ -725,6 +725,12 @@ pub fn sys_wait(pid: u64) -> i64 {
     syscall1(SYS_WAIT, pid) as i64
 }
 
+/// Send a signal to a process.
+/// sig: signal number (9 = SIGKILL, 15 = SIGTERM, etc.)
+pub fn sys_kill(pid: u64, sig: u32) -> i64 {
+    syscall2(62, pid, sig as u64) as i64
+}
+
 /// Yield the CPU to another ready process/thread.
 pub fn sys_yield_cpu() -> i64 {
     syscall0(SYS_YIELD) as i64
@@ -756,6 +762,14 @@ pub fn sys_exec(path: &[u8]) -> i64 {
     syscall1(SYS_EXEC, path.as_ptr() as u64) as i64
 }
 
+/// Jalon 127: Execute a binary with argv and envp arrays.
+/// path: null-terminated path to the binary.
+/// argv: pointer to null-terminated array of string pointers.
+/// envp: pointer to null-terminated array of string pointers.
+pub fn sys_execve(path: &[u8], argv: *const *const u8, envp: *const *const u8) -> i64 {
+    syscall3(SYS_EXEC, path.as_ptr() as u64, argv as u64, envp as u64) as i64
+}
+
 /// Execute a binary by path (null-terminated), replacing current process.
 /// Alias for sys_exec with explicit path parameter.
 pub fn sys_exec_path(path: &[u8]) -> i64 {
@@ -765,6 +779,26 @@ pub fn sys_exec_path(path: &[u8]) -> i64 {
 /// Fork the current process. Returns child PID to parent, 0 to child.
 pub fn sys_fork() -> i64 {
     syscall0(SYS_FORK) as i64
+}
+
+// ============================================================
+// Jalon 129: Cognitive Pipe — stdout capture syscalls
+// ============================================================
+
+const SYS_CAPTURE_STDOUT: u64 = 591;
+const SYS_READ_CAPTURED: u64 = 592;
+
+/// Enable/disable stdout capture on a child process.
+/// When enabled, the child's writes to fd 1/2 are intercepted and
+/// published via INTENT_TOOL_STDOUT on the Cognitive Bus.
+pub fn sys_capture_stdout(child_pid: u64, enable: bool) -> i64 {
+    syscall2(SYS_CAPTURE_STDOUT, child_pid, if enable { 1 } else { 0 }) as i64
+}
+
+/// Read the last captured stdout text from the kernel IPC buffer.
+/// Returns the number of bytes read.
+pub fn sys_read_captured(buf: &mut [u8]) -> i64 {
+    syscall2(SYS_READ_CAPTURED, buf.as_mut_ptr() as u64, buf.len() as u64) as i64
 }
 
 // ============================================================

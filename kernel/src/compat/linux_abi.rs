@@ -2107,10 +2107,29 @@ pub fn linux_process_vm_readv(pid: u64, local_iov: u64, liovcnt: u64, remote_iov
 //
 // This is the bridge between native Linux binaries and the AI pipeline.
 
-/// Intent ID for process stdout/stderr output
+/// Intent ID for process stdout/stderr output (legacy hash-based)
 pub const INTENT_PROCESS_OUTPUT: u32 = 0xC001;
 /// Intent ID for process exit notification
 pub const INTENT_PROCESS_EXIT: u32 = 0xC002;
+/// Jalon 129: Intent ID for captured tool stdout (full text in IPC buffer)
+pub const INTENT_TOOL_STDOUT: u32 = 0xC010;
+
+// ═══════════════════════════════════════════════════════════
+// Jalon 129: Static IPC buffer for stdout capture
+// Stores the last captured text (up to 4096 bytes) for the parent to read.
+// ═══════════════════════════════════════════════════════════
+static mut CAPTURED_TEXT_BUF: [u8; 4096] = [0u8; 4096];
+static mut CAPTURED_TEXT_LEN: usize = 0;
+static mut CAPTURED_TEXT_PID: u64 = 0;
+
+/// Read the last captured text from the IPC buffer.
+/// Returns (pid, &[u8]) of the last captured output.
+pub fn read_captured_text() -> (u64, &'static [u8]) {
+    unsafe {
+        let len = core::cmp::min(CAPTURED_TEXT_LEN, 4096);
+        (CAPTURED_TEXT_PID, &CAPTURED_TEXT_BUF[..len])
+    }
+}
 
 /// Capture process output and publish to Cognitive Bus.
 /// Called from sys_write when fd=1 or fd=2 for a child process.
@@ -2159,6 +2178,48 @@ pub fn cognitive_pipe_exit(pid: u64, exit_code: i32) {
         "[COGNITIVE-PIPE] Process PID {} exited with code {} — published INTENT_PROCESS_EXIT",
         pid, exit_code
     );
+}
+
+/// Jalon 129: True Cognitive Pipe — capture full stdout text into IPC buffer.
+/// Called from sys_write when a process has captured_by_pid set.
+/// Copies the text into CAPTURED_TEXT_BUF and publishes INTENT_TOOL_STDOUT.
+///
+/// payload layout: (child_pid << 32) | (len & 0xFFFF_FFFF)
+pub fn cognitive_pipe_capture_text(
+    child_pid: u64,
+    parent_pid: u64,
+    fd: u32,
+    buf_addr: u64,
+    len: u64,
+) {
+    if len == 0 || len > 4096 { return; }
+    let n = len as usize;
+
+    // Copy text from user space into kernel IPC buffer
+    unsafe {
+        let src = buf_addr as *const u8;
+        for i in 0..n {
+            CAPTURED_TEXT_BUF[i] = core::ptr::read_volatile(src.add(i));
+        }
+        CAPTURED_TEXT_LEN = n;
+        CAPTURED_TEXT_PID = child_pid;
+    }
+
+    crate::serial_println!(
+        "[CAPTURE] PID {} -> parent PID {}, fd={}, len={} bytes",
+        child_pid, parent_pid, fd, n
+    );
+
+    // Publish INTENT_TOOL_STDOUT with payload = (child_pid << 32) | len
+    let payload = (child_pid << 32) | (n as u64);
+    let msg = crate::ipc::IntentMessage::new(
+        crate::ipc::ComponentId::Worker,
+        crate::ipc::ComponentId::Orchestrator,
+        INTENT_TOOL_STDOUT,
+        crate::ipc::Priority::High,
+        payload,
+    );
+    let _ = crate::ipc::bus::publish(msg);
 }
 
 // ═══════════════════════════════════════════════════════════

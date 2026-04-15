@@ -1096,6 +1096,164 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
     })
 }
 
+// ═══════════════════════════════════════════════════════════════
+// Jalon 127: Build System V ABI Stack with real argv/envp
+// ═══════════════════════════════════════════════════════════════
+
+/// Build a proper System V x86_64 ABI stack for execve.
+///
+/// Writes strings, pointers, auxv, argc onto the top stack page.
+/// Returns the final RSP value (16-byte aligned, pointing to argc).
+///
+/// Stack layout (growing DOWN from page top):
+///   [string area: argv[0]\0, argv[1]\0, ..., envp[0]\0, ...]
+///   [16 random bytes]
+///   [padding to 16-byte align]
+///   [AT_NULL, 0]
+///   [auxv entries ...]
+///   [NULL]                <- end of envp
+///   [envp[N-1] ptr ... envp[0] ptr]
+///   [NULL]                <- end of argv
+///   [argv[N-1] ptr ... argv[0] ptr]
+///   [argc]                <- RSP points here
+///
+/// SAFETY: pml4_phys must be a valid PML4 with the top stack page mapped.
+pub unsafe fn build_sysv_stack(
+    pml4_phys: u64,
+    argv: &[alloc::string::String],
+    envp: &[alloc::string::String],
+    entry_point: u64,
+) -> Option<u64> {
+    // Find the physical frame backing the top stack page
+    let top_stack_page_vaddr = USER_STACK_TOP - PAGE_SIZE; // 0x7FFF_FFFF_E000
+    let frame_phys = lookup_page_frame(pml4_phys, top_stack_page_vaddr)?;
+    let page_base = phys_to_virt(frame_phys) as *mut u8;
+
+    // We have 4096 bytes in this page. Layout:
+    // Offsets 0xC00..0xFFF: string area + random bytes (1024 bytes for strings)
+    // Offsets 0x400..0xBFF: pointer/auxv area (2048 bytes = 256 u64s)
+
+    // --- Phase 1: Write strings starting at offset 0xC00 ---
+    let mut str_offset: usize = 0xC00;
+    let mut argv_vaddrs: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+    let mut envp_vaddrs: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+
+    for arg in argv.iter() {
+        let bytes = arg.as_bytes();
+        let len = core::cmp::min(bytes.len(), 255); // Limit each arg to 255 bytes
+        if str_offset + len + 1 > 0xFF0 { break; } // Leave room for random bytes
+        let vaddr = top_stack_page_vaddr + str_offset as u64;
+        for i in 0..len {
+            core::ptr::write_volatile(page_base.add(str_offset + i), bytes[i]);
+        }
+        core::ptr::write_volatile(page_base.add(str_offset + len), 0u8); // NUL
+        argv_vaddrs.push(vaddr);
+        str_offset += len + 1;
+    }
+
+    for env in envp.iter() {
+        let bytes = env.as_bytes();
+        let len = core::cmp::min(bytes.len(), 255);
+        if str_offset + len + 1 > 0xFF0 { break; }
+        let vaddr = top_stack_page_vaddr + str_offset as u64;
+        for i in 0..len {
+            core::ptr::write_volatile(page_base.add(str_offset + i), bytes[i]);
+        }
+        core::ptr::write_volatile(page_base.add(str_offset + len), 0u8);
+        envp_vaddrs.push(vaddr);
+        str_offset += len + 1;
+    }
+
+    // --- Phase 2: Write 16 random bytes at offset 0xFF0 ---
+    let random_vaddr = top_stack_page_vaddr + 0xFF0;
+    {
+        let tsc: u64;
+        core::arch::asm!("rdtsc", "shl rdx, 32", "or rax, rdx",
+                         out("rax") tsc, out("rdx") _, options(nomem, nostack));
+        let random_ptr = page_base.add(0xFF0);
+        let mut seed = tsc;
+        for i in 0..16 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            core::ptr::write_volatile(random_ptr.add(i), (seed >> 33) as u8);
+        }
+    }
+
+    // --- Phase 3: Build pointer/auxv area growing DOWN from offset 0xBF8 ---
+    let auxv: [(u64, u64); 14] = [
+        (AT_PAGESZ,  4096),
+        (AT_PHDR,    entry_point & !0xFFF),
+        (AT_PHENT,   56),
+        (AT_PHNUM,   4),    // Approximate
+        (AT_ENTRY,   entry_point),
+        (AT_BASE,    0),
+        (AT_FLAGS,   0),
+        (AT_UID,     0),
+        (AT_EUID,    0),
+        (AT_GID,     0),
+        (AT_EGID,    0),
+        (AT_SECURE,  0),
+        (AT_RANDOM,  random_vaddr),
+        (AT_HWCAP,   0x078bfbff),
+    ];
+
+    // Total u64 entries:
+    //   1 (argc) + argv_vaddrs.len() (argv ptrs) + 1 (NULL)
+    //   + envp_vaddrs.len() (envp ptrs) + 1 (NULL)
+    //   + auxv.len()*2 (type/value pairs) + 2 (AT_NULL pair)
+    let total_entries = 1 + argv_vaddrs.len() + 1 + envp_vaddrs.len() + 1 + auxv.len() * 2 + 2;
+    let stack_data_size = total_entries * 8;
+
+    // RSP must be 16-byte aligned, well within the page
+    let rsp_offset = (0xBF8 - stack_data_size) & !0xF;
+    if rsp_offset < 0x100 {
+        // Too many args, not enough stack space
+        crate::serial_println!("[ELF] WARNING: argv/envp too large for stack page");
+        return None;
+    }
+
+    let rsp_vaddr = top_stack_page_vaddr + rsp_offset as u64;
+
+    let write_u64 = |off: usize, val: u64| {
+        let ptr = page_base.add(off) as *mut u64;
+        core::ptr::write_volatile(ptr, val);
+    };
+
+    let mut pos = rsp_offset;
+
+    // argc
+    write_u64(pos, argv_vaddrs.len() as u64); pos += 8;
+
+    // argv[0], argv[1], ...
+    for &vaddr in argv_vaddrs.iter() {
+        write_u64(pos, vaddr); pos += 8;
+    }
+    // argv terminator (NULL)
+    write_u64(pos, 0); pos += 8;
+
+    // envp[0], envp[1], ...
+    for &vaddr in envp_vaddrs.iter() {
+        write_u64(pos, vaddr); pos += 8;
+    }
+    // envp terminator (NULL)
+    write_u64(pos, 0); pos += 8;
+
+    // AuxV entries
+    for &(atype, aval) in auxv.iter() {
+        write_u64(pos, atype); pos += 8;
+        write_u64(pos, aval);  pos += 8;
+    }
+    // AT_NULL terminator
+    write_u64(pos, AT_NULL); pos += 8;
+    write_u64(pos, 0);
+
+    crate::serial_println!(
+        "[ELF] Jalon 127: System V stack built: argc={}, envc={}, RSP=0x{:X}",
+        argv_vaddrs.len(), envp_vaddrs.len(), rsp_vaddr
+    );
+
+    Some(rsp_vaddr)
+}
+
 // ===== Load ELF from VFS path =====
 
 /// Load an ELF binary from the VFS and create a Ring 3 process

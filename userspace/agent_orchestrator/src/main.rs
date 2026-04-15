@@ -1,15 +1,18 @@
-//! AetherionOS Jalon 125 — Agent Orchestrateur (Thalamus + Hippocampe + Pipe Cognitif)
+//! AetherionOS Jalon 126 — Agent Orchestrateur v5.0
+//! (Thalamus + Hippocampe + Pipe Cognitif + Autonomous Loop + Personas)
 //!
 //! Chapitre ACHA 3.2 (Thalamus) + 3.3 (Hippocampe) + 3.5 (World Connection):
 //!   - Ecoute INTENT_USER_PROMPT (0x8001) sur le Cognitive Bus
 //!   - Memoire Reflexe O(1): dictionnaire hash -> action immediate (<1ms)
+//!   - Session Memory: tracks last 16 exchanges for context-aware responses
+//!   - Autonomous Loop: tool result -> LLM analysis -> next action -> repeat
+//!   - Persona System: 11 specialized AI personas (pentester, analyst, dev, etc.)
 //!   - Routage intelligent: questions connues -> reponse directe,
 //!     questions complexes -> reveil du LLM via INTENT_LLM_WAKEUP
 //!   - Network queries -> delegate to HTTP Agent via INTENT_HTTP_REQUEST (0xB002)
-//!   - Consumes INTENT_API_RESPONSE (0xB001) for HTTP results
 //!   - Jalon 118: Pipe Cognitif — consumes INTENT_PROCESS_OUTPUT (0xC001)
-//!     from child processes and routes to LLM or memory reflex
 //!   - Jalon 120: Learned reflexes — stores answer hashes for O(1) recall
+//!   - Jalon 126: MCP result reinjection — tool output fed back to LLM
 //!
 //! Intents:
 //!   IN:  0x8001 INTENT_USER_PROMPT    — requete utilisateur (hash du prompt)
@@ -17,11 +20,14 @@
 //!   IN:  0x8010 INTENT_LLM_OUTPUT     — sortie LLM pour synthese
 //!   IN:  0xC001 INTENT_PROCESS_OUTPUT — stdout d'un processus enfant (Pipe Cognitif)
 //!   IN:  0xC002 INTENT_PROCESS_EXIT   — notification de fin de processus enfant
+//!   IN:  0x9003 INTENT_MCP_RESULT     — result from MCP tool execution
+//!   IN:  0xD001 INTENT_PERSONA_SET    — set active persona
 //!   OUT: 0x8002 INTENT_REFLEX_HIT     — reponse reflexe trouvee
 //!   OUT: 0x8003 INTENT_LLM_WAKEUP     — LLM requis pour question complexe
 //!   OUT: 0x8004 INTENT_ORCH_READY     — orchestrateur pret
 //!   OUT: 0x8005 INTENT_ORCH_RESPONSE  — reponse de l'orchestrateur
 //!   OUT: 0xB002 INTENT_HTTP_REQUEST   — requete HTTP a l'Agent HTTP
+//!   OUT: 0x9002 INTENT_MCP_EXECUTE    — trigger MCP tool execution
 
 #![no_std]
 #![no_main]
@@ -49,6 +55,171 @@ const INTENT_NET_QUERY: u64       = 0xB004;
 // Jalon 118: Pipe Cognitif intents
 const INTENT_PROCESS_OUTPUT: u32  = 0xC001;
 const INTENT_PROCESS_EXIT: u32    = 0xC002;
+
+// Jalon 126: Autonomous loop + Persona intents
+const INTENT_MCP_EXECUTE: u64     = 0x9002;
+const INTENT_MCP_RESULT: u32      = 0x9003;
+const INTENT_PERSONA_SET: u32     = 0xD001;
+const INTENT_AUTONOMOUS_STEP: u64 = 0xD010;
+
+// Jalon 129: Tool stdout capture intent
+const INTENT_TOOL_STDOUT: u32     = 0xC010;
+
+// =====================================================
+// Jalon 126: Session Memory — last 16 exchanges
+// =====================================================
+const SESSION_SIZE: usize = 16;
+
+#[derive(Clone, Copy)]
+struct SessionEntry {
+    prompt_hash: u64,
+    response_hash: u64,
+    action_taken: u32,
+    timestamp_tsc: u64,
+}
+
+struct SessionMemory {
+    entries: [SessionEntry; SESSION_SIZE],
+    head: usize,
+    count: usize,
+    /// Number of autonomous steps completed
+    auto_steps: u64,
+    /// Current autonomous goal hash (0 = no goal)
+    current_goal: u64,
+}
+
+impl SessionMemory {
+    fn new() -> Self {
+        let empty = SessionEntry {
+            prompt_hash: 0, response_hash: 0, action_taken: 0, timestamp_tsc: 0,
+        };
+        SessionMemory {
+            entries: [empty; SESSION_SIZE],
+            head: 0,
+            count: 0,
+            auto_steps: 0,
+            current_goal: 0,
+        }
+    }
+
+    fn push(&mut self, prompt: u64, response: u64, action: u32) {
+        self.entries[self.head] = SessionEntry {
+            prompt_hash: prompt,
+            response_hash: response,
+            action_taken: action,
+            timestamp_tsc: sys_rdtsc(),
+        };
+        self.head = (self.head + 1) % SESSION_SIZE;
+        if self.count < SESSION_SIZE { self.count += 1; }
+    }
+
+    fn last_action(&self) -> u32 {
+        if self.count == 0 { return 0; }
+        let idx = if self.head == 0 { SESSION_SIZE - 1 } else { self.head - 1 };
+        self.entries[idx].action_taken
+    }
+
+    fn last_response(&self) -> u64 {
+        if self.count == 0 { return 0; }
+        let idx = if self.head == 0 { SESSION_SIZE - 1 } else { self.head - 1 };
+        self.entries[idx].response_hash
+    }
+}
+
+// =====================================================
+// Jalon 126: Persona System — 11 specialized AI roles
+// =====================================================
+#[derive(Clone, Copy, PartialEq)]
+#[repr(u8)]
+enum Persona {
+    Assistant = 0,      // Default: personal assistant
+    Pentester = 1,      // Network/Web/APK security testing
+    DataAnalyst = 2,    // Data analysis, statistics, visualization
+    SoftDev = 3,        // Software development (Rust, C, Python)
+    WebDev = 4,         // Web development (HTML, CSS, JS, APIs)
+    OsDev = 5,          // Operating system development
+    FoundryDev = 6,     // Smart contract development (Solidity, Foundry)
+    CryptoDev = 7,      // Cryptocurrency development & trading
+    Financial = 8,      // Financial analysis & trading agent
+    Orchestrator = 9,   // Meta-agent: orchestrates other personas
+    Adversary = 10,     // Adversarial testing / red team / game AI
+}
+
+const PERSONA_COUNT: usize = 11;
+
+struct PersonaState {
+    active: Persona,
+    names: [&'static [u8]; PERSONA_COUNT],
+    descriptions: [&'static [u8]; PERSONA_COUNT],
+    /// Tools each persona is authorized to use (bitmask)
+    tool_mask: [u32; PERSONA_COUNT],
+}
+
+impl PersonaState {
+    fn new() -> Self {
+        PersonaState {
+            active: Persona::Assistant,
+            names: [
+                b"Assistant",
+                b"Pentester",
+                b"DataAnalyst",
+                b"SoftDev",
+                b"WebDev",
+                b"OsDev",
+                b"FoundryDev",
+                b"CryptoDev",
+                b"Financial",
+                b"Orchestrator",
+                b"Adversary",
+            ],
+            descriptions: [
+                b"Personal assistant - manages tasks, reminders, system queries",
+                b"Pentester pro - network/web/APK security, nmap/hydra/nuclei",
+                b"Data analyst - statistics, ML, pandas, visualization",
+                b"Software developer - Rust/C/Python, compiler, debugger",
+                b"Web developer - HTML/CSS/JS/APIs, Deno, HTTP, REST",
+                b"OS developer - kernel, drivers, bare-metal, assembly",
+                b"Foundry developer - Solidity, smart contracts, EVM, forge/cast",
+                b"Crypto developer - blockchain, DeFi, tokenomics, trading bots",
+                b"Financial agent - market analysis, portfolio, risk assessment",
+                b"Meta-orchestrator - coordinates other personas for complex tasks",
+                b"Adversary - red team, CTF, game AI, adversarial testing",
+            ],
+            // Tool authorization bitmask:
+            // bit 0: busybox, bit 1: nmap, bit 2: curl, bit 3: python
+            // bit 4: git, bit 5: forge, bit 6: node/deno, bit 7: sqlite
+            // bit 8: file_read, bit 9: file_write, bit 10: exec
+            tool_mask: [
+                0x7FF, // Assistant: all tools
+                0x707, // Pentester: busybox, nmap, curl, python, exec
+                0x309, // DataAnalyst: busybox, python, file_read, file_write
+                0x71F, // SoftDev: busybox, nmap, curl, python, git, exec
+                0x64F, // WebDev: busybox, curl, python, node/deno, exec
+                0x71B, // OsDev: busybox, nmap, python, git, exec
+                0x72F, // FoundryDev: busybox, curl, python, forge, git, exec
+                0x76F, // CryptoDev: busybox, curl, python, forge, node/deno, git, exec
+                0x309, // Financial: busybox, python, file_read, file_write
+                0x7FF, // Orchestrator: all tools
+                0x7FF, // Adversary: all tools
+            ],
+        }
+    }
+
+    fn set_persona(&mut self, id: u8) {
+        if (id as usize) < PERSONA_COUNT {
+            self.active = unsafe { core::mem::transmute(id) };
+            print("[ORCH] Persona switched to: ");
+            sys_write(1, self.names[id as usize]);
+            print(" - ");
+            sys_write(1, self.descriptions[id as usize]);
+            println("");
+        }
+    }
+
+    fn can_use_tool(&self, tool_bit: u32) -> bool {
+        self.tool_mask[self.active as usize] & (1 << tool_bit) != 0
+    }
+}
 
 // =====================================================
 // Hippocampe: Memoire Reflexe O(1)
@@ -405,16 +576,18 @@ fn handle_process_exit(payload: u64) {
 const CONFIDENCE_THRESHOLD: u8 = 70;
 
 // =====================================================
-// MAIN: Thalamus Event Loop v4.0 (with Pipe Cognitif + Learned Reflexes)
+// MAIN: Thalamus Event Loop v5.0
+// (Pipe Cognitif + Learned Reflexes + Session Memory + Autonomous Loop + Personas)
 // =====================================================
 #[no_mangle]
 pub extern "C" fn main() -> i64 {
     println("============================================================");
-    println("[ORCH] AetherionOS Thalamus Orchestrator v4.0 (Jalon 125)");
+    println("[ORCH] AetherionOS Thalamus Orchestrator v5.0 (Jalon 126)");
     println("[ORCH] ACHA Ch.3.2 (Thalamus) + Ch.3.3 (Hippocampe)");
     println("[ORCH]   + Jalon 118: Pipe Cognitif (child stdout -> AI)");
     println("[ORCH]   + Jalon 120: Learned Reflexes O(1)");
-    println("[ORCH]   + Jalon 125: Python/Node Interpreter Support");
+    println("[ORCH]   + Jalon 126: Session Memory + Autonomous Loop");
+    println("[ORCH]   + Jalon 126: Persona System (11 specialized AIs)");
     println("============================================================");
 
     // Initialize Reflex Memory (Hippocampe)
@@ -427,29 +600,49 @@ pub extern "C" fn main() -> i64 {
 
     // Initialize Learned Answer Store (Jalon 120)
     let mut answers = LearnedAnswerStore::new();
-    // Pre-populate the first learned reflex: 2+2=? → "4"
     answers.store(djb2_hash(b"2+2=?"), b"4");
     answers.store(djb2_hash(b"2+2"), b"4");
     answers.store(djb2_hash(b"what is 2+2"), b"4");
     answers.store(djb2_hash(b"what is 2+2?"), b"4");
     print("[ORCH] Learned Answer Store: ");
     print_u64(answers.count as u64);
-    println(" entries (Jalon 120: 2+2=? -> 4)");
+    println(" entries");
+
+    // Jalon 126: Session Memory
+    let mut session = SessionMemory::new();
+    println("[ORCH] Session Memory: 16 slots initialized");
+
+    // Jalon 126: Persona System
+    let mut personas = PersonaState::new();
+    print("[ORCH] Persona System: ");
+    print_u64(PERSONA_COUNT as u64);
+    println(" personas loaded");
+    print("[ORCH] Active persona: ");
+    sys_write(1, personas.names[personas.active as usize]);
+    println("");
+
+    // Print persona list
+    println("[ORCH] Available personas:");
+    let mut pi: usize = 0;
+    while pi < PERSONA_COUNT {
+        print("[ORCH]   ");
+        print_u64(pi as u64);
+        print(": ");
+        sys_write(1, personas.names[pi]);
+        print(" - ");
+        sys_write(1, personas.descriptions[pi]);
+        println("");
+        pi += 1;
+    }
 
     print("[ORCH] Confidence threshold: ");
     print_u64(CONFIDENCE_THRESHOLD as u64);
     println("%");
-    println("[ORCH] Routing: Reflex | HTTP | LLM | PipeCognitif");
+    println("[ORCH] Routing: Reflex | HTTP | LLM | MCP | PipeCognitif | Autonomous");
 
     // Signal readiness
     sys_bus_publish(INTENT_ORCH_READY, 2, reflex.count as u64);
-    println("[ORCH] Published INTENT_ORCH_READY (0x8004) on Cognitive Bus");
-    println("[ORCH] Listening for:");
-    println("[ORCH]   - INTENT_USER_PROMPT     (0x8001)");
-    println("[ORCH]   - INTENT_API_RESPONSE    (0xB001)");
-    println("[ORCH]   - INTENT_LLM_OUTPUT      (0x8010)");
-    println("[ORCH]   - INTENT_PROCESS_OUTPUT  (0xC001) [Pipe Cognitif]");
-    println("[ORCH]   - INTENT_PROCESS_EXIT    (0xC002)");
+    println("[ORCH] Published INTENT_ORCH_READY (0x8004)");
 
     let mut msg_buf: [u64; 8] = [0; 8];
     let mut api_buf: [u64; 8] = [0; 8];
@@ -458,12 +651,14 @@ pub extern "C" fn main() -> i64 {
     let mut llm_routes: u64 = 0;
     let mut http_routes: u64 = 0;
     let mut pipe_outputs: u64 = 0;
+    let mut mcp_results: u64 = 0;
+    let mut auto_loops: u64 = 0;
 
     let mut idle_cycles: u64 = 0;
     let max_idle: u64 = 5_000_000;
 
     loop {
-        // ── Check for user prompts ──
+        // ── 1. Check for user prompts ──
         let result = sys_bus_consume_intent(&mut msg_buf, INTENT_USER_PROMPT);
 
         if result == 0 {
@@ -471,9 +666,11 @@ pub extern "C" fn main() -> i64 {
             idle_cycles = 0;
             total_queries += 1;
 
-            print("[ORCH] Received INTENT_USER_PROMPT #");
+            print("[ORCH] [");
+            sys_write(1, personas.names[personas.active as usize]);
+            print("] Prompt #");
             print_u64(total_queries);
-            print(", hash=0x");
+            print(" hash=0x");
             print_u64(prompt_hash);
             println("");
 
@@ -485,23 +682,20 @@ pub extern "C" fn main() -> i64 {
 
                     if is_network_action(entry.action_code) {
                         http_routes += 1;
-                        print("[ORCH] NETWORK ROUTE! action=");
-                        print_u64(entry.action_code as u64);
-                        print(", latency=");
-                        print_u64(cycles);
-                        println(" cycles");
                         execute_reflex(entry.action_code, &answers, prompt_hash);
+                        session.push(prompt_hash, entry.action_code as u64, entry.action_code);
                         sys_bus_publish(INTENT_ORCH_RESPONSE, 2, prompt_hash);
                     } else {
                         reflex_hits += 1;
                         print("[ORCH] REFLEX HIT! action=");
                         print_u64(entry.action_code as u64);
-                        print(", confidence=");
+                        print(", conf=");
                         print_u64(entry.confidence as u64);
-                        print("%, latency=");
+                        print("%, ");
                         print_u64(cycles);
                         println(" cycles");
                         execute_reflex(entry.action_code, &answers, prompt_hash);
+                        session.push(prompt_hash, entry.action_code as u64, entry.action_code);
                         sys_bus_publish(INTENT_REFLEX_HIT, 2,
                             ((entry.action_code as u64) << 32) | (entry.confidence as u64));
                         sys_bus_publish(INTENT_ORCH_RESPONSE, 2, prompt_hash);
@@ -510,74 +704,176 @@ pub extern "C" fn main() -> i64 {
                 None => {
                     llm_routes += 1;
                     let cycles = sys_rdtsc() - t0;
-                    print("[ORCH] No reflex match. Routing to LLM (");
+                    print("[ORCH] No reflex. LLM route (");
                     print_u64(cycles);
-                    println(" cycles lookup)");
+                    println(" cycles)");
+                    session.push(prompt_hash, 0, 0);
                     sys_bus_publish(INTENT_LLM_WAKEUP, 3, prompt_hash);
                 }
             }
+        }
 
-            // Stats
-            print("[ORCH] Stats: total=");
-            print_u64(total_queries);
-            print(", reflexes=");
-            print_u64(reflex_hits);
-            print(", http=");
-            print_u64(http_routes);
-            print(", llm=");
-            print_u64(llm_routes);
-            print(", pipe=");
-            print_u64(pipe_outputs);
+        // ── 2. Jalon 126: Persona switch ──
+        let persona_r = sys_bus_consume_intent(&mut api_buf, INTENT_PERSONA_SET);
+        if persona_r == 0 {
+            idle_cycles = 0;
+            let persona_id = (api_buf[4] & 0xFF) as u8;
+            personas.set_persona(persona_id);
+        }
+
+        // ── 3. Jalon 126: MCP result reinjection (Autonomous Loop) ──
+        let mcp_r = sys_bus_consume_intent(&mut api_buf, INTENT_MCP_RESULT);
+        if mcp_r == 0 {
+            idle_cycles = 0;
+            mcp_results += 1;
+            let result_payload = api_buf[4];
+
+            print("[ORCH] MCP result #");
+            print_u64(mcp_results);
+            print(" payload=0x");
+            print_u64(result_payload);
             println("");
-        } else {
-            // ── Jalon 118: Pipe Cognitif — check for child process output ──
-            let pipe_result = sys_bus_consume_intent(&mut api_buf, INTENT_PROCESS_OUTPUT);
-            if pipe_result == 0 {
-                idle_cycles = 0;
-                handle_process_output(api_buf[4], &mut pipe_outputs);
-            }
 
-            // ── Jalon 118: Check for child process exit ──
-            let exit_result = sys_bus_consume_intent(&mut api_buf, INTENT_PROCESS_EXIT);
-            if exit_result == 0 {
-                idle_cycles = 0;
-                handle_process_exit(api_buf[4]);
-            }
+            // Record in session
+            session.push(0, result_payload, ACTION_LEARNED + 1);
 
-            // ── Check for API responses ──
-            let api_result = sys_bus_consume_intent(&mut api_buf, INTENT_API_RESPONSE);
-            if api_result == 0 {
-                idle_cycles = 0;
-                println("[ORCH] Received INTENT_API_RESPONSE (0xB001)");
-                handle_api_response(api_buf[4]);
-            }
+            // Autonomous loop: if we have a goal, reinject result to LLM
+            if session.current_goal != 0 {
+                auto_loops += 1;
+                session.auto_steps += 1;
+                print("[ORCH] AUTONOMOUS STEP #");
+                print_u64(session.auto_steps);
+                println(" - reinjecting tool result to LLM");
+                // Send the tool result back to LLM for analysis
+                sys_bus_publish(INTENT_LLM_WAKEUP, 3, result_payload);
 
-            // ── Check for LLM output ──
-            let llm_result = sys_bus_consume_intent(&mut api_buf, INTENT_LLM_OUTPUT);
-            if llm_result == 0 {
-                idle_cycles = 0;
-                println("[ORCH] Received INTENT_LLM_OUTPUT (0x8010)");
-                println("[ORCH] LLM synthesis complete, publishing final response");
-                sys_bus_publish(INTENT_ORCH_RESPONSE, 1, api_buf[4]);
-            }
-
-            idle_cycles += 1;
-            sys_yield();
-
-            if idle_cycles >= max_idle {
-                if total_queries > 0 || pipe_outputs > 0 {
-                    println("[ORCH] ========================================");
-                    print("[ORCH] Session: ");
-                    print_u64(total_queries);
-                    print(" queries, ");
-                    print_u64(reflex_hits);
-                    print(" reflexes, ");
-                    print_u64(pipe_outputs);
-                    println(" pipe outputs");
-                    println("[ORCH] ========================================");
+                // Safety: max 10 autonomous steps per goal
+                if session.auto_steps >= 10 {
+                    println("[ORCH] AUTONOMOUS: Max steps reached, halting loop");
+                    session.current_goal = 0;
+                    session.auto_steps = 0;
                 }
-                idle_cycles = 0;
             }
+        }
+
+        // ── 3b. Jalon 129: INTENT_TOOL_STDOUT — captured tool stdout ──
+        let tool_stdout_r = sys_bus_consume_intent(&mut api_buf, INTENT_TOOL_STDOUT);
+        if tool_stdout_r == 0 {
+            idle_cycles = 0;
+            let payload = api_buf[4];
+            let child_pid = payload >> 32;
+            let text_len = payload & 0xFFFF_FFFF;
+            print("[ORCH] Tool stdout captured: PID=");
+            print_u64(child_pid);
+            print(" len=");
+            print_u64(text_len);
+            println(" bytes");
+
+            // Read captured text from kernel IPC buffer
+            let mut capture_buf = [0u8; 2048];
+            let n = sys_read_captured(&mut capture_buf);
+            if n > 0 {
+                print("[ORCH] Tool output (first 128 bytes): ");
+                let preview = if n > 128 { 128 } else { n as usize };
+                sys_write_fd(1, &capture_buf[..preview]);
+                println("");
+
+                // Record in session memory
+                session.push(0, payload, ACTION_LEARNED + 2);
+
+                // If autonomous goal active, reinject to LLM for analysis
+                if session.current_goal != 0 {
+                    auto_loops += 1;
+                    session.auto_steps += 1;
+                    print("[ORCH] AUTONOMOUS: Reinjecting tool stdout to LLM (step #");
+                    print_u64(session.auto_steps);
+                    println(")");
+                    sys_bus_publish(INTENT_LLM_WAKEUP, 3, payload);
+                }
+            }
+        }
+
+        // ── 4. Pipe Cognitif — child process output ──
+        let pipe_result = sys_bus_consume_intent(&mut api_buf, INTENT_PROCESS_OUTPUT);
+        if pipe_result == 0 {
+            idle_cycles = 0;
+            handle_process_output(api_buf[4], &mut pipe_outputs);
+        }
+
+        // ── 5. Child process exit ──
+        let exit_result = sys_bus_consume_intent(&mut api_buf, INTENT_PROCESS_EXIT);
+        if exit_result == 0 {
+            idle_cycles = 0;
+            handle_process_exit(api_buf[4]);
+        }
+
+        // ── 6. API responses ──
+        let api_result = sys_bus_consume_intent(&mut api_buf, INTENT_API_RESPONSE);
+        if api_result == 0 {
+            idle_cycles = 0;
+            handle_api_response(api_buf[4]);
+        }
+
+        // ── 7. LLM output ──
+        let llm_result = sys_bus_consume_intent(&mut api_buf, INTENT_LLM_OUTPUT);
+        if llm_result == 0 {
+            idle_cycles = 0;
+            let llm_payload = api_buf[4];
+            println("[ORCH] LLM output received");
+
+            // Learn from LLM output — store for future O(1) recall
+            if session.count > 0 {
+                let last_prompt = session.entries[
+                    if session.head == 0 { SESSION_SIZE - 1 } else { session.head - 1 }
+                ].prompt_hash;
+                if last_prompt != 0 {
+                    // Store this as a learned answer
+                    let mut ans_buf = [0u8; 8];
+                    let mut v = llm_payload;
+                    let mut ai = 8usize;
+                    while v > 0 && ai > 0 {
+                        ai -= 1;
+                        ans_buf[ai] = b'0' + (v % 10) as u8;
+                        v /= 10;
+                    }
+                    answers.store(last_prompt, &ans_buf[ai..8]);
+                }
+            }
+
+            session.push(0, llm_payload, ACTION_LEARNED);
+            sys_bus_publish(INTENT_ORCH_RESPONSE, 1, llm_payload);
+        }
+
+        idle_cycles += 1;
+        sys_yield();
+
+        // Periodic stats
+        if idle_cycles >= max_idle {
+            if total_queries > 0 || pipe_outputs > 0 || mcp_results > 0 {
+                println("[ORCH] ========================================");
+                print("[ORCH] Session: q=");
+                print_u64(total_queries);
+                print(" rfx=");
+                print_u64(reflex_hits);
+                print(" llm=");
+                print_u64(llm_routes);
+                print(" mcp=");
+                print_u64(mcp_results);
+                print(" pipe=");
+                print_u64(pipe_outputs);
+                print(" auto=");
+                print_u64(auto_loops);
+                println("");
+                print("[ORCH] Persona: ");
+                sys_write(1, personas.names[personas.active as usize]);
+                print(", memory: ");
+                print_u64(session.count as u64);
+                print("/");
+                print_u64(SESSION_SIZE as u64);
+                println(" slots");
+                println("[ORCH] ========================================");
+            }
+            idle_cycles = 0;
         }
     }
 }

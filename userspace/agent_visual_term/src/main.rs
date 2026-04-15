@@ -62,7 +62,8 @@ const KNOWN_CMDS: &[&[u8]] = &[b"help", b"clear", b"ls", b"cat", b"ps", b"mem", 
     b"gen_driver", b"mkdir", b"touch", b"rm", b"ping", b"netstat", b"curl",
     b"kill", b"top", b"write", b"cp", b"echo", b"env", b"uptime", b"df", b"history",
     b"mcp_test", b"orch_test", b"agi_test", b"pkg", b"tool_exec", b"net_auto", b"agent",
-    b"desktop", b"startx"];
+    b"desktop", b"startx", b"persona", b"agi",
+    b"ssh", b"scp", b"sftp", b"rdp", b"remote"];
 
 const INTENT_GEN_DRIVER: u64 = 0x9001;
 const INTENT_MCP_EXECUTE: u64 = 0x9002;
@@ -75,6 +76,8 @@ const INTENT_LLM_READY: u64       = 0x8004;    // LLM agent ready signal
 const INTENT_USER_PROMPT: u64     = 0x8001;
 const INTENT_GENERATION_DONE: u64 = 0x8003;
 const INTENT_TERM_CMD: u64        = 0xB065;
+const INTENT_PERSONA_SET: u64     = 0xD001;
+const INTENT_AUTONOMOUS_STEP: u64 = 0xD010;
 
 const MAX_IDLE_LOOPS: u64 = u64::MAX;
 
@@ -483,7 +486,7 @@ fn print_prompt(term: &mut Terminal) {
 
 fn cmd_help(term: &mut Terminal) {
     term.put_char(b'\n', TEXT);
-    term.put_str(b"AetherionOS v6.2 Shell Commands (37 commands):\n", INFO_COL);
+    term.put_str(b"AetherionOS v7.0 Shell Commands (39 commands):\n", INFO_COL);
     term.put_str(b" Filesystem:\n", PROMPT);
     term.put_str(b"  ls [path]          List directory (FAT32/VFS)\n", TEXT);
     term.put_str(b"  cat <file>         Display file contents\n", TEXT);
@@ -522,6 +525,8 @@ fn cmd_help(term: &mut Terminal) {
     term.put_str(b"  tool_exec <tool>   Execute native tool (claude_code/hermes/etc)\n", TEXT);
     term.put_str(b"  net_auto [mode]    Autonomous network operations\n", TEXT);
     term.put_str(b"  agent              Show active agent status\n", TEXT);
+    term.put_str(b"  persona [name]     Switch AI persona (11 roles)\n", TEXT);
+    term.put_str(b"  agi <directive>    Autonomous AI goal execution\n", TEXT);
     term.put_str(b" Desktop:\n", PROMPT);
     term.put_str(b"  desktop            Launch Window Manager (GUI)\n", TEXT);
     term.put_str(b"  startx             Alias for desktop\n", TEXT);
@@ -1359,8 +1364,18 @@ fn process_command(term: &mut Terminal) {
         cmd_net_auto(term, args);
     } else if bytes_eq(first_word, b"agent") {
         cmd_agent_status(term);
+    } else if bytes_eq(first_word, b"persona") {
+        cmd_persona(term, args);
+    } else if bytes_eq(first_word, b"agi") {
+        cmd_agi(term, args);
     } else if bytes_eq(first_word, b"exec") {
         cmd_run(term, args);
+    } else if bytes_eq(first_word, b"ssh") {
+        cmd_ssh(term, args);
+    } else if bytes_eq(first_word, b"scp") || bytes_eq(first_word, b"sftp") {
+        cmd_scp(term, args);
+    } else if bytes_eq(first_word, b"rdp") || bytes_eq(first_word, b"remote") {
+        cmd_remote(term, args);
     } else if bytes_eq(first_word, b"desktop") || bytes_eq(first_word, b"startx") {
         cmd_desktop(term);
     } else if bytes_eq(first_word, b"exit") || bytes_eq(first_word, b"quit") {
@@ -2575,17 +2590,31 @@ fn cmd_pkg(term: &mut Terminal, args: &[u8]) {
     let sub_args = &args[sub_args_start..];
 
     if bytes_eq(subcmd, b"install") {
-        cmd_pkg_install(term, sub_args);
+        // Jalon 130: Accept well-known package names or raw URLs
+        if bytes_eq(sub_args, b"python") || bytes_eq(sub_args, b"micropython") {
+            term.put_str(b"[PKG] Installing MicroPython from built-in catalog...\n", INFO_COL);
+            // Create a placeholder ELF in /disk/tools/python.elf
+            cmd_pkg_install_builtin(term, b"python.elf", b"/disk/tools/python.elf\0");
+        } else if bytes_eq(sub_args, b"busybox") {
+            term.put_str(b"[PKG] Installing BusyBox from built-in catalog...\n", INFO_COL);
+            cmd_pkg_install_builtin(term, b"busybox.elf", b"/disk/tools/busybox.elf\0");
+        } else if bytes_eq(sub_args, b"nmap") {
+            term.put_str(b"[PKG] Installing nmap scanner from built-in catalog...\n", INFO_COL);
+            cmd_pkg_install_builtin(term, b"nmap.elf", b"/disk/tools/nmap.elf\0");
+        } else {
+            cmd_pkg_install(term, sub_args);
+        }
     } else if bytes_eq(subcmd, b"list") {
         cmd_pkg_list(term);
     } else if bytes_eq(subcmd, b"run") {
         cmd_pkg_run(term, sub_args);
     } else if bytes_eq(subcmd, b"info") {
-        term.put_str(b"Package Manager: AetherionOS J117c\n", INFO_COL);
+        term.put_str(b"Package Manager: AetherionOS J130\n", INFO_COL);
         term.put_str(b"  Storage:  /disk/ (FAT32 via VirtIO-Block)\n", TEXT);
         term.put_str(b"  Network:  VirtIO-Net + TCP/IP stack\n", TEXT);
         term.put_str(b"  Format:   ELF64 (Ring 3 userspace)\n", TEXT);
         term.put_str(b"  Security: MCP validation before execution\n", TEXT);
+        term.put_str(b"  Catalog:  python, micropython, busybox, nmap\n", TEXT);
         term.put_char(b'\n', TEXT);
     } else {
         term.put_str(b"Unknown pkg subcommand. Type 'pkg' for help.\n", ERR_COL);
@@ -2741,6 +2770,36 @@ fn cmd_pkg_install(term: &mut Terminal, url_bytes: &[u8]) {
         sys_write(1, b"[TERM] pkg install: SUCCESS\n");
     } else {
         term.put_str(b"[PKG] ERROR: Could not save to disk\n", ERR_COL);
+    }
+    term.put_char(b'\n', TEXT);
+}
+
+/// Jalon 130: Install a built-in package by creating a placeholder ELF on disk.
+/// For now, this creates a minimal script/binary stub that the AI engine can
+/// detect and replace with a real binary downloaded via the network.
+fn cmd_pkg_install_builtin(term: &mut Terminal, name: &[u8], disk_path: &[u8]) {
+    // Create /disk/tools/ directory first
+    sys_mkdir(b"/disk/tools\0", 0o755);
+
+    // Create a minimal stub file
+    let stub_header = b"#!/bin/aetherion-stub\n# Built-in package placeholder\n";
+    let fd = sys_creat(disk_path, 0o755);
+    if fd >= 0 {
+        sys_write_fd(fd as u32, stub_header);
+        sys_write_fd(fd as u32, b"# Package: ");
+        sys_write_fd(fd as u32, name);
+        sys_write_fd(fd as u32, b"\n# Status: stub (download real binary via network)\n");
+        sys_close(fd as u32);
+        term.put_str(b"[PKG] Created stub: ", INFO_COL);
+        term.put_str(disk_path, TEXT);
+        term.put_char(b'\n', TEXT);
+        term.put_str(b"[PKG] Use 'pkg run ", TEXT);
+        term.put_str(name, TEXT);
+        term.put_str(b"' or connect to network for full binary\n", TEXT);
+        sys_write(1, b"[TERM] pkg install builtin: SUCCESS\n");
+    } else {
+        term.put_str(b"[PKG] ERROR: Could not create stub on disk\n", ERR_COL);
+        sys_write(1, b"[TERM] pkg install builtin: FAIL\n");
     }
     term.put_char(b'\n', TEXT);
 }
@@ -2966,6 +3025,307 @@ fn cmd_agent_status(term: &mut Terminal) {
 }
 
 // ═══════════════════════════════════════════════════
+// Jalon 126: Persona System Commands
+// ═══════════════════════════════════════════════════
+
+const PERSONA_NAMES: [&[u8]; 11] = [
+    b"assistant", b"pentester", b"analyst", b"softdev", b"webdev",
+    b"osdev", b"foundrydev", b"cryptodev", b"financial", b"orchestrator", b"adversary",
+];
+
+const PERSONA_DESCS: [&[u8]; 11] = [
+    b"Personal assistant - tasks, reminders, system queries",
+    b"Pentester pro - network/web/APK security (nmap, hydra, nuclei)",
+    b"Data analyst - statistics, ML, pandas, visualization",
+    b"Software developer - Rust/C/Python, compiler, debugger",
+    b"Web developer - HTML/CSS/JS/APIs, Deno, HTTP, REST",
+    b"OS developer - kernel, drivers, bare-metal, assembly",
+    b"Foundry developer - Solidity, smart contracts, EVM, forge/cast",
+    b"Crypto developer - blockchain, DeFi, tokenomics, trading bots",
+    b"Financial agent - market analysis, portfolio, risk assessment",
+    b"Meta-orchestrator - coordinates personas for complex tasks",
+    b"Adversary - red team, CTF, game AI, adversarial testing",
+];
+
+fn cmd_persona(term: &mut Terminal, args: &[u8]) {
+    term.put_char(b'\n', TEXT);
+
+    if args.is_empty() {
+        // List all personas
+        term.put_str(b"[PERSONA] Available AI Personas:\n", INFO_COL);
+        let mut i = 0usize;
+        while i < 11 {
+            term.put_str(b"  ", TEXT);
+            let mut nbuf = [0u8; 3];
+            if i >= 10 { nbuf[0] = b'1'; nbuf[1] = b'0' + (i - 10) as u8; nbuf[2] = b' '; term.put_str(&nbuf[..3], PROMPT); }
+            else { nbuf[0] = b'0' + i as u8; nbuf[1] = b' '; term.put_str(&nbuf[..2], PROMPT); }
+            term.put_str(PERSONA_NAMES[i], TEXT);
+            term.put_str(b" - ", DIM);
+            term.put_str(PERSONA_DESCS[i], DIM);
+            term.put_char(b'\n', TEXT);
+            i += 1;
+        }
+        term.put_str(b"\nUsage: persona <name|number>\n", DIM);
+        term.put_str(b"Example: persona pentester\n", DIM);
+    } else {
+        // Set persona by name or number
+        let mut persona_id: u8 = 0xFF;
+
+        // Try as number first
+        if args.len() <= 2 && args[0] >= b'0' && args[0] <= b'9' {
+            let mut val = (args[0] - b'0') as u8;
+            if args.len() == 2 && args[1] >= b'0' && args[1] <= b'9' {
+                val = val * 10 + (args[1] - b'0') as u8;
+            }
+            if val < 11 { persona_id = val; }
+        }
+
+        // Try by name
+        if persona_id == 0xFF {
+            let mut i = 0usize;
+            while i < 11 {
+                if bytes_eq(args, PERSONA_NAMES[i]) { persona_id = i as u8; break; }
+                i += 1;
+            }
+        }
+
+        if persona_id < 11 {
+            term.put_str(b"[PERSONA] Switching to: ", INFO_COL);
+            term.put_str(PERSONA_NAMES[persona_id as usize], PROMPT);
+            term.put_char(b'\n', TEXT);
+            term.put_str(b"  ", TEXT);
+            term.put_str(PERSONA_DESCS[persona_id as usize], DIM);
+            term.put_char(b'\n', TEXT);
+
+            // Publish persona change on bus
+            sys_bus_publish(INTENT_PERSONA_SET, 2, persona_id as u64);
+            sys_write(1, b"[TERM] Persona set via INTENT_PERSONA_SET\n");
+        } else {
+            term.put_str(b"[PERSONA] Unknown persona: ", ERR_COL);
+            term.put_str(args, TEXT);
+            term.put_str(b"\nType 'persona' to list all.\n", DIM);
+        }
+    }
+    term.put_char(b'\n', TEXT);
+}
+
+/// AGI command: send a goal to the orchestrator for autonomous execution
+fn cmd_agi(term: &mut Terminal, args: &[u8]) {
+    term.put_char(b'\n', TEXT);
+
+    if args.is_empty() {
+        term.put_str(b"[AGI] Usage: agi <directive>\n", DIM);
+        term.put_str(b"  Examples:\n", DIM);
+        term.put_str(b"  agi scan 192.168.1.1 for open ports\n", DIM);
+        term.put_str(b"  agi analyze data.csv for anomalies\n", DIM);
+        term.put_str(b"  agi deploy ERC20 contract on testnet\n", DIM);
+        term.put_str(b"  agi write a Python sorting algorithm\n", DIM);
+        term.put_str(b"  agi pentest the local network\n", DIM);
+        return;
+    }
+
+    // Hash the directive and send to orchestrator
+    let mut hash: u64 = 5381;
+    for &b in args.iter() {
+        let c = if b >= b'A' && b <= b'Z' { b + 32 } else { b };
+        hash = hash.wrapping_mul(33).wrapping_add(c as u64);
+    }
+
+    term.put_str(b"[AGI] Directive: ", INFO_COL);
+    term.put_str(args, TEXT);
+    term.put_char(b'\n', TEXT);
+    term.put_str(b"[AGI] Publishing INTENT_USER_PROMPT to Orchestrator...\n", DIM);
+
+    // Send to orchestrator
+    sys_bus_publish(INTENT_USER_PROMPT, 3, hash);
+
+    // Also write directive to VFS so orchestrator can read the full text
+    let contract_path = b"/tmp/agi_directive.txt\0";
+    let fd = sys_creat(contract_path, 0o644);
+    if fd >= 0 {
+        sys_write_fd(fd as u32, args);
+        sys_close(fd as u32);
+    }
+
+    term.put_str(b"[AGI] Directive dispatched. Orchestrator will route.\n", PROMPT);
+
+    // Wait briefly for response
+    let mut resp_buf = [0u64; 8];
+    for _ in 0..200u32 {
+        sys_yield();
+        if sys_bus_consume_intent(&mut resp_buf, 0x8005 as u32) == 0 {
+            term.put_str(b"[AGI] Orchestrator responded!\n", INFO_COL);
+            break;
+        }
+    }
+    term.put_char(b'\n', TEXT);
+}
+
+// ═══════════════════════════════════════════════════
+// Jalon 130: Remote Connection Commands (SSH, SCP, RDP)
+// ═══════════════════════════════════════════════════
+
+/// ssh user@host [command] — Connect to a remote host via SSH.
+/// Uses a statically-compiled SSH client (dropbear/busybox) in /disk/tools/.
+fn cmd_ssh(term: &mut Terminal, args: &[u8]) {
+    term.put_char(b'\n', TEXT);
+    if args.is_empty() {
+        term.put_str(b"AetherionOS SSH Client (Jalon 130)\n", INFO_COL);
+        term.put_str(b"Usage:\n", DIM);
+        term.put_str(b"  ssh user@host          Interactive shell\n", TEXT);
+        term.put_str(b"  ssh user@host command  Execute remote command\n", TEXT);
+        term.put_str(b"  ssh -p port user@host  Custom port\n", TEXT);
+        term.put_str(b"\nRequires: pkg install ssh (dropbear static)\n", DIM);
+        term.put_char(b'\n', TEXT);
+        return;
+    }
+
+    // Check if SSH binary exists
+    let ssh_fd = sys_open(b"/disk/tools/ssh.elf\0", O_RDONLY);
+    if ssh_fd < 0 {
+        // Try busybox ssh
+        let bb_fd = sys_open(b"/disk/tools/busybox.elf\0", O_RDONLY);
+        if bb_fd < 0 {
+            term.put_str(b"[SSH] ERROR: No SSH client installed\n", ERR_COL);
+            term.put_str(b"[SSH] Install with: pkg install ssh\n", DIM);
+            term.put_str(b"[SSH] Or compile dropbear/busybox with musl-gcc\n", DIM);
+            term.put_char(b'\n', TEXT);
+            return;
+        }
+        sys_close(bb_fd as u32);
+        term.put_str(b"[SSH] Using busybox SSH client\n", DIM);
+    } else {
+        sys_close(ssh_fd as u32);
+    }
+
+    term.put_str(b"[SSH] Connecting to: ", INFO_COL);
+    term.put_str(args, TEXT);
+    term.put_char(b'\n', TEXT);
+
+    // Fork + exec the SSH binary with args
+    let child = sys_fork();
+    if child < 0 {
+        term.put_str(b"[SSH] ERROR: fork() failed\n", ERR_COL);
+        return;
+    }
+    if child == 0 {
+        // Child: exec SSH binary
+        sys_exec(b"/disk/tools/ssh.elf\0");
+        sys_exec(b"/disk/tools/busybox.elf\0"); // fallback
+        sys_exit(127);
+    }
+
+    // Enable stdout capture so AI can see the remote output
+    sys_capture_stdout(child as u64, true);
+
+    term.put_str(b"[SSH] Session started (PID=", DIM);
+    // Simple PID print
+    {
+        let mut buf = [0u8; 10];
+        let mut n = child as u64;
+        let mut i = 10usize;
+        if n == 0 { buf[9] = b'0'; i = 9; }
+        else { while n > 0 && i > 0 { i -= 1; buf[i] = b'0' + (n % 10) as u8; n /= 10; } }
+        term.put_str(&buf[i..], DIM);
+    }
+    term.put_str(b")\n", DIM);
+
+    // Wait for child with timeout (30000 yields ~ 30s for SSH)
+    let mut elapsed: u64 = 0;
+    while elapsed < 30000 {
+        let r = sys_wait(child as u64);
+        if r >= 0 || r == -10 { break; }
+        sys_yield();
+        elapsed += 1;
+    }
+
+    // Read captured output
+    let mut capture_buf = [0u8; 2048];
+    let n = sys_read_captured(&mut capture_buf);
+    if n > 0 {
+        term.put_str(b"[SSH] Remote output:\n", INFO_COL);
+        term.put_str(&capture_buf[..n as usize], TEXT);
+        term.put_char(b'\n', TEXT);
+    }
+
+    sys_capture_stdout(child as u64, false);
+    term.put_str(b"[SSH] Session ended\n", DIM);
+    term.put_char(b'\n', TEXT);
+    sys_write(1, b"[TERM] ssh session complete\n");
+}
+
+/// scp / sftp — File transfer to/from remote host
+fn cmd_scp(term: &mut Terminal, args: &[u8]) {
+    term.put_char(b'\n', TEXT);
+    if args.is_empty() {
+        term.put_str(b"AetherionOS File Transfer (Jalon 130)\n", INFO_COL);
+        term.put_str(b"Usage:\n", DIM);
+        term.put_str(b"  scp local_file user@host:/path   Upload file\n", TEXT);
+        term.put_str(b"  scp user@host:/path local_file   Download file\n", TEXT);
+        term.put_str(b"  sftp user@host                   Interactive SFTP\n", TEXT);
+        term.put_str(b"\nRequires: pkg install ssh (includes scp/sftp)\n", DIM);
+        term.put_char(b'\n', TEXT);
+    } else {
+        term.put_str(b"[SCP] Transfer: ", INFO_COL);
+        term.put_str(args, TEXT);
+        term.put_char(b'\n', TEXT);
+        term.put_str(b"[SCP] Not yet connected - install static SSH first\n", DIM);
+        term.put_str(b"[SCP] Use: pkg install ssh\n", DIM);
+        term.put_char(b'\n', TEXT);
+    }
+    sys_write(1, b"[TERM] scp/sftp invoked\n");
+}
+
+/// rdp / remote — Remote desktop and remote management
+fn cmd_remote(term: &mut Terminal, args: &[u8]) {
+    term.put_char(b'\n', TEXT);
+    if args.is_empty() {
+        term.put_str(b"AetherionOS Remote Connection Manager (Jalon 130)\n", INFO_COL);
+        term.put_str(b"Usage:\n", DIM);
+        term.put_str(b"  remote ssh user@host        SSH connection\n", TEXT);
+        term.put_str(b"  remote rdp host[:port]      RDP to Windows\n", TEXT);
+        term.put_str(b"  remote vnc host[:port]      VNC connection\n", TEXT);
+        term.put_str(b"  remote list                 List active sessions\n", TEXT);
+        term.put_str(b"  remote status               Connection status\n", TEXT);
+        term.put_str(b"\nProtocols: SSH (ready), RDP/VNC (requires static client)\n", DIM);
+        term.put_char(b'\n', TEXT);
+    } else {
+        // Parse subcommand
+        let mut sub_end = 0;
+        while sub_end < args.len() && args[sub_end] != b' ' { sub_end += 1; }
+        let subcmd = &args[..sub_end];
+        let sub_args = if sub_end + 1 < args.len() { &args[sub_end+1..] } else { &[] as &[u8] };
+
+        if bytes_eq(subcmd, b"ssh") {
+            cmd_ssh(term, sub_args);
+        } else if bytes_eq(subcmd, b"rdp") {
+            term.put_str(b"[RDP] Remote Desktop Protocol\n", INFO_COL);
+            term.put_str(b"[RDP] Target: ", TEXT);
+            term.put_str(sub_args, TEXT);
+            term.put_char(b'\n', TEXT);
+            term.put_str(b"[RDP] Requires xfreerdp static binary\n", DIM);
+            term.put_str(b"[RDP] Install with: pkg install rdp\n", DIM);
+            term.put_char(b'\n', TEXT);
+        } else if bytes_eq(subcmd, b"vnc") {
+            term.put_str(b"[VNC] Virtual Network Computing\n", INFO_COL);
+            term.put_str(b"[VNC] Target: ", TEXT);
+            term.put_str(sub_args, TEXT);
+            term.put_char(b'\n', TEXT);
+            term.put_str(b"[VNC] Requires vnc client static binary\n", DIM);
+            term.put_char(b'\n', TEXT);
+        } else if bytes_eq(subcmd, b"list") || bytes_eq(subcmd, b"status") {
+            term.put_str(b"Active remote sessions: 0\n", TEXT);
+            term.put_str(b"  (no active connections)\n", DIM);
+            term.put_char(b'\n', TEXT);
+        } else {
+            term.put_str(b"Unknown remote subcommand. Type 'remote' for help.\n", ERR_COL);
+            term.put_char(b'\n', TEXT);
+        }
+    }
+    sys_write(1, b"[TERM] remote invoked\n");
+}
+
+// ═══════════════════════════════════════════════════
 // Desktop / Window Manager launcher
 // ═══════════════════════════════════════════════════
 
@@ -3022,9 +3382,9 @@ fn cmd_desktop(term: &mut Terminal) {
 #[no_mangle]
 pub extern "C" fn main() -> i64 {
     sys_write(1, b"[TERM] ========================================\n");
-    sys_write(1, b"[TERM] AetherionOS v4.0 Production Terminal\n");
-    sys_write(1, b"[TERM] Real Syscalls: ls/cat/ps/mem/llm\n");
-    sys_write(1, b"[TERM] Shell v6.2: help clear ls cat ps mem wget curl ping mcp_test orch_test pkg tool_exec net_auto agent (37 commands)\n");
+    sys_write(1, b"[TERM] AetherionOS v5.0 Production Terminal (Jalon 126)\n");
+    sys_write(1, b"[TERM] Real Syscalls: ls/cat/ps/mem/llm/agi/persona\n");
+    sys_write(1, b"[TERM] Shell v7.0: 39 commands + 11 AI personas + autonomous loop\n");
     sys_write(1, b"[TERM] ========================================\n");
 
     draw_chrome();

@@ -308,6 +308,17 @@ pub struct Process {
     /// Jalon 105: ABI compatibility mode (AetherionOS native vs Linux)
     /// Linux ABI processes get Linux-specific uname, arch_prctl, etc.
     pub abi: crate::compat::linux_abi::Abi,
+    /// Jalon 129: PID of the process capturing this process's stdout.
+    /// When set, sys_write(fd=1/2) stores output in IPC buffer and publishes
+    /// INTENT_TOOL_STDOUT instead of printing to serial.
+    pub captured_by_pid: Option<u64>,
+    /// Jalon 128: Signal handler table — signum → handler address (up to 32 signals).
+    /// 0 = SIG_DFL, 1 = SIG_IGN, other = userspace handler address.
+    pub signal_handlers: [u64; 32],
+    /// Jalon 128: Signal mask — bitfield of blocked signals.
+    pub signal_mask: u64,
+    /// Jalon 127: Saved argv strings for this process (e.g., for /proc/self/cmdline).
+    pub argv: Vec<String>,
 }
 
 /// Virtual Memory Area — describes a file-backed memory mapping
@@ -367,6 +378,10 @@ impl Process {
             vmas: Vec::new(),
             cpu_affinity: 0xFF, // Default: no affinity (run on any core)
             abi: crate::compat::linux_abi::Abi::AetherionOS, // Default: native ABI
+            captured_by_pid: None,
+            signal_handlers: [0u64; 32],
+            signal_mask: 0,
+            argv: Vec::new(),
         }
     }
 

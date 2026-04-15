@@ -433,9 +433,9 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         47 => sys_tcp_shutdown_syscall(a1 as u32),   // shutdown(fd, how)
         49 => sys_bind(a1 as u32, a2 as u16),        // bind(fd, addr, len)
         50 => sys_stub_listen(a1 as u32, a2),        // listen [stub]
-        56 => sys_clone(a1),                         // clone(flags)
+        56 => sys_clone(a1, a2, a3, a4, a5),           // clone(flags, stack, ptid, ctid, tls) — Jalon 128
         57 => sys_fork(),                            // fork()
-        59 => sys_exec(a1),                          // execve(path, argv, envp)
+        59 => sys_execve(a1, a2, a3),                   // execve(path, argv, envp) — Jalon 127
         60 => sys_exit(a1),                          // exit(code)
         61 => sys_wait(a1),                          // wait4(pid)
         62 => sys_kill(a1, a2 as u32),               // kill(pid, sig)
@@ -465,6 +465,10 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         262 => sys_stub_newfstatat(a1, a2, a3),       // newfstatat [stub]
         220 => 0,                                      // semtimedop [stub — IPC semaphore]
         221 => 0,                                      // fadvise64 [stub — posix_fadvise]
+        232 => sys_stub_epoll_wait(a1, a2, a3, a4),    // epoll_wait — Jalon 128
+        233 => 0,                                      // epoll_ctl [stub]
+        213 => 0,                                      // epoll_create [stub]
+        291 => 0,                                      // epoll_create1 [stub]
         270 => 0,                                      // pselect6 [stub — synchronous I/O mux]
         271 => 0,                                      // ppoll [stub — poll variant]
         272 => 0,                                      // unshare [stub — namespace]
@@ -510,6 +514,10 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         // ── AetherionOS HID polling (moved from Linux #11) ──
         590 => sys_poll_hid(),
 
+        // ── Jalon 129: Cognitive Pipe stdout capture ──
+        591 => sys_capture_stdout(a1, a2),               // capture_stdout(child_pid, enable)
+        592 => sys_read_captured(a1, a2),                 // read_captured(buf, max_len)
+
         // ── POSIX filesystem operations ──
         84  => sys_rmdir(a1),                        // rmdir(path)
         85  => sys_creat(a1, a2),                    // creat(path, mode) — touch
@@ -533,10 +541,62 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
 fn sys_stub_munmap(_addr: u64, _len: u64) -> u64 { 0 }
 
 /// rt_sigaction(signum, act, oldact) -> 0 (accept signal registrations silently)
-fn sys_stub_rt_sigaction(_signum: u64, _act: u64, _oldact: u64) -> u64 { 0 }
+/// Jalon 128: rt_sigaction — store signal handler in Process.
+/// act/oldact point to struct sigaction { sa_handler, sa_flags, sa_restorer, sa_mask }
+/// We only store the handler address (first u64 of the struct).
+fn sys_stub_rt_sigaction(signum: u64, act: u64, oldact: u64) -> u64 {
+    let current_pid = crate::scheduler::current_pid();
+    if signum == 0 || signum >= 32 { return EINVAL; }
 
-/// rt_sigprocmask(how, set, oldset) -> 0 (accept signal mask changes silently)
-fn sys_stub_rt_sigprocmask(_how: u64, _set: u64, _oldset: u64) -> u64 { 0 }
+    // Save old handler if oldact is non-null
+    if oldact != 0 && validate_user_ptr(oldact, 8) {
+        let old_handler = crate::process::with_process(current_pid, |p| {
+            p.signal_handlers[signum as usize]
+        }).unwrap_or(0);
+        unsafe { core::ptr::write_volatile(oldact as *mut u64, old_handler); }
+    }
+
+    // Set new handler if act is non-null
+    if act != 0 && validate_user_ptr(act, 8) {
+        let handler = unsafe { core::ptr::read_volatile(act as *const u64) };
+        crate::process::with_process_mut(current_pid, |p| {
+            p.signal_handlers[signum as usize] = handler;
+        });
+        crate::serial_println!(
+            "[SIGNAL] PID {} set handler for signal {}: 0x{:X}",
+            current_pid, signum, handler
+        );
+    }
+
+    0
+}
+
+/// Jalon 128: rt_sigprocmask — store signal mask in Process.
+/// how: SIG_BLOCK(0), SIG_UNBLOCK(1), SIG_SETMASK(2)
+fn sys_stub_rt_sigprocmask(how: u64, set: u64, oldset: u64) -> u64 {
+    let current_pid = crate::scheduler::current_pid();
+
+    // Save old mask if oldset is non-null
+    if oldset != 0 && validate_user_ptr(oldset, 8) {
+        let old_mask = crate::process::with_process(current_pid, |p| p.signal_mask).unwrap_or(0);
+        unsafe { core::ptr::write_volatile(oldset as *mut u64, old_mask); }
+    }
+
+    // Update mask if set is non-null
+    if set != 0 && validate_user_ptr(set, 8) {
+        let new_bits = unsafe { core::ptr::read_volatile(set as *const u64) };
+        crate::process::with_process_mut(current_pid, |p| {
+            match how {
+                0 => p.signal_mask |= new_bits,           // SIG_BLOCK
+                1 => p.signal_mask &= !new_bits,          // SIG_UNBLOCK
+                2 => p.signal_mask = new_bits,             // SIG_SETMASK
+                _ => {}
+            }
+        });
+    }
+
+    0
+}
 
 /// pwrite64(fd, buf, count, offset) -> count (pretend write succeeded)
 fn sys_stub_pwrite64(_fd: u32, _buf: u64, count: u64, _offset: u64) -> u64 { count }
@@ -896,6 +956,16 @@ fn sys_stub_nanosleep(_req: u64, _rem: u64) -> u64 {
     0
 }
 
+/// Jalon 128: epoll_wait(epfd, events, maxevents, timeout) -> 0
+/// Stub: yields once and returns 0 (no events). Sufficient for basic MicroPython support.
+fn sys_stub_epoll_wait(_epfd: u64, _events: u64, _maxevents: u64, timeout: u64) -> u64 {
+    if timeout > 0 {
+        let yields = core::cmp::min(timeout / 10, 50);
+        for _ in 0..yields { sys_yield(); }
+    }
+    0
+}
+
 /// accept(fd, addr, addrlen) -> -ENOSYS (not yet implemented)
 fn sys_stub_accept(_fd: u32, _addr: u64, _addrlen: u64) -> u64 { ENOSYS }
 
@@ -1120,6 +1190,25 @@ fn sys_write(fd: u64, buf_addr: u64, len: u64) -> u64 {
 
     match fd_type {
         crate::process::FdType::Tty => {
+            // ═══════════════════════════════════════════════════════════
+            // Jalon 129: Cognitive Pipe — stdout capture for AI tool calls
+            // If this process has captured_by_pid set, store output in IPC
+            // buffer and publish INTENT_TOOL_STDOUT instead of printing.
+            // ═══════════════════════════════════════════════════════════
+            if (fd == 1 || fd == 2) && len > 0 && len <= 4096 && validate_user_ptr(buf_addr, len) {
+                let captured_by = crate::process::with_process(current_pid, |p| {
+                    p.captured_by_pid
+                }).flatten();
+
+                if let Some(parent_pid) = captured_by {
+                    // Store output text and publish INTENT_TOOL_STDOUT
+                    crate::compat::linux_abi::cognitive_pipe_capture_text(
+                        current_pid, parent_pid, fd as u32, buf_addr, len
+                    );
+                    return len; // Suppress serial output — text goes to IPC only
+                }
+            }
+
             // stdout/stderr -> serial output (atomic: no preemption during write)
             let n = len as usize;
             if n > 0 && n <= 8192 && validate_user_ptr(buf_addr, len) {
@@ -1295,13 +1384,40 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
             let mut temp_buf = [0u8; 256];
             let max_read = core::cmp::min(len as usize, temp_buf.len());
 
-            // Jalon 125+: Semi-blocking read with bounded yield loop.
-            // Try to read immediately; if empty, yield up to 200 times
-            // (allowing keyboard IRQs to fire and fill kbd_buffer).
-            // This prevents the terminal from busy-spinning in a tight
-            // sys_read -> sys_yield -> sys_read loop that starves the keyboard.
+            // Jalon 126: TRUE semi-blocking read with interrupt-enabled yield.
+            //
+            // CRITICAL FIX: SYSCALL entry masks RFLAGS.IF via SFMASK, so
+            // keyboard IRQ1 cannot fire during the yield loop. We must
+            // temporarily enable interrupts (STI) to let the PIC deliver
+            // IRQ1 → keyboard_interrupt_handler → kbd_push_byte.
+            //
+            // Flow: try read → empty? → STI → PAUSE → CLI → retry (up to 500x)
+            // Each iteration takes ~1-2 us with PAUSE, total timeout ~1ms.
+            let n = crate::process::kbd_read(&mut temp_buf, max_read);
+            if n > 0 {
+                unsafe {
+                    let dst = buf_addr as *mut u8;
+                    for i in 0..n {
+                        core::ptr::write_volatile(dst.add(i), temp_buf[i]);
+                    }
+                }
+                return n as u64;
+            }
+
+            // No data available — enable interrupts and poll with backoff
             let mut attempts: u32 = 0;
             loop {
+                // Enable interrupts so IRQ1 can deliver keystrokes
+                unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
+                // PAUSE gives the CPU a hint to save power + lets pending IRQs fire
+                unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
+                // Small busy-wait to give IRQ time to complete
+                for _ in 0..50u32 {
+                    unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
+                }
+                // Disable interrupts before accessing shared kernel state
+                unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+
                 let n = crate::process::kbd_read(&mut temp_buf, max_read);
                 if n > 0 {
                     unsafe {
@@ -1313,11 +1429,9 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
                     return n as u64;
                 }
                 attempts += 1;
-                if attempts > 200 {
-                    return 0; // Timeout — return EAGAIN-like 0
+                if attempts >= 500 {
+                    return 0; // No data after ~1ms — return 0 (non-blocking)
                 }
-                // Yield to let keyboard IRQs fire + other processes run
-                sys_yield();
             }
         }
 
@@ -1725,34 +1839,69 @@ fn sys_getppid() -> u64 {
 /// child_stack: top of a pre-allocated stack for the new thread.
 ///   The stack must have the function pointer at (child_stack - 8).
 /// Returns: child_pid to the parent, 0 to the child thread.
-fn sys_clone(child_stack: u64) -> u64 {
+/// Jalon 128: Enhanced clone with CLONE_VM support.
+/// Linux clone(flags, child_stack, parent_tid, child_tid, tls)
+///
+/// CLONE_VM (0x100): share address space (thread-like).
+/// CLONE_FS (0x200), CLONE_FILES (0x400), CLONE_SIGHAND (0x800): accepted but ignored.
+/// CLONE_THREAD (0x10000): full thread semantics (share PID namespace).
+///
+/// If child_stack == 0 and CLONE_VM not set, behaves like fork().
+fn sys_clone(flags: u64, child_stack: u64, _parent_tid: u64, _child_tid: u64, _tls: u64) -> u64 {
     let current_pid = crate::scheduler::current_pid();
 
-    crate::serial_println!("[SYSCALL] sys_clone(stack=0x{:X}) from PID {}", child_stack, current_pid);
+    const CLONE_VM: u64      = 0x0000_0100;
+    const CLONE_FS: u64      = 0x0000_0200;
+    const CLONE_FILES: u64   = 0x0000_0400;
+    const CLONE_SIGHAND: u64 = 0x0000_0800;
+    const CLONE_THREAD: u64  = 0x0001_0000;
+    const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+    const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+    const SIGCHLD: u64 = 17;
 
+    crate::serial_println!(
+        "[SYSCALL] sys_clone(flags=0x{:X}, stack=0x{:X}) from PID {} [CLONE_VM={}]",
+        flags, child_stack, current_pid, flags & CLONE_VM != 0
+    );
+
+    let has_clone_vm = flags & CLONE_VM != 0;
+
+    // If flags == SIGCHLD (17) and stack == 0, this is fork() via glibc clone wrapper
+    if !has_clone_vm && child_stack == 0 {
+        crate::serial_println!("[CLONE] fork-like clone (no CLONE_VM, stack=0) -> delegating to fork");
+        return sys_fork();
+    }
+
+    // For CLONE_VM threads, we need a valid stack
     if child_stack == 0 {
-        crate::serial_println!("[SYSCALL] clone: invalid child_stack 0x{:X}", child_stack);
+        crate::serial_println!("[CLONE] CLONE_VM but no stack provided");
         return EINVAL;
     }
 
-    // Read the function pointer from (child_stack - 8)
-    // The C wrapper writes: *(stack_top - 8) = (uint64_t)start_routine;
-    let fn_ptr = unsafe { core::ptr::read_volatile((child_stack - 8) as *const u64) };
-    crate::serial_println!("[SYSCALL] clone: fn_ptr=0x{:X}", fn_ptr);
+    // Read the function pointer from (child_stack - 8) if using our convention
+    // Linux pthread_create puts the start routine differently, but for our
+    // no_std binaries, fn_ptr is at stack_top - 8.
+    let fn_ptr = if validate_user_ptr(child_stack.wrapping_sub(8), 8) {
+        unsafe { core::ptr::read_volatile((child_stack - 8) as *const u64) }
+    } else {
+        0
+    };
 
-    // Create the child thread (shares PML4 = shared address space)
-    match crate::process::clone_thread(current_pid, child_stack - 16, fn_ptr) {
+    crate::serial_println!("[CLONE] fn_ptr=0x{:X}, CLONE_VM={}", fn_ptr, has_clone_vm);
+
+    // Create the child thread (shares PML4 = shared address space when CLONE_VM)
+    match crate::process::clone_thread(current_pid, child_stack.wrapping_sub(16), fn_ptr) {
         Ok(child_pid) => {
             // Enqueue the child in the scheduler
             crate::scheduler::enqueue_process(child_pid);
             crate::serial_println!(
-                "[SYSCALL] clone: thread PID {} created (shared PML4, stack=0x{:X}, fn=0x{:X})",
-                child_pid, child_stack - 16, fn_ptr
+                "[CLONE] thread PID {} created (shared PML4={}, stack=0x{:X}, fn=0x{:X})",
+                child_pid, has_clone_vm, child_stack - 16, fn_ptr
             );
             child_pid
         }
         Err(e) => {
-            crate::serial_println!("[SYSCALL] clone: error: {}", e);
+            crate::serial_println!("[CLONE] error: {}", e);
             ENOMEM
         }
     }
@@ -2192,11 +2341,33 @@ unsafe fn clone_pml4_deep(src_pml4_phys: u64) -> Option<u64> {
     Some(new_pml4_phys)
 }
 
-// ===== sys_exec(path) =====
+// ===== sys_execve(path, argv, envp) — Jalon 127 =====
+
+/// Read a null-terminated array of string pointers from user space.
+/// Returns up to `max` strings. Used to parse argv[] and envp[].
+fn read_user_string_array(array_addr: u64, max: usize) -> alloc::vec::Vec<alloc::string::String> {
+    let mut result = alloc::vec::Vec::new();
+    if array_addr == 0 || !validate_user_ptr(array_addr, 8) {
+        return result;
+    }
+    for i in 0..max {
+        let ptr_addr = array_addr + (i as u64) * 8;
+        if !validate_user_ptr(ptr_addr, 8) { break; }
+        let str_ptr = unsafe { core::ptr::read_volatile(ptr_addr as *const u64) };
+        if str_ptr == 0 { break; } // NULL terminator
+        if !validate_user_ptr(str_ptr, 1) { break; }
+        match unsafe { read_user_string(str_ptr) } {
+            Some(s) => result.push(s),
+            None => break,
+        }
+    }
+    result
+}
 
 /// Execute a new ELF binary, replacing the current process.
+/// Jalon 127: True System V ABI execve with argv/envp support.
 /// Jalon 95: Supports VFS (/bin/*), FAT32 (/disk/*), and bare names.
-fn sys_exec(path_addr: u64) -> u64 {
+fn sys_execve(path_addr: u64, argv_addr: u64, envp_addr: u64) -> u64 {
     if !validate_user_ptr(path_addr, 1) {
         return EFAULT;
     }
@@ -2206,7 +2377,24 @@ fn sys_exec(path_addr: u64) -> u64 {
         None => return EFAULT,
     };
 
-    crate::serial_println!("[SYSCALL] sys_exec(\"{}\")", path);
+    // Jalon 127: Read argv[] and envp[] from userspace
+    let user_argv = read_user_string_array(argv_addr, 64);
+    let user_envp = read_user_string_array(envp_addr, 64);
+
+    // If no argv provided, use path as argv[0]
+    let argv: alloc::vec::Vec<alloc::string::String> = if user_argv.is_empty() {
+        alloc::vec![path.clone()]
+    } else {
+        user_argv
+    };
+
+    crate::serial_println!(
+        "[SYSCALL] sys_execve(\"{}\", argc={}, envc={})",
+        path, argv.len(), user_envp.len()
+    );
+    for (i, a) in argv.iter().enumerate() {
+        crate::serial_println!("[EXECVE]   argv[{}] = \"{}\"", i, a);
+    }
 
     // Resolve the path for lookup
     let resolved = if path.starts_with('/') {
@@ -2274,13 +2462,40 @@ fn sys_exec(path_addr: u64) -> u64 {
                 current_pid, result.entry_point, result.stack_pointer, result.pml4_phys
             );
 
+            // ═══════════════════════════════════════════════════════════
+            // Jalon 127: Rebuild user stack with REAL argv/envp
+            // System V ABI x86_64 stack layout (growing down):
+            //   [string data: argv[0]\0, argv[1]\0, ..., envp[0]\0, ...]
+            //   [padding to 16-byte align]
+            //   [AT_NULL, 0]
+            //   [auxv entries...]
+            //   [NULL]              <- end of envp
+            //   [envp[0] ptr, envp[1] ptr, ...]
+            //   [NULL]              <- end of argv
+            //   [argv[0] ptr, argv[1] ptr, ...]
+            //   [argc]              <- RSP points here
+            // ═══════════════════════════════════════════════════════════
+            let final_rsp = unsafe {
+                crate::elf::build_sysv_stack(
+                    result.pml4_phys,
+                    &argv,
+                    &user_envp,
+                    result.entry_point,
+                )
+            }.unwrap_or(result.stack_pointer);
+
+            crate::serial_println!(
+                "[EXECVE] Jalon 127: System V stack built, argc={}, RSP=0x{:X}",
+                argv.len(), final_rsp
+            );
+
             // Replace the current process's address space and state
             // Jalon 94: Free the OLD page table before replacing
             let old_pml4 = crate::process::with_process(current_pid, |p| p.pml4_phys).unwrap_or(0);
             crate::process::with_process_mut(current_pid, |p| {
                 p.pml4_phys = result.pml4_phys;
                 p.entry_point = result.entry_point;
-                p.stack_pointer = result.stack_pointer;
+                p.stack_pointer = final_rsp;
                 p.name = alloc::string::String::from(&resolved[..]);
                 // Reset FD table to just stdio (exec replaces everything)
                 p.fd_table = crate::process::FdTable::new_with_stdio();
@@ -2289,6 +2504,12 @@ fn sys_exec(path_addr: u64) -> u64 {
                 p.saved_user_rsp = 0;
                 p.saved_syscall_regs = [0; 8];
                 p.is_forked = false;
+                // Jalon 127: Store argv for /proc/self/cmdline
+                p.argv = argv.clone();
+                // Jalon 129: Reset capture state on exec
+                p.captured_by_pid = None;
+                p.signal_handlers = [0u64; 32];
+                p.signal_mask = 0;
             });
 
             // Jalon 94: Free old page table AFTER CR3 has been changed
@@ -2309,7 +2530,7 @@ fn sys_exec(path_addr: u64) -> u64 {
                 // swapgs before IRETQ: we're inside a syscall handler (GS=PER_CPU)
                 // Must restore user GS (=0) before returning to Ring 3
                 core::arch::asm!("swapgs", options(nomem, nostack));
-                crate::elf::jump_to_ring3(result.entry_point, result.stack_pointer);
+                crate::elf::jump_to_ring3(result.entry_point, final_rsp);
             }
         }
         Err(e) => {
@@ -2317,6 +2538,11 @@ fn sys_exec(path_addr: u64) -> u64 {
             ENOENT
         }
     }
+}
+
+/// Backward-compatible wrapper: old sys_exec(path) routes to sys_execve(path, 0, 0)
+fn sys_exec(path_addr: u64) -> u64 {
+    sys_execve(path_addr, 0, 0)
 }
 
 // ===== sys_exit(code) =====
@@ -4631,6 +4857,60 @@ fn sys_brk(new_break: u64) -> u64 {
 /// Returns a packed HidEvent (8 bytes) or 0 if no events.
 fn sys_poll_hid() -> u64 {
     crate::drivers::mouse::poll_event()
+}
+
+// ===== Jalon 129: sys_capture_stdout(child_pid, enable) =====
+
+/// Set or clear stdout capture on a child process.
+/// When enable=1, the child's writes to fd 1/2 will be captured and sent via
+/// INTENT_TOOL_STDOUT. When enable=0, capture is disabled.
+/// The parent PID is automatically set to the current (calling) process.
+fn sys_capture_stdout(child_pid: u64, enable: u64) -> u64 {
+    let parent_pid = crate::scheduler::current_pid();
+
+    if child_pid == 0 { return EINVAL; }
+
+    let current_captured = if enable != 0 {
+        Some(parent_pid)
+    } else {
+        None
+    };
+
+    let ok = crate::process::with_process_mut(child_pid, |p| {
+        p.captured_by_pid = current_captured;
+    });
+
+    match ok {
+        Some(_) => {
+            crate::serial_println!(
+                "[CAPTURE] PID {} {} stdout capture for child PID {}",
+                parent_pid,
+                if enable != 0 { "enabled" } else { "disabled" },
+                child_pid
+            );
+            0
+        }
+        None => {
+            crate::serial_println!("[CAPTURE] Child PID {} not found", child_pid);
+            EINVAL
+        }
+    }
+}
+
+/// Jalon 129: sys_read_captured — read the last captured stdout text from IPC buffer.
+/// Returns the number of bytes read into the user buffer, or 0 if no data.
+fn sys_read_captured(buf_addr: u64, max_len: u64) -> u64 {
+    if !validate_user_ptr(buf_addr, max_len) { return EFAULT; }
+    let (pid, data) = crate::compat::linux_abi::read_captured_text();
+    if data.is_empty() { return 0; }
+    let copy_len = core::cmp::min(data.len(), max_len as usize);
+    unsafe {
+        let dst = buf_addr as *mut u8;
+        for i in 0..copy_len {
+            core::ptr::write_volatile(dst.add(i), data[i]);
+        }
+    }
+    copy_len as u64
 }
 
 // ===== sys_fb_fill_rect(packed_xy, packed_wh, color) -> u64 (Jalon 39) =====
