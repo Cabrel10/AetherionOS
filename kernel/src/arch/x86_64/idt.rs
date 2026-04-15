@@ -897,10 +897,67 @@ extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStac
         unsafe { super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET + 1); }
         return;
     }
+
+    // Jalon 131: Track Ctrl and Alt modifier keys
+    // Ctrl make/break (0x1D / 0x9D)
+    if scancode == 0x1D || scancode == 0x9D {
+        crate::drivers::mouse::update_modifier(0x1D, scancode & 0x80 != 0);
+        crate::drivers::mouse::push_key_event(scancode & 0x7F, scancode & 0x80 != 0);
+        unsafe { super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET + 1); }
+        return;
+    }
+    // Alt make/break (0x38 / 0xB8)
+    if scancode == 0x38 || scancode == 0xB8 {
+        crate::drivers::mouse::update_modifier(0x38, scancode & 0x80 != 0);
+        crate::drivers::mouse::push_key_event(scancode & 0x7F, scancode & 0x80 != 0);
+        unsafe { super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET + 1); }
+        return;
+    }
+
     // Ignore all other release codes (bit 7 set) — no logging
     if scancode & 0x80 != 0 {
         // Push release event to HID ring for WM
         crate::drivers::mouse::push_key_event(scancode & 0x7F, true);
+        unsafe { super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET + 1); }
+        return;
+    }
+
+    // Jalon 131: Intercept Ctrl+key shortcuts before ASCII conversion
+    let (ctrl, alt, _) = crate::drivers::mouse::get_modifiers();
+    if ctrl {
+        match scancode {
+            0x14 => { /* Ctrl+T: push special shortcut to HID ring */
+                crate::drivers::mouse::push_key_event(scancode, false);
+                crate::process::kbd_push_byte(0x14); // Ctrl+T
+            }
+            0x2E => { /* Ctrl+C: interrupt */
+                crate::process::kbd_push_byte(0x03); // ETX = Ctrl+C
+            }
+            0x26 => { /* Ctrl+L: clear */
+                crate::process::kbd_push_byte(0x0C); // FF = Ctrl+L
+            }
+            0x2D => { /* Ctrl+X: kill */
+                crate::process::kbd_push_byte(0x18); // CAN = Ctrl+X
+            }
+            _ => {
+                // Generic Ctrl+key: push ASCII code 1-26 (Ctrl+A=1, Ctrl+Z=26)
+                let ascii = scancode_set1_to_ascii(scancode);
+                if ascii >= b'a' && ascii <= b'z' {
+                    crate::process::kbd_push_byte(ascii - b'a' + 1);
+                }
+            }
+        }
+        crate::drivers::mouse::push_key_event(scancode, false);
+        unsafe { super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET + 1); }
+        return;
+    }
+
+    if alt {
+        // Alt+Tab = 0x0F (Tab scancode)
+        if scancode == 0x0F {
+            crate::process::kbd_push_byte(0x1B); // ESC for Alt+Tab (window switch)
+        }
+        crate::drivers::mouse::push_key_event(scancode, false);
         unsafe { super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET + 1); }
         return;
     }
