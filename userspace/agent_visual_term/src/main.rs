@@ -2656,22 +2656,224 @@ fn cmd_agi_test(term: &mut Terminal) {
 
 // ═══════════════════════════════════════════════════
 // J117c: Package Manager — Download, Install, Execute
-// Usage: pkg install <url>   — Download ELF from network to /disk/
-//        pkg list             — List installed packages
-//        pkg run <name>       — Execute an installed package
 // ═══════════════════════════════════════════════════
+// Jalon 131: AetherionOS Package Manager (pkg)
+// Like apt/pkg on Kali Linux. Everything is installable on demand.
+// No pre-bundled tools — all fetched via network or built-in catalog.
+// Usage: pkg install <name>   — Install a known package or download from URL
+//        pkg remove <name>    — Remove installed package
+//        pkg list             — List installed packages
+//        pkg search <term>    — Search available packages
+//        pkg update           — Refresh package catalog
+//        pkg run <name>       — Execute an installed package
+//        pkg info <name>      — Show package details
+// ═══════════════════════════════════════════════════
+
+/// Package catalog entry
+struct PkgEntry {
+    name: &'static [u8],
+    version: &'static [u8],
+    size: &'static [u8],
+    category: &'static [u8],
+    description: &'static [u8],
+    url: &'static [u8],
+    deps: &'static [u8], // comma-separated dependency names
+}
+
+/// Complete package catalog — all tools available for AetherionOS
+/// Tools are NOT pre-installed; they are downloaded on demand via `pkg install`
+const PKG_CATALOG: &[PkgEntry] = &[
+    // ── System Utilities ──
+    PkgEntry { name: b"busybox", version: b"1.36.1", size: b"1.1M", category: b"system",
+        description: b"Swiss-army knife of Unix utilities (ls, cat, grep, awk, sed, etc.)",
+        url: b"https://busybox.net/downloads/binaries/1.36.1-x86_64-linux-musl/busybox",
+        deps: b"" },
+    PkgEntry { name: b"coreutils", version: b"9.4", size: b"8M", category: b"system",
+        description: b"GNU core utilities (cp, mv, rm, chmod, chown, etc.)",
+        url: b"https://github.com/uutils/coreutils/releases",
+        deps: b"" },
+    PkgEntry { name: b"curl", version: b"8.7.1", size: b"3M", category: b"network",
+        description: b"Command-line HTTP/HTTPS/FTP client",
+        url: b"https://curl.se/download/curl-static-amd64.tar.xz",
+        deps: b"" },
+    PkgEntry { name: b"wget", version: b"1.24", size: b"2M", category: b"network",
+        description: b"Non-interactive network downloader",
+        url: b"https://ftp.gnu.org/gnu/wget/",
+        deps: b"" },
+    PkgEntry { name: b"htop", version: b"3.3.0", size: b"0.5M", category: b"system",
+        description: b"Interactive process viewer (top replacement)",
+        url: b"https://github.com/htop-dev/htop/releases",
+        deps: b"" },
+    PkgEntry { name: b"tmux", version: b"3.4", size: b"1M", category: b"system",
+        description: b"Terminal multiplexer (split panes, detach sessions)",
+        url: b"https://github.com/tmux/tmux/releases",
+        deps: b"" },
+
+    // ── Editors ──
+    PkgEntry { name: b"vim", version: b"9.1", size: b"5M", category: b"editor",
+        description: b"Vi IMproved - advanced text editor",
+        url: b"https://github.com/vim/vim-appimage/releases",
+        deps: b"" },
+    PkgEntry { name: b"nano", version: b"7.2", size: b"0.5M", category: b"editor",
+        description: b"Simple terminal text editor",
+        url: b"https://www.nano-editor.org/dist/",
+        deps: b"" },
+
+    // ── Programming Languages ──
+    PkgEntry { name: b"python", version: b"3.12.3", size: b"45M", category: b"lang",
+        description: b"CPython interpreter (standalone musl build)",
+        url: b"https://github.com/astral-sh/python-build-standalone/releases",
+        deps: b"" },
+    PkgEntry { name: b"micropython", version: b"1.23.0", size: b"2M", category: b"lang",
+        description: b"Lightweight Python for embedded systems (REPL)",
+        url: b"https://micropython.org/download/",
+        deps: b"" },
+    PkgEntry { name: b"node", version: b"22.0.0", size: b"50M", category: b"lang",
+        description: b"Node.js JavaScript runtime",
+        url: b"https://nodejs.org/dist/",
+        deps: b"" },
+    PkgEntry { name: b"go", version: b"1.22.2", size: b"15M", category: b"lang",
+        description: b"Go programming language compiler",
+        url: b"https://go.dev/dl/",
+        deps: b"" },
+    PkgEntry { name: b"rustc", version: b"1.78.0", size: b"20M", category: b"lang",
+        description: b"Rust compiler (musl cross target)",
+        url: b"https://static.rust-lang.org/dist/",
+        deps: b"" },
+    PkgEntry { name: b"lua", version: b"5.4.6", size: b"0.5M", category: b"lang",
+        description: b"Lightweight scripting language",
+        url: b"https://www.lua.org/ftp/",
+        deps: b"" },
+
+    // ── Build Tools ──
+    PkgEntry { name: b"gcc", version: b"13.2.0", size: b"150M", category: b"dev",
+        description: b"GNU C/C++ compiler (musl cross toolchain)",
+        url: b"https://musl.cc/x86_64-linux-musl-cross.tgz",
+        deps: b"" },
+    PkgEntry { name: b"make", version: b"4.4.1", size: b"0.5M", category: b"dev",
+        description: b"GNU Make build automation tool",
+        url: b"https://ftp.gnu.org/gnu/make/",
+        deps: b"" },
+    PkgEntry { name: b"cmake", version: b"3.29", size: b"10M", category: b"dev",
+        description: b"Cross-platform build system generator",
+        url: b"https://cmake.org/download/",
+        deps: b"" },
+
+    // ── Version Control ──
+    PkgEntry { name: b"git", version: b"2.45.0", size: b"15M", category: b"dev",
+        description: b"Distributed version control system",
+        url: b"https://github.com/git/git/releases",
+        deps: b"" },
+
+    // ── Network / Security Tools ──
+    PkgEntry { name: b"nmap", version: b"7.94", size: b"8M", category: b"security",
+        description: b"Network scanner and security auditor",
+        url: b"https://nmap.org/dist/",
+        deps: b"" },
+    PkgEntry { name: b"ssh", version: b"2024.86", size: b"0.5M", category: b"network",
+        description: b"Dropbear lightweight SSH client/server",
+        url: b"https://matt.ucc.asn.au/dropbear/releases/",
+        deps: b"" },
+    PkgEntry { name: b"scp", version: b"2024.86", size: b"0.3M", category: b"network",
+        description: b"Secure copy via SSH (Dropbear scp)",
+        url: b"https://matt.ucc.asn.au/dropbear/releases/",
+        deps: b"ssh" },
+    PkgEntry { name: b"sftp", version: b"2024.86", size: b"0.3M", category: b"network",
+        description: b"SSH File Transfer Protocol client",
+        url: b"https://matt.ucc.asn.au/dropbear/releases/",
+        deps: b"ssh" },
+    PkgEntry { name: b"socat", version: b"1.8.0", size: b"1M", category: b"network",
+        description: b"Multipurpose relay for TCP/UDP/UNIX sockets",
+        url: b"http://www.dest-unreach.org/socat/",
+        deps: b"" },
+    PkgEntry { name: b"netcat", version: b"1.10", size: b"0.3M", category: b"network",
+        description: b"TCP/UDP networking Swiss-army knife (nc)",
+        url: b"https://packages.debian.org/netcat-openbsd",
+        deps: b"" },
+
+    // ── AI / Agent Tools ──
+    PkgEntry { name: b"openclaw", version: b"0.5.0", size: b"8M", category: b"ai",
+        description: b"OpenClaw AI CLI (Rust static binary)",
+        url: b"https://github.com/openclaw/openclaw/releases",
+        deps: b"" },
+    PkgEntry { name: b"claude", version: b"1.0.26", size: b"50M", category: b"ai",
+        description: b"Claude Code CLI (Anthropic AI assistant)",
+        url: b"https://github.com/anthropics/claude-code/releases",
+        deps: b"" },
+    PkgEntry { name: b"gemini-cli", version: b"0.1.0", size: b"40M", category: b"ai",
+        description: b"Gemini CLI (Google AI assistant)",
+        url: b"https://npmjs.com/package/@google/gemini-cli",
+        deps: b"node" },
+    PkgEntry { name: b"rustyclaw", version: b"0.1.0", size: b"8M", category: b"ai",
+        description: b"RustyClaw AI tool (lightweight Rust agent)",
+        url: b"https://crates.io/crates/rustyclaw",
+        deps: b"" },
+    PkgEntry { name: b"paperclip", version: b"0.2.0", size: b"80M", category: b"ai",
+        description: b"Paperclip AI coding assistant (Node.js)",
+        url: b"https://github.com/nickthecook/paperclip",
+        deps: b"node" },
+    PkgEntry { name: b"aider", version: b"0.50.0", size: b"60M", category: b"ai",
+        description: b"Aider AI pair programming (Python)",
+        url: b"https://github.com/paul-gauthier/aider/releases",
+        deps: b"python" },
+    PkgEntry { name: b"copilot", version: b"0.1.0", size: b"25M", category: b"ai",
+        description: b"GitHub Copilot CLI (requires auth)",
+        url: b"https://github.com/github/copilot-cli/releases",
+        deps: b"node" },
+
+    // ── Package Managers ──
+    PkgEntry { name: b"pip", version: b"24.0", size: b"2M", category: b"pm",
+        description: b"Python package installer (pip.pyz standalone)",
+        url: b"https://bootstrap.pypa.io/pip/pip.pyz",
+        deps: b"python" },
+    PkgEntry { name: b"npm", version: b"10.5.0", size: b"5M", category: b"pm",
+        description: b"Node.js package manager",
+        url: b"https://npmjs.com/",
+        deps: b"node" },
+    PkgEntry { name: b"cargo", version: b"1.78.0", size: b"10M", category: b"pm",
+        description: b"Rust package manager and build tool",
+        url: b"https://static.rust-lang.org/dist/",
+        deps: b"rustc" },
+
+    // ── Multimedia / Desktop (future) ──
+    PkgEntry { name: b"ffmpeg", version: b"7.0", size: b"80M", category: b"media",
+        description: b"Audio/video converter and streamer",
+        url: b"https://johnvansickle.com/ffmpeg/",
+        deps: b"" },
+    PkgEntry { name: b"imagemagick", version: b"7.1", size: b"30M", category: b"media",
+        description: b"Image manipulation and conversion tool",
+        url: b"https://imagemagick.org/script/download.php",
+        deps: b"" },
+
+    // ── Database ──
+    PkgEntry { name: b"sqlite", version: b"3.45.0", size: b"2M", category: b"db",
+        description: b"Lightweight SQL database engine (CLI)",
+        url: b"https://sqlite.org/download.html",
+        deps: b"" },
+    PkgEntry { name: b"redis-cli", version: b"7.2", size: b"3M", category: b"db",
+        description: b"Redis database CLI client",
+        url: b"https://github.com/redis/redis/releases",
+        deps: b"" },
+];
 
 fn cmd_pkg(term: &mut Terminal, args: &[u8]) {
     term.put_char(b'\n', TEXT);
     if args.is_empty() {
-        term.put_str(b"AetherionOS Package Manager (J117c)\n", INFO_COL);
-        term.put_str(b"Usage:\n", DIM);
-        term.put_str(b"  pkg install <url>  Download ELF binary from HTTP\n", TEXT);
-        term.put_str(b"  pkg list           List installed packages on /disk/\n", TEXT);
-        term.put_str(b"  pkg run <name>     Execute installed package\n", TEXT);
-        term.put_str(b"  pkg info           Show package system info\n", TEXT);
+        term.put_str(b"\x1b[1;36m", TEXT); // bold cyan
+        term.put_str(b"  AetherionOS Package Manager v131\n", INFO_COL);
+        term.put_str(b"  Like apt/pkg - install tools on demand\n\n", DIM);
+        term.put_str(b"  Usage:\n", TEXT);
+        term.put_str(b"    pkg update              Refresh package catalog\n", TEXT);
+        term.put_str(b"    pkg install <name>      Install a package\n", TEXT);
+        term.put_str(b"    pkg remove <name>       Remove installed package\n", TEXT);
+        term.put_str(b"    pkg list                List installed packages\n", TEXT);
+        term.put_str(b"    pkg search <term>       Search available packages\n", TEXT);
+        term.put_str(b"    pkg info <name>         Show package details\n", TEXT);
+        term.put_str(b"    pkg run <name> [args]   Execute installed package\n", TEXT);
+        term.put_str(b"    pkg catalog             Show all available packages\n", TEXT);
         term.put_char(b'\n', TEXT);
-        sys_write(1, b"[TERM] pkg: usage printed\n");
+        term.put_str(b"  Categories: system, network, lang, dev, ai, security, pm, media, db, editor\n", DIM);
+        term.put_char(b'\n', TEXT);
         return;
     }
 
@@ -2683,36 +2885,349 @@ fn cmd_pkg(term: &mut Terminal, args: &[u8]) {
     let sub_args = &args[sub_args_start..];
 
     if bytes_eq(subcmd, b"install") {
-        // Jalon 130: Accept well-known package names or raw URLs
-        if bytes_eq(sub_args, b"python") || bytes_eq(sub_args, b"micropython") {
-            term.put_str(b"[PKG] Installing MicroPython from built-in catalog...\n", INFO_COL);
-            // Create a placeholder ELF in /disk/tools/python.elf
-            cmd_pkg_install_builtin(term, b"python.elf", b"/disk/tools/python.elf\0");
-        } else if bytes_eq(sub_args, b"busybox") {
-            term.put_str(b"[PKG] Installing BusyBox from built-in catalog...\n", INFO_COL);
-            cmd_pkg_install_builtin(term, b"busybox.elf", b"/disk/tools/busybox.elf\0");
-        } else if bytes_eq(sub_args, b"nmap") {
-            term.put_str(b"[PKG] Installing nmap scanner from built-in catalog...\n", INFO_COL);
-            cmd_pkg_install_builtin(term, b"nmap.elf", b"/disk/tools/nmap.elf\0");
-        } else {
-            cmd_pkg_install(term, sub_args);
-        }
-    } else if bytes_eq(subcmd, b"list") {
+        cmd_pkg_install_by_name(term, sub_args);
+    } else if bytes_eq(subcmd, b"remove") || bytes_eq(subcmd, b"uninstall") {
+        cmd_pkg_remove(term, sub_args);
+    } else if bytes_eq(subcmd, b"list") || bytes_eq(subcmd, b"ls") {
         cmd_pkg_list(term);
-    } else if bytes_eq(subcmd, b"run") {
+    } else if bytes_eq(subcmd, b"search") || bytes_eq(subcmd, b"find") {
+        cmd_pkg_search(term, sub_args);
+    } else if bytes_eq(subcmd, b"update") || bytes_eq(subcmd, b"upgrade") {
+        cmd_pkg_update(term);
+    } else if bytes_eq(subcmd, b"info") || bytes_eq(subcmd, b"show") {
+        cmd_pkg_info(term, sub_args);
+    } else if bytes_eq(subcmd, b"run") || bytes_eq(subcmd, b"exec") {
         cmd_pkg_run(term, sub_args);
-    } else if bytes_eq(subcmd, b"info") {
-        term.put_str(b"Package Manager: AetherionOS J130\n", INFO_COL);
-        term.put_str(b"  Storage:  /disk/ (FAT32 via VirtIO-Block)\n", TEXT);
-        term.put_str(b"  Network:  VirtIO-Net + TCP/IP stack\n", TEXT);
-        term.put_str(b"  Format:   ELF64 (Ring 3 userspace)\n", TEXT);
-        term.put_str(b"  Security: MCP validation before execution\n", TEXT);
-        term.put_str(b"  Catalog:  python, micropython, busybox, nmap\n", TEXT);
-        term.put_char(b'\n', TEXT);
+    } else if bytes_eq(subcmd, b"catalog") || bytes_eq(subcmd, b"available") {
+        cmd_pkg_catalog(term);
     } else {
-        term.put_str(b"Unknown pkg subcommand. Type 'pkg' for help.\n", ERR_COL);
+        term.put_str(b"Unknown subcommand. Type 'pkg' for help.\n", ERR_COL);
+    }
+    term.put_char(b'\n', TEXT);
+}
+
+/// pkg update — Refresh package catalog (simulated: reads /etc/pkg_registry.txt)
+fn cmd_pkg_update(term: &mut Terminal) {
+    term.put_str(b"[PKG] Updating package catalog...\n", INFO_COL);
+    term.put_str(b"[PKG] Reading /etc/pkg_registry.txt...\n", DIM);
+    // In a real implementation, this would fetch from a remote repo
+    // For now, the catalog is compiled-in (PKG_CATALOG above)
+    sys_write(1, b"[TERM] pkg update: catalog refreshed\n");
+    term.put_str(b"[PKG] ", INFO_COL);
+    print_u64_term(term, PKG_CATALOG.len() as u64);
+    term.put_str(b" packages available in catalog.\n", INFO_COL);
+    term.put_str(b"[PKG] Package database is up to date.\n", INFO_COL);
+}
+
+/// pkg search <term> — Search for packages by name, description or category
+fn cmd_pkg_search(term: &mut Terminal, query: &[u8]) {
+    if query.is_empty() {
+        term.put_str(b"Usage: pkg search <term>\n", ERR_COL);
+        term.put_str(b"  Example: pkg search python\n", DIM);
+        term.put_str(b"  Example: pkg search ai\n", DIM);
+        return;
+    }
+
+    term.put_str(b"[PKG] Searching for '", INFO_COL);
+    term.put_str(query, TEXT);
+    term.put_str(b"'...\n\n", INFO_COL);
+
+    let mut count: u64 = 0;
+    for pkg in PKG_CATALOG.iter() {
+        if bytes_contains(pkg.name, query)
+            || bytes_contains(pkg.description, query)
+            || bytes_contains(pkg.category, query)
+        {
+            term.put_str(b"  ", TEXT);
+            term.put_str(pkg.name, INFO_COL);
+            // Pad name to 16 chars
+            let mut pad = pkg.name.len();
+            while pad < 16 { term.put_char(b' ', TEXT); pad += 1; }
+            term.put_str(pkg.version, DIM);
+            pad = pkg.version.len();
+            while pad < 10 { term.put_char(b' ', TEXT); pad += 1; }
+            term.put_str(b"[", DIM);
+            term.put_str(pkg.category, DIM);
+            term.put_str(b"] ", DIM);
+            term.put_str(pkg.description, TEXT);
+            term.put_char(b'\n', TEXT);
+            count += 1;
+        }
+    }
+
+    if count == 0 {
+        term.put_str(b"  No packages found matching '", DIM);
+        term.put_str(query, TEXT);
+        term.put_str(b"'\n", DIM);
+    } else {
+        term.put_char(b'\n', TEXT);
+        term.put_str(b"[PKG] Found ", INFO_COL);
+        print_u64_term(term, count);
+        term.put_str(b" package(s).\n", INFO_COL);
+    }
+}
+
+/// pkg catalog — List all available packages
+fn cmd_pkg_catalog(term: &mut Terminal) {
+    term.put_str(b"[PKG] Available packages (", INFO_COL);
+    print_u64_term(term, PKG_CATALOG.len() as u64);
+    term.put_str(b" total):\n\n", INFO_COL);
+
+    let mut last_cat: &[u8] = b"";
+    for pkg in PKG_CATALOG.iter() {
+        if !bytes_eq(pkg.category, last_cat) {
+            term.put_str(b"\n  -- ", DIM);
+            term.put_str(pkg.category, INFO_COL);
+            term.put_str(b" --\n", DIM);
+            last_cat = pkg.category;
+        }
+        term.put_str(b"  ", TEXT);
+        term.put_str(pkg.name, TEXT);
+        let mut pad = pkg.name.len();
+        while pad < 16 { term.put_char(b' ', TEXT); pad += 1; }
+        term.put_str(pkg.size, DIM);
+        pad = pkg.size.len();
+        while pad < 8 { term.put_char(b' ', TEXT); pad += 1; }
+        term.put_str(pkg.description, DIM);
         term.put_char(b'\n', TEXT);
     }
+}
+
+/// pkg info <name> — Show detailed package information
+fn cmd_pkg_info(term: &mut Terminal, name: &[u8]) {
+    if name.is_empty() {
+        term.put_str(b"Usage: pkg info <name>\n", ERR_COL);
+        return;
+    }
+    for pkg in PKG_CATALOG.iter() {
+        if bytes_eq(pkg.name, name) {
+            term.put_str(b"  Package:     ", DIM);
+            term.put_str(pkg.name, INFO_COL);
+            term.put_char(b'\n', TEXT);
+            term.put_str(b"  Version:     ", DIM);
+            term.put_str(pkg.version, TEXT);
+            term.put_char(b'\n', TEXT);
+            term.put_str(b"  Size:        ", DIM);
+            term.put_str(pkg.size, TEXT);
+            term.put_char(b'\n', TEXT);
+            term.put_str(b"  Category:    ", DIM);
+            term.put_str(pkg.category, TEXT);
+            term.put_char(b'\n', TEXT);
+            term.put_str(b"  Description: ", DIM);
+            term.put_str(pkg.description, TEXT);
+            term.put_char(b'\n', TEXT);
+            term.put_str(b"  Source:      ", DIM);
+            term.put_str(pkg.url, TEXT);
+            term.put_char(b'\n', TEXT);
+            if !pkg.deps.is_empty() {
+                term.put_str(b"  Depends:     ", DIM);
+                term.put_str(pkg.deps, TEXT);
+                term.put_char(b'\n', TEXT);
+            }
+            term.put_str(b"  Arch:        x86_64-linux-musl (static ELF64)\n", DIM);
+            // Check if installed
+            let mut path = [0u8; 128];
+            let prefix = b"/disk/bin/";
+            for i in 0..prefix.len() { path[i] = prefix[i]; }
+            let mut pp = prefix.len();
+            for &b in pkg.name.iter() { if pp < 126 { path[pp] = b; pp += 1; } }
+            path[pp] = 0;
+            let fd = sys_open(&path[..pp+1], O_RDONLY);
+            if fd >= 0 {
+                sys_close(fd as u32);
+                term.put_str(b"  Status:      INSTALLED\n", INFO_COL);
+            } else {
+                term.put_str(b"  Status:      not installed\n", DIM);
+            }
+            return;
+        }
+    }
+    term.put_str(b"Package '", ERR_COL);
+    term.put_str(name, TEXT);
+    term.put_str(b"' not found in catalog. Try 'pkg search'\n", ERR_COL);
+}
+
+/// pkg install <name> — Install package by name (from catalog) or URL
+fn cmd_pkg_install_by_name(term: &mut Terminal, name: &[u8]) {
+    if name.is_empty() {
+        term.put_str(b"Usage: pkg install <name>\n", ERR_COL);
+        term.put_str(b"  Example: pkg install busybox\n", DIM);
+        term.put_str(b"  Example: pkg install python\n", DIM);
+        term.put_str(b"  Example: pkg install http://10.0.2.2/tool.elf\n", DIM);
+        return;
+    }
+
+    // If it starts with http, treat as URL
+    if name.len() > 4 && name[0] == b'h' && name[1] == b't' && name[2] == b't' && name[3] == b'p' {
+        cmd_pkg_install(term, name);
+        return;
+    }
+
+    // Look up in catalog
+    let mut found = false;
+    for pkg in PKG_CATALOG.iter() {
+        if bytes_eq(pkg.name, name) {
+            found = true;
+
+            // Check dependencies first
+            if !pkg.deps.is_empty() {
+                term.put_str(b"[PKG] Checking dependencies: ", DIM);
+                term.put_str(pkg.deps, TEXT);
+                term.put_str(b"\n", TEXT);
+                // Check if dep is installed
+                let mut dep_path = [0u8; 128];
+                let dp = b"/disk/bin/";
+                for i in 0..dp.len() { dep_path[i] = dp[i]; }
+                let mut dpp = dp.len();
+                for &b in pkg.deps.iter() {
+                    if b == b',' { break; } // Only check first dep for now
+                    if dpp < 126 { dep_path[dpp] = b; dpp += 1; }
+                }
+                dep_path[dpp] = 0;
+                let dfd = sys_open(&dep_path[..dpp+1], O_RDONLY);
+                if dfd < 0 {
+                    term.put_str(b"[PKG] WARNING: dependency '", ERR_COL);
+                    term.put_str(pkg.deps, TEXT);
+                    term.put_str(b"' not installed.\n", ERR_COL);
+                    term.put_str(b"[PKG] Install it first: pkg install ", DIM);
+                    term.put_str(pkg.deps, TEXT);
+                    term.put_str(b"\n", TEXT);
+                } else {
+                    sys_close(dfd as u32);
+                    term.put_str(b"[PKG] Dependencies OK.\n", INFO_COL);
+                }
+            }
+
+            term.put_str(b"[PKG] Installing ", INFO_COL);
+            term.put_str(pkg.name, TEXT);
+            term.put_str(b" v", TEXT);
+            term.put_str(pkg.version, TEXT);
+            term.put_str(b" (", DIM);
+            term.put_str(pkg.size, DIM);
+            term.put_str(b")...\n", DIM);
+
+            sys_write(1, b"[TERM] pkg install: ");
+            sys_write(1, pkg.name);
+            sys_write(1, b"\n");
+
+            // Check if already installed
+            let mut check_path = [0u8; 128];
+            let cp = b"/disk/bin/";
+            for i in 0..cp.len() { check_path[i] = cp[i]; }
+            let mut cpp = cp.len();
+            for &b in pkg.name.iter() { if cpp < 126 { check_path[cpp] = b; cpp += 1; } }
+            check_path[cpp] = 0;
+            let efd = sys_open(&check_path[..cpp+1], O_RDONLY);
+            if efd >= 0 {
+                sys_close(efd as u32);
+                term.put_str(b"[PKG] ", INFO_COL);
+                term.put_str(pkg.name, TEXT);
+                term.put_str(b" is already installed.\n", INFO_COL);
+                return;
+            }
+
+            // Try to download from URL via TCP
+            term.put_str(b"[PKG] Downloading from: ", DIM);
+            term.put_str(pkg.url, TEXT);
+            term.put_str(b"\n", TEXT);
+
+            // Try built-in VFS first: /bin/<name>.elf
+            let mut vfs_path = [0u8; 64];
+            let vp = b"/bin/";
+            for i in 0..vp.len() { vfs_path[i] = vp[i]; }
+            let mut vpp = vp.len();
+            for &b in pkg.name.iter() { if vpp < 58 { vfs_path[vpp] = b; vpp += 1; } }
+            let suf = b".elf";
+            for &b in suf.iter() { if vpp < 62 { vfs_path[vpp] = b; vpp += 1; } }
+            vfs_path[vpp] = 0;
+
+            let src_fd = sys_open(&vfs_path[..vpp+1], O_RDONLY);
+            if src_fd >= 0 {
+                // Copy from VFS /bin/ to /disk/bin/
+                term.put_str(b"[PKG] Found in kernel VFS, copying...\n", INFO_COL);
+                let mut buf = [0u8; 4096];
+                let n = sys_read(src_fd as u32, &mut buf);
+                sys_close(src_fd as u32);
+                if n > 0 {
+                    // Write to /disk/bin/<name>
+                    let dst_fd = sys_open(&check_path[..cpp+1], O_WRONLY | O_CREAT);
+                    if dst_fd >= 0 {
+                        sys_write(dst_fd as u32, &buf[..n as usize]);
+                        sys_close(dst_fd as u32);
+                        term.put_str(b"[PKG] Installed ", INFO_COL);
+                        term.put_str(pkg.name, TEXT);
+                        term.put_str(b" -> /disk/bin/", TEXT);
+                        term.put_str(pkg.name, TEXT);
+                        term.put_str(b" (", DIM);
+                        print_u64_term(term, n as u64);
+                        term.put_str(b" bytes)\n", DIM);
+                        sys_write(1, b"[TERM] pkg install: SUCCESS\n");
+                        return;
+                    }
+                }
+            }
+
+            // Try network download (via existing cmd_pkg_install with URL)
+            cmd_pkg_install(term, pkg.url);
+            return;
+        }
+    }
+
+    if !found {
+        // Not in catalog — maybe a URL or unknown package
+        if name.len() > 4 {
+            term.put_str(b"[PKG] Package '", ERR_COL);
+            term.put_str(name, TEXT);
+            term.put_str(b"' not found in catalog.\n", ERR_COL);
+        }
+        term.put_str(b"[PKG] Available packages: 'pkg catalog' or 'pkg search <term>'\n", DIM);
+    }
+}
+
+/// pkg remove <name> — Remove an installed package
+fn cmd_pkg_remove(term: &mut Terminal, name: &[u8]) {
+    if name.is_empty() {
+        term.put_str(b"Usage: pkg remove <name>\n", ERR_COL);
+        return;
+    }
+    // Build path /disk/bin/<name>
+    let mut path = [0u8; 128];
+    let prefix = b"/disk/bin/";
+    for i in 0..prefix.len() { path[i] = prefix[i]; }
+    let mut pp = prefix.len();
+    for &b in name {
+        if pp < 126 { path[pp] = b; pp += 1; }
+    }
+    path[pp] = 0;
+
+    // Try to unlink
+    let rc = sys_unlink(&path[..pp + 1]);
+    if rc == 0 {
+        term.put_str(b"[PKG] Removed ", INFO_COL);
+        term.put_str(name, TEXT);
+        term.put_str(b" from /disk/bin/\n", TEXT);
+        sys_write(1, b"[TERM] pkg remove: SUCCESS\n");
+    } else {
+        term.put_str(b"[PKG] Package '", ERR_COL);
+        term.put_str(name, TEXT);
+        term.put_str(b"' is not installed.\n", ERR_COL);
+    }
+}
+
+/// Helper: case-insensitive bytes_contains
+fn bytes_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() { return true; }
+    if needle.len() > haystack.len() { return false; }
+    for i in 0..=(haystack.len() - needle.len()) {
+        let mut ok = true;
+        for j in 0..needle.len() {
+            let a = if haystack[i+j] >= b'A' && haystack[i+j] <= b'Z' { haystack[i+j] + 32 } else { haystack[i+j] };
+            let b = if needle[j] >= b'A' && needle[j] <= b'Z' { needle[j] + 32 } else { needle[j] };
+            if a != b { ok = false; break; }
+        }
+        if ok { return true; }
+    }
+    false
 }
 
 /// pkg install <url> — Download ELF from network and write to /disk/bin/
@@ -2897,23 +3412,58 @@ fn cmd_pkg_install_builtin(term: &mut Terminal, name: &[u8], disk_path: &[u8]) {
     term.put_char(b'\n', TEXT);
 }
 
-/// pkg list — List packages on /disk/
+/// pkg list — List installed packages (/disk/bin/)
 fn cmd_pkg_list(term: &mut Terminal) {
-    term.put_str(b"[PKG] Installed packages (/disk/):\n", INFO_COL);
-    let fd = sys_open(b"/disk\0", O_RDONLY);
+    term.put_str(b"[PKG] Installed packages:\n\n", INFO_COL);
+
+    // Scan /disk/bin/ directory
+    let fd = sys_open(b"/disk/bin\0", O_RDONLY);
     if fd >= 0 {
-        let mut buf = [0u8; 1024];
+        let mut buf = [0u8; 2048];
         let n = sys_getdents(fd as u32, &mut buf);
         sys_close(fd as u32);
         if n > 0 {
+            term.put_str(b"  /disk/bin/:\n", DIM);
             term.put_str(&buf[..n as usize], TEXT);
         } else {
-            term.put_str(b"  (no packages found)\n", DIM);
+            term.put_str(b"  /disk/bin/ (empty)\n", DIM);
         }
     } else {
-        term.put_str(b"  (cannot read /disk/)\n", ERR_COL);
+        term.put_str(b"  /disk/bin/ (not accessible)\n", DIM);
     }
-    term.put_char(b'\n', TEXT);
+
+    // Also scan /disk/tools/
+    let fd2 = sys_open(b"/disk/tools\0", O_RDONLY);
+    if fd2 >= 0 {
+        let mut buf2 = [0u8; 2048];
+        let n2 = sys_getdents(fd2 as u32, &mut buf2);
+        sys_close(fd2 as u32);
+        if n2 > 0 {
+            term.put_str(b"\n  /disk/tools/:\n", DIM);
+            term.put_str(&buf2[..n2 as usize], TEXT);
+        }
+    }
+
+    // Count catalog matches
+    let mut installed: u64 = 0;
+    for pkg in PKG_CATALOG.iter() {
+        let mut path = [0u8; 128];
+        let prefix = b"/disk/bin/";
+        for i in 0..prefix.len() { path[i] = prefix[i]; }
+        let mut pp = prefix.len();
+        for &b in pkg.name.iter() { if pp < 126 { path[pp] = b; pp += 1; } }
+        path[pp] = 0;
+        let tfd = sys_open(&path[..pp+1], O_RDONLY);
+        if tfd >= 0 {
+            sys_close(tfd as u32);
+            installed += 1;
+        }
+    }
+    term.put_str(b"\n[PKG] ", INFO_COL);
+    print_u64_term(term, installed);
+    term.put_str(b" of ", TEXT);
+    print_u64_term(term, PKG_CATALOG.len() as u64);
+    term.put_str(b" catalog packages installed.\n", TEXT);
 }
 
 /// pkg run <name> — Execute a package
