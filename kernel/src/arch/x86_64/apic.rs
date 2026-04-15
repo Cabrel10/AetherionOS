@@ -125,7 +125,7 @@ unsafe fn apic_read(offset: u32) -> u32 {
     let base = APIC_BASE_ADDR.load(Ordering::SeqCst) as u64;
     let phys_offset = crate::elf::phys_offset();
     let virt = base + phys_offset + offset as u64;
-    core::ptr::read_volatile(virt as *const u32)
+    core::ptr::read_unaligned(virt as *const u32)
 }
 
 #[inline]
@@ -133,7 +133,7 @@ unsafe fn apic_write(offset: u32, val: u32) {
     let base = APIC_BASE_ADDR.load(Ordering::SeqCst) as u64;
     let phys_offset = crate::elf::phys_offset();
     let virt = base + phys_offset + offset as u64;
-    core::ptr::write_volatile(virt as *mut u32, val);
+    core::ptr::write_unaligned(virt as *mut u32, val);
 }
 
 // =====================================================================
@@ -422,7 +422,7 @@ pub fn wake_application_processors() {
 
             let sync = unsafe {
                 let sync_ptr = (phys_offset + 0x8000 + TRAMP_SYNC_FLAG_OFF as u64) as *const u32;
-                core::ptr::read_volatile(sync_ptr)
+                core::ptr::read_unaligned(sync_ptr)
             };
 
             // Also check AP_ALIVE for the Rust-side signal
@@ -629,7 +629,7 @@ pub extern "C" fn ap_main() -> ! {
     unsafe {
         let phys_offset = crate::elf::phys_offset();
         let sync_ptr = (phys_offset + 0x8000 + TRAMP_SYNC_FLAG_OFF as u64) as *mut u32;
-        core::ptr::write_volatile(sync_ptr, 1);
+        core::ptr::write_unaligned(sync_ptr, 1);
         core::arch::asm!("mfence", options(nomem, nostack));
     }
 
