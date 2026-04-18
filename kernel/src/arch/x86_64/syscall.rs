@@ -289,6 +289,47 @@ unsafe fn read_user_string(addr: u64) -> Option<alloc::string::String> {
 #[naked]
 unsafe extern "C" fn syscall_entry() {
     asm!(
+        // J135: EARLIEST POSSIBLE diagnostic — write 'S' to serial COM1 (0x3F8)
+        // BEFORE doing anything else. If we see 'S' in the serial output, we
+        // have confirmation that syscall_entry was entered. If we never see
+        // 'S', the fault happens during SYSCALL delivery itself (before any
+        // kernel instruction executes), pointing at an MSR/CR3/IDT problem
+        // rather than a bug in our asm. This uses no memory accesses — only
+        // I/O port writes + R11 scratch (r11 was clobbered by SYSCALL to hold
+        // RFLAGS which we'll restore later from the saved context anyway).
+        // Safe without a valid stack.
+        //
+        // WARNING: we MUST NOT clobber:
+        //   - RAX (syscall number)
+        //   - RDI/RSI/RDX/R10/R8/R9 (syscall args 1..6)
+        //   - RCX (user RIP, saved by SYSCALL)
+        //   - R11 (user RFLAGS, saved by SYSCALL) — we restore it from the
+        //     pushed context later, so we can use it here. Actually no, R11
+        //     holds user's RFLAGS that we push later. Don't clobber. Use a
+        //     different approach: write using port-only instructions with
+        //     immediate-style data loaded into a safe register.
+        //
+        // Simplest: use AL/DX but save them via XCHG with a free register.
+        // Actually, RAX holds the syscall number which we WILL preserve by
+        // saving it later; but we need it intact for the dispatcher. So we
+        // emit the byte using AL, then restore AL from RAX... no, we have
+        // no spare register.
+        //
+        // SOLUTION: Use the port 0xE9 (QEMU debug port) — it is NOT a real
+        // serial port so it doesn't go to the file-based log, but it shows
+        // up on QEMU stdout when `-debugcon stdio` is used. Still requires
+        // AL/DX though. Let's just use `xchg rax, [<scratch>]`? No — needs
+        // memory.
+        //
+        // FINAL APPROACH: skip this diagnostic. The fault state alone gives
+        // us enough info (RIP=LSTAR, GS=0, CR2=0xC). See below for analysis.
+
+        // J134c: NOP sled BEFORE swapgs so we can see if RIP actually moves.
+        // If the fault is reported AT swapgs but really on the next instruction,
+        // we'd see RIP at entry+3 instead of entry+0.
+        "nop",
+        "nop",
+        "nop",
         // 1. Switch to kernel GS
         "swapgs",
 
@@ -429,6 +470,21 @@ fn print_hex_raw(val: u64) {
 /// syscall automatically — no fxsave/fxrstor needed in the fast path.
 #[no_mangle]
 extern "C" fn syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
+    // J134c: trace every syscall from PID 19 (Visual Terminal) to pinpoint
+    // exactly which call sequence crashes the kernel path. Only log the
+    // first 10 to avoid serial flooding.
+    let pid = crate::scheduler::current_pid();
+    if pid == 19 {
+        static FIRST_10: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        let c = FIRST_10.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if c < 10 {
+            crate::serial_println!(
+                "[SC#{} PID19] nr={} a1=0x{:X} a2=0x{:X} a3=0x{:X} a4=0x{:X} a5=0x{:X}",
+                c, nr, a1, a2, a3, a4, a5
+            );
+        }
+    }
     syscall_dispatch(nr, a1, a2, a3, a4, a5)
 }
 

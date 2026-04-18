@@ -1505,7 +1505,14 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 let _ = memory_manager.frame_allocator.alloc_frame_kernel();
             }
             unsafe { elf::init_frame_pool(base_phys, pool_frames); }
-            serial_println!("       [OK] ELF frame pool: {} frames ({} GB)", pool_frames, pool_frames * 4 / 1024 / 1024);
+            serial_println!("       [OK] ELF frame pool: {} frames ({} GB) base_phys=0x{:X}", pool_frames, pool_frames * 4 / 1024 / 1024, base_phys);
+            // J135: sanity check — ensure the pool does NOT overlap kernel .text/.rodata/.data/.bss
+            // kernel image spans roughly [0x200000, 0xC10000] in physical memory for this build
+            let pool_end = base_phys + (pool_frames as u64) * 4096;
+            serial_println!("       [J135] ELF pool phys range: 0x{:X} - 0x{:X}", base_phys, pool_end);
+            if base_phys < 0x1_000_000 && pool_end > 0x200_000 {
+                serial_println!("       [J135-WARN] ELF pool OVERLAPS kernel image (0x200000-0xC10000)!");
+            }
         } else {
             serial_write("       [WARN] No frames for ELF pool\n");
         }

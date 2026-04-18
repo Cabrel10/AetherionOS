@@ -180,6 +180,22 @@ impl FrameAllocator {
         self.search_hint = frame + 1;
 
         let phys_addr = PhysAddr::new((frame as u64).checked_mul(FRAME_SIZE as u64)?);
+        // J135: sanity check — if we're allocating a frame that overlaps the
+        // kernel image (approx 0x200000-0xC10000 for this build), log a
+        // warning. The bootloader should have marked this region as non-usable,
+        // but double-check at runtime to catch regressions.
+        let phys_u64 = phys_addr.as_u64();
+        if phys_u64 >= 0x200_000 && phys_u64 < 0xD00_000 {
+            // Only log the first such overlap to avoid serial flooding.
+            static ONCE: core::sync::atomic::AtomicBool =
+                core::sync::atomic::AtomicBool::new(false);
+            if !ONCE.swap(true, core::sync::atomic::Ordering::SeqCst) {
+                crate::serial_println!(
+                    "[FRAME-WARN] Allocated frame at phys 0x{:X} overlaps kernel image!",
+                    phys_u64
+                );
+            }
+        }
         PhysFrame::from_start_address(phys_addr).ok()
     }
 

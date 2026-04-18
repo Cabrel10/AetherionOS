@@ -61,7 +61,14 @@ lazy_static! {
         idt.general_protection_fault.set_handler_fn(general_protection_fault_handler);
 
         // Exception: Page fault (#PF) - demand paging for Ring 3 stack
-        idt.page_fault.set_handler_fn(page_fault_handler);
+        // Jalon 134c: Use dedicated IST1 so that PFs taken in syscall_entry
+        // (before the user->kernel stack switch) have a trustworthy kernel
+        // stack to run on. Without this, #PF runs on the user RSP, which is
+        // fragile and can cascade into #DF.
+        unsafe {
+            idt.page_fault.set_handler_fn(page_fault_handler)
+                .set_stack_index(gdt::page_fault_ist_index());
+        }
 
         // Exception: x87 FPU error (#MF)
         idt.x87_floating_point.set_handler_fn(x87_floating_point_handler);
@@ -102,6 +109,38 @@ lazy_static! {
 pub fn init() {
     IDT.load();
     crate::serial_println!("[IDT] Loaded with 20 exception handlers + demand paging");
+
+    // J134c: Dump the live IDT entry for #PF (vector 14) to confirm that
+    // IST=1 was applied. We read from the IDTR base via SIDT and inspect
+    // bytes at entry 14 (offset 14*16 = 0xE0). The IST field is byte[4], bits 0..2.
+    unsafe {
+        let mut idtr: [u8; 10] = [0; 10];
+        core::arch::asm!("sidt [{}]", in(reg) idtr.as_mut_ptr(),
+            options(nostack, preserves_flags));
+        let idt_base = u64::from_le_bytes([
+            idtr[2], idtr[3], idtr[4], idtr[5],
+            idtr[6], idtr[7], idtr[8], idtr[9],
+        ]);
+        let pf_entry = (idt_base + 14 * 16) as *const u8;
+        let b = [
+            *pf_entry.add(0), *pf_entry.add(1), *pf_entry.add(2), *pf_entry.add(3),
+            *pf_entry.add(4), *pf_entry.add(5), *pf_entry.add(6), *pf_entry.add(7),
+        ];
+        let ist = b[4] & 0x07;
+        let type_attr = b[5];
+        let handler_lo = u16::from_le_bytes([b[0], b[1]]) as u64;
+        let sel = u16::from_le_bytes([b[2], b[3]]);
+        let handler_mid = u16::from_le_bytes([b[6], b[7]]) as u64;
+        let handler_high = u32::from_le_bytes([
+            *pf_entry.add(8), *pf_entry.add(9),
+            *pf_entry.add(10), *pf_entry.add(11),
+        ]) as u64;
+        let handler = handler_lo | (handler_mid << 16) | (handler_high << 32);
+        crate::serial_println!(
+            "[IDT-DIAG] IDT[14] (#PF): handler=0x{:X} sel=0x{:X} IST={} type=0x{:X}",
+            handler, sel, ist, type_attr
+        );
+    }
 }
 
 /// Load the BSP's IDT on an AP core (Jalon 101).
@@ -304,9 +343,28 @@ extern "x86-interrupt" fn device_not_available_handler(stack_frame: InterruptSta
 }
 
 extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame, _error_code: u64) -> ! {
-    crate::serial_println!("[EXCEPTION] #DF DOUBLE FAULT at {:?}", stack_frame.instruction_pointer);
-    crate::serial_println!("[EXCEPTION] Stack frame: {:?}", stack_frame);
-    panic!("Double fault - possible stack overflow");
+    use x86_64::registers::control::Cr2;
+    let cr2 = Cr2::read().as_u64();
+    let cr3: u64;
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)); }
+    let gsb: u64;
+    let kgsb: u64;
+    unsafe {
+        let (gslo, gshi): (u32, u32);
+        core::arch::asm!("rdmsr", in("ecx") 0xC000_0101u32,
+            out("eax") gslo, out("edx") gshi, options(nomem, nostack));
+        gsb = ((gshi as u64) << 32) | (gslo as u64);
+        let (klo, khi): (u32, u32);
+        core::arch::asm!("rdmsr", in("ecx") 0xC000_0102u32,
+            out("eax") klo, out("edx") khi, options(nomem, nostack));
+        kgsb = ((khi as u64) << 32) | (klo as u64);
+    }
+    crate::serial_println!("[DF] DOUBLE FAULT rip={:?} rsp=0x{:X} cs=0x{:X} rflags=0x{:X}",
+        stack_frame.instruction_pointer, stack_frame.stack_pointer.as_u64(),
+        stack_frame.code_segment, stack_frame.cpu_flags);
+    crate::serial_println!("[DF] CR2=0x{:X} CR3=0x{:X} GS_BASE=0x{:X} KERNEL_GS_BASE=0x{:X}",
+        cr2, cr3, gsb, kgsb);
+    panic!("Double fault - possible stack overflow or PF-in-PF cascade");
 }
 
 extern "x86-interrupt" fn invalid_tss_handler(stack_frame: InterruptStackFrame, error_code: u64) {
@@ -718,6 +776,157 @@ extern "x86-interrupt" fn page_fault_handler(
     let is_user_mode = error_code.contains(PageFaultErrorCode::USER_MODE);
     let page_addr = addr_raw & !0xFFF;
 
+    // Jalon 134b: Deep forensic diagnostic for low-address (NULL-page) kernel-mode
+    // page faults — these are typically caused by GS-base misconfiguration in the
+    // SYSCALL entry path (stale swapgs, corrupted KERNEL_GS_BASE MSR, etc.).
+    // We log CS:RIP, CR2, error_code, CR3, GS_BASE, KERNEL_GS_BASE once per boot.
+    // Jalon 134c: extended to ALL kernel-mode faults so we capture CR2 top-of-space
+    // faults (e.g., 0xFFFFFFFFFFFFFFF0 stack underflow) too.
+    if !is_user_mode {
+        // J134c: log up to 8 kernel-mode faults to detect cascades
+        static DEEP_COUNT: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        let n = DEEP_COUNT.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        if n < 8 {
+            let rip = stack_frame.instruction_pointer.as_u64();
+            let cs  = stack_frame.code_segment;
+            let rfl = stack_frame.cpu_flags;
+            let rsp = stack_frame.stack_pointer.as_u64();
+            let err = error_code.bits();
+            let cr3: u64;
+            unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)); }
+            // Read GS_BASE (IA32_GS_BASE = 0xC0000101) and KERNEL_GS_BASE (0xC0000102)
+            let gsb: u64;
+            let kgsb: u64;
+            unsafe {
+                let (gslo, gshi): (u32, u32);
+                core::arch::asm!("rdmsr", in("ecx") 0xC000_0101u32,
+                    out("eax") gslo, out("edx") gshi, options(nomem, nostack));
+                gsb = ((gshi as u64) << 32) | (gslo as u64);
+                let (klo, khi): (u32, u32);
+                core::arch::asm!("rdmsr", in("ecx") 0xC000_0102u32,
+                    out("eax") klo, out("edx") khi, options(nomem, nostack));
+                kgsb = ((khi as u64) << 32) | (klo as u64);
+            }
+            // J134c: also capture the handler's own RSP - if IST1 fired, we
+            // should be running on PF_STACK (around IST1 top in GDT diag).
+            let my_rsp: u64;
+            unsafe { core::arch::asm!("mov {}, rsp", out(reg) my_rsp, options(nomem, nostack)); }
+            crate::serial_println!(
+                "[PF-DEEP #{}] addr=0x{:X} err=0x{:X} CS=0x{:X} RIP=0x{:X} RFL=0x{:X} RSP(saved)=0x{:X} RSP(live)=0x{:X}",
+                n, addr_raw, err, cs, rip, rfl, rsp, my_rsp
+            );
+            crate::serial_println!(
+                "[PF-DEEP] CR2=0x{:X} CR3=0x{:X} GS_BASE=0x{:X} KERNEL_GS_BASE=0x{:X}",
+                addr_raw, cr3, gsb, kgsb
+            );
+            let pid = crate::scheduler::current_pid();
+            crate::serial_println!("[PF-DEEP] PID={} user_mode={}", pid, is_user_mode);
+
+            // J134c: Page-table walk for the faulting RIP to detect missing mappings
+            // in the current CR3. We translate RIP virtual -> physical using CR3.
+            unsafe {
+                let phys_off: u64 = 0xFFFF_8000_0000_0000;
+                let pml4_phys = cr3 & !0xFFF;
+                let walk_va = rip;
+                let pml4_i = (walk_va >> 39) & 0x1FF;
+                let pdpt_i = (walk_va >> 30) & 0x1FF;
+                let pd_i   = (walk_va >> 21) & 0x1FF;
+                let pt_i   = (walk_va >> 12) & 0x1FF;
+                let pml4_e = core::ptr::read_volatile(
+                    (pml4_phys + phys_off + pml4_i * 8) as *const u64);
+                crate::serial_println!(
+                    "[PF-WALK] RIP=0x{:X} PML4[{}]=0x{:X}",
+                    walk_va, pml4_i, pml4_e
+                );
+                if pml4_e & 0x1 != 0 {
+                    let pdpt_phys = pml4_e & 0x000F_FFFF_FFFF_F000;
+                    let pdpt_e = core::ptr::read_volatile(
+                        (pdpt_phys + phys_off + pdpt_i * 8) as *const u64);
+                    crate::serial_println!("[PF-WALK] PDPT[{}]=0x{:X}", pdpt_i, pdpt_e);
+                    if pdpt_e & 0x1 != 0 && pdpt_e & 0x80 == 0 {
+                        let pd_phys = pdpt_e & 0x000F_FFFF_FFFF_F000;
+                        let pd_e = core::ptr::read_volatile(
+                            (pd_phys + phys_off + pd_i * 8) as *const u64);
+                        crate::serial_println!("[PF-WALK] PD[{}]=0x{:X}", pd_i, pd_e);
+                        if pd_e & 0x1 != 0 && pd_e & 0x80 == 0 {
+                            let pt_phys = pd_e & 0x000F_FFFF_FFFF_F000;
+                            let pt_e = core::ptr::read_volatile(
+                                (pt_phys + phys_off + pt_i * 8) as *const u64);
+                            crate::serial_println!("[PF-WALK] PT[{}]=0x{:X}", pt_i, pt_e);
+                        }
+                    }
+                }
+                // J135: Full page-table walk for CR2 (the faulting data address)
+                // to detect exactly which level is missing. We also dump 16 bytes
+                // of instructions at RIP to verify the CPU actually decoded our
+                // expected swapgs/mov sequence.
+                if addr_raw < 0x0001_0000_0000_0000 || addr_raw >= 0xFFFF_0000_0000_0000 {
+                    let va = addr_raw;
+                    let i4 = (va >> 39) & 0x1FF;
+                    let i3 = (va >> 30) & 0x1FF;
+                    let i2 = (va >> 21) & 0x1FF;
+                    let i1 = (va >> 12) & 0x1FF;
+                    let pml4_e = core::ptr::read_volatile(
+                        (pml4_phys + phys_off + i4 * 8) as *const u64);
+                    crate::serial_println!("[PF-WALK-CR2] CR2=0x{:X} PML4[{}]=0x{:X}", va, i4, pml4_e);
+                    if pml4_e & 0x1 != 0 {
+                        let pdpt_phys = pml4_e & 0x000F_FFFF_FFFF_F000;
+                        let pdpt_e = core::ptr::read_volatile(
+                            (pdpt_phys + phys_off + i3 * 8) as *const u64);
+                        crate::serial_println!("[PF-WALK-CR2] PDPT[{}]=0x{:X}", i3, pdpt_e);
+                        if pdpt_e & 0x1 != 0 && pdpt_e & 0x80 == 0 {
+                            let pd_phys = pdpt_e & 0x000F_FFFF_FFFF_F000;
+                            let pd_e = core::ptr::read_volatile(
+                                (pd_phys + phys_off + i2 * 8) as *const u64);
+                            crate::serial_println!("[PF-WALK-CR2] PD[{}]=0x{:X}", i2, pd_e);
+                            if pd_e & 0x1 != 0 && pd_e & 0x80 == 0 {
+                                let pt_phys = pd_e & 0x000F_FFFF_FFFF_F000;
+                                let pt_e = core::ptr::read_volatile(
+                                    (pt_phys + phys_off + i1 * 8) as *const u64);
+                                crate::serial_println!("[PF-WALK-CR2] PT[{}]=0x{:X}", i1, pt_e);
+                            }
+                        }
+                    }
+                }
+
+                // J135: dump 16 bytes of code at RIP to verify the CPU decoded
+                // our expected NOP+swapgs+mov sequence. We use the physical-offset
+                // mapping to read, which is always accessible in kernel mode.
+                let rip_phys = rip.wrapping_sub(phys_off); // assumes kernel phys-offset mapping
+                let rip_ptr = rip as *const u8;
+                let b0 = core::ptr::read_volatile(rip_ptr);
+                let b1 = core::ptr::read_volatile(rip_ptr.add(1));
+                let b2 = core::ptr::read_volatile(rip_ptr.add(2));
+                let b3 = core::ptr::read_volatile(rip_ptr.add(3));
+                let b4 = core::ptr::read_volatile(rip_ptr.add(4));
+                let b5 = core::ptr::read_volatile(rip_ptr.add(5));
+                let b6 = core::ptr::read_volatile(rip_ptr.add(6));
+                let b7 = core::ptr::read_volatile(rip_ptr.add(7));
+                crate::serial_println!(
+                    "[PF-CODE] RIP=0x{:X} (phys=0x{:X}) bytes: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                    rip, rip_phys, b0, b1, b2, b3, b4, b5, b6, b7
+                );
+
+                // J135: Also dump the raw error code fields for clarity.
+                //   bit 0 (P):    0=not-present, 1=protection-violation
+                //   bit 1 (W):    0=read, 1=write
+                //   bit 2 (U):    0=supervisor, 1=user-mode access
+                //   bit 3 (R):    1=reserved-bit violation
+                //   bit 4 (I/D):  1=instruction-fetch fault
+                let b_p = err & 1;
+                let b_w = (err >> 1) & 1;
+                let b_u = (err >> 2) & 1;
+                let b_r = (err >> 3) & 1;
+                let b_i = (err >> 4) & 1;
+                crate::serial_println!(
+                    "[PF-ERR-DECODE] P={} W={} U={} RSVD={} I/D={} (err=0x{:X})",
+                    b_p, b_w, b_u, b_r, b_i, err
+                );
+            }
+        }
+    }
+
     // --- Demand paging for user stack ---
     if is_user_mode
         && addr_raw >= USER_STACK_DEMAND_LOW
@@ -1109,13 +1318,20 @@ pub fn check_pending_switch() -> bool {
             let f_rip = unsafe { core::ptr::read_volatile(&new_rip) };
             let f_rsp = unsafe { core::ptr::read_volatile(&new_rsp) };
             let f_cr3 = unsafe { core::ptr::read_volatile(&new_pml4) };
-            // Perform the actual context switch via IRETQ
-            // This switches to the new process and never returns to caller
+            // Perform the actual context switch via IRETQ.
+            // Jalon 134b: DO NOT swapgs before iretq.
+            // At this point in kernel context, GS_BASE=0 (reset_gs_bases'd) and
+            // KERNEL_GS_BASE=&PER_CPU. On entering Ring 3, GS_BASE remains 0,
+            // KERNEL_GS_BASE stays &PER_CPU. The next SYSCALL entry will
+            // swapgs once, correctly making GS=&PER_CPU for kernel access.
+            // A swapgs HERE would invert the roles, leaving GS=&PER_CPU in
+            // Ring 3 and then the next syscall would swapgs again, setting
+            // GS=0 in kernel mode → every gs:[N] access faults with CR2=N.
+            // This was the root cause of the [PF-NULLPTR] addr=0xC/0x18 bug.
             unsafe {
                 core::arch::asm!(
                     "cli",
                     "mov cr3, r8",              // Switch page tables (r8 = PML4)
-                    "swapgs",
                     "push 0x1B",                // SS (Ring 3 data)
                     "push r9",                  // RSP (user stack, guaranteed in r9)
                     "push 0x202",               // RFLAGS (IF=1)
