@@ -1509,6 +1509,15 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         } else {
             serial_write("       [WARN] No frames for ELF pool\n");
         }
+
+        // KPTI: Now that phys_offset is known, relocate LSTAR and IDT handlers
+        // to physical-offset mapping addresses. This is critical for user processes
+        // whose ELF segments overlap kernel .text (e.g., BusyBox at 0x400000).
+        // Without this, syscall/interrupt handlers are unreachable after CR3 switch.
+        arch::x86_64::syscall::relocate_lstar_for_kpti();
+        // IDT relocation deferred to just before first user process launch.
+        // The timer ISR must work at identity-mapped addresses during boot tests.
+        // arch::x86_64::idt::relocate_idt_for_kpti(phys_offset);
     }
 
     // === Step 14: Mount ELF binaries in VFS ===
@@ -1863,6 +1872,69 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
             }
 
             serial_println!("       [OK] {} files from FAT32 mounted under /disk/", entries.len());
+
+            // ═══════════════════════════════════════════════════════════
+            // Jalon 134: Mount /lib from FAT32 for dynamic linker (ld.so)
+            // The musl dynamic linker and libc live in /lib/ on the disk.
+            // Mount them into the VFS so sys_open can find them.
+            // ═══════════════════════════════════════════════════════════
+            {
+                // Create /lib directory in VFS
+                let mut root = crate::fs::vfs::lock_root();
+                root.entry(alloc::string::String::from("lib"))
+                    .or_insert_with(|| fs::vfs::VfsNode::Directory(alloc::collections::BTreeMap::new()));
+            }
+
+            // Read /lib/ directory from FAT32 and mount files
+            let lib_entries = fs::fat32::list_directory_path("lib");
+            let mut lib_count = 0usize;
+            for entry in &lib_entries {
+                if entry.is_directory { continue; }
+                let fat_path = alloc::format!("lib/{}", entry.name);
+                if let Some(data) = fs::fat32::read_file_path(&fat_path) {
+                    let mut root = crate::fs::vfs::lock_root();
+                    if let Some(fs::vfs::VfsNode::Directory(ref mut lib_dir)) = root.get_mut("lib") {
+                        let lower_name = entry.name.to_lowercase();
+                        lib_dir.insert(
+                            lower_name.clone(),
+                            fs::vfs::VfsNode::File(data.clone()),
+                        );
+                        serial_println!("       [OK] /lib/{} mounted ({} bytes)", lower_name, data.len());
+                        lib_count += 1;
+                    }
+                }
+            }
+            if lib_count > 0 {
+                serial_println!("       [OK] {} library files from FAT32:/lib/ mounted in VFS:/lib/", lib_count);
+            } else {
+                serial_write("       [INFO] No libraries found in FAT32:/lib/\n");
+            }
+
+            // Also create /lib64 -> /lib alias (many Linux binaries look for /lib64)
+            {
+                let mut root = crate::fs::vfs::lock_root();
+                root.entry(alloc::string::String::from("lib64"))
+                    .or_insert_with(|| fs::vfs::VfsNode::Directory(alloc::collections::BTreeMap::new()));
+                // Copy lib entries to lib64
+                let lib_files: alloc::vec::Vec<(alloc::string::String, alloc::vec::Vec<u8>)> = {
+                    if let Some(fs::vfs::VfsNode::Directory(ref lib_dir)) = root.get("lib") {
+                        lib_dir.iter().filter_map(|(name, node)| {
+                            if let fs::vfs::VfsNode::File(ref data) = node {
+                                Some((name.clone(), data.clone()))
+                            } else {
+                                None
+                            }
+                        }).collect()
+                    } else {
+                        alloc::vec::Vec::new()
+                    }
+                };
+                if let Some(fs::vfs::VfsNode::Directory(ref mut lib64_dir)) = root.get_mut("lib64") {
+                    for (name, data) in lib_files {
+                        lib64_dir.insert(name, fs::vfs::VfsNode::File(data));
+                    }
+                }
+            }
         } else {
             serial_write("       [SKIP] No FAT32 filesystem (no VirtIO-Block disk)\n");
         }

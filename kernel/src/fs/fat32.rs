@@ -601,7 +601,8 @@ impl Fat32Fs {
         let mut iterations = 0;
 
         loop {
-            if remaining == 0 || iterations > 1000 { break; }
+            // Support files up to ~25 MB at 512 bytes/cluster (50000 clusters)
+            if remaining == 0 || iterations > 50000 { break; }
             iterations += 1;
 
             let cluster_data = self.read_cluster(cluster)?;

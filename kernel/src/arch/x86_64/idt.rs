@@ -115,6 +115,146 @@ pub fn idt_ref() -> &'static InterruptDescriptorTable {
     &IDT
 }
 
+// ===== KPTI: Relocated IDT for user-mode interrupt handling =====
+//
+// When user ELF binaries (e.g., BusyBox at 0x400000) overlap kernel .text,
+// the identity-mapped IDT handler addresses become invalid after CR3 switch.
+// This relocated IDT uses the physical-offset mapping addresses
+// (0xFFFF800000000000 + phys_addr) for all handlers, which are mapped in
+// every PML4 via PML4[256].
+//
+// The IDT itself (at ~0x664CE0) is in .bss (PD[3]), outside the BusyBox
+// range, so it remains accessible. But the handlers it points to are in
+// .text (PD[2], 0x400000-0x5FFFFF), which gets overwritten.
+
+/// Secondary IDT with handler addresses relocated to phys-offset mapping.
+/// Stored as raw bytes because we need to patch handler addresses manually.
+/// Size: 256 entries × 16 bytes = 4096 bytes (one page, aligned).
+#[repr(C, align(16))]
+struct RawIdt {
+    entries: [u8; 256 * 16],
+}
+
+static mut KPTI_IDT: RawIdt = RawIdt { entries: [0; 256 * 16] };
+
+/// Relocate IDT handler addresses by adding phys_offset to each entry.
+/// Called after phys_offset is known (post-boot, before first execve).
+///
+/// This patches all 256 IDT entries: for each entry that is present
+/// (has a non-zero handler address in the identity-mapped range),
+/// the handler address is replaced with handler + phys_offset.
+/// The relocated IDT is then loaded with LIDT.
+pub fn relocate_idt_for_kpti(phys_offset: u64) {
+    if phys_offset == 0 {
+        crate::serial_println!("[IDT-KPTI] phys_offset is 0, skipping IDT relocation");
+        return;
+    }
+
+    unsafe {
+        // Get the current IDT base address from the IDTR register
+        let mut idtr: [u8; 10] = [0; 10];
+        core::arch::asm!(
+            "sidt [{}]",
+            in(reg) idtr.as_mut_ptr(),
+            options(nostack, preserves_flags)
+        );
+        let idt_limit = u16::from_le_bytes([idtr[0], idtr[1]]);
+        let idt_base = u64::from_le_bytes([
+            idtr[2], idtr[3], idtr[4], idtr[5],
+            idtr[6], idtr[7], idtr[8], idtr[9],
+        ]);
+
+        let num_entries = ((idt_limit as usize) + 1) / 16;
+        crate::serial_println!(
+            "[IDT-KPTI] Current IDT: base=0x{:X}, limit=0x{:X}, entries={}",
+            idt_base, idt_limit, num_entries
+        );
+
+        // Copy the entire IDT into our KPTI_IDT buffer
+        let src = idt_base as *const u8;
+        let dst = KPTI_IDT.entries.as_mut_ptr();
+        core::ptr::copy_nonoverlapping(src, dst, core::cmp::min((idt_limit + 1) as usize, 256 * 16));
+
+        // Patch each entry: add phys_offset to the handler address
+        let mut patched = 0u32;
+        for i in 0..num_entries {
+            let entry = dst.add(i * 16);
+            // Read the current handler address from the IDT entry:
+            //   bits 0-15:  bytes [0..2]   (offset_low)
+            //   bits 16-31: bytes [6..8]   (offset_mid)
+            //   bits 32-63: bytes [8..12]  (offset_high)
+            let offset_low  = u16::from_le_bytes([*entry.add(0), *entry.add(1)]) as u64;
+            let offset_mid  = u16::from_le_bytes([*entry.add(6), *entry.add(7)]) as u64;
+            let offset_high = u32::from_le_bytes([
+                *entry.add(8), *entry.add(9), *entry.add(10), *entry.add(11),
+            ]) as u64;
+
+            let handler_addr = offset_low | (offset_mid << 16) | (offset_high << 32);
+
+            // Check if this entry has a handler (present bit in type_attr byte 5)
+            let type_attr = *entry.add(5);
+            if type_attr & 0x80 == 0 {
+                continue; // not present
+            }
+            if handler_addr == 0 {
+                continue;
+            }
+
+            // Add phys_offset to relocate the handler
+            let new_addr = handler_addr.wrapping_add(phys_offset);
+
+            // Write back the new address
+            let new_low = (new_addr & 0xFFFF) as u16;
+            let new_mid = ((new_addr >> 16) & 0xFFFF) as u16;
+            let new_high = ((new_addr >> 32) & 0xFFFF_FFFF) as u32;
+
+            let low_bytes = new_low.to_le_bytes();
+            *entry.add(0) = low_bytes[0];
+            *entry.add(1) = low_bytes[1];
+
+            let mid_bytes = new_mid.to_le_bytes();
+            *entry.add(6) = mid_bytes[0];
+            *entry.add(7) = mid_bytes[1];
+
+            let high_bytes = new_high.to_le_bytes();
+            *entry.add(8)  = high_bytes[0];
+            *entry.add(9)  = high_bytes[1];
+            *entry.add(10) = high_bytes[2];
+            *entry.add(11) = high_bytes[3];
+
+            patched += 1;
+        }
+
+        crate::serial_println!(
+            "[IDT-KPTI] Patched {} IDT entries with phys_offset=0x{:X}",
+            patched, phys_offset
+        );
+
+        // Load the new IDT
+        let new_idt_base = KPTI_IDT.entries.as_ptr() as u64;
+        let new_idtr: [u8; 10] = {
+            let limit_bytes = idt_limit.to_le_bytes();
+            let base_bytes = new_idt_base.to_le_bytes();
+            [
+                limit_bytes[0], limit_bytes[1],
+                base_bytes[0], base_bytes[1], base_bytes[2], base_bytes[3],
+                base_bytes[4], base_bytes[5], base_bytes[6], base_bytes[7],
+            ]
+        };
+
+        core::arch::asm!(
+            "lidt [{}]",
+            in(reg) new_idtr.as_ptr(),
+            options(nostack, preserves_flags)
+        );
+
+        crate::serial_println!(
+            "[IDT-KPTI] New IDT loaded at 0x{:X} (limit=0x{:X})",
+            new_idt_base, idt_limit
+        );
+    }
+}
+
 // ===== Handlers Exceptions =====
 
 extern "x86-interrupt" fn divide_error_handler(stack_frame: InterruptStackFrame) {
@@ -285,6 +425,140 @@ fn is_valid_user_rip(rip: u64) -> bool {
 fn kill_user_and_switch(current_pid: u64, addr_raw: u64) {
     let _ = crate::process::set_state(current_pid, crate::process::ProcessState::Terminated);
     crate::serial_println!("[SIGSEGV] PID {} terminated (addr 0x{:X})", current_pid, addr_raw);
+
+    // ── Jalon 132: Resume parent via sysretq if it's Blocked in sys_wait ──
+    // When a forked child is killed by SIGSEGV, the parent is Blocked in sys_wait.
+    // We must restore the parent's FULL register context (all callee-saved regs)
+    // and return the wait result (child PID << 16 | exit_code) via RAX.
+    // This mirrors the forked-child-exit path in sys_exit (Jalon 25) exactly.
+    let parent_pid = crate::process::with_process(current_pid, |p| p.ppid).unwrap_or(0);
+    crate::serial_println!("[SIGSEGV-J132] child={} ppid={}", current_pid, parent_pid);
+    if parent_pid > 1 {
+        let parent_state = crate::process::get_state(parent_pid);
+        let parent_blocked = parent_state == Some(crate::process::ProcessState::Blocked);
+        crate::serial_println!("[SIGSEGV-J132] parent {} state={:?} blocked={}", parent_pid, parent_state, parent_blocked);
+        if parent_blocked {
+            // Get parent's saved context (set by sys_wait before launching child)
+            let parent_ctx = crate::process::with_process(parent_pid, |p| {
+                (p.saved_user_rip, p.saved_user_rsp, p.saved_kernel_rsp,
+                 p.saved_syscall_regs, p.pml4_phys)
+            });
+            if let Some((_saved_rip, saved_rsp, _krsp, saved_regs, pml4)) = parent_ctx {
+                // saved_regs[7] = rcx = the RIP to return to (after the syscall instruction)
+                // saved_regs[6] = r11 = RFLAGS
+                if saved_regs[7] != 0 && pml4 != 0 {
+                    // ── PRIMARY PATH: sysretq (matches sys_exit exactly) ──
+                    let _ = crate::process::set_state(
+                        parent_pid,
+                        crate::process::ProcessState::Running,
+                    );
+                    crate::scheduler::set_current_pid(parent_pid);
+
+                    // Build wait result: (child_pid << 16) | (exit_code = SIGSEGV = 11)
+                    let wait_result = ((current_pid & 0xFFFF) << 16) | (11u64 & 0xFFFF);
+
+                    let r15 = saved_regs[0];
+                    let r14 = saved_regs[1];
+                    let r13 = saved_regs[2];
+                    let r12 = saved_regs[3];
+                    let rbx = saved_regs[4];
+                    let rbp = saved_regs[5];
+                    let r11 = saved_regs[6]; // RFLAGS for sysretq
+                    let rcx = saved_regs[7]; // RIP for sysretq
+
+                    crate::serial_println!(
+                        "[SIGSEGV-J132] Resuming parent PID {} via sysretq: RAX=0x{:X} RCX(RIP)=0x{:X} RSP=0x{:X} PML4=0x{:X}",
+                        parent_pid, wait_result, rcx, saved_rsp, pml4
+                    );
+
+                    // Set up GS: we need GS=PER_CPU now (for kernel use), and after
+                    // swapgs GS=0 (user). reset_gs_bases sets GS=0, KERNEL_GS=PER_CPU,
+                    // so we need an extra swapgs to make GS=PER_CPU before the asm block.
+                    let core_id = crate::arch::x86_64::apic::current_core() as u8;
+                    crate::arch::x86_64::syscall::reset_gs_bases_for_core(core_id);
+
+                    // Write parent's user RSP into PER_CPU struct (static mut, not GS-relative)
+                    unsafe {
+                        crate::arch::x86_64::syscall::set_per_cpu_user_rsp(saved_rsp);
+                    }
+
+                    // Switch to parent's address space and sysretq.
+                    // CRITICAL: We use the IRETQ approach (like sys_exit fallback) instead
+                    // of sysretq to avoid register-clobbering issues in the inline asm.
+                    // IRETQ pops RIP, CS, RFLAGS, RSP, SS from the stack, so we push them.
+                    //
+                    // We also need to restore callee-saved regs. We do this before the IRETQ
+                    // using a staged approach: first push IRETQ frame, then restore regs, then IRETQ.
+                    //
+                    // Use read_volatile to prevent optimizer from reusing registers.
+                    let f_pml4 = unsafe { core::ptr::read_volatile(&pml4) };
+                    let f_rsp  = unsafe { core::ptr::read_volatile(&saved_rsp) };
+                    let f_rip  = unsafe { core::ptr::read_volatile(&rcx) }; // rcx = saved user RIP
+                    let f_rax  = unsafe { core::ptr::read_volatile(&wait_result) };
+
+                    unsafe {
+                        // Phase 1: Switch CR3 and build IRETQ frame on kernel stack
+                        core::arch::asm!(
+                            "cli",
+                            "mov cr3, {pml4}",   // Switch to parent's page tables
+                            "mov rax, {rax_val}", // Pre-load RAX with wait result
+                            "push 0x1B",          // SS (Ring 3 data)
+                            "push {rsp_val}",     // RSP (parent user stack)
+                            "push 0x202",         // RFLAGS (IF=1)
+                            "push 0x23",          // CS (Ring 3 code)
+                            "push {rip_val}",     // RIP (parent return addr)
+                            pml4 = in(reg) f_pml4,
+                            rsp_val = in(reg) f_rsp,
+                            rip_val = in(reg) f_rip,
+                            rax_val = in(reg) f_rax,
+                            options(preserves_flags),
+                        );
+                        // Phase 2: Restore callee-saved registers from saved_regs
+                        core::arch::asm!(
+                            "mov r15, {v_r15}",
+                            "mov r14, {v_r14}",
+                            "mov r13, {v_r13}",
+                            "mov r12, {v_r12}",
+                            "mov rbx, {v_rbx}",
+                            "mov rbp, {v_rbp}",
+                            v_r15 = in(reg) r15,
+                            v_r14 = in(reg) r14,
+                            v_r13 = in(reg) r13,
+                            v_r12 = in(reg) r12,
+                            v_rbx = in(reg) rbx,
+                            v_rbp = in(reg) rbp,
+                        );
+                        // Phase 3: swapgs + iretq (GS=0 currently, KERNEL_GS=PER_CPU)
+                        // After swapgs: GS=PER_CPU, KERNEL_GS=0.
+                        // On next syscall entry, the CPU swapgs again → GS=0, KERNEL_GS=PER_CPU.
+                        // Wait — that's wrong. We need: user mode has GS=0 (user).
+                        // reset_gs_bases set GS=0, KERNEL_GS=PER_CPU.
+                        // swapgs swaps them: GS=PER_CPU, KERNEL_GS=0.
+                        // On next syscall: swapgs → GS=0, KERNEL_GS=PER_CPU — WRONG.
+                        // So we should NOT swapgs here. GS is already 0 (user) and
+                        // KERNEL_GS is PER_CPU (ready for next syscall entry swapgs).
+                        core::arch::asm!(
+                            "iretq",
+                            options(noreturn),
+                        );
+                    }
+                } else {
+                    // ── FALLBACK: mark parent Ready for scheduler ──
+                    let _ = crate::process::set_state(parent_pid, crate::process::ProcessState::Ready);
+                    crate::serial_println!(
+                        "[SIGSEGV-J132] Woke parent PID {} (fallback, saved_regs[7]=0x{:X} pml4=0x{:X})",
+                        parent_pid, saved_regs[7], pml4
+                    );
+                }
+            } else {
+                let _ = crate::process::set_state(parent_pid, crate::process::ProcessState::Ready);
+                crate::serial_println!(
+                    "[SIGSEGV-J132] Woke parent PID {} (no context available)",
+                    parent_pid
+                );
+            }
+        }
+    }
 
     // ── Jalon 109: DEFERRED page table GC ──
     // On SMP, freeing the PML4 immediately is dangerous: another core may
@@ -623,10 +897,13 @@ extern "x86-interrupt" fn page_fault_handler(
         }
     }
 
-    // Jalon 109: Kernel-mode fault at a user-visible address is NOT a true
+    // Jalon 109+133: Kernel-mode fault at a user-visible address is NOT a true
     // kernel panic — it happens during IRETQ when the CPU pushes to the
     // user stack or fetches the first user-mode instruction.  Treat it as
     // SIGSEGV (kill the offending process) instead of halting the core.
+    //
+    // Jalon 133: Log NULL-pointer kernel bugs (addr < 0x1000) with a warning
+    // so they are visible in the serial log, but still kill the process.
     {
         let in_user_stack  = addr_raw >= USER_STACK_DEMAND_LOW && addr_raw < USER_STACK_DEMAND_HIGH;
         let in_elf_region  = addr_raw >= ELF_DEMAND_LOW && addr_raw < ELF_DEMAND_HIGH;
@@ -637,10 +914,17 @@ extern "x86-interrupt" fn page_fault_handler(
         if !is_user_mode && (in_user_stack || in_elf_region || in_user_heap || is_user_addr) {
             let current_pid = crate::scheduler::current_pid();
             if current_pid != 0 {
-                crate::serial_println!(
-                    "[PF-IRETQ] PID {} addr=0x{:X} rip={:?} (kernel-mode fault at user addr, treating as SIGSEGV)",
-                    current_pid, addr_raw, stack_frame.instruction_pointer
-                );
+                if addr_raw < 0x1000 {
+                    crate::serial_println!(
+                        "[PF-NULLPTR] PID {} KERNEL NULL deref addr=0x{:X} rip={:?} (KERNEL BUG!)",
+                        current_pid, addr_raw, stack_frame.instruction_pointer
+                    );
+                } else {
+                    crate::serial_println!(
+                        "[PF-IRETQ] PID {} addr=0x{:X} rip={:?} (kernel-mode fault at user addr, treating as SIGSEGV)",
+                        current_pid, addr_raw, stack_frame.instruction_pointer
+                    );
+                }
                 kill_user_and_switch(current_pid, addr_raw);
                 // kill_user_and_switch does not return if another process is ready
             }
