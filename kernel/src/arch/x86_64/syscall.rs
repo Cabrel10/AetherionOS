@@ -4572,19 +4572,29 @@ pub fn init() {
         wrmsr(IA32_STAR, star);
         crate::serial_println!("[SYSCALL] STAR: 0x{:016X}", star);
 
-        // 3. LSTAR — set to the physical-offset mapping address of syscall_entry.
-        // KPTI: User PML4[0] has user ELF pages (e.g., BusyBox at 0x400000)
-        // that overwrite kernel .text at 0x4xxxxx. The identity-mapped address
-        // of syscall_entry is unusable after CR3 switch. By setting LSTAR to
-        // phys_offset + syscall_entry, the CPU can reach the handler through
-        // PML4[256] (physical memory offset), which is mapped in every PML4.
+        // 3. LSTAR — syscall entry point.
+        //
+        // J135: the bootloader may load the kernel at a physical address
+        // that differs from its ELF VMA. Using `identity + phys_offset`
+        // blindly is WRONG when that happens (see relocate_lstar_for_kpti
+        // for the full analysis). At `init()` time phys_offset may or may
+        // not be available: if it is, we do the proper CR3 walk to find
+        // the actual physical address of syscall_entry and use the
+        // phys-offset VA (which is always reachable, even from user PML4s
+        // that don't clone PML4[0]). If phys_offset is still zero, we fall
+        // back to the low-half identity VA — this works at early-boot
+        // time when only the kernel's own CR3 is active; once user
+        // processes are created, `relocate_lstar_for_kpti` must run.
         let handler_identity_addr = syscall_entry as *const () as u64;
         let phys_off = crate::elf::phys_offset();
         let handler_addr = if phys_off != 0 {
-            // Use physical-offset mapping: PML4[256], always mapped in user PML4
-            handler_identity_addr + phys_off
+            let actual_phys = virt_to_phys_via_cr3(handler_identity_addr);
+            if actual_phys != 0 {
+                phys_off + actual_phys
+            } else {
+                handler_identity_addr + phys_off
+            }
         } else {
-            // Fallback during early boot before phys_offset is set
             handler_identity_addr
         };
         wrmsr(IA32_LSTAR, handler_addr);
@@ -4618,7 +4628,25 @@ pub fn relocate_lstar_for_kpti() {
     }
 
     let handler_identity = syscall_entry as *const () as u64;
-    let handler_high = handler_identity + phys_off;
+
+    // J135 FIX: The bootloader may load the kernel at a physical address
+    // DIFFERENT from its ELF LMA/VMA (observed delta = +0x1FF000 with
+    // bootloader 0.9.23). The naive `handler_identity + phys_off` formula
+    // assumes phys = VMA, which is FALSE in that case, and points LSTAR
+    // to a physical page containing unrelated .rodata/.strtab bytes,
+    // causing a fault on every SYSCALL from Ring 3.
+    //
+    // Correct fix: walk the current (kernel) CR3 page tables to find the
+    // actual physical address where `syscall_entry` was loaded, then
+    // compute LSTAR = phys_off + actual_phys.
+    let handler_phys = unsafe { virt_to_phys_via_cr3(handler_identity) };
+    let handler_high = if handler_phys != 0 {
+        phys_off + handler_phys
+    } else {
+        // Fallback: if the walk failed (shouldn't happen), fall back to
+        // the old (possibly-wrong) formula so we at least try to run.
+        handler_identity + phys_off
+    };
 
     unsafe {
         wrmsr(IA32_LSTAR, handler_high);
@@ -4630,8 +4658,8 @@ pub fn relocate_lstar_for_kpti() {
     }
 
     crate::serial_println!(
-        "[SYSCALL-KPTI] LSTAR relocated: 0x{:016X} -> 0x{:016X} (phys_off=0x{:X})",
-        handler_identity, handler_high, phys_off
+        "[SYSCALL-KPTI] LSTAR relocated: 0x{:016X} -> 0x{:016X} (actual_phys=0x{:X}, phys_off=0x{:X})",
+        handler_identity, handler_high, handler_phys, phys_off
     );
 }
 
@@ -4665,6 +4693,88 @@ pub fn reset_gs_bases() {
             per_cpu_addr
         );
     }
+}
+
+// =====================================================================
+// J135: Virtual -> Physical translation via current CR3
+// =====================================================================
+//
+// CRITICAL DISCOVERY: The bootloader 0.9.x loads the kernel at a physical
+// address that is DIFFERENT from the ELF's LMA/VMA. Specifically,
+// `syscall_entry` lives at ELF VMA 0x481950 but the bootloader loaded it
+// at physical address 0x680950 (delta = +0x1FF000).
+//
+// The bootloader creates 4 KiB page-table entries that correctly map
+// VA 0x481950 -> phys 0x680950 in PML4[0] (kernel low-half identity map).
+//
+// The kernel's phys_offset region (PML4[256]) is a naive 2 MiB huge-page
+// identity mapping where VA 0xFFFF800000XXXXXX -> phys 0xXXXXXX. This
+// means VA 0xFFFF800000481950 -> phys 0x481950 (STRTAB strings, NOT the
+// kernel code!), while the real syscall_entry is at phys 0x680950.
+//
+// Consequence: setting LSTAR = syscall_entry_va + phys_offset points to
+// garbage and causes a PF on every SYSCALL from Ring 3 with CR2 showing
+// whatever junk is at the wrong physical page (e.g., 0x3F8 was actually
+// the crash downstream after syscall_entry executed garbage bytes).
+//
+// Fix: compute the ACTUAL physical address of syscall_entry by walking
+// the current CR3's page tables, then set LSTAR = phys_offset + real_phys.
+
+/// Walk the current CR3's page tables to translate a virtual address to
+/// its backing physical address. Returns 0 on failure (not mapped).
+///
+/// Supports 4 KiB, 2 MiB, and 1 GiB pages. Reads page-table entries via
+/// the kernel's phys_offset region (which must be established before
+/// calling this).
+///
+/// SAFETY: Caller must ensure phys_offset is non-zero and the page tables
+/// are not concurrently modified.
+pub unsafe fn virt_to_phys_via_cr3(virt: u64) -> u64 {
+    let phys_off = crate::elf::phys_offset();
+    if phys_off == 0 {
+        return 0;
+    }
+
+    let cr3: u64;
+    core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
+    let pml4_phys = cr3 & 0x000F_FFFF_FFFF_F000;
+
+    let pml4_idx = ((virt >> 39) & 0x1FF) as usize;
+    let pdpt_idx = ((virt >> 30) & 0x1FF) as usize;
+    let pd_idx   = ((virt >> 21) & 0x1FF) as usize;
+    let pt_idx   = ((virt >> 12) & 0x1FF) as usize;
+    let off_4k   = virt & 0xFFF;
+    let off_2m   = virt & 0x1F_FFFF;
+    let off_1g   = virt & 0x3FFF_FFFF;
+
+    let pml4_va = phys_off + pml4_phys;
+    let pml4_entry = core::ptr::read_volatile((pml4_va + (pml4_idx as u64) * 8) as *const u64);
+    if (pml4_entry & 1) == 0 { return 0; }
+    let pdpt_phys = pml4_entry & 0x000F_FFFF_FFFF_F000;
+
+    let pdpt_va = phys_off + pdpt_phys;
+    let pdpt_entry = core::ptr::read_volatile((pdpt_va + (pdpt_idx as u64) * 8) as *const u64);
+    if (pdpt_entry & 1) == 0 { return 0; }
+    if (pdpt_entry & (1 << 7)) != 0 {
+        let base = pdpt_entry & 0x000F_FFFF_C000_0000;
+        return base + off_1g;
+    }
+    let pd_phys = pdpt_entry & 0x000F_FFFF_FFFF_F000;
+
+    let pd_va = phys_off + pd_phys;
+    let pd_entry = core::ptr::read_volatile((pd_va + (pd_idx as u64) * 8) as *const u64);
+    if (pd_entry & 1) == 0 { return 0; }
+    if (pd_entry & (1 << 7)) != 0 {
+        let base = pd_entry & 0x000F_FFFF_FFE0_0000;
+        return base + off_2m;
+    }
+    let pt_phys = pd_entry & 0x000F_FFFF_FFFF_F000;
+
+    let pt_va = phys_off + pt_phys;
+    let pt_entry = core::ptr::read_volatile((pt_va + (pt_idx as u64) * 8) as *const u64);
+    if (pt_entry & 1) == 0 { return 0; }
+    let page = pt_entry & 0x000F_FFFF_FFFF_F000;
+    page + off_4k
 }
 
 // =====================================================================
