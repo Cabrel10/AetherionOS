@@ -801,6 +801,23 @@ pub fn sys_read_captured(buf: &mut [u8]) -> i64 {
     syscall2(SYS_READ_CAPTURED, buf.as_mut_ptr() as u64, buf.len() as u64) as i64
 }
 
+// ── Jalon 136 (Tasks 5/6): command execution bridge ──
+const SYS_RUN_COMMAND: u64 = 593;
+const SYS_READ_CMD_REQUEST: u64 = 594;
+
+/// Publish INTENT_RUN_COMMAND with the given command string.
+/// The MCP agent will consume it, fork/execve, capture output, and
+/// publish INTENT_COMMAND_OUTPUT. Returns 0 on success.
+pub fn sys_run_command(cmd: &[u8]) -> i64 {
+    syscall2(SYS_RUN_COMMAND, cmd.as_ptr() as u64, cmd.len() as u64) as i64
+}
+
+/// Read the pending INTENT_RUN_COMMAND request into the given buffer.
+/// Returns the number of bytes copied (0 if no pending command).
+pub fn sys_read_cmd_request(buf: &mut [u8]) -> i64 {
+    syscall2(SYS_READ_CMD_REQUEST, buf.as_mut_ptr() as u64, buf.len() as u64) as i64
+}
+
 // ============================================================
 // POSIX Filesystem Operations (mkdir, rmdir, creat, unlink)
 // ============================================================

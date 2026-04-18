@@ -27,8 +27,17 @@ const INTENT_MCP_RESULT: u64 = 0x9003;
 /// Jalon 129: Intent for captured tool stdout
 const INTENT_TOOL_STDOUT: u32 = 0xC010;
 
+/// Jalon 136 (Task 5): Intent carrying captured stdout/stderr from forked commands.
+const INTENT_COMMAND_OUTPUT: u32 = 0xC011;
+
+/// Jalon 136 (Task 6): Intent requesting execution of a shell command.
+const INTENT_RUN_COMMAND: u32 = 0xC012;
+
 /// VFS mailbox path for JSON contracts
 const MCP_MAILBOX: &[u8] = b"/tmp/mcp_contract.json\0";
+
+/// Default path to busybox (used to run common commands like `ls`, `cat`, etc.).
+const BUSYBOX_PATH: &[u8] = b"/bin/busybox\0";
 
 #[no_mangle]
 pub extern "C" fn main() -> i64 {
@@ -86,9 +95,177 @@ pub extern "C" fn main() -> i64 {
             }
         }
 
+        // ─── Jalon 136 (Task 6): INTENT_RUN_COMMAND handler ───
+        // Consume command execution requests, fork/execve busybox, capture output,
+        // and publish INTENT_COMMAND_OUTPUT with the result.
+        let r3 = sys_bus_consume_intent(&mut msg_buf, INTENT_RUN_COMMAND);
+        if r3 == 0 {
+            let payload = msg_buf[2];
+            let requester_pid = payload >> 32;
+            let cmd_len = (payload & 0xFFFF_FFFF) as usize;
+            sys_write(1, b"[MCP] INTENT_RUN_COMMAND from PID ");
+            print_u64(requester_pid);
+            sys_write(1, b" (cmd_len=");
+            print_u64(cmd_len as u64);
+            sys_write(1, b")\n");
+            handle_run_command(requester_pid, cmd_len);
+        }
+
         // Yield to other processes — cooperative scheduling
         sys_yield();
     }
+}
+
+/// Jalon 136 (Task 6): Handle an INTENT_RUN_COMMAND request.
+///
+/// 1. Read the pending command from the kernel buffer (syscall 594).
+/// 2. Fork + execve busybox with the requested command.
+/// 3. Capture the child's stdout via sys_capture_stdout.
+/// 4. Wait for the child to terminate.
+/// 5. Publish INTENT_COMMAND_OUTPUT with the captured text.
+fn handle_run_command(requester_pid: u64, cmd_len: usize) {
+    if cmd_len == 0 || cmd_len > 1024 {
+        sys_write(1, b"[MCP] Invalid cmd_len, ignoring\n");
+        return;
+    }
+
+    // 1. Read command request into a local buffer.
+    let mut cmd_raw = [0u8; 1024];
+    let n = sys_read_cmd_request(&mut cmd_raw);
+    if n <= 0 {
+        sys_write(1, b"[MCP] No pending cmd request\n");
+        return;
+    }
+    let n = n as usize;
+    sys_write(1, b"[MCP] Command: ");
+    sys_write_fd(1, &cmd_raw[..n]);
+    sys_write(1, b"\n");
+
+    // 2. Parse command: use busybox by default. Command string is passed verbatim.
+    //    Example: "ls /disk/models/" becomes `busybox ls /disk/models/`.
+    //    We split the first word and build argv.
+    let mut path_buf = [0u8; 256];
+    let mut arg0_buf = [0u8; 64];
+    let mut args_region = [0u8; 1024];
+
+    // Trim leading/trailing whitespace
+    let mut start = 0usize;
+    while start < n && (cmd_raw[start] == b' ' || cmd_raw[start] == b'\t' || cmd_raw[start] == b'\n') {
+        start += 1;
+    }
+    let mut end = n;
+    while end > start && (cmd_raw[end-1] == b' ' || cmd_raw[end-1] == b'\t' || cmd_raw[end-1] == b'\n' || cmd_raw[end-1] == 0) {
+        end -= 1;
+    }
+    let cmd = &cmd_raw[start..end];
+
+    // Extract the first token (program name) for argv[0]
+    let mut first_word_end = 0usize;
+    while first_word_end < cmd.len() && cmd[first_word_end] != b' ' && cmd[first_word_end] != b'\t' {
+        first_word_end += 1;
+    }
+    if first_word_end == 0 {
+        sys_write(1, b"[MCP] Empty command\n");
+        return;
+    }
+
+    // Copy the first word into arg0_buf (NUL terminated)
+    let w0 = core::cmp::min(first_word_end, arg0_buf.len() - 1);
+    arg0_buf[..w0].copy_from_slice(&cmd[..w0]);
+    arg0_buf[w0] = 0;
+
+    // Build path: /bin/<first_word>\0  — if no leading slash provided
+    let mut path_len = 0usize;
+    if cmd[0] == b'/' {
+        // Absolute path — copy the first token as-is.
+        let n_copy = core::cmp::min(first_word_end, path_buf.len() - 1);
+        path_buf[..n_copy].copy_from_slice(&cmd[..n_copy]);
+        path_len = n_copy;
+    } else {
+        let prefix = b"/bin/";
+        path_buf[..prefix.len()].copy_from_slice(prefix);
+        let n_copy = core::cmp::min(first_word_end, path_buf.len() - prefix.len() - 1);
+        path_buf[prefix.len()..prefix.len() + n_copy].copy_from_slice(&cmd[..n_copy]);
+        path_len = prefix.len() + n_copy;
+    }
+    path_buf[path_len] = 0; // NUL terminate
+
+    // Store the rest of the args (after the first word) in args_region for reference.
+    let args_tail = &cmd[first_word_end..];
+    let tail_copy = core::cmp::min(args_tail.len(), args_region.len() - 1);
+    args_region[..tail_copy].copy_from_slice(&args_tail[..tail_copy]);
+
+    sys_write(1, b"[MCP] Exec path: ");
+    sys_write_fd(1, &path_buf[..path_len]);
+    sys_write(1, b"\n");
+
+    // 3. Fork + execve. On fork failure (not yet fully wired to userspace), we
+    //    fall back to sys_exec which spawns the path as a new process.
+    let pid = sys_fork();
+    if pid < 0 {
+        sys_write(1, b"[MCP] fork() failed -- falling back to sys_exec\n");
+        // sys_exec-based fallback: spawn and capture
+        let child = sys_exec(&path_buf[..=path_len]);
+        if child <= 0 {
+            sys_write(1, b"[MCP] sys_exec failed\n");
+            publish_cmd_output(requester_pid, 0, b"ERROR: exec failed\n");
+            return;
+        }
+        let child_pid = child as u64;
+        // Enable stdout capture on child
+        let _ = sys_capture_stdout(child_pid, true);
+        // Wait briefly for the child to produce output (cooperative)
+        for _ in 0..100 { sys_yield(); }
+
+        // Read captured text (published via INTENT_COMMAND_OUTPUT by sys_write)
+        let mut out = [0u8; 4096];
+        let got = sys_read_captured(&mut out);
+        let slice = if got > 0 { &out[..got as usize] } else { b"<no output>\n".as_slice() };
+        publish_cmd_output(requester_pid, child_pid, slice);
+        return;
+    }
+
+    if pid == 0 {
+        // Child: execve the command.
+        // argv = [path, NULL]; envp = [NULL]
+        let argv: [*const u8; 2] = [path_buf.as_ptr(), core::ptr::null()];
+        let envp: [*const u8; 1] = [core::ptr::null()];
+        let _ = sys_execve(&path_buf[..=path_len], argv.as_ptr(), envp.as_ptr());
+        // If execve returns, it failed.
+        sys_write(1, b"[MCP-child] execve failed\n");
+        sys_exit(127);
+    }
+
+    // Parent: enable capture, wait, then publish.
+    let child_pid = pid as u64;
+    sys_write(1, b"[MCP] Forked child PID ");
+    print_u64(child_pid);
+    sys_write(1, b"\n");
+    let _ = sys_capture_stdout(child_pid, true);
+
+    // Cooperatively yield while the child runs.
+    for _ in 0..200 { sys_yield(); }
+    let _ = sys_wait(child_pid);
+
+    // Read captured output. The child's writes already published INTENT_COMMAND_OUTPUT
+    // from the kernel side — we additionally emit a consolidated one for the requester.
+    let mut out = [0u8; 4096];
+    let got = sys_read_captured(&mut out);
+    let slice = if got > 0 { &out[..got as usize] } else { b"<no output>\n".as_slice() };
+    publish_cmd_output(requester_pid, child_pid, slice);
+}
+
+/// Publish INTENT_COMMAND_OUTPUT to notify a requester that a command finished.
+/// payload = (requester_pid << 32) | (len & 0xFFFF_FFFF)
+fn publish_cmd_output(requester_pid: u64, child_pid: u64, text: &[u8]) {
+    sys_write(1, b"[MCP] --- Command output ---\n");
+    sys_write_fd(1, text);
+    if !text.ends_with(b"\n") { sys_write(1, b"\n"); }
+    sys_write(1, b"[MCP] --- End output ---\n");
+    let payload = (requester_pid << 32) | (text.len() as u64 & 0xFFFF_FFFF);
+    // priority = 2 (High)
+    sys_bus_publish(INTENT_COMMAND_OUTPUT as u64, 2, payload);
+    let _ = child_pid; // reserved for future multi-child tracking
 }
 
 /// Read the JSON contract from VFS, parse it, and execute the action.

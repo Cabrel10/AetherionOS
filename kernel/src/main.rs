@@ -2858,7 +2858,19 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 serial_write("[WATCHDOG] Jalon 100: Kernel Watchdog ACTIVE (auto-respawn on crash)\n");
                 serial_write("========================================\n");
 
+                // Prepare GS for the trampoline: the exec_trampoline does swapgs,
+                // so GS_BASE must be PER_CPU (kernel state) and KERNEL_GS_BASE=0.
+                // After swapgs in trampoline: GS_BASE=0 (user), KERNEL_GS_BASE=PER_CPU.
+                // We call reset_gs_bases to set KERNEL_GS_BASE=PER_CPU, then fix GS_BASE.
                 arch::x86_64::syscall::reset_gs_bases();
+                // reset_gs_bases sets: GS_BASE=0, KERNEL_GS_BASE=PER_CPU
+                // We need: GS_BASE=PER_CPU, KERNEL_GS_BASE=0 (for swapgs to produce correct state)
+                // Fix by swapping them now — the trampoline's swapgs will swap back.
+                unsafe {
+                    core::arch::asm!("swapgs", options(nomem, nostack));
+                }
+                // Now: GS_BASE=PER_CPU, KERNEL_GS_BASE=0
+                // After trampoline's swapgs: GS_BASE=0, KERNEL_GS_BASE=PER_CPU ✓
 
                 // CRITICAL Jalon 109b: Re-read values from the process table to
                 // guarantee correctness. The boot stack is nearly exhausted after
@@ -2902,24 +2914,19 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 );
 
                 unsafe {
-                    core::arch::asm!(
-                        "cli",
-                        // Switch to syscall kernel stack (r8 = kernel stack top)
-                        "mov rsp, r8",
-                        // Switch address space to the user process (r9 = PML4)
-                        "mov cr3, r9",
-                        // Build IRETQ stack frame with hardcoded registers
-                        "push 0x1B",          // SS (User Data, RPL=3)
-                        "push r10",           // RSP (user stack, guaranteed in r10)
-                        "push 0x202",         // RFLAGS (IF=1)
-                        "push 0x23",          // CS (User Code, RPL=3)
-                        "push r11",           // RIP (entry point, guaranteed in r11)
-                        "iretq",
-                        in("r8") kernel_stack_top,
-                        in("r9") final_cr3,
-                        in("r10") final_rsp,
-                        in("r11") final_rip,
-                        options(noreturn),
+                    // Phase 1: Store user_cr3 in PER_CPU[48] so sysretq path
+                    // can restore it later.
+                    arch::x86_64::syscall::set_user_cr3(final_cr3);
+
+                    // Use exec_switch_cr3_and_ring3 which jumps to the trampoline
+                    // via PML4[256] (phys-offset). This address is present in BOTH
+                    // kernel and user PML4, avoiding the race condition where IRETQ
+                    // faults because the CR3 switch makes the current instruction
+                    // page inaccessible.
+                    elf::exec_switch_cr3_and_ring3(
+                        final_cr3,
+                        final_rip,
+                        final_rsp,
                     );
                 }
             }
