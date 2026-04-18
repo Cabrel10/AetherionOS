@@ -87,9 +87,15 @@ struct AlignedStack([u8; KERNEL_SYSCALL_STACK_SIZE]);
 static mut SYSCALL_STACK: AlignedStack = AlignedStack([0; KERNEL_SYSCALL_STACK_SIZE]);
 
 /// Per-CPU data structure accessed via GS base after swapgs.
-/// Layout is ABI-critical: offset 0 = kernel_rsp, offset 8 = user_rsp, offset 16 = user_rip,
-/// offset 24 = saved_kernel_rsp (for sys_wait parent resume),
-/// offset 32 = user_r10 (4th syscall argument for pread64, sendto, etc.).
+/// Layout is ABI-critical — offsets are hardcoded in assembly:
+///   offset  0 = kernel_rsp
+///   offset  8 = user_rsp
+///   offset 16 = user_rip
+///   offset 24 = saved_kernel_rsp
+///   offset 32 = user_r10
+///   offset 40 = kernel_cr3   (KPTI: kernel page-table base)
+///   offset 48 = user_cr3     (KPTI: user page-table base)
+///   offset 56 = user_r9      (6th syscall arg, e.g. mmap offset)
 #[repr(C)]
 struct PerCpuData {
     kernel_rsp: u64,        // offset 0: kernel RSP loaded on SYSCALL entry
@@ -97,6 +103,9 @@ struct PerCpuData {
     user_rip: u64,          // offset 16: user RIP saved on SYSCALL entry (from RCX)
     saved_kernel_rsp: u64,  // offset 24: snapshot of kernel RSP after pushes (for sys_wait)
     user_r10: u64,          // offset 32: 4th syscall arg (r10 in Linux syscall ABI)
+    kernel_cr3: u64,        // offset 40: kernel PML4 phys addr (KPTI CR3 switch)
+    user_cr3: u64,          // offset 48: user PML4 phys addr (KPTI CR3 switch)
+    user_r9: u64,           // offset 56: 6th syscall arg (r9 in Linux syscall ABI, e.g. mmap offset)
 }
 
 static mut PER_CPU: PerCpuData = PerCpuData {
@@ -105,6 +114,9 @@ static mut PER_CPU: PerCpuData = PerCpuData {
     user_rip: 0,
     saved_kernel_rsp: 0,
     user_r10: 0,
+    kernel_cr3: 0,
+    user_cr3: 0,
+    user_r9: 0,
 };
 
 // =====================================================================
@@ -136,6 +148,9 @@ static mut AP_PER_CPU: [PerCpuData; MAX_CPUS] = {
         user_rip: 0,
         saved_kernel_rsp: 0,
         user_r10: 0,
+        kernel_cr3: 0,
+        user_cr3: 0,
+        user_r9: 0,
     };
     [INIT; MAX_CPUS]
 };
@@ -207,13 +222,26 @@ fn saved_user_r10() -> u64 {
     val
 }
 
+/// Return the 6th syscall argument (R9 in Linux syscall ABI).
+/// Used by mmap (offset parameter).
+/// SMP-safe: reads from the current core's per-CPU data via GS base.
+#[inline]
+fn saved_user_r9() -> u64 {
+    let val: u64;
+    unsafe {
+        asm!("mov {}, gs:[56]", out(reg) val, options(nomem, nostack));
+    }
+    val
+}
+
 // ===== User pointer validation =====
 
 /// Validate that a user pointer range [ptr, ptr+len) is within user address space
 #[inline]
 fn validate_user_ptr(addr: u64, len: u64) -> bool {
     // Accept both lower-half (<0x8000_0000_0000) and userspace ELF region (0x80_0000_0000+)
-    if addr == 0 { return false; }
+    // Jalon 133: Reject NULL page (< 0x1000) to prevent kernel NULL-pointer deref
+    if addr < 0x1000 { return false; }
     if len > 0x2_0000_0000 { return false; } // 8 GiB sanity (Jalon 68: was 256 MiB)
     // Standard user-space: below canonical hole
     if addr < USER_ADDR_LIMIT {
@@ -246,6 +274,17 @@ unsafe fn read_user_string(addr: u64) -> Option<alloc::string::String> {
 }
 
 // ===== SYSCALL entry point (naked, assembly) =====
+//
+// KPTI (Kernel Page-Table Isolation) design:
+// This function may execute from its PHYSICAL-OFFSET mapping address
+// (0xFFFF800000000000 + phys_addr) because user-mode processes whose ELF
+// overlaps kernel .text (e.g., BusyBox at 0x400000) unmap the kernel code
+// at its identity-mapped address. LSTAR is set to the phys-offset address
+// so the CPU can reach this code even when user PML4[0] has user pages.
+//
+// After swapgs + saving user state, we switch CR3 to the kernel PML4
+// (gs:[40]) so the full kernel address space is available. Before sysretq,
+// we switch CR3 back to the user PML4 (gs:[48]).
 
 #[naked]
 unsafe extern "C" fn syscall_entry() {
@@ -257,7 +296,20 @@ unsafe extern "C" fn syscall_entry() {
         "mov gs:[8], rsp",
         "mov gs:[16], rcx",   // save user RIP (RCX holds return addr from SYSCALL)
         "mov gs:[32], r10",   // save R10 = 4th syscall argument (pread64 offset, etc.)
+        "mov gs:[56], r9",    // save R9 = 6th syscall argument (mmap offset, etc.)
         "mov rsp, gs:[0]",
+
+        // 2b. KPTI: Switch to kernel page tables.
+        // gs:[40] = kernel_cr3 (physical address of kernel PML4).
+        // After this, all kernel code is accessible at both identity-mapped
+        // and phys-offset addresses. User pages at 0x400000+ are now the
+        // kernel's original pages (not BusyBox).
+        // We use a scratch register (r10 already saved above) for the mov.
+        "mov r10, gs:[40]",   // r10 = kernel_cr3
+        "test r10, r10",      // skip if kernel_cr3 == 0 (not set yet)
+        "jz 2f",
+        "mov cr3, r10",
+        "2:",
 
         // 3. Build a stack frame with all user state
         "push rcx",     // user RIP (saved by SYSCALL)
@@ -280,8 +332,9 @@ unsafe extern "C" fn syscall_entry() {
         //    System V calling convention: rdi, rsi, rdx, rcx, r8, r9
         //    From SYSCALL: rax=nr, rdi=a1, rsi=a2, rdx=a3, r10=a4, r8=a5
         //    Note: r8 still holds user's 5th arg, r10 was saved to gs:[32]
+        "mov r10, gs:[32]",   // reload user r10 (we clobbered it for CR3 switch)
         "mov r9, r8",      // 6th SysV arg = a5 (user R8) — MUST be before r8 is overwritten
-        "mov r8, r10",     // 5th SysV arg = a4 (user R10, still in register)
+        "mov r8, r10",     // 5th SysV arg = a4 (user R10)
         "mov rcx, rdx",    // 4th SysV arg = a3 (user RDX)
         "mov rdx, rsi",    // 3rd SysV arg = a2 (user RSI)
         "mov rsi, rdi",    // 2nd SysV arg = a1 (user RDI)
@@ -308,6 +361,14 @@ unsafe extern "C" fn syscall_entry() {
 
         // 6. Restore user RSP
         "mov rsp, gs:[8]",
+
+        // 6b. KPTI: Switch back to user page tables before returning to Ring 3.
+        // gs:[48] = user_cr3 (the process's PML4).
+        "mov r10, gs:[48]",
+        "test r10, r10",      // skip if user_cr3 == 0 (not set yet)
+        "jz 3f",
+        "mov cr3, r10",
+        "3:",
 
         // 7. Swap back to user GS
         "swapgs",
@@ -377,8 +438,15 @@ extern "C" fn syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, 
 /// get Linux-specific behavior for certain syscalls (uname, arch_prctl, etc.)
 /// Syscall numbers match Linux x86_64 ABI for POSIX compatibility.
 fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
-    // Jalon 105: Check if this process uses Linux ABI and route to Linux-specific handlers
+    // Jalon 133: Debug trace — log first 10 syscalls from each PID > 19 (external binaries)
     let current_pid = crate::scheduler::current_pid();
+    if current_pid >= 20 {
+        crate::serial_println!(
+            "[SC] PID {} nr={} a1=0x{:X} a2=0x{:X} a3=0x{:X}",
+            current_pid, nr, a1, a2, a3
+        );
+    }
+    // Jalon 105: Check if this process uses Linux ABI and route to Linux-specific handlers
     if current_pid != 0 {
         let is_linux = crate::process::with_process(current_pid, |p| {
             p.abi == crate::compat::linux_abi::Abi::Linux
@@ -403,7 +471,7 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         5  => sys_stub_fstat(a1 as u32, a2),         // fstat(fd, buf)     [stub]
         7  => sys_poll(a1, a2, a3),                    // poll(fds, nfds, timeout) — real impl
         8  => sys_seek(a1 as u32, a2 as i64, a3 as u32), // lseek(fd, off, whence)
-        9  => sys_mmap(a1, a2, a3),                  // mmap(addr, len, prot)
+        9  => sys_mmap_full(a1, a2, a3, a4, a5),      // mmap(addr, len, prot, flags=R10, fd=R8)
         10 => sys_mprotect(a1, a2, a3),              // mprotect — Jalon 131 real PTE modification
         11 => sys_stub_munmap(a1, a2),               // munmap(addr, len) [stub]
         12 => sys_brk(a1),                           // brk(new_break)
@@ -507,7 +575,7 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         81  => 0,                                      // fchdir [stub]
         82  => 0,                                      // rename [stub]
         86  => 0,                                      // symlink [stub]
-        88  => 0,                                      // readlink [stub]
+        88  => sys_readlink(a1, a2, a3),                 // readlink(path, buf, bufsiz)
         89  => 0,                                      // chmod [stub]
         90  => 0,                                      // fchmod [stub]
         91  => 0,                                      // chown [stub]
@@ -578,7 +646,7 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         264 => 0,                                      // renameat [stub]
         265 => 0,                                      // linkat [stub]
         266 => 0,                                      // symlinkat [stub]
-        267 => 0,                                      // readlinkat [stub]
+        267 => sys_readlink(a2, a3, a4),                 // readlinkat(dirfd, path, buf, bufsiz) → readlink
         268 => 0,                                      // fchmodat [stub]
         269 => sys_stub_access(a2, a3),               // faccessat → access
         280 => 0,                                      // utimensat [stub]
@@ -1556,6 +1624,43 @@ fn sys_gettimeofday(tv_addr: u64, _tz_addr: u64) -> u64 {
 /// exit_group(code) -> same as exit
 fn sys_stub_exit_group(code: u64) -> u64 { sys_exit(code) }
 
+/// readlink(path, buf, bufsiz) -> bytes written, or EINVAL
+/// Supports /proc/self/exe (returns the path of the current executable).
+fn sys_readlink(path_addr: u64, buf_addr: u64, bufsiz: u64) -> u64 {
+    if !validate_user_ptr(path_addr, 1) || !validate_user_ptr(buf_addr, bufsiz) {
+        return EFAULT;
+    }
+
+    let path = match unsafe { read_user_string(path_addr) } {
+        Some(p) => p,
+        None => return EFAULT,
+    };
+
+    let current_pid = crate::scheduler::current_pid();
+
+    // Handle /proc/self/exe
+    let target = if path == "/proc/self/exe" {
+        // Return the path of the current process's executable
+        crate::process::with_process(current_pid, |p| p.name.clone())
+            .unwrap_or_else(|| alloc::string::String::from("/bin/unknown"))
+    } else {
+        // For other paths, return EINVAL (not a symlink)
+        return EINVAL;
+    };
+
+    let target_bytes = target.as_bytes();
+    let copy_len = core::cmp::min(target_bytes.len(), bufsiz as usize);
+
+    unsafe {
+        let dst = buf_addr as *mut u8;
+        for i in 0..copy_len {
+            core::ptr::write_volatile(dst.add(i), target_bytes[i]);
+        }
+    }
+
+    copy_len as u64
+}
+
 /// openat(dirfd, path, flags) -> route to sys_open (ignoring dirfd)
 fn sys_stub_openat(_dirfd: u64, path_addr: u64, flags: u64) -> u64 {
     sys_open(path_addr, flags as u32)
@@ -2527,37 +2632,69 @@ fn sys_yield() -> u64 {
         // Update PER_CPU with new process's user state
         PER_CPU.user_rsp = new_rsp;
         PER_CPU.user_rip = new_rip;
+        // KPTI: Store new process's PML4 for syscall_entry's exit CR3 switch
+        PER_CPU.user_cr3 = new_pml4;
 
         if is_first_run {
-            // First-run: use IRETQ which is proven to work for launching processes.
-            // IRETQ pops: RIP, CS, RFLAGS, RSP, SS from the stack.
-            // Jalon 109c: FORCE explicit GPR allocation (r8=CR3, r9=RSP, r10=RIP)
-            // Generic in(reg) allows LLVM to coalesce registers, causing PML4 addr
-            // to overwrite RIP. Hardcoded registers eliminate this entirely.
+            // First-run: use heap-allocated trampoline (same approach as execve).
+            // The trampoline is at PML4[136] (kernel heap, 0x444444440000+)
+            // which survives the CR3 switch to any user PML4.
             let f_cr3 = core::ptr::read_unaligned(&new_pml4);
             let f_rsp = core::ptr::read_unaligned(&new_rsp);
             let f_rip = core::ptr::read_unaligned(&new_rip);
+
+            // Allocate heap trampoline: mov cr3,r8 + swapgs + iretq
+            let trampoline_buf = alloc::vec![0u8; 64];
+            let trampoline_ptr = trampoline_buf.as_ptr() as *mut u8;
+            let trampoline_addr = trampoline_ptr as u64;
+            // mov cr3, r8   (41 0F 22 D8)
+            *trampoline_ptr.add(0) = 0x41;
+            *trampoline_ptr.add(1) = 0x0F;
+            *trampoline_ptr.add(2) = 0x22;
+            *trampoline_ptr.add(3) = 0xD8;
+            // swapgs         (0F 01 F8)
+            *trampoline_ptr.add(4) = 0x0F;
+            *trampoline_ptr.add(5) = 0x01;
+            *trampoline_ptr.add(6) = 0xF8;
+            // iretq           (48 CF)
+            *trampoline_ptr.add(7) = 0x48;
+            *trampoline_ptr.add(8) = 0xCF;
+
             asm!(
                 "cli",
-                // Switch address space FIRST (r8 = PML4 physical address)
-                "mov cr3, r8",
-                // SWAPGS before touching user stack frame
-                "swapgs",
-                // Build IRETQ frame on the kernel stack
-                "push 0x1B",    // SS (Ring 3 data, GDT entry 3 | RPL=3)
-                "push r9",      // RSP (user stack, guaranteed in r9)
-                "push 0x202",   // RFLAGS (IF=1, reserved bit 1)
-                "push 0x23",    // CS (Ring 3 code, GDT entry 4 | RPL=3)
-                "push r10",     // RIP (entry point, guaranteed in r10)
-                "iretq",
+                // Build IRETQ frame on the current (kernel) stack
+                "push 0x1B",    // SS (Ring 3 data)
+                "push r9",      // RSP (user stack)
+                "push 0x202",   // RFLAGS (IF=1)
+                "push 0x23",    // CS (Ring 3 code)
+                "push r10",     // RIP (entry point)
+                // Zero GPRs to prevent kernel state leaks
+                "xor rax, rax",
+                "xor rbx, rbx",
+                "xor rdx, rdx",
+                "xor rsi, rsi",
+                "xor rdi, rdi",
+                "xor rbp, rbp",
+                "xor r9, r9",
+                "xor r10, r10",
+                "xor r11, r11",
+                "xor r12, r12",
+                "xor r13, r13",
+                "xor r14, r14",
+                "xor r15, r15",
+                // Jump to heap trampoline (does: mov cr3 → swapgs → iretq)
+                "jmp rcx",
+                in("rcx") trampoline_addr,
                 in("r8") f_cr3,
                 in("r9") f_rsp,
                 in("r10") f_rip,
                 options(noreturn),
             );
+            // trampoline_buf leaked intentionally
         }
 
         // Resumed process: restore callee-saved registers and return via sysretq.
+        // KPTI: Use heap-allocated trampoline for the CR3 switch + sysretq.
 
         let r15 = new_regs[0];
         let r14 = new_regs[1];
@@ -2568,42 +2705,50 @@ fn sys_yield() -> u64 {
         // new_regs[6] = r11 (user RFLAGS) — goes into R11 for sysretq
         // new_regs[7] = rcx (user RIP)   — goes into RCX for sysretq
 
-        // CRITICAL: Use explicit register constraints to prevent clobbering.
-        // Step 1: Load rip, rflags, rsp, cr3 into fixed scratch registers.
-        // Step 2: Restore callee-saved registers from generic in(reg) operands.
-        //         The compiler allocates these 6 operands to any available GPRs,
-        //         but since rax/rdi/rsi/rdx are already consumed in step 1,
-        //         the compiler won't allocate them to those registers.
-        // Step 3: Use the fixed scratch regs to set up sysretq.
+        // Allocate heap trampoline: mov cr3,rdx + swapgs + sysretq
+        // Uses rdx for CR3 (already loaded by inline asm)
+        let sysret_trampoline_buf = alloc::vec![0u8; 64];
+        let sysret_ptr = sysret_trampoline_buf.as_ptr() as *mut u8;
+        let sysret_trampoline = sysret_ptr as u64;
+        // mov cr3, rdx   (0F 22 DA)
+        *sysret_ptr.add(0) = 0x0F;
+        *sysret_ptr.add(1) = 0x22;
+        *sysret_ptr.add(2) = 0xDA;
+        // swapgs           (0F 01 F8)
+        *sysret_ptr.add(3) = 0x0F;
+        *sysret_ptr.add(4) = 0x01;
+        *sysret_ptr.add(5) = 0xF8;
+        // sysretq           (48 0F 07)
+        *sysret_ptr.add(6) = 0x48;
+        *sysret_ptr.add(7) = 0x0F;
+        *sysret_ptr.add(8) = 0x07;
+
         let rip_v: u64 = new_rip;
         let rfl_v: u64 = new_rflags;
         let rsp_v: u64 = new_rsp;
         let cr3_v: u64 = new_pml4;
         asm!(
             "cli",
-            // Step 1: Restore callee-saved regs FIRST (they come from in(reg),
-            // which the compiler guarantees won't conflict with explicit regs below)
+            // Step 1: Restore callee-saved regs FIRST
             "mov r15, {r15}",
             "mov r14, {r14}",
             "mov r13, {r13}",
             "mov r12, {r12}",
             "mov rbx, {rbx}",
             "mov rbp, {rbp}",
-            // Step 2: Switch address space (rdx is explicitly bound to cr3_v)
-            "mov cr3, rdx",
-            // Step 3: Set up for sysretq (rax=rip, rdi=rfl, rsi=rsp_v are explicit)
+            // Step 2: Set up for sysretq
             "mov rcx, rax",           // RCX = user RIP
             "mov r11, rdi",           // R11 = user RFLAGS
             "mov rsp, rsi",           // RSP = user stack
-            // Step 4: Switch back to user GS
-            "swapgs",
-            // Step 5: Return to user space — sysretq sets RIP=RCX, RFLAGS=R11
-            "sysretq",
-            // Explicit register bindings (compiler CANNOT reassign these)
+            // Step 3: Jump to heap trampoline that does: mov cr3 → swapgs → sysretq
+            // r8 holds the trampoline address, rdx holds the CR3 value
+            "jmp r8",
+            // Explicit register bindings
             in("rax") rip_v,
             in("rdi") rfl_v,
             in("rsi") rsp_v,
             in("rdx") cr3_v,
+            in("r8") sysret_trampoline,
             // Generic register bindings for callee-saved values
             r15 = in(reg) r15,
             r14 = in(reg) r14,
@@ -2613,6 +2758,7 @@ fn sys_yield() -> u64 {
             rbp = in(reg) rbp,
             options(noreturn),
         );
+        // sysret_trampoline_buf leaked intentionally
     }
 }
 
@@ -2842,34 +2988,55 @@ fn read_user_string_array(array_addr: u64, max: usize) -> alloc::vec::Vec<alloc:
 /// Execute a new ELF binary, replacing the current process.
 /// Jalon 127: True System V ABI execve with argv/envp support.
 /// Jalon 95: Supports VFS (/bin/*), FAT32 (/disk/*), and bare names.
+/// Execute a new ELF binary, replacing the current process.
+/// Jalon 127: True System V ABI execve with argv/envp support.
+/// Jalon 95: Supports VFS (/bin/*), FAT32 (/disk/*), and bare names.
 fn sys_execve(path_addr: u64, argv_addr: u64, envp_addr: u64) -> u64 {
+    let current_pid = crate::scheduler::current_pid();
+
+    // Jalon 133: Sanitize argv/envp addresses — AetherionOS native execve() (syscall1)
+    // only passes the path in RDI; RSI/RDX may contain garbage register values.
+    // Treat any address in the NULL page (< 0x1000) as 0 (no argv/envp provided).
+    let argv_addr = if argv_addr < 0x1000 { 0 } else { argv_addr };
+    let envp_addr = if envp_addr < 0x1000 { 0 } else { envp_addr };
+
     if !validate_user_ptr(path_addr, 1) {
         return EFAULT;
     }
 
     let path = match unsafe { read_user_string(path_addr) } {
         Some(p) => p,
-        None => return EFAULT,
-    };
-
-    // Jalon 127: Read argv[] and envp[] from userspace
-    let user_argv = read_user_string_array(argv_addr, 64);
-    let user_envp = read_user_string_array(envp_addr, 64);
-
-    // If no argv provided, use path as argv[0]
-    let argv: alloc::vec::Vec<alloc::string::String> = if user_argv.is_empty() {
-        alloc::vec![path.clone()]
-    } else {
-        user_argv
+        None => {
+            return EFAULT;
+        }
     };
 
     crate::serial_println!(
-        "[SYSCALL] sys_execve('{}', argc={}, envc={})",
-        path, argv.len(), user_envp.len()
+        "[EXECVE] PID {} path='{}' argv_addr=0x{:X} envp_addr=0x{:X}",
+        current_pid, path, argv_addr, envp_addr
     );
-    for (i, a) in argv.iter().enumerate() {
-        crate::serial_println!("[EXECVE]   argv[{}] = '{}'", i, a);
+
+    // Build argv: skip read_user_string_array when addresses are null/invalid
+    let argv: alloc::vec::Vec<alloc::string::String>;
+    let user_envp: alloc::vec::Vec<alloc::string::String>;
+
+    if argv_addr != 0 && validate_user_ptr(argv_addr, 8) {
+        let user_argv = read_user_string_array(argv_addr, 64);
+        argv = if user_argv.is_empty() { alloc::vec![path.clone()] } else { user_argv };
+    } else {
+        argv = alloc::vec![path.clone()];
     }
+
+    if envp_addr != 0 && validate_user_ptr(envp_addr, 8) {
+        user_envp = read_user_string_array(envp_addr, 64);
+    } else {
+        user_envp = alloc::vec::Vec::new();
+    }
+
+    crate::serial_println!(
+        "[EXECVE] sys_execve('{}', argc={}, envc={}) PID {}",
+        path, argv.len(), user_envp.len(), current_pid
+    );
 
     // Resolve the path for lookup
     let resolved = if path.starts_with('/') {
@@ -2906,6 +3073,30 @@ fn sys_execve(path_addr: u64, argv_addr: u64, envp_addr: u64) -> u64 {
             }
         }
     }
+    // ── Priority 2b: Jalon 134 — Try FAT32 for /bin/* (dynamic binaries) ──
+    else if resolved.starts_with("/bin/") {
+        let fat_path = &resolved[1..]; // strip leading '/', keep "bin/..."
+        match crate::fs::fat32::read_file_path(fat_path) {
+            Some(data) => {
+                crate::serial_println!("[EXEC] Loaded from FAT32:/{} ({} bytes)", fat_path, data.len());
+                data
+            }
+            None => {
+                // Last-chance: try flat filename in FAT32 root
+                let bare = &resolved[5..]; // strip "/bin/"
+                match crate::fs::fat32::read_file(bare) {
+                    Some(data) => {
+                        crate::serial_println!("[EXEC] Loaded from FAT32 root (bare): {} ({} bytes)", bare, data.len());
+                        data
+                    }
+                    None => {
+                        crate::serial_println!("[EXEC] File not found: {} (VFS+FAT32)", resolved);
+                        return ENOENT;
+                    }
+                }
+            }
+        }
+    }
     // ── Priority 3: Try FAT32 root for bare names (e.g. "busybox.elf") ──
     else {
         match crate::fs::fat32::read_file(&resolved) {
@@ -2926,50 +3117,116 @@ fn sys_execve(path_addr: u64, argv_addr: u64, envp_addr: u64) -> u64 {
         return ENOENT;
     }
 
-    crate::serial_println!("[EXEC] Loading ELF: {} ({} bytes, entry will be resolved)", resolved, elf_data.len());
+    crate::serial_println!("[EXEC] Loading ELF: {} ({} bytes)", resolved, elf_data.len());
 
     // Load the ELF binary
     match crate::elf::load_elf_binary(&elf_data) {
         Ok(result) => {
             let current_pid = crate::scheduler::current_pid();
             crate::serial_println!(
-                "[EXEC] ELF loaded for PID {}: entry=0x{:X} stack=0x{:X} pml4=0x{:X}",
-                current_pid, result.entry_point, result.stack_pointer, result.pml4_phys
+                "[EXEC] ELF loaded for PID {}: entry=0x{:X} stack=0x{:X} pml4=0x{:X} interp={:?}",
+                current_pid, result.entry_point, result.stack_pointer, result.pml4_phys,
+                result.interp_path
             );
 
             // ═══════════════════════════════════════════════════════════
-            // Jalon 127: Rebuild user stack with REAL argv/envp
-            // System V ABI x86_64 stack layout (growing down):
-            //   [string data: argv[0]\0, argv[1]\0, ..., envp[0]\0, ...]
-            //   [padding to 16-byte align]
-            //   [AT_NULL, 0]
-            //   [auxv entries...]
-            //   [NULL]              <- end of envp
-            //   [envp[0] ptr, envp[1] ptr, ...]
-            //   [NULL]              <- end of argv
-            //   [argv[0] ptr, argv[1] ptr, ...]
-            //   [argc]              <- RSP points here
+            // Jalon 134: Dynamic linker integration
+            // If the binary has a PT_INTERP, load the interpreter (ld.so)
+            // into the same address space at a high base address, then
+            // start execution at the interpreter's entry point.
+            // ═══════════════════════════════════════════════════════════
+            let mut launch_entry = result.entry_point;
+            let mut interp_base: u64 = 0;
+
+            if let Some(ref interp_path) = result.interp_path {
+                crate::serial_println!(
+                    "[EXEC] Dynamic binary: loading interpreter '{}'", interp_path
+                );
+
+                // Map the interpreter path to a VFS/FAT32 location
+                // The interpreter is at /lib/ld-musl-x86_64.so.1 on disk
+                // In the kernel, we try VFS first, then FAT32
+                let interp_resolved = if interp_path.starts_with("/") {
+                    interp_path.clone()
+                } else {
+                    alloc::format!("/lib/{}", interp_path)
+                };
+
+                // Try to load the interpreter data
+                let interp_data = if let Ok(data) = crate::fs::vfs::file_read(&interp_resolved) {
+                    crate::serial_println!("[EXEC] Interpreter from VFS: {} ({} bytes)", interp_resolved, data.len());
+                    Some(data)
+                } else {
+                    // Try FAT32: /lib/ld-musl-x86_64.so.1 -> lib/ld-musl-x86_64.so.1
+                    let fat_path = if interp_resolved.starts_with("/") {
+                        &interp_resolved[1..]
+                    } else {
+                        &interp_resolved
+                    };
+                    match crate::fs::fat32::read_file_path(fat_path) {
+                        Some(data) => {
+                            crate::serial_println!("[EXEC] Interpreter from FAT32: {} ({} bytes)", fat_path, data.len());
+                            Some(data)
+                        }
+                        None => {
+                            crate::serial_println!("[EXEC] WARNING: Interpreter not found: {}", interp_resolved);
+                            None
+                        }
+                    }
+                };
+
+                if let Some(interp_data) = interp_data {
+                    // Load interpreter at high base address to avoid conflicts
+                    // with the main binary. 0x7FC0_0000_0000 is a common choice.
+                    const INTERP_BASE: u64 = 0x7FC0_0000_0000;
+
+                    match crate::elf::load_interp_into_pml4(&interp_data, result.pml4_phys, INTERP_BASE) {
+                        Ok(interp_result) => {
+                            launch_entry = interp_result.entry_point;
+                            interp_base = interp_result.base_vaddr;
+                            crate::serial_println!(
+                                "[EXEC] Interpreter loaded: entry=0x{:X}, base=0x{:X}, main_entry=0x{:X}",
+                                launch_entry, interp_base, result.entry_point
+                            );
+                        }
+                        Err(e) => {
+                            crate::serial_println!(
+                                "[EXEC] WARNING: Failed to load interpreter: {}. Falling back to static entry.", e
+                            );
+                        }
+                    }
+                }
+            }
+
+            // ═══════════════════════════════════════════════════════════
+            // Jalon 127+134: Rebuild user stack with REAL argv/envp
+            // For dynamic binaries, AT_ENTRY = main binary entry,
+            // AT_BASE = interpreter base, launch RIP = interpreter entry.
             // ═══════════════════════════════════════════════════════════
             let final_rsp = unsafe {
                 crate::elf::build_sysv_stack(
                     result.pml4_phys,
                     &argv,
                     &user_envp,
-                    result.entry_point,
+                    result.entry_point,  // AT_ENTRY: main binary entry
+                    interp_base,         // AT_BASE: interpreter base (0 if static)
+                    result.phdr_vaddr,
+                    result.phdr_count,
                 )
             }.unwrap_or(result.stack_pointer);
 
             crate::serial_println!(
-                "[EXECVE] Jalon 127: System V stack built, argc={}, RSP=0x{:X}",
-                argv.len(), final_rsp
+                "[EXECVE] Stack built: argc={}, RSP=0x{:X}, AT_PHDR=0x{:X}, AT_ENTRY=0x{:X}, AT_BASE=0x{:X}, launch=0x{:X}",
+                argv.len(), final_rsp, result.phdr_vaddr, result.entry_point, interp_base, launch_entry
             );
+
 
             // Replace the current process's address space and state
             // Jalon 94: Free the OLD page table before replacing
             let old_pml4 = crate::process::with_process(current_pid, |p| p.pml4_phys).unwrap_or(0);
             crate::process::with_process_mut(current_pid, |p| {
                 p.pml4_phys = result.pml4_phys;
-                p.entry_point = result.entry_point;
+                p.entry_point = launch_entry;  // Use interpreter entry for dynamic binaries
                 p.stack_pointer = final_rsp;
                 p.name = alloc::string::String::from(&resolved[..]);
                 // Reset FD table to just stdio (exec replaces everything)
@@ -2989,23 +3246,126 @@ fn sys_execve(path_addr: u64, argv_addr: u64, envp_addr: u64) -> u64 {
 
             // Jalon 94: Free old page table AFTER CR3 has been changed
             // We'll free it right after switching to the new PML4
-            crate::serial_println!("[EXEC] Switching to Ring 3: {}", resolved);
-
-            // Switch CR3 and jump to Ring 3
+            crate::serial_println!(
+                "[EXEC] Switching to Ring 3: {} entry=0x{:X} (launch=0x{:X}) rsp=0x{:X} pml4=0x{:X}",
+                resolved, result.entry_point, launch_entry, final_rsp, result.pml4_phys
+            );
+            
+            // DIAGNOSTIC: Verify kernel mapping in new PML4 before CR3 switch
             unsafe {
-                core::arch::asm!(
-                    "mov cr3, {}",
-                    in(reg) result.pml4_phys,
-                    options(nostack)
+                let pml4_virt = crate::elf::phys_to_virt(result.pml4_phys) as *const u64;
+                let e0 = core::ptr::read_volatile(pml4_virt.add(0));
+                let e136 = core::ptr::read_volatile(pml4_virt.add(136));
+                let e256 = core::ptr::read_volatile(pml4_virt.add(256));
+                crate::serial_println!(
+                    "[EXEC-DIAG] PML4[0]=0x{:X} PML4[136]=0x{:X} PML4[256]=0x{:X} (P bits: {},{},{})",
+                    e0, e136, e256, e0 & 1, e136 & 1, e256 & 1
                 );
-                // Now safe to free old PML4 since we're on the new one
-                if old_pml4 != 0 && old_pml4 != result.pml4_phys {
-                    crate::elf::free_user_page_table(old_pml4);
-                }
-                // swapgs before IRETQ: we're inside a syscall handler (GS=PER_CPU)
-                // Must restore user GS (=0) before returning to Ring 3
-                core::arch::asm!("swapgs", options(nomem, nostack));
-                crate::elf::jump_to_ring3(result.entry_point, final_rsp);
+                // Also check if kernel .text address is resolvable
+                // Kernel text at 0x408560
+                let kern_txt = 0x408560u64;
+                let frame = crate::elf::lookup_page_frame_pub(result.pml4_phys, kern_txt);
+                crate::serial_println!(
+                    "[EXEC-DIAG] kernel .text 0x{:X} frame={:?}",
+                    kern_txt, frame
+                );
+            }
+
+
+            // Switch CR3 and jump to Ring 3 via the high-address trampoline.
+            // CRITICAL: BusyBox (and other Linux binaries) are linked at 0x400000,
+            // which overlaps with kernel .text (0x408560). The new PML4 has user
+            // pages at 0x400000+ that replace kernel .text. We CANNOT just do
+            // "mov cr3, new_pml4" and continue executing kernel code, because the
+            // kernel code at our current RIP will be unmapped after the CR3 switch.
+            //
+            // Solution: exec_switch_cr3_and_ring3() jumps to a trampoline via its
+            // physical-offset mapping (0xFFFF800000000000+phys). PML4[256] is
+            // present in BOTH old and new PML4, so the trampoline remains accessible
+            // during the CR3 switch. The trampoline does: mov cr3 → swapgs → iretq.
+            unsafe {
+                // Read values through volatile to prevent optimizer reuse
+                // Use launch_entry (= interpreter entry for dynamic, main entry for static)
+                let f_rip = core::ptr::read_volatile(&launch_entry);
+                let f_rsp = core::ptr::read_volatile(&final_rsp);
+                let f_pml4 = core::ptr::read_volatile(&result.pml4_phys);
+
+                // KPTI: Store user's CR3 in per-CPU data so syscall_entry
+                // can switch back to user page tables on sysretq.
+                PER_CPU.user_cr3 = f_pml4;
+
+                // CRITICAL: CR3 switch + Ring 3 transition via heap-allocated trampoline.
+                //
+                // Problem: BusyBox at 0x400000 overlaps kernel .text in PML4[0].
+                // After mov cr3, instructions at the current RIP become BusyBox code.
+                //
+                // Solution: Allocate a trampoline on the KERNEL HEAP (virtual address
+                // 0x444444440000+, PML4[136]). This region is NOT overlapped by any
+                // user ELF, so it survives the CR3 switch. We copy machine code bytes
+                // (mov cr3 + swapgs + iretq) there, build the IRETQ frame on the
+                // current stack, then jump to the heap trampoline with interrupts off.
+                
+                // Allocate a small buffer on the kernel heap
+                let trampoline_buf = alloc::vec![0u8; 64];
+                let trampoline_ptr = trampoline_buf.as_ptr() as *mut u8;
+                let trampoline_addr = trampoline_ptr as u64;
+                
+                // Write trampoline machine code:
+                // mov cr3, r8   (41 0F 22 D8)
+                // swapgs         (0F 01 F8)
+                // iretq           (48 CF)
+                *trampoline_ptr.add(0) = 0x41;   // REX.B
+                *trampoline_ptr.add(1) = 0x0F;   // 2-byte opcode prefix
+                *trampoline_ptr.add(2) = 0x22;   // mov cr, reg
+                *trampoline_ptr.add(3) = 0xD8;   // cr3, r8
+                *trampoline_ptr.add(4) = 0x0F;   // 2-byte opcode prefix
+                *trampoline_ptr.add(5) = 0x01;   // swapgs prefix
+                *trampoline_ptr.add(6) = 0xF8;   // swapgs
+                *trampoline_ptr.add(7) = 0x48;   // REX.W
+                *trampoline_ptr.add(8) = 0xCF;   // iretq
+                
+                crate::serial_println!(
+                    "[EXEC] Heap trampoline at 0x{:X} (PML4[{}]), cr3=0x{:X}, rip=0x{:X}, rsp=0x{:X}",
+                    trampoline_addr, trampoline_addr >> 39, f_pml4, f_rip, f_rsp
+                );
+                
+                // Use rcx for trampoline address (not clobbered by any xor below)
+                let trampoline_reg = trampoline_addr;
+                core::arch::asm!(
+                    // Disable interrupts
+                    "cli",
+                    // Build IRETQ frame on the current (still valid) kernel stack
+                    "push 0x1B",      // SS (Ring 3 data)
+                    "push r9",        // RSP (user stack)
+                    "push 0x202",     // RFLAGS (IF=1)
+                    "push 0x23",      // CS (Ring 3 code)
+                    "push r10",       // RIP (user entry)
+                    // Zero all registers except r8 (CR3) and rcx (trampoline addr)
+                    // r9, r10 are consumed by the pushes above
+                    "xor rax, rax",
+                    "xor rbx, rbx",
+                    "xor rdx, rdx",
+                    "xor rsi, rsi",
+                    "xor rdi, rdi",
+                    "xor rbp, rbp",
+                    "xor r9, r9",
+                    "xor r10, r10",
+                    "xor r11, r11",
+                    "xor r12, r12",
+                    "xor r13, r13",
+                    "xor r14, r14",
+                    "xor r15, r15",
+                    // Jump to heap trampoline (PML4[136], safe across CR3 switch)
+                    // Trampoline does: mov cr3, r8 → swapgs → iretq
+                    // After iretq, rcx and r8 are overwritten by the CPU (CS:RIP)
+                    "jmp rcx",
+                    in("rcx") trampoline_reg,
+                    in("r8") f_pml4,
+                    in("r9") f_rsp,
+                    in("r10") f_rip,
+                    options(noreturn),
+                );
+                // trampoline_buf is leaked intentionally (process is transitioning)
             }
         }
         Err(e) => {
@@ -3080,21 +3440,27 @@ fn sys_exit(code: u64) -> u64 {
                 );
                 let _ = crate::process::set_state(next_child, crate::process::ProcessState::Running);
                 crate::scheduler::set_current_pid(next_child);
-                // Jalon 109c: hardcoded GPR allocation for child IRETQ
+                // KPTI: Use heap trampoline for child launch
+                unsafe { PER_CPU.user_cr3 = child_pml4; }
                 let f_pml4_c = unsafe { core::ptr::read_unaligned(&child_pml4) };
                 let f_stack_c = unsafe { core::ptr::read_unaligned(&child_stack) };
                 let f_entry_c = unsafe { core::ptr::read_unaligned(&child_entry) };
                 unsafe {
+                    let tb = alloc::vec![0u8; 64];
+                    let tp = tb.as_ptr() as *mut u8;
+                    let ta = tp as u64;
+                    *tp.add(0) = 0x41; *tp.add(1) = 0x0F; *tp.add(2) = 0x22; *tp.add(3) = 0xD8;
+                    *tp.add(4) = 0x0F; *tp.add(5) = 0x01; *tp.add(6) = 0xF8;
+                    *tp.add(7) = 0x48; *tp.add(8) = 0xCF;
                     core::arch::asm!(
                         "cli",
-                        "mov cr3, r8",      // r8 = child PML4
-                        "swapgs",           // Restore user GS before Ring 3
-                        "push 0x1B",        // SS
-                        "push r9",          // RSP (child stack, guaranteed in r9)
-                        "push 0x202",       // RFLAGS
-                        "push 0x23",        // CS
-                        "push r10",         // RIP (child entry, guaranteed in r10)
-                        "iretq",
+                        "push 0x1B", "push r9", "push 0x202", "push 0x23", "push r10",
+                        "xor rax, rax", "xor rbx, rbx", "xor rdx, rdx",
+                        "xor rsi, rsi", "xor rdi, rdi", "xor rbp, rbp",
+                        "xor r9, r9", "xor r10, r10", "xor r11, r11",
+                        "xor r12, r12", "xor r13, r13", "xor r14, r14", "xor r15, r15",
+                        "jmp rcx",
+                        in("rcx") ta,
                         in("r8") f_pml4_c,
                         in("r9") f_stack_c,
                         in("r10") f_entry_c,
@@ -3121,14 +3487,11 @@ fn sys_exit(code: u64) -> u64 {
                 crate::scheduler::set_current_pid(parent_pid);
                 let _ = crate::process::set_state(parent_pid, crate::process::ProcessState::Running);
 
-                // Switch CR3 to parent PML4
+                // KPTI: Set user_cr3 for parent and switch via trampoline
                 unsafe {
-                    core::arch::asm!("mov cr3, {}", in(reg) pml4, options(nostack));
+                    PER_CPU.user_cr3 = pml4;
                 }
 
-                // Resume parent via sysretq through the normal syscall_entry return path.
-                // This restores all user registers (r15-r12, rbx, rbp, r11=RFLAGS, rcx=RIP)
-                // that were saved by syscall_entry when the parent called sys_wait.
                 let wait_result = ((current & 0xFFFF) << 16) | (code & 0xFFFF);
                 crate::serial_println!(
                     "[SYSCALL] sysretq to parent: RAX=0x{:X}, regs saved={}",
@@ -3136,27 +3499,28 @@ fn sys_exit(code: u64) -> u64 {
                 );
 
                 if saved_regs[7] != 0 {
-                    // Restore the full register state from saved_regs and return via sysretq.
-                    // saved_regs: [r15, r14, r13, r12, rbx, rbp, r11(RFLAGS), rcx(RIP)]
                     let r15 = saved_regs[0];
                     let r14 = saved_regs[1];
                     let r13 = saved_regs[2];
                     let r12 = saved_regs[3];
                     let rbx = saved_regs[4];
                     let rbp = saved_regs[5];
-                    let r11 = saved_regs[6]; // user RFLAGS
-                    let rcx = saved_regs[7]; // user RIP
-
-                    // Write parent's user RSP into PER_CPU.user_rsp (gs:[8])
-                    unsafe { PER_CPU.user_rsp = saved_rsp; }
-
-                    crate::serial_println!(
-                        "[SYSCALL] Restoring regs: RCX(RIP)=0x{:X} R11(RFLAGS)=0x{:X} RBP=0x{:X} RBX=0x{:X}",
-                        rcx, r11, rbp, rbx
-                    );
+                    let r11 = saved_regs[6];
+                    let rcx = saved_regs[7];
 
                     unsafe {
+                        PER_CPU.user_rsp = saved_rsp;
+
+                        // KPTI: sysretq trampoline
+                        let tb = alloc::vec![0u8; 64];
+                        let tp = tb.as_ptr() as *mut u8;
+                        let ta = tp as u64;
+                        *tp.add(0) = 0x0F; *tp.add(1) = 0x22; *tp.add(2) = 0xDA; // mov cr3,rdx
+                        *tp.add(3) = 0x0F; *tp.add(4) = 0x01; *tp.add(5) = 0xF8; // swapgs
+                        *tp.add(6) = 0x48; *tp.add(7) = 0x0F; *tp.add(8) = 0x07; // sysretq
+
                         core::arch::asm!(
+                            "cli",
                             "mov r15, {v_r15}",
                             "mov r14, {v_r14}",
                             "mov r13, {v_r13}",
@@ -3166,9 +3530,10 @@ fn sys_exit(code: u64) -> u64 {
                             "mov r11, {v_r11}",
                             "mov rcx, {v_rcx}",
                             "mov rax, {result}",
-                            "mov rsp, gs:[8]",      // Restore user RSP
-                            "swapgs",               // Swap back to user GS
-                            "sysretq",              // Return to Ring 3
+                            "mov rsp, gs:[8]",
+                            "jmp r8",
+                            in("rdx") pml4,
+                            in("r8") ta,
                             v_r15 = in(reg) r15,
                             v_r14 = in(reg) r14,
                             v_r13 = in(reg) r13,
@@ -3182,25 +3547,38 @@ fn sys_exit(code: u64) -> u64 {
                         );
                     }
                 } else if saved_rip != 0 && saved_rsp != 0 {
-                    // Fallback: kernel_rsp not saved, use IRETQ (may lose callee-saved regs)
+                    // Fallback IRETQ trampoline
                     crate::serial_println!(
                         "[SYSCALL] Fallback IRETQ to parent: RIP=0x{:X}, RSP=0x{:X}",
                         saved_rip, saved_rsp
                     );
-                    // Jalon 109c: hardcoded GPR allocation for parent IRETQ
                     let f_result = unsafe { core::ptr::read_unaligned(&wait_result) };
                     let f_rsp_p = unsafe { core::ptr::read_unaligned(&saved_rsp) };
                     let f_rip_p = unsafe { core::ptr::read_unaligned(&saved_rip) };
                     unsafe {
+                        let tb = alloc::vec![0u8; 64];
+                        let tp = tb.as_ptr() as *mut u8;
+                        let ta = tp as u64;
+                        // nop (no CR3 switch needed — already on parent PML4 via kernel)
+                        // swapgs (0F 01 F8)
+                        *tp.add(0) = 0x0F; *tp.add(1) = 0x01; *tp.add(2) = 0xF8;
+                        // iretq (48 CF)
+                        *tp.add(3) = 0x48; *tp.add(4) = 0xCF;
+
                         core::arch::asm!(
+                            "cli",
+                            // Switch to parent PML4 first (we're on kernel PML4)
+                            "mov cr3, {pml4}",
                             "mov rax, r8",      // r8 = wait result
-                            "swapgs",
                             "push 0x1B",
                             "push r9",          // r9 = parent RSP
                             "push 0x202",
                             "push 0x23",
                             "push r10",         // r10 = parent RIP
-                            "iretq",
+                            // Jump to trampoline for swapgs + iretq
+                            "jmp rcx",
+                            pml4 = in(reg) pml4,
+                            in("rcx") ta,
                             in("r8") f_result,
                             in("r9") f_rsp_p,
                             in("r10") f_rip_p,
@@ -3289,8 +3667,16 @@ fn sys_exit(code: u64) -> u64 {
                         );
 
                         unsafe {
-                            core::arch::asm!("mov cr3, {}", in(reg) pml4, options(nostack));
+                            PER_CPU.user_cr3 = pml4;
+                            // KPTI: sysretq trampoline
+                            let tb = alloc::vec![0u8; 64];
+                            let tp = tb.as_ptr() as *mut u8;
+                            let ta = tp as u64;
+                            *tp.add(0) = 0x0F; *tp.add(1) = 0x22; *tp.add(2) = 0xDA;
+                            *tp.add(3) = 0x0F; *tp.add(4) = 0x01; *tp.add(5) = 0xF8;
+                            *tp.add(6) = 0x48; *tp.add(7) = 0x0F; *tp.add(8) = 0x07;
                             core::arch::asm!(
+                                "cli",
                                 "mov r15, {v_r15}",
                                 "mov r14, {v_r14}",
                                 "mov r13, {v_r13}",
@@ -3301,8 +3687,9 @@ fn sys_exit(code: u64) -> u64 {
                                 "mov rcx, {v_rcx}",
                                 "mov rax, {result}",
                                 "mov rsp, gs:[8]",
-                                "swapgs",
-                                "sysretq",
+                                "jmp r8",
+                                in("rdx") pml4,
+                                in("r8") ta,
                                 v_r15 = in(reg) r15,
                                 v_r14 = in(reg) r14,
                                 v_r13 = in(reg) r13,
@@ -3329,23 +3716,30 @@ fn sys_exit(code: u64) -> u64 {
                             parent_pid, saved_rip
                         );
 
-                        // Jalon 109c: hardcoded GPR for forked child exit IRETQ
+                        // KPTI: heap trampoline for fallback IRETQ
+                        unsafe { PER_CPU.user_cr3 = pml4; }
                         let f_pml4_fc = unsafe { core::ptr::read_unaligned(&pml4) };
                         let f_result_fc = unsafe { core::ptr::read_unaligned(&wait_result) };
                         let f_rsp_fc = unsafe { core::ptr::read_unaligned(&saved_rsp) };
                         let f_rip_fc = unsafe { core::ptr::read_unaligned(&saved_rip) };
                         unsafe {
+                            let tb = alloc::vec![0u8; 64];
+                            let tp = tb.as_ptr() as *mut u8;
+                            let ta = tp as u64;
+                            *tp.add(0) = 0x41; *tp.add(1) = 0x0F; *tp.add(2) = 0x22; *tp.add(3) = 0xD8; // mov cr3,r8
+                            *tp.add(4) = 0x0F; *tp.add(5) = 0x01; *tp.add(6) = 0xF8; // swapgs
+                            *tp.add(7) = 0x48; *tp.add(8) = 0xCF; // iretq
                             core::arch::asm!(
                                 "cli",
-                                "mov cr3, r8",       // r8 = PML4
                                 "mov rax, r9",       // r9 = wait result
-                                "swapgs",
                                 "push 0x1B",
                                 "push r10",          // r10 = parent RSP
                                 "push 0x202",
                                 "push 0x23",
                                 "push r11",          // r11 = parent RIP
-                                "iretq",
+                                // Jump to heap trampoline: mov cr3 → swapgs → iretq
+                                "jmp rcx",
+                                in("rcx") ta,
                                 in("r8") f_pml4_fc,
                                 in("r9") f_result_fc,
                                 in("r10") f_rsp_fc,
@@ -3409,12 +3803,26 @@ pub fn launch_next_userspace_process(exclude_pid: u64) {
                 let r11 = saved_regs[6]; // RFLAGS
                 let rcx = saved_regs[7]; // RIP
 
-                // Write child's user RSP into PER_CPU
-                unsafe { PER_CPU.user_rsp = saved_rsp; }
+                // Write child's user RSP into PER_CPU + KPTI user_cr3
+                unsafe {
+                    PER_CPU.user_rsp = saved_rsp;
+                    PER_CPU.user_cr3 = pml4;
+                }
 
                 unsafe {
-                    core::arch::asm!("mov cr3, {}", in(reg) pml4, options(nostack));
+                    // KPTI: Allocate sysretq trampoline on kernel heap
+                    let tb = alloc::vec![0u8; 64];
+                    let tp = tb.as_ptr() as *mut u8;
+                    let ta = tp as u64;
+                    // mov cr3, rdx   (0F 22 DA)
+                    *tp.add(0) = 0x0F; *tp.add(1) = 0x22; *tp.add(2) = 0xDA;
+                    // swapgs           (0F 01 F8)
+                    *tp.add(3) = 0x0F; *tp.add(4) = 0x01; *tp.add(5) = 0xF8;
+                    // sysretq           (48 0F 07)
+                    *tp.add(6) = 0x48; *tp.add(7) = 0x0F; *tp.add(8) = 0x07;
+
                     core::arch::asm!(
+                        "cli",
                         "mov r15, {v_r15}",
                         "mov r14, {v_r14}",
                         "mov r13, {v_r13}",
@@ -3425,8 +3833,10 @@ pub fn launch_next_userspace_process(exclude_pid: u64) {
                         "mov rcx, {v_rcx}",
                         "xor eax, eax",         // RAX = 0 (fork return for child!)
                         "mov rsp, gs:[8]",      // Restore user RSP
-                        "swapgs",               // Swap back to user GS
-                        "sysretq",              // Return to Ring 3
+                        // Jump to heap trampoline: mov cr3 → swapgs → sysretq
+                        "jmp r8",
+                        in("rdx") pml4,
+                        in("r8") ta,
                         v_r15 = in(reg) r15,
                         v_r14 = in(reg) r14,
                         v_r13 = in(reg) r13,
@@ -3437,6 +3847,7 @@ pub fn launch_next_userspace_process(exclude_pid: u64) {
                         v_rcx = in(reg) rcx,
                         options(noreturn),
                     );
+                    // tb leaked intentionally
                 }
             }
         }
@@ -3448,26 +3859,55 @@ pub fn launch_next_userspace_process(exclude_pid: u64) {
         );
         crate::scheduler::set_current_pid(next_pid);
         let _ = crate::process::set_state(next_pid, crate::process::ProcessState::Running);
-        // Jalon 109c: FORCE explicit GPR allocation (r8=CR3, r9=RSP, r10=RIP)
+
+        // KPTI: Set user_cr3 + use heap trampoline for safe CR3 switch
+        unsafe { PER_CPU.user_cr3 = pml4; }
         let f_pml4 = unsafe { core::ptr::read_unaligned(&pml4) };
         let f_stack = unsafe { core::ptr::read_unaligned(&stack) };
         let f_entry = unsafe { core::ptr::read_unaligned(&entry) };
         unsafe {
+            // Allocate iretq trampoline on kernel heap
+            let tb = alloc::vec![0u8; 64];
+            let tp = tb.as_ptr() as *mut u8;
+            let ta = tp as u64;
+            // mov cr3, r8   (41 0F 22 D8)
+            *tp.add(0) = 0x41; *tp.add(1) = 0x0F; *tp.add(2) = 0x22; *tp.add(3) = 0xD8;
+            // swapgs           (0F 01 F8)
+            *tp.add(4) = 0x0F; *tp.add(5) = 0x01; *tp.add(6) = 0xF8;
+            // iretq             (48 CF)
+            *tp.add(7) = 0x48; *tp.add(8) = 0xCF;
+
             core::arch::asm!(
                 "cli",
-                "mov cr3, r8",      // r8 = PML4 (hardcoded, cannot be coalesced)
-                "swapgs",           // Restore user GS before Ring 3
+                // Build IRETQ frame on current kernel stack
                 "push 0x1B",        // SS
-                "push r9",          // RSP (user stack, guaranteed in r9)
+                "push r9",          // RSP (user stack)
                 "push 0x202",       // RFLAGS
                 "push 0x23",        // CS
-                "push r10",         // RIP (entry point, guaranteed in r10)
-                "iretq",
+                "push r10",         // RIP (entry point)
+                // Zero GPRs
+                "xor rax, rax",
+                "xor rbx, rbx",
+                "xor rdx, rdx",
+                "xor rsi, rsi",
+                "xor rdi, rdi",
+                "xor rbp, rbp",
+                "xor r9, r9",
+                "xor r10, r10",
+                "xor r11, r11",
+                "xor r12, r12",
+                "xor r13, r13",
+                "xor r14, r14",
+                "xor r15, r15",
+                // Jump to heap trampoline: mov cr3 → swapgs → iretq
+                "jmp rcx",
+                in("rcx") ta,
                 in("r8") f_pml4,
                 in("r9") f_stack,
                 in("r10") f_entry,
                 options(noreturn),
             );
+            // tb leaked intentionally
         }
     }
 }
@@ -3513,8 +3953,8 @@ fn sys_wait(pid: u64) -> u64 {
         p.saved_syscall_regs = saved_regs;
     });
     crate::serial_println!(
-        "[SYSCALL] wait: saved parent context RIP=0x{:X} RSP=0x{:X} KRSP=0x{:X}",
-        parent_rip, parent_rsp, parent_kernel_rsp
+        "[SYSCALL] wait: saved parent ctx RIP=0x{:X} RSP=0x{:X} KRSP=0x{:X} rcx(RIP)=0x{:X} r11(FL)=0x{:X}",
+        parent_rip, parent_rsp, parent_kernel_rsp, saved_regs[7], saved_regs[6]
     );
 
     // Check for ready child threads to run
@@ -3571,7 +4011,8 @@ fn sys_wait(pid: u64) -> u64 {
 
         // Mark child as Running, parent as Blocked
         let _ = crate::process::set_state(child_pid, crate::process::ProcessState::Running);
-        let _ = crate::process::set_state(current, crate::process::ProcessState::Blocked);
+        let block_ok = crate::process::set_state(current, crate::process::ProcessState::Blocked);
+        crate::serial_println!("[SYSCALL] wait: parent PID {} -> Blocked result={:?}", current, block_ok);
         crate::scheduler::set_current_pid(child_pid);
 
         // Clear forked flag
@@ -4039,9 +4480,22 @@ pub fn init() {
         PER_CPU.kernel_rsp = stack_top;
         PER_CPU.user_rsp = 0;
 
+        // KPTI: Store the kernel's CR3 in per-CPU data.
+        // After execve, user PML4[0] may have user ELF pages that overwrite
+        // kernel .text. syscall_entry switches CR3 to this value to restore
+        // access to kernel code.
+        let kernel_cr3: u64;
+        core::arch::asm!("mov {}, cr3", out(reg) kernel_cr3, options(nomem, nostack));
+        PER_CPU.kernel_cr3 = kernel_cr3 & !0xFFF;
+        PER_CPU.user_cr3 = 0; // will be set during execve
+
         crate::serial_println!(
             "[SYSCALL] Kernel syscall stack: top=0x{:X}, size={} bytes",
             stack_top, KERNEL_SYSCALL_STACK_SIZE
+        );
+        crate::serial_println!(
+            "[SYSCALL] KPTI: kernel_cr3=0x{:X}",
+            PER_CPU.kernel_cr3
         );
 
         // Set KERNEL_GS_BASE to &PER_CPU (swapped in by swapgs)
@@ -4062,10 +4516,26 @@ pub fn init() {
         wrmsr(IA32_STAR, star);
         crate::serial_println!("[SYSCALL] STAR: 0x{:016X}", star);
 
-        // 3. LSTAR
-        let handler_addr = syscall_entry as *const () as u64;
+        // 3. LSTAR — set to the physical-offset mapping address of syscall_entry.
+        // KPTI: User PML4[0] has user ELF pages (e.g., BusyBox at 0x400000)
+        // that overwrite kernel .text at 0x4xxxxx. The identity-mapped address
+        // of syscall_entry is unusable after CR3 switch. By setting LSTAR to
+        // phys_offset + syscall_entry, the CPU can reach the handler through
+        // PML4[256] (physical memory offset), which is mapped in every PML4.
+        let handler_identity_addr = syscall_entry as *const () as u64;
+        let phys_off = crate::elf::phys_offset();
+        let handler_addr = if phys_off != 0 {
+            // Use physical-offset mapping: PML4[256], always mapped in user PML4
+            handler_identity_addr + phys_off
+        } else {
+            // Fallback during early boot before phys_offset is set
+            handler_identity_addr
+        };
         wrmsr(IA32_LSTAR, handler_addr);
-        crate::serial_println!("[SYSCALL] LSTAR: 0x{:016X}", handler_addr);
+        crate::serial_println!(
+            "[SYSCALL] LSTAR: 0x{:016X} (identity=0x{:X}, phys_off=0x{:X})",
+            handler_addr, handler_identity_addr, phys_off
+        );
 
         // 4. SFMASK
         wrmsr(IA32_FMASK, SFMASK_VALUE);
@@ -4075,6 +4545,46 @@ pub fn init() {
     crate::serial_println!("[OK] SYSCALL/SYSRET fully configured (43 registered)");
     crate::serial_println!("[J79] Unified POSIX FD routing: Tty/File/Socket/Pipe dispatch active");
     crate::serial_println!("[J8] Dynamic module execution: sys_load_module(280) live");
+}
+
+/// KPTI: Re-set LSTAR to the physical-offset mapping address of syscall_entry.
+/// Called after set_phys_mem_offset() so that the correct offset is used.
+///
+/// User ELF binaries (e.g., BusyBox at 0x400000) overwrite kernel .text in
+/// PML4[0] after CR3 switch. By pointing LSTAR to the phys-offset mapping
+/// (PML4[256], always present in every PML4), the SYSCALL handler remains
+/// reachable even when kernel .text is unmapped at its identity-mapped address.
+pub fn relocate_lstar_for_kpti() {
+    let phys_off = crate::elf::phys_offset();
+    if phys_off == 0 {
+        crate::serial_println!("[SYSCALL-KPTI] phys_offset is 0, skipping LSTAR relocation");
+        return;
+    }
+
+    let handler_identity = syscall_entry as *const () as u64;
+    let handler_high = handler_identity + phys_off;
+
+    unsafe {
+        wrmsr(IA32_LSTAR, handler_high);
+        // Also update kernel_cr3 in PER_CPU (might not have been set if init()
+        // ran before phys_offset was available)
+        let cr3: u64;
+        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
+        PER_CPU.kernel_cr3 = cr3 & !0xFFF;
+    }
+
+    crate::serial_println!(
+        "[SYSCALL-KPTI] LSTAR relocated: 0x{:016X} -> 0x{:016X} (phys_off=0x{:X})",
+        handler_identity, handler_high, phys_off
+    );
+}
+
+/// Set the user CR3 in PER_CPU data for KPTI CR3 switching.
+/// Called by execve and context switch code when changing to a user process.
+pub fn set_user_cr3(user_pml4_phys: u64) {
+    unsafe {
+        PER_CPU.user_cr3 = user_pml4_phys;
+    }
 }
 
 /// Get the top of the kernel syscall stack.
@@ -4127,6 +4637,7 @@ pub fn init_per_core_syscall(core_id: u8) {
         AP_PER_CPU[idx].user_rip = 0;
         AP_PER_CPU[idx].saved_kernel_rsp = 0;
         AP_PER_CPU[idx].user_r10 = 0;
+        AP_PER_CPU[idx].user_r9 = 0;
 
         // Set KERNEL_GS_BASE to this core's PerCpuData
         let per_cpu_addr = &AP_PER_CPU[idx] as *const PerCpuData as u64;
@@ -4188,60 +4699,146 @@ pub fn get_kernel_rsp_for_core(core_id: u8) -> u64 {
     }
 }
 
-// ===== sys_mmap(addr, len, prot) =====
-/// Simplified mmap: allocates anonymous memory pages at a fixed virtual address.
-/// Returns the virtual address of the mapped region, or ENOMEM on failure.
-/// For simplicity, we always map at MMAP_BASE (0x400000000000) + offset.
+/// Jalon 132: Set PER_CPU.user_rsp from outside syscall.rs (used by SIGSEGV parent resume)
+/// SAFETY: Must be called with interrupts disabled (inside page fault handler).
+pub unsafe fn set_per_cpu_user_rsp(rsp: u64) {
+    PER_CPU.user_rsp = rsp;
+}
+
+// ===== sys_mmap_full(addr, len, prot, flags, fd) =====
+// Linux mmap(2) with full 6-argument support:
+//   RDI = addr_hint, RSI = len, RDX = prot, R10 = flags, R8 = fd, R9 = offset
+// Supports both anonymous (MAP_ANONYMOUS) and file-backed mappings.
+// File-backed mmap is required by ld.so to map shared libraries.
+
+/// MAP_ANONYMOUS flag (Linux)
+const MAP_ANONYMOUS: u64 = 0x20;
+/// MAP_PRIVATE flag (Linux)
+const MAP_PRIVATE: u64 = 0x02;
+/// MAP_FIXED flag (Linux)
+const MAP_FIXED: u64 = 0x10;
+
 /// Atomic counter for mmap allocations (each call gets a unique region)
 static MMAP_NEXT_OFFSET: AtomicU64 = AtomicU64::new(0);
 
-fn sys_mmap(addr_hint: u64, len: u64, _prot: u64) -> u64 {
+/// Full Linux mmap(2) implementation for dynamic linker support.
+/// Handles both anonymous and file-backed mappings.
+fn sys_mmap_full(addr_hint: u64, len: u64, prot: u64, flags: u64, fd: u64) -> u64 {
     const MMAP_BASE: u64 = 0x0000_4000_0000_0000; // PML4[128]
+    let file_offset = saved_user_r9(); // 6th arg: file offset
 
-    if len == 0 || len > 64 * 1024 * 1024 {
+    if len == 0 || len > 256 * 1024 * 1024 { // Allow up to 256MB for libc
         return EINVAL;
     }
 
+    let is_anonymous = (flags & MAP_ANONYMOUS) != 0 || fd as i64 == -1;
+    let is_fixed = (flags & MAP_FIXED) != 0;
+
+    let current_pid = crate::scheduler::current_pid();
+
+    // Only log for the first few mmaps per process to avoid serial flood
+    static MMAP_LOG_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    let log_count = MMAP_LOG_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+    if log_count < 20 {
+        crate::serial_println!(
+            "[MMAP] PID={} addr=0x{:X} len={} prot=0x{:X} flags=0x{:X} fd={} offset=0x{:X} anon={}",
+            current_pid, addr_hint, len, prot, flags, fd as i64, file_offset, is_anonymous
+        );
+    }
+
     let num_pages = ((len + 4095) / 4096) as usize;
-
-    // Atomically reserve space: each mmap gets a unique address range
-    let page_offset = MMAP_NEXT_OFFSET.fetch_add(num_pages as u64, AtomicOrdering::SeqCst);
-
-    crate::serial_println!(
-        "[SYSCALL] sys_mmap(addr=0x{:X}, len={}, pages={}, offset={})",
-        addr_hint, len, num_pages, page_offset
-    );
 
     // Get current process PML4 from CR3
     let cr3: u64;
     unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)); }
     let pml4_phys = cr3 & !0xFFF;
 
-    // Map pages at unique offset from MMAP_BASE
-    let base_vaddr = MMAP_BASE + page_offset * 4096;
+    // Determine the base virtual address
+    let base_vaddr = if is_fixed && addr_hint != 0 && addr_hint >= 0x1000 {
+        // MAP_FIXED: use exactly the requested address
+        addr_hint & !0xFFF
+    } else if addr_hint != 0 && addr_hint >= 0x1000 && addr_hint < 0x0000_8000_0000_0000 {
+        // Hint address: try to use it (MAP_FIXED not set, but honor hint)
+        addr_hint & !0xFFF
+    } else {
+        // No hint or hint=NULL: allocate from MMAP_BASE
+        let page_offset = MMAP_NEXT_OFFSET.fetch_add(num_pages as u64, AtomicOrdering::SeqCst);
+        MMAP_BASE + page_offset * 4096
+    };
+
+    // Compute page table flags from prot
+    let mut page_flags: u64 = 0x01 | 0x04; // PRESENT | USER_ACCESSIBLE
+    if prot & 0x02 != 0 { // PROT_WRITE
+        page_flags |= 0x02; // WRITABLE
+    }
+    if prot & 0x04 == 0 { // !PROT_EXEC => set NX
+        page_flags |= 1u64 << 63;
+    }
+
+    // Resolve file path for file-backed mapping
+    let file_path: Option<alloc::string::String> = if !is_anonymous {
+        crate::process::with_fd_table(current_pid, |fd_table| {
+            fd_table.get(fd as usize).map(|entry| entry.path.clone())
+        }).flatten()
+    } else {
+        None
+    };
+
+    // Map pages
     for i in 0..num_pages {
         let vaddr = base_vaddr + (i as u64) * 4096;
         let frame = unsafe { crate::elf::alloc_demand_frame() };
         match frame {
             Some(paddr) => {
-                // Zero the frame
                 unsafe {
                     let phys_offset = crate::elf::phys_offset();
-                    core::ptr::write_bytes(
-                        (paddr + phys_offset) as *mut u8,
-                        0,
-                        4096
-                    );
-                    // Map with USER | WRITABLE | PRESENT | NX
-                    let flags: u64 = 0x01 | 0x02 | 0x04 | (1u64 << 63);
-                    if crate::elf::demand_map_user_page(pml4_phys, vaddr, paddr, flags).is_err() {
-                        crate::serial_println!("[SYSCALL] mmap: page mapping failed at 0x{:X}", vaddr);
+                    let page_ptr = (paddr + phys_offset) as *mut u8;
+
+                    // Zero the frame first
+                    core::ptr::write_bytes(page_ptr, 0, 4096);
+
+                    // For file-backed mappings, read file data into the page
+                    if !is_anonymous {
+                        if let Some(ref path) = file_path {
+                            let page_file_offset = file_offset + (i as u64) * 4096;
+                            let mut buf = [0u8; 4096];
+                            let bytes_read = crate::fs::vfs::file_read_at_offset(
+                                path, page_file_offset, &mut buf
+                            );
+                            if bytes_read == 0 && path.starts_with("/disk/") {
+                                // Try FAT32 direct read
+                                let disk_path = &path[6..];
+                                let _ = crate::fs::fat32::read_file_at_offset(
+                                    disk_path, page_file_offset, &mut buf
+                                );
+                            }
+                            // Also try VFS paths like /lib/...
+                            if bytes_read == 0 && (path.starts_with("/lib/") || path.starts_with("/lib64/")) {
+                                // Read from FAT32 without /disk/ prefix
+                                let fat_path = &path[1..]; // Remove leading /
+                                let _ = crate::fs::fat32::read_file_at_offset(
+                                    fat_path, page_file_offset, &mut buf
+                                );
+                            }
+                            if bytes_read > 0 || !is_anonymous {
+                                core::ptr::copy_nonoverlapping(
+                                    buf.as_ptr(), page_ptr,
+                                    core::cmp::min(bytes_read, 4096)
+                                );
+                            }
+                        }
+                    }
+
+                    if crate::elf::demand_map_user_page(pml4_phys, vaddr, paddr, page_flags).is_err() {
+                        if log_count < 20 {
+                            crate::serial_println!("[MMAP] page mapping failed at 0x{:X}", vaddr);
+                        }
                         return ENOMEM;
                     }
                 }
             }
             None => {
-                crate::serial_println!("[SYSCALL] mmap: out of frames at page {}", i);
+                crate::serial_println!("[MMAP] out of frames at page {}", i);
                 return ENOMEM;
             }
         }
@@ -6298,7 +6895,8 @@ pub fn sys_read_pub(fd: u32, buf: u64, len: u64) -> u64 {
 
 /// Public wrapper for sys_mmap, used by compat::linux_abi
 pub fn sys_mmap_pub(addr: u64, len: u64, prot: u64) -> u64 {
-    sys_mmap(addr, len, prot)
+    // Route to full mmap with anonymous flags
+    sys_mmap_full(addr, len, prot, MAP_ANONYMOUS | MAP_PRIVATE, !0u64)
 }
 
 /// Public wrapper for sys_getdents, used by compat::linux_abi

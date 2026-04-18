@@ -423,11 +423,13 @@ impl Process {
         use ProcessState::*;
         match (self.state, new_state) {
             (Ready, Running) => true,
+            (Ready, Blocked) => true,   // Jalon 132: scheduler doesn't track Running; Ready processes can block in sys_wait
             (Running, Ready) => true,
             (Running, Blocked) => true,
             (Running, Terminated) => true,
             (Blocked, Ready) => true,
-            (_, Terminated) => true,   // anything can be killed
+            (Blocked, Running) => true, // Jalon 132: wake from Blocked directly to Running
+            (_, Terminated) => true,    // anything can be killed
             _ => false,
         }
     }

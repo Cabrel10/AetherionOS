@@ -50,12 +50,17 @@ const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 /// ELF type: executable
 const ET_EXEC: u16 = 2;
+/// ELF type: shared object / PIE executable
+const ET_DYN: u16 = 3;
 /// ELF machine: x86-64
 const EM_X86_64: u16 = 62;
 
 /// Program header types
 const PT_LOAD: u32 = 1;
+const PT_INTERP: u32 = 3;
 const PT_NOTE: u32 = 4;
+const PT_PHDR: u32 = 6;
+const PT_DYNAMIC: u32 = 2;
 const PT_GNU_EH_FRAME: u32 = 0x6474e550;
 const PT_GNU_STACK: u32 = 0x6474e551;
 const PT_GNU_RELRO: u32 = 0x6474e552;
@@ -433,9 +438,9 @@ pub fn parse_header(data: &[u8]) -> Result<Elf64Ehdr, ElfError> {
         return Err(ElfError::NotLittleEndian);
     }
 
-    // Verify executable type
+    // Verify executable type (ET_EXEC or ET_DYN for PIE executables)
     let e_type = hdr.e_type;
-    if e_type != ET_EXEC {
+    if e_type != ET_EXEC && e_type != ET_DYN {
         return Err(ElfError::NotExecutable);
     }
 
@@ -504,8 +509,13 @@ pub fn set_phys_mem_offset(offset: u64) {
 
 /// Convert physical address to virtual using the offset mapping
 #[inline]
-fn phys_to_virt(phys: u64) -> u64 {
+pub fn phys_to_virt(phys: u64) -> u64 {
     phys + phys_offset()
+}
+
+/// Public wrapper for lookup_page_frame (diagnostic use)
+pub unsafe fn lookup_page_frame_pub(pml4_phys: u64, vaddr: u64) -> Option<u64> {
+    lookup_page_frame(pml4_phys, vaddr)
 }
 
 /// Create a new PML4 page table for a user process.
@@ -559,9 +569,13 @@ unsafe fn create_user_pml4() -> Result<u64, ElfError> {
         }
     }
 
+    // DIAGNOSTIC: Verify kernel mapping is intact in new PML4
+    // Kernel .text is at ~0x408560 = PML4[0], PDPT[0], PD[2]
+    let new_pml4_e0 = core::ptr::read_volatile(new_pml4_virt.add(0));
+    let has_kernel = new_pml4_e0 & 0x01 != 0;
     crate::serial_println!(
-        "[ELF] User PML4 created: phys=0x{:X} ({} kernel entries cloned, PML4[1] shared)",
-        new_pml4_phys, copied
+        "[ELF] User PML4 created: phys=0x{:X} ({} entries cloned) PML4[0]=0x{:X} kernel={}",
+        new_pml4_phys, copied, new_pml4_e0, has_kernel
     );
 
     Ok(new_pml4_phys)
@@ -571,6 +585,11 @@ unsafe fn create_user_pml4() -> Result<u64, ElfError> {
 /// Returns the physical frame address if the page is present, None otherwise.
 /// Used to detect overlapping ELF segments that share the same page.
 unsafe fn lookup_page_frame(pml4_phys: u64, vaddr: u64) -> Option<u64> {
+    // Mask for extracting the physical address from a page table entry.
+    // Bits 12-51 contain the physical address; bits 0-11 are flags;
+    // bits 52-62 are software-available; bit 63 is NX (No Execute).
+    const PTE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+
     let indices = [
         ((vaddr >> 39) & 0x1FF) as usize,
         ((vaddr >> 30) & 0x1FF) as usize,
@@ -585,13 +604,13 @@ unsafe fn lookup_page_frame(pml4_phys: u64, vaddr: u64) -> Option<u64> {
         if entry & 0x01 == 0 {
             return None;
         }
-        table_phys = entry & !0xFFF;
+        table_phys = entry & PTE_ADDR_MASK;
     }
 
     let pt_virt = phys_to_virt(table_phys) as *const u64;
     let pte = core::ptr::read_volatile(pt_virt.add(indices[3]));
     if pte & 0x01 != 0 {
-        Some(pte & !0xFFF)
+        Some(pte & PTE_ADDR_MASK)
     } else {
         None
     }
@@ -674,28 +693,20 @@ unsafe fn map_user_page(
             if !owned {
                 // NOT owned by this load — deep copy to isolate
                 let new_table = alloc_elf_frame().ok_or(ElfError::OutOfMemory)?;
-                // CRITICAL: Zero the new table first, then selectively
-                // copy only non-user entries (kernel entries).
-                // User entries from previous processes must NOT be copied.
+                // Deep copy the ENTIRE table to preserve all mappings
+                // (kernel entries AND existing user entries from fork).
+                // The new process's user pages will overwrite the old ones
+                // as the ELF segments are mapped. Stale entries from the
+                // forked parent are harmless since they'll be overwritten or
+                // freed when this process exits.
+                //
+                // PREVIOUS BUG: We were only copying entries outside the ELF pool,
+                // which dropped kernel intermediate tables that had been deep-copied
+                // during fork (and thus lived in the ELF pool). This caused a triple
+                // fault on CR3 switch because kernel .text was unmapped.
                 let src_virt = phys_to_virt(existing_phys) as *const u64;
                 let dst_virt = phys_to_virt(new_table) as *mut u64;
-                // Zero the whole table
-                core::ptr::write_bytes(dst_virt as *mut u8, 0, PAGE_SIZE as usize);
-                // Only copy kernel-owned entries (those NOT from ELF pool)
-                let pool_base = ELF_POOL.base_frame;
-                let pool_end = pool_base + (ELF_POOL.max_frames as u64) * PAGE_SIZE;
-                for idx in 0..512usize {
-                    let e = core::ptr::read_volatile(src_virt.add(idx));
-                    if e & 0x01 != 0 {
-                        let phys = e & !0xFFF;
-                        // Only copy if it points OUTSIDE the ELF pool (kernel-owned)
-                        if phys < pool_base || phys >= pool_end {
-                            core::ptr::write_volatile(dst_virt.add(idx), e);
-                        }
-                        // ELF pool entries from previous loads are DROPPED
-                        // — they will be recreated for this process
-                    }
-                }
+                core::ptr::copy_nonoverlapping(src_virt, dst_virt, 512);
                 let new_entry = new_table | (entry & 0xFFF) | 0x07; // P|W|U
                 core::ptr::write_volatile(table_virt.add(indices[level]), new_entry);
                 if OWNED_COUNT < OWNED_TABLES.len() {
@@ -729,6 +740,30 @@ pub struct ElfLoadResult {
     /// Jalon 105: True if this ELF binary was detected as a Linux binary
     /// (via EI_OSABI, PT_INTERP, or GNU PT_NOTE)
     pub is_linux_abi: bool,
+    /// Virtual address of program headers in memory (for AT_PHDR auxv).
+    /// Computed as: first_load_vaddr + e_phoff - first_load_offset.
+    pub phdr_vaddr: u64,
+    /// Number of program headers (for AT_PHNUM auxv)
+    pub phdr_count: u16,
+    /// PT_INTERP path (e.g., "/lib/ld-musl-x86_64.so.1")
+    pub interp_path: Option<alloc::string::String>,
+    /// Whether this is an ET_DYN (PIE) binary
+    pub is_pie: bool,
+}
+
+/// Result of loading ELF segments into an existing PML4 at a given base address.
+/// Used for loading the interpreter (ld.so) into the same address space as the main binary.
+pub struct InterpLoadResult {
+    /// Interpreter entry point (base + e_entry for ET_DYN)
+    pub entry_point: u64,
+    /// Base virtual address where the interpreter was loaded
+    pub base_vaddr: u64,
+    /// Number of segments loaded
+    pub segments_loaded: usize,
+    /// Virtual address of interpreter's program headers in memory
+    pub phdr_vaddr: u64,
+    /// Number of interpreter program headers
+    pub phdr_count: u16,
 }
 
 /// Load an ELF binary into a new per-process address space
@@ -748,23 +783,64 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
     let hdr = parse_header(elf_data)?;
     let entry = hdr.e_entry;
     let phnum = hdr.e_phnum;
+    let e_phoff = hdr.e_phoff;
+    let e_type = hdr.e_type;
+    let is_pie = e_type == ET_DYN;
 
     // Jalon 105: Detect Linux ABI for Linuxulator compatibility
     let is_linux_abi = crate::compat::linux_abi::detect_linux_elf(elf_data);
 
     crate::serial_println!(
-        "[ELF] Header OK: entry=0x{:X}, phnum={}, abi={}",
-        entry, phnum, if is_linux_abi { "Linux" } else { "AetherionOS" }
+        "[ELF] Header OK: entry=0x{:X}, phnum={}, type={}, abi={}",
+        entry, phnum, if is_pie { "DYN/PIE" } else { "EXEC" },
+        if is_linux_abi { "Linux" } else { "AetherionOS" }
     );
 
     // Step 2: Parse program headers
     let phdrs = parse_program_headers(elf_data, &hdr)?;
+
+    // Step 2b: Detect PT_INTERP (dynamic linker path)
+    let mut interp_path: Option<alloc::string::String> = None;
+    for phdr in phdrs.iter() {
+        if phdr.p_type == PT_INTERP {
+            let offset = phdr.p_offset as usize;
+            let size = phdr.p_filesz as usize;
+            if offset + size <= elf_data.len() && size > 0 {
+                // Read the interpreter path (NUL-terminated string)
+                let path_bytes = &elf_data[offset..offset + size];
+                // Strip trailing NUL
+                let end = path_bytes.iter().position(|&b| b == 0).unwrap_or(size);
+                if let Ok(path_str) = core::str::from_utf8(&path_bytes[..end]) {
+                    interp_path = Some(alloc::string::String::from(path_str));
+                    crate::serial_println!(
+                        "[ELF] PT_INTERP detected: '{}'", path_str
+                    );
+                }
+            }
+        }
+    }
+
+    // Step 2c: For PIE (ET_DYN) binaries, compute base address offset.
+    // PIE binaries have segments starting at vaddr 0; we load them at a fixed base
+    // to avoid conflicts with the interpreter (which we load at a higher address).
+    let pie_base: u64 = if is_pie {
+        // Load PIE main binary at 0x0040_0000 (typical Linux default for PIE ASLR off)
+        0x0040_0000u64
+    } else {
+        0 // ET_EXEC: use the vaddr from the ELF as-is
+    };
 
     // Step 3: Create per-process PML4
     let pml4_phys = unsafe { create_user_pml4()? };
 
     // Step 4: Map PT_LOAD segments
     let mut segments_loaded = 0usize;
+
+    // Track the first PT_LOAD segment's vaddr and file offset to compute AT_PHDR.
+    // AT_PHDR = first_load_vaddr + e_phoff - first_load_offset
+    let mut first_load_vaddr: u64 = 0;
+    let mut first_load_offset: u64 = 0;
+    let mut found_first_load = false;
 
     // Track already-mapped pages to handle overlapping segments (e.g., .rodata + .got
     // sharing the same 4K page). Max 256 unique pages per ELF (~1 MiB of mapped code/data).
@@ -788,7 +864,8 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
             continue;
         }
 
-        let vaddr = phdr.p_vaddr;
+        let raw_vaddr = phdr.p_vaddr;
+        let vaddr = raw_vaddr + pie_base; // Apply PIE base offset for ET_DYN
         let memsz = phdr.p_memsz;
         let filesz = phdr.p_filesz;
         let offset = phdr.p_offset;
@@ -809,6 +886,13 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
                 i, vaddr
             );
             return Err(ElfError::AddressOutOfRange);
+        }
+
+        // Track first PT_LOAD segment for AT_PHDR computation
+        if !found_first_load {
+            first_load_vaddr = vaddr;
+            first_load_offset = offset;
+            found_first_load = true;
         }
 
         let page_flags = elf_flags_to_page_flags(p_flags);
@@ -964,13 +1048,18 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
         let frame_phys = top_stack_frame_phys;
         if frame_phys == 0 {
             crate::serial_println!("[ELF] WARNING: Cannot find stack top page for AuxV injection");
+            let computed_phdr_vaddr = if found_first_load { first_load_vaddr + e_phoff - first_load_offset } else { 0 };
             return Ok(ElfLoadResult {
-                entry_point: entry,
+                entry_point: entry + pie_base,
                 stack_pointer: USER_STACK_INITIAL_RSP,
                 pml4_phys,
                 segments_loaded,
                 frames_used: frames_after - frames_before,
                 is_linux_abi,
+                phdr_vaddr: computed_phdr_vaddr,
+                phdr_count: phnum,
+                interp_path: interp_path.clone(),
+                is_pie,
             });
         }
 
@@ -1010,10 +1099,19 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
         // We use offset 0xE00 as the base for our stack data (plenty of room)
         // Each entry is 8 bytes (u64). We build bottom-up then set RSP.
 
+        // Jalon 133: Compute correct AT_PHDR from first PT_LOAD segment.
+        // AT_PHDR = first_load_vaddr + e_phoff - first_load_offset
+        // This gives the virtual address where program headers are mapped in memory.
+        let computed_phdr_vaddr = if found_first_load {
+            first_load_vaddr + e_phoff - first_load_offset
+        } else {
+            entry & !0xFFF  // fallback
+        };
+
         // Compute AuxV entries
         let auxv: [(u64, u64); 14] = [
             (AT_PAGESZ,  4096),
-            (AT_PHDR,    entry & !0xFFF),       // Approximate: base of first segment
+            (AT_PHDR,    computed_phdr_vaddr),   // Correct phdr address in memory
             (AT_PHENT,   56),                    // sizeof(Elf64_Phdr)
             (AT_PHNUM,   phdrs.len() as u64),
             (AT_ENTRY,   entry),
@@ -1071,28 +1169,204 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
         write_u64(pos, 0);
 
         crate::serial_println!(
-            "[ELF] Linux ABI: AuxV injected, RSP=0x{:X}, argc=1, AT_RANDOM=0x{:X}",
-            rsp_vaddr, random_vaddr
+            "[ELF] Linux ABI: AuxV injected, RSP=0x{:X}, argc=1, AT_PHDR=0x{:X}, AT_RANDOM=0x{:X}",
+            rsp_vaddr, computed_phdr_vaddr, random_vaddr
         );
 
         rsp_vaddr
     };
 
+    // Apply PIE base to entry point
+    let final_entry = entry + pie_base;
+
     crate::serial_println!(
-        "[ELF] Load complete: entry=0x{:X}, stack_rsp=0x{:X}, segments={}, frames={}",
-        entry,
+        "[ELF] Load complete: entry=0x{:X}, stack_rsp=0x{:X}, segments={}, frames={}, pie_base=0x{:X}",
+        final_entry,
         linux_rsp,
         segments_loaded,
-        frames_after - frames_before
+        frames_after - frames_before,
+        pie_base
     );
 
+    let final_phdr_vaddr = if found_first_load { first_load_vaddr + e_phoff - first_load_offset } else { 0 };
+
+    if interp_path.is_some() {
+        crate::serial_println!(
+            "[ELF] Dynamic binary: interp='{}', AT_PHDR=0x{:X}, AT_ENTRY=0x{:X}",
+            interp_path.as_ref().unwrap(), final_phdr_vaddr, final_entry
+        );
+    }
+
     Ok(ElfLoadResult {
-        entry_point: entry,
+        entry_point: final_entry,
         stack_pointer: linux_rsp,
         pml4_phys,
         segments_loaded,
         frames_used: frames_after - frames_before,
         is_linux_abi,
+        phdr_vaddr: final_phdr_vaddr,
+        phdr_count: phnum,
+        interp_path,
+        is_pie,
+    })
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Jalon 134: Load interpreter (ld.so) into existing PML4
+// ═══════════════════════════════════════════════════════════════
+
+/// Load an ET_DYN ELF (interpreter/ld.so) into an existing process PML4
+/// at a given base virtual address.
+///
+/// This is called after load_elf_binary() has loaded the main executable.
+/// The interpreter is mapped at `base_vaddr` (e.g., 0x7FC0_0000_0000) to
+/// avoid conflicts with the main binary's address range.
+///
+/// Returns the interpreter's adjusted entry point and metadata.
+pub fn load_interp_into_pml4(
+    interp_data: &[u8],
+    pml4_phys: u64,
+    base_vaddr: u64,
+) -> Result<InterpLoadResult, ElfError> {
+    // Parse interpreter ELF header
+    let hdr = parse_header(interp_data)?;
+    let e_entry = hdr.e_entry;
+    let e_phoff = hdr.e_phoff;
+    let phnum = hdr.e_phnum;
+
+    crate::serial_println!(
+        "[INTERP] Loading interpreter: e_entry=0x{:X}, phnum={}, base=0x{:X}",
+        e_entry, phnum, base_vaddr
+    );
+
+    let phdrs = parse_program_headers(interp_data, &hdr)?;
+
+    let mut segments_loaded = 0usize;
+    let mut first_load_vaddr: u64 = 0;
+    let mut first_load_offset: u64 = 0;
+    let mut found_first_load = false;
+
+    let mut mapped_pages: [(u64, u64); 512] = [(0, 0); 512];
+    let mut mapped_page_count: usize = 0;
+
+    for (i, phdr) in phdrs.iter().enumerate() {
+        if phdr.p_type != PT_LOAD {
+            continue;
+        }
+
+        let raw_vaddr = phdr.p_vaddr;
+        let vaddr = raw_vaddr + base_vaddr; // Relocate to base
+        let memsz = phdr.p_memsz;
+        let filesz = phdr.p_filesz;
+        let offset = phdr.p_offset;
+        let p_flags = phdr.p_flags;
+
+        if offset + filesz > interp_data.len() as u64 {
+            crate::serial_println!("[INTERP] ERROR: Segment {} exceeds file bounds", i);
+            return Err(ElfError::InvalidSegment);
+        }
+
+        if vaddr >= USER_ADDR_LIMIT || vaddr + memsz > USER_ADDR_LIMIT {
+            crate::serial_println!("[INTERP] ERROR: Segment {} vaddr 0x{:X} out of range", i, vaddr);
+            return Err(ElfError::AddressOutOfRange);
+        }
+
+        if !found_first_load {
+            first_load_vaddr = vaddr;
+            first_load_offset = offset;
+            found_first_load = true;
+        }
+
+        let page_flags = elf_flags_to_page_flags(p_flags);
+        let page_start = vaddr & !0xFFF;
+        let page_end = (vaddr + memsz + 0xFFF) & !0xFFF;
+        let num_pages = ((page_end - page_start) / PAGE_SIZE) as usize;
+
+        crate::serial_println!(
+            "[INTERP] Segment {}: vaddr=0x{:X}, memsz=0x{:X}, filesz=0x{:X}, pages={}",
+            i, vaddr, memsz, filesz, num_pages
+        );
+
+        for page_idx in 0..num_pages {
+            let page_vaddr = page_start + (page_idx as u64) * PAGE_SIZE;
+
+            // Check if page already mapped by a previous segment
+            let mut existing_frame: Option<u64> = None;
+            for k in 0..mapped_page_count {
+                if mapped_pages[k].0 == page_vaddr {
+                    existing_frame = Some(mapped_pages[k].1);
+                    break;
+                }
+            }
+
+            let frame_phys = if let Some(f) = existing_frame {
+                f
+            } else {
+                let new_frame = unsafe { alloc_elf_frame().ok_or(ElfError::OutOfMemory)? };
+                unsafe {
+                    core::ptr::write_bytes(
+                        phys_to_virt(new_frame) as *mut u8,
+                        0,
+                        PAGE_SIZE as usize,
+                    );
+                }
+                if mapped_page_count < mapped_pages.len() {
+                    mapped_pages[mapped_page_count] = (page_vaddr, new_frame);
+                    mapped_page_count += 1;
+                }
+                new_frame
+            };
+
+            // Copy file data
+            {
+                let seg_start = vaddr;
+                let seg_end = vaddr + filesz;
+                let page_start_va = page_vaddr;
+                let page_end_va = page_vaddr + PAGE_SIZE;
+                let copy_start = core::cmp::max(seg_start, page_start_va);
+                let copy_end = core::cmp::min(seg_end, page_end_va);
+
+                if copy_start < copy_end {
+                    let copy_len = (copy_end - copy_start) as usize;
+                    let file_off = offset + (copy_start - seg_start);
+                    let dest_offset = (copy_start - page_start_va) as usize;
+
+                    if copy_len > 0 && (file_off as usize + copy_len) <= interp_data.len() {
+                        unsafe {
+                            let dst = (phys_to_virt(frame_phys) as *mut u8).add(dest_offset);
+                            let src = interp_data.as_ptr().add(file_off as usize);
+                            core::ptr::copy_nonoverlapping(src, dst, copy_len);
+                        }
+                    }
+                }
+            }
+
+            unsafe {
+                map_user_page(pml4_phys, page_vaddr, frame_phys, page_flags)?;
+            }
+        }
+
+        segments_loaded += 1;
+    }
+
+    let interp_entry = e_entry + base_vaddr;
+    let interp_phdr_vaddr = if found_first_load {
+        first_load_vaddr + e_phoff - first_load_offset
+    } else {
+        0
+    };
+
+    crate::serial_println!(
+        "[INTERP] Loaded: entry=0x{:X}, base=0x{:X}, segments={}, phdr=0x{:X}",
+        interp_entry, base_vaddr, segments_loaded, interp_phdr_vaddr
+    );
+
+    Ok(InterpLoadResult {
+        entry_point: interp_entry,
+        base_vaddr,
+        segments_loaded,
+        phdr_vaddr: interp_phdr_vaddr,
+        phdr_count: phnum,
     })
 }
 
@@ -1118,16 +1392,30 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
 ///   [argc]                <- RSP points here
 ///
 /// SAFETY: pml4_phys must be a valid PML4 with the top stack page mapped.
+///
+/// Parameters:
+///   - main_entry: the main binary's entry point (for AT_ENTRY)
+///   - interp_base: base address where the interpreter was loaded (for AT_BASE), 0 if static
+///   - phdr_vaddr: virtual address of the MAIN binary's program headers (for AT_PHDR)
+///   - phdr_count: number of MAIN binary's program headers (for AT_PHNUM)
 pub unsafe fn build_sysv_stack(
     pml4_phys: u64,
     argv: &[alloc::string::String],
     envp: &[alloc::string::String],
-    entry_point: u64,
+    main_entry: u64,
+    interp_base: u64,
+    phdr_vaddr: u64,
+    phdr_count: u16,
 ) -> Option<u64> {
     // Find the physical frame backing the top stack page
     let top_stack_page_vaddr = USER_STACK_TOP - PAGE_SIZE; // 0x7FFF_FFFF_E000
     let frame_phys = lookup_page_frame(pml4_phys, top_stack_page_vaddr)?;
-    let page_base = phys_to_virt(frame_phys) as *mut u8;
+    let virt_addr = phys_to_virt(frame_phys);
+    crate::serial_println!(
+        "[ELF] build_sysv_stack: pml4=0x{:X}, stack_page=0x{:X}, frame=0x{:X}, virt=0x{:X}",
+        pml4_phys, top_stack_page_vaddr, frame_phys, virt_addr
+    );
+    let page_base = virt_addr as *mut u8;
 
     // We have 4096 bytes in this page. Layout:
     // Offsets 0xC00..0xFFF: string area + random bytes (1024 bytes for strings)
@@ -1179,13 +1467,17 @@ pub unsafe fn build_sysv_stack(
     }
 
     // --- Phase 3: Build pointer/auxv area growing DOWN from offset 0xBF8 ---
+    // Jalon 134: Use correct AT_PHDR (main binary's phdr), AT_ENTRY (main entry),
+    // and AT_BASE (interpreter base, 0 for static binaries).
+    let actual_phdr = if phdr_vaddr != 0 { phdr_vaddr } else { main_entry & !0xFFF };
+    let actual_phnum = if phdr_count > 0 { phdr_count as u64 } else { 4 };
     let auxv: [(u64, u64); 14] = [
         (AT_PAGESZ,  4096),
-        (AT_PHDR,    entry_point & !0xFFF),
+        (AT_PHDR,    actual_phdr),              // Main binary's program headers in memory
         (AT_PHENT,   56),
-        (AT_PHNUM,   4),    // Approximate
-        (AT_ENTRY,   entry_point),
-        (AT_BASE,    0),
+        (AT_PHNUM,   actual_phnum),             // Main binary's program header count
+        (AT_ENTRY,   main_entry),               // Main binary's entry point (ld.so uses this)
+        (AT_BASE,    interp_base),              // Interpreter base address (0 for static)
         (AT_FLAGS,   0),
         (AT_UID,     0),
         (AT_EUID,    0),
@@ -1247,8 +1539,8 @@ pub unsafe fn build_sysv_stack(
     write_u64(pos, 0);
 
     crate::serial_println!(
-        "[ELF] Jalon 127: System V stack built: argc={}, envc={}, RSP=0x{:X}",
-        argv_vaddrs.len(), envp_vaddrs.len(), rsp_vaddr
+        "[ELF] Jalon 127: System V stack built: argc={}, envc={}, RSP=0x{:X}, AT_PHDR=0x{:X}, AT_PHNUM={}",
+        argv_vaddrs.len(), envp_vaddrs.len(), rsp_vaddr, actual_phdr, actual_phnum
     );
 
     Some(rsp_vaddr)
@@ -1323,12 +1615,127 @@ pub fn load_elf(path: &str) -> Result<u64, ElfError> {
 ///
 /// SAFETY: The page tables must be loaded (CR3) before calling this.
 /// The entry_point and stack_pointer must be mapped in the user address space.
+/// Trampoline for execve: switches CR3 and jumps to Ring 3.
+///
+/// This function MUST be called via its physical-offset mapping address
+/// (0xFFFF800000000000 + phys_addr) because the new PML4 may not have
+/// kernel .text mapped at its identity-mapped address (PML4[0] may be
+/// overwritten by user ELF segments like BusyBox at 0x400000).
+///
+/// Register convention (all passed in):
+///   r8  = new PML4 physical address (for CR3)
+///   r9  = user RSP (stack pointer for iretq)
+///   r10 = user RIP (entry point for iretq)
+///
+/// This function never returns.
+#[naked]
+pub unsafe extern "C" fn exec_trampoline() -> ! {
+    core::arch::asm!(
+        // The caller has already:
+        //   - Disabled interrupts (cli)
+        //   - Relocated RSP to the physical-offset mapping
+        // Register convention:
+        //   r8  = new PML4 physical address
+        //   r9  = user RSP
+        //   r10 = user RIP
+
+        // Switch to new address space
+        "mov cr3, r8",
+
+        // Swap GS: kernel GS -> user GS
+        "swapgs",
+
+        // Zero all GPRs to prevent kernel state leaks
+        "xor rax, rax",
+        "xor rbx, rbx",
+        "xor rcx, rcx",
+        "xor rdx, rdx",
+        "xor rsi, rsi",
+        "xor rdi, rdi",
+        "xor rbp, rbp",
+        "xor r8, r8",
+        "xor r11, r11",
+        "xor r12, r12",
+        "xor r13, r13",
+        "xor r14, r14",
+        "xor r15, r15",
+        // Build IRETQ frame
+        "push 0x1B",     // SS  = User Data (RPL=3)
+        "push r9",       // RSP = user stack
+        "push 0x202",    // RFLAGS (IF=1)
+        "push 0x23",     // CS  = User Code (RPL=3)
+        "push r10",      // RIP = entry point
+        "iretq",
+        options(noreturn),
+    );
+}
+
+/// Execute a CR3 switch + jump to Ring 3 safely, even when the new PML4
+/// has user ELF segments that overlap kernel .text (e.g., BusyBox at 0x400000).
+///
+/// Strategy: We call exec_trampoline via its physical-offset mapping address.
+/// PML4[256] (physical memory offset at 0xFFFF800000000000) is present in BOTH
+/// the old and new PML4, so the trampoline code remains accessible during and
+/// after the CR3 switch.
+pub unsafe fn exec_switch_cr3_and_ring3(
+    new_pml4_phys: u64,
+    user_entry: u64,
+    user_rsp: u64,
+) -> ! {
+    // Compute the physical address of exec_trampoline
+    let trampoline_virt = exec_trampoline as *const () as u64;
+    // Convert identity-mapped VA to physical address
+    // Kernel is identity-mapped, so phys = virt for low addresses
+    let trampoline_phys = trampoline_virt; // identity mapping: phys == virt
+    // Compute the high-half virtual address via physical memory offset
+    let phys_off = phys_offset();
+    let trampoline_high = trampoline_phys + phys_off;
+
+    // Load arguments into the registers expected by the trampoline:
+    //   r8  = new CR3
+    //   r9  = user RSP
+    //   r10 = user RIP
+    // Then jump to the trampoline at its high-address mapping.
+    core::arch::asm!(
+        "cli",
+        "add rsp, {phys_off}",
+        "jmp {trampoline}",
+        phys_off = in(reg) phys_off,
+        trampoline = in(reg) trampoline_high,
+        in("r8") new_pml4_phys,
+        in("r9") user_rsp,
+        in("r10") user_entry,
+        options(noreturn),
+    );
+}
+
 #[allow(unused)]
 pub unsafe fn jump_to_ring3(entry_point: u64, stack_pointer: u64) -> ! {
-    // Jalon 109c: hardcoded GPR allocation (r9=RSP, r10=RIP)
+    // Jalon 133: Direct UART trace (no lock, no formatting) to confirm we reach here
+    core::arch::asm!(
+        "2: mov dx, 0x3FD", "in al, dx", "test al, 0x20", "jz 2b",
+        "mov dx, 0x3F8", "mov al, 0x4A", "out dx, al",  // 'J'
+        out("dx") _, out("al") _, options(nomem, nostack, preserves_flags)
+    );
+    // Jalon 109c+133: Clear all GPRs to prevent leaking kernel state to user mode.
+    // Also prevents stale register values from being misinterpreted as syscall args.
     let f_rsp = core::ptr::read_volatile(&stack_pointer);
     let f_rip = core::ptr::read_volatile(&entry_point);
     core::arch::asm!(
+        // Zero all general-purpose registers that user code might read
+        "xor rax, rax",
+        "xor rbx, rbx",
+        "xor rcx, rcx",
+        "xor rdx, rdx",
+        "xor rsi, rsi",
+        "xor rdi, rdi",
+        "xor rbp, rbp",
+        "xor r8, r8",
+        "xor r11, r11",
+        "xor r12, r12",
+        "xor r13, r13",
+        "xor r14, r14",
+        "xor r15, r15",
         // Push SS (User Data = 0x1B)
         "push 0x1B",
         // Push RSP (user stack pointer, guaranteed in r9)

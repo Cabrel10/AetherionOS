@@ -1,16 +1,20 @@
-// kernel/src/drivers/mouse.rs - PS/2 Mouse Driver (Jalon 37)
+// kernel/src/drivers/mouse.rs - PS/2 Mouse Driver (Jalon 37 + Jalon 131)
 //
 // Implements the PS/2 auxiliary device (mouse) protocol.
 // PS/2 mouse communicates via IRQ 12 using port 0x60 (data) and 0x64 (command).
 //
-// Protocol: 3-byte packets:
+// Jalon 131: Upgraded to Intellimouse protocol (4-byte packets):
 //   Byte 0: flags (Y overflow, X overflow, Y sign, X sign, always1, middle, right, left)
 //   Byte 1: X movement (signed, 9-bit with sign from byte 0)
 //   Byte 2: Y movement (signed, 9-bit with sign from byte 0)
+//   Byte 3: Z movement (scroll wheel, signed 8-bit)
+//
+// Buttons: bit 0 = Left, bit 1 = Right, bit 2 = Middle
 //
 // References:
-//   - OSDev Wiki: PS/2 Mouse
+//   - OSDev Wiki: PS/2 Mouse, Intellimouse
 //   - IBM PS/2 Technical Reference
+//   - Microsoft Intellimouse specification
 
 use core::sync::atomic::{AtomicI32, AtomicU8, AtomicBool, AtomicUsize, Ordering};
 
@@ -25,6 +29,8 @@ pub enum HidEventType {
     MouseButton = 2,
     KeyPress = 3,
     KeyRelease = 4,
+    MouseScroll = 5,    // Jalon 131: Scroll wheel event
+    MouseRightClick = 6, // Jalon 131: Right-click event
 }
 
 /// A single HID event (packed for syscall transfer)
@@ -66,13 +72,24 @@ static MOUSE_Y: AtomicI32 = AtomicI32::new(384);
 static MOUSE_BUTTONS: AtomicU8 = AtomicU8::new(0);
 static MOUSE_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
-// 3-byte packet accumulator
-static PACKET_BYTE: [AtomicU8; 3] = [
+// 4-byte packet accumulator (Intellimouse protocol)
+static PACKET_BYTE: [AtomicU8; 4] = [
+    AtomicU8::new(0),
     AtomicU8::new(0),
     AtomicU8::new(0),
     AtomicU8::new(0),
 ];
 static PACKET_IDX: AtomicU8 = AtomicU8::new(0);
+
+// Intellimouse mode flag (4-byte packets)
+static INTELLIMOUSE: AtomicBool = AtomicBool::new(false);
+
+// Scroll wheel accumulator
+static SCROLL_Y: AtomicI32 = AtomicI32::new(0);
+
+// Keyboard modifier state (Jalon 131)
+static CTRL_PRESSED: AtomicBool = AtomicBool::new(false);
+static ALT_PRESSED: AtomicBool = AtomicBool::new(false);
 
 // Lock-free event ring buffer (64 events)
 const EVENT_RING_SIZE: usize = 64;
@@ -150,9 +167,9 @@ fn mouse_read() -> u8 {
 
 // ===== Public API =====
 
-/// Initialize the PS/2 mouse
+/// Initialize the PS/2 mouse with Intellimouse extensions (Jalon 131)
 pub fn init() {
-    crate::serial_println!("[MOUSE] Initializing PS/2 mouse driver...");
+    crate::serial_println!("[MOUSE] Initializing PS/2 mouse driver (Jalon 131: Intellimouse)...");
 
     // Step 1: Enable the auxiliary (mouse) PS/2 port
     controller_cmd(0xA8); // Enable port 2
@@ -169,11 +186,31 @@ pub fn init() {
     mouse_write(0xF6);
     let _ack = mouse_read(); // ACK (0xFA)
 
-    // Step 4: Enable mouse data reporting
+    // Step 4: Intellimouse magic sequence to enable scroll wheel
+    // Send: Set Sample Rate 200, 100, 80 — this activates 4-byte Intellimouse packets
+    for &rate in &[200u8, 100, 80] {
+        mouse_write(0xF3); // Set Sample Rate command
+        let _ = mouse_read(); // ACK
+        mouse_write(rate);
+        let _ = mouse_read(); // ACK
+    }
+
+    // Step 5: Read mouse ID to verify Intellimouse mode
+    mouse_write(0xF2); // Get Device ID
+    let _ = mouse_read(); // ACK
+    let mouse_id = mouse_read();
+    if mouse_id == 3 || mouse_id == 4 {
+        INTELLIMOUSE.store(true, Ordering::SeqCst);
+        crate::serial_println!("[MOUSE] Intellimouse mode ACTIVATED (ID={}, 4-byte packets, scroll wheel)", mouse_id);
+    } else {
+        crate::serial_println!("[MOUSE] Standard mouse (ID={}, 3-byte packets, no scroll)", mouse_id);
+    }
+
+    // Step 6: Enable mouse data reporting
     mouse_write(0xF4);
     let _ack = mouse_read(); // ACK (0xFA)
 
-    // Step 5: Unmask IRQ 12 in the PIC (slave PIC, IRQ 4 on slave = bit 4)
+    // Step 7: Unmask IRQ 12 in the PIC (slave PIC, IRQ 4 on slave = bit 4)
     let mask = inb(0xA1);
     outb(0xA1, mask & !0x10); // Clear bit 4 (IRQ 12 on slave PIC)
 
@@ -183,9 +220,12 @@ pub fn init() {
 }
 
 /// Handle IRQ 12 - called from the interrupt handler
+/// Jalon 131: Supports both 3-byte (standard) and 4-byte (Intellimouse) packets
 pub fn handle_irq() {
     let byte = inb(0x60);
     let idx = PACKET_IDX.load(Ordering::Relaxed);
+    let is_intelli = INTELLIMOUSE.load(Ordering::Relaxed);
+    let packet_size: u8 = if is_intelli { 4 } else { 3 };
 
     match idx {
         0 => {
@@ -202,6 +242,16 @@ pub fn handle_irq() {
         }
         2 => {
             PACKET_BYTE[2].store(byte, Ordering::Relaxed);
+            if packet_size == 3 {
+                PACKET_IDX.store(0, Ordering::Relaxed);
+                process_packet();
+            } else {
+                PACKET_IDX.store(3, Ordering::Relaxed);
+            }
+        }
+        3 => {
+            // Intellimouse byte 3: scroll wheel (Z-axis)
+            PACKET_BYTE[3].store(byte, Ordering::Relaxed);
             PACKET_IDX.store(0, Ordering::Relaxed);
             process_packet();
         }
@@ -211,7 +261,8 @@ pub fn handle_irq() {
     }
 }
 
-/// Process a complete 3-byte mouse packet
+/// Process a complete mouse packet (3 or 4 bytes)
+/// Jalon 131: Generates separate events for movement, scroll, and button clicks
 fn process_packet() {
     let flags = PACKET_BYTE[0].load(Ordering::Relaxed);
     let raw_dx = PACKET_BYTE[1].load(Ordering::Relaxed) as i16;
@@ -232,20 +283,65 @@ fn process_packet() {
     MOUSE_X.store(new_x, Ordering::Relaxed);
     MOUSE_Y.store(new_y, Ordering::Relaxed);
 
-    // Update buttons
-    let buttons = flags & 0x07; // bits 0-2: left, right, middle
-    MOUSE_BUTTONS.store(buttons, Ordering::Relaxed);
+    // Update buttons: bit 0 = Left, bit 1 = Right, bit 2 = Middle
+    let buttons = flags & 0x07;
+    let old_buttons = MOUSE_BUTTONS.swap(buttons, Ordering::Relaxed);
 
-    // Push event to ring buffer
-    let evt = HidEvent {
-        event_type: HidEventType::MouseMove as u8,
-        buttons,
-        dx,
-        dy,
-        scancode: 0,
-        _pad: 0,
-    };
-    push_event(evt);
+    // Push movement event
+    if dx != 0 || dy != 0 {
+        push_event(HidEvent {
+            event_type: HidEventType::MouseMove as u8,
+            buttons,
+            dx,
+            dy,
+            scancode: 0,
+            _pad: 0,
+        });
+    }
+
+    // Detect button state changes and push separate button events
+    let changed = buttons ^ old_buttons;
+    if changed != 0 {
+        // Right-click detection (bit 1)
+        if changed & 0x02 != 0 && buttons & 0x02 != 0 {
+            push_event(HidEvent {
+                event_type: HidEventType::MouseRightClick as u8,
+                buttons,
+                dx: new_x as i16,  // Include position for context menu
+                dy: new_y as i16,
+                scancode: 2,       // Right button ID
+                _pad: 0,
+            });
+        }
+        // Left-click or any button change
+        push_event(HidEvent {
+            event_type: HidEventType::MouseButton as u8,
+            buttons,
+            dx: new_x as i16,
+            dy: new_y as i16,
+            scancode: changed,
+            _pad: 0,
+        });
+    }
+
+    // Intellimouse: process scroll wheel (byte 3)
+    if INTELLIMOUSE.load(Ordering::Relaxed) {
+        let raw_z = PACKET_BYTE[3].load(Ordering::Relaxed) as i8;
+        if raw_z != 0 {
+            // Update scroll accumulator
+            let old_scroll = SCROLL_Y.load(Ordering::Relaxed);
+            SCROLL_Y.store(old_scroll + raw_z as i32, Ordering::Relaxed);
+            // Push scroll event
+            push_event(HidEvent {
+                event_type: HidEventType::MouseScroll as u8,
+                buttons,
+                dx: 0,
+                dy: raw_z as i16,  // positive = scroll up, negative = scroll down
+                scancode: 0,
+                _pad: 0,
+            });
+        }
+    }
 }
 
 /// Push a keyboard event (called from keyboard IRQ handler)
@@ -290,9 +386,39 @@ pub fn get_state() -> (i32, i32, u8) {
     )
 }
 
+/// Get scroll wheel delta (and reset)
+pub fn get_scroll_delta() -> i32 {
+    SCROLL_Y.swap(0, Ordering::Relaxed)
+}
+
 /// Is the mouse driver initialized?
 pub fn is_available() -> bool {
     MOUSE_INITIALIZED.load(Ordering::Relaxed)
+}
+
+/// Is Intellimouse (scroll wheel) active?
+pub fn has_scroll_wheel() -> bool {
+    INTELLIMOUSE.load(Ordering::Relaxed)
+}
+
+// ===== Keyboard modifier state (Jalon 131) =====
+
+/// Update keyboard modifier state (called from keyboard IRQ handler)
+pub fn update_modifier(scancode: u8, is_release: bool) {
+    match scancode {
+        0x1D => CTRL_PRESSED.store(!is_release, Ordering::Relaxed),  // Left Ctrl
+        0x38 => ALT_PRESSED.store(!is_release, Ordering::Relaxed),   // Left Alt
+        _ => {}
+    }
+}
+
+/// Get keyboard modifier state: (ctrl, alt, shift)
+pub fn get_modifiers() -> (bool, bool, bool) {
+    (
+        CTRL_PRESSED.load(Ordering::Relaxed),
+        ALT_PRESSED.load(Ordering::Relaxed),
+        false, // Shift is tracked in idt.rs SHIFT_PRESSED
+    )
 }
 
 /// Run self-tests
