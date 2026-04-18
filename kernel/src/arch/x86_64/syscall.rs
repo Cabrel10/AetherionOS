@@ -516,287 +516,425 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         }
     }
 
-    match nr {
-        // ── Core POSIX file I/O (Linux x86_64 ABI) ──
-        // Reference: https://filippo.io/linux-syscall-table/
-        0  => sys_read(a1 as u32, a2, a3),          // read(fd, buf, count)
-        1  => sys_write(a1, a2, a3),                 // write(fd, buf, count)
-        2  => sys_open(a1, a2 as u32),               // open(path, flags, mode)
-        3  => sys_close(a1 as u32),                  // close(fd)
-        4  => sys_stub_stat(a1, a2),                 // stat(path, buf)    [stub]
-        5  => sys_stub_fstat(a1 as u32, a2),         // fstat(fd, buf)     [stub]
-        7  => sys_poll(a1, a2, a3),                    // poll(fds, nfds, timeout) — real impl
-        8  => sys_seek(a1 as u32, a2 as i64, a3 as u32), // lseek(fd, off, whence)
-        9  => sys_mmap_full(a1, a2, a3, a4, a5),      // mmap(addr, len, prot, flags=R10, fd=R8)
-        10 => sys_mprotect(a1, a2, a3),              // mprotect — Jalon 131 real PTE modification
-        11 => sys_stub_munmap(a1, a2),               // munmap(addr, len) [stub]
-        12 => sys_brk(a1),                           // brk(new_break)
-        13 => sys_stub_rt_sigaction(a1, a2, a3),     // rt_sigaction [stub for musl/glibc]
-        14 => sys_stub_rt_sigprocmask(a1, a2, a3),   // rt_sigprocmask [stub for musl/glibc]
-        15 => 0,                                      // rt_sigreturn [stub — handled by kernel]
-        16 => sys_ioctl(a1 as u32, a2, a3),           // ioctl — Jalon 131 real TTY/termios support
-        17 => sys_pread64(a1 as u32, a2, a3, a4),  // pread64(fd, buf, count, offset=R10)
-        18 => sys_stub_pwrite64(a1 as u32, a2, a3, a4), // pwrite64 [stub] offset=R10
-        19 => sys_stub_readv(a1 as u32, a2, a3),     // readv (real scatter-gather read)
-        20 => sys_stub_writev(a1 as u32, a2, a3),    // writev (real gather write)
-        21 => sys_stub_access(a1, a2),               // access(path, mode) [stub]
-        22 => sys_pipe(a1),                          // pipe(pipefd[2])
-        24 => sys_yield(),                           // sched_yield()
-        25 => 0,                                      // mremap [stub — return 0]
-        28 => 0,                                      // madvise [stub]
-        33 => sys_dup2(a1 as u32, a2 as u32),        // dup2(oldfd, newfd)
-        35 => sys_nanosleep(a1, a2),                  // nanosleep — Jalon 131 real TSC-based delay
-        37 => 0,                                      // alarm [stub]
-        38 => 0,                                      // setitimer [stub]
-        39 => sys_getpid(),                          // getpid()
-        41 => sys_socket(a1 as u32, a2 as u32, a3 as u32), // socket(domain, type, proto)
-        42 => sys_tcp_connect(a1 as u32, a2, a3),    // connect(fd, addr, len)
-        43 => sys_stub_accept(a1 as u32, a2, a3),    // accept [stub]
-        44 => sys_sendto(a1 as u32, a2, a3),         // sendto
-        45 => sys_recvfrom(a1 as u32, a2, a3),       // recvfrom
-        47 => sys_tcp_shutdown_syscall(a1 as u32),   // shutdown(fd, how)
-        49 => sys_bind(a1 as u32, a2 as u16),        // bind(fd, addr, len)
-        50 => sys_stub_listen(a1 as u32, a2),        // listen [stub]
-        56 => sys_clone(a1, a2, a3, a4, a5),           // clone(flags, stack, ptid, ctid, tls) — Jalon 128
-        57 => sys_fork(),                            // fork()
-        59 => sys_execve(a1, a2, a3),                   // execve(path, argv, envp) — Jalon 127
-        60 => sys_exit(a1),                          // exit(code)
-        61 => sys_wait(a1),                          // wait4(pid)
-        62 => sys_kill(a1, a2 as u32),               // kill(pid, sig)
-        63 => sys_stub_uname(a1),                    // uname(buf)
-        72 => sys_stub_fcntl(a1 as u32, a2, a3),     // fcntl [stub]
-        78 => sys_getdents(a1 as u32, a2, a3),       // getdents(fd, buf, len)
-        79 => sys_stub_getcwd(a1, a2),               // getcwd [stub]
-        83 => sys_mkdir(a1, a2),                     // mkdir(path, mode)
-        87 => sys_unlink(a1),                         // unlink(path) — rm
-        96 => sys_gettimeofday(a1, a2),              // gettimeofday — Jalon 131 real TSC-based
-        97 => sys_stub_getrlimit(a1, a2),            // getrlimit [stub]
-        102 => sys_stub_getuid(),                     // getuid [stub]
-        104 => sys_stub_getgid(),                     // getgid [stub]
-        107 => sys_stub_geteuid(),                    // geteuid [stub]
-        108 => sys_stub_getegid(),                    // getegid [stub]
-        110 => sys_getppid(),                         // getppid (Linux ABI #110)
-        131 => sys_stub_sigaltstack(a1, a2),          // sigaltstack [stub]
-        158 => sys_arch_prctl(a1, a2),                // arch_prctl — Jalon 131 real FS/GS MSR
-        186 => sys_stub_gettid(),                     // gettid [stub]
-        201 => sys_stub_time(a1),                     // time [stub]
-        202 => sys_futex(a1, a2, a3),                   // futex(uaddr, op, val) — real impl
-        204 => sys_yield(),                           // sched_getaffinity [stub → yield]
-        218 => sys_stub_set_tid_address(a1),          // set_tid_address [stub]
-        228 => sys_clock_gettime(a1, a2),             // clock_gettime — Jalon 131 real TSC-calibrated
-        231 => sys_stub_exit_group(a1),               // exit_group = exit
-        257 => sys_stub_openat(a1, a2, a3),           // openat [routed to sys_open]
-        262 => sys_stub_newfstatat(a1, a2, a3),       // newfstatat [stub]
-        220 => 0,                                      // semtimedop [stub — IPC semaphore]
-        221 => 0,                                      // fadvise64 [stub — posix_fadvise]
-        232 => sys_stub_epoll_wait(a1, a2, a3, a4),    // epoll_wait — Jalon 128
-        233 => 0,                                      // epoll_ctl [stub]
-        213 => 0,                                      // epoll_create [stub]
-        291 => 0,                                      // epoll_create1 [stub]
-        270 => 0,                                      // pselect6 [stub — synchronous I/O mux]
-        271 => 0,                                      // ppoll [stub — poll variant]
-        272 => 0,                                      // unshare [stub — namespace]
-        273 => sys_set_robust_list(a1, a2),            // set_robust_list — Jalon 131 stores ptr
-        274 => 0,                                      // get_robust_list [stub]
-        293 => sys_pipe2(a1, a2),                      // pipe2(pipefd, flags) — Jalon 131
-        302 => sys_stub_prlimit64(a1, a2, a3),        // prlimit64 [stub with generous limits]
-        318 => sys_getrandom(a1, a2, a3),             // getrandom — Jalon 131 Xorshift128+ PRNG
-        334 => 0,                                      // rseq [stub — restartable sequences]
-
-        // ── Additional Linux syscalls for musl/glibc compatibility (Jalon 131) ──
-        23  => 0,                                      // select [stub]
-        26  => 0,                                      // msync [stub]
-        27  => 0,                                      // mincore [stub]
-        29  => 0,                                      // shmget [stub]
-        30  => 0,                                      // shmat [stub]
-        31  => 0,                                      // shmctl [stub]
-        32  => sys_dup(a1 as u32),                    // dup(oldfd) — Jalon 131
-        34  => 0,                                      // pause [stub]
-        36  => 0,                                      // getitimer [stub]
-        40  => 0,                                      // sendfile [stub]
-        46  => 0,                                      // recvmsg [stub]
-        48  => 0,                                      // shutdown [stub]
-        51  => 0,                                      // getsockname [stub]
-        52  => 0,                                      // getpeername [stub]
-        53  => 0,                                      // socketpair [stub]
-        54  => sys_setsockopt(a1 as u32, a2, a3, a4, a5), // setsockopt — Jalon 131
-        55  => 0,                                      // getsockopt [stub]
-        58  => 0,                                      // vfork [stub → alias for fork]
-        73  => sys_stub_flock(a1, a2),                // flock [stub]
-        74  => 0,                                      // fsync [stub]
-        75  => 0,                                      // fdatasync [stub]
-        76  => 0,                                      // truncate [stub]
-        77  => 0,                                      // ftruncate [stub]
-        80  => 0,                                      // chdir [stub]
-        81  => 0,                                      // fchdir [stub]
-        82  => 0,                                      // rename [stub]
-        86  => 0,                                      // symlink [stub]
-        88  => sys_readlink(a1, a2, a3),                 // readlink(path, buf, bufsiz)
-        89  => 0,                                      // chmod [stub]
-        90  => 0,                                      // fchmod [stub]
-        91  => 0,                                      // chown [stub]
-        92  => 0,                                      // fchown [stub]
-        93  => 0,                                      // lchown [stub]
-        95  => 0,                                      // umask [stub → always 0022]
-        99  => 0,                                      // sysinfo [stub]
-        100 => 0,                                      // times [stub]
-        101 => 0,                                      // ptrace [stub]
-        105 => 0,                                      // setuid [stub]
-        106 => 0,                                      // setgid [stub]
-        109 => 0,                                      // setpgid [stub]
-        111 => 0,                                      // getpgrp [stub → 0]
-        112 => 0,                                      // setsid [stub]
-        113 => 0,                                      // setreuid [stub]
-        114 => 0,                                      // setregid [stub]
-        115 => 0,                                      // getgroups [stub → 0]
-        116 => 0,                                      // setgroups [stub]
-        117 => 0,                                      // setresuid [stub]
-        118 => 0,                                      // getresuid [stub]
-        119 => 0,                                      // setresgid [stub]
-        120 => 0,                                      // getresgid [stub]
-        121 => 0,                                      // getpgid [stub → 0]
-        122 => 0,                                      // setfsuid [stub]
-        123 => 0,                                      // setfsgid [stub]
-        124 => 0,                                      // getsid [stub → 0]
-        125 => 0,                                      // capget [stub]
-        126 => 0,                                      // capset [stub]
-        130 => 0,                                      // rt_sigsuspend [stub]
-        132 => 0,                                      // utime [stub]
-        137 => 0,                                      // statfs [stub]
-        138 => 0,                                      // fstatfs [stub]
-        140 => 0,                                      // getpriority [stub → 0]
-        141 => 0,                                      // setpriority [stub]
-        142 => 0,                                      // sched_setparam [stub]
-        143 => 0,                                      // sched_getparam [stub]
-        144 => 0,                                      // sched_setscheduler [stub]
-        145 => 0,                                      // sched_getscheduler [stub]
-        146 => 0,                                      // sched_get_priority_max [stub → 99]
-        147 => 0,                                      // sched_get_priority_min [stub → 0]
-        157 => 0,                                      // prctl [stub]
-        160 => 0,                                      // setrlimit [stub]
-        200 => 0,                                      // tkill [stub]
-        203 => 0,                                      // sched_setaffinity [stub]
-        204 => 0,                                      // sched_getaffinity [stub]
-        206 => 0,                                      // io_setup [stub]
-        207 => 0,                                      // io_destroy [stub]
-        217 => 0,                                      // getdents64 → route to getdents
-        222 => 0,                                      // timer_create [stub]
-        223 => 0,                                      // timer_settime [stub]
-        224 => 0,                                      // timer_gettime [stub]
-        225 => 0,                                      // timer_getoverrun [stub]
-        226 => 0,                                      // timer_delete [stub]
-        227 => sys_clock_gettime(a1, a2),             // clock_settime [redirect to gettime]
-        229 => sys_clock_gettime(0, a1),              // clock_getres [return clock resolution]
-        230 => sys_nanosleep(a1, a2),                 // clock_nanosleep [redirect]
-        234 => 0,                                      // tgkill [stub]
-        235 => 0,                                      // utimes [stub]
-        247 => 0,                                      // waitid [stub]
-        254 => 0,                                      // inotify_init [stub]
-        255 => 0,                                      // inotify_add_watch [stub]
-        256 => 0,                                      // inotify_rm_watch [stub]
-        258 => sys_mkdir(a2, a3),                     // mkdirat(dirfd, path, mode) → mkdir
-        259 => 0,                                      // mknodat [stub]
-        260 => 0,                                      // fchownat [stub]
-        261 => 0,                                      // futimesat [stub]
-        263 => sys_unlink(a2),                         // unlinkat(dirfd, path) → unlink
-        264 => 0,                                      // renameat [stub]
-        265 => 0,                                      // linkat [stub]
-        266 => 0,                                      // symlinkat [stub]
-        267 => sys_readlink(a2, a3, a4),                 // readlinkat(dirfd, path, buf, bufsiz) → readlink
-        268 => 0,                                      // fchmodat [stub]
-        269 => sys_stub_access(a2, a3),               // faccessat → access
-        280 => 0,                                      // utimensat [stub]
-        281 => 0,                                      // epoll_pwait [stub]
-        282 => 0,                                      // signalfd [stub]
-        283 => 0,                                      // timerfd_create [stub]
-        284 => 0,                                      // eventfd [stub]
-        285 => 0,                                      // fallocate [stub]
-        286 => 0,                                      // timerfd_settime [stub]
-        287 => 0,                                      // timerfd_gettime [stub]
-        288 => 0,                                      // accept4 [stub]
-        289 => 0,                                      // signalfd4 [stub]
-        290 => 0,                                      // eventfd2 [stub]
-        292 => sys_dup2(a1 as u32, a2 as u32),        // dup3(old, new, flags) → dup2
-        294 => 0,                                      // inotify_init1 [stub]
-        295 => sys_stub_readv(a1 as u32, a2, a3),     // preadv → readv
-        296 => sys_stub_writev(a1 as u32, a2, a3),    // pwritev → writev
-        297 => 0,                                      // rt_tgsigqueueinfo [stub]
-        298 => 0,                                      // perf_event_open [stub]
-        303 => 0,                                      // name_to_handle_at [stub]
-        309 => 0,                                      // getcpu [stub]
-        314 => 0,                                      // sched_setattr [stub]
-        315 => 0,                                      // sched_getattr [stub]
-        316 => 0,                                      // renameat2 [stub]
-        317 => 0,                                      // seccomp [stub]
-        319 => 0,                                      // memfd_create [stub]
-        322 => 0,                                      // execveat [stub]
-        325 => 0,                                      // mlock2 [stub]
-        326 => 0,                                      // copy_file_range [stub]
-        327 => sys_stub_readv(a1 as u32, a2, a3),     // preadv2 → readv
-        328 => sys_stub_writev(a1 as u32, a2, a3),    // pwritev2 → writev
-        332 => 0,                                      // statx [stub]
-        435 => 0,                                      // clone3 [stub — use clone instead]
-        439 => 0,                                      // faccessat2 [stub]
-
-        // ── AetherionOS custom syscalls (500+, no Linux ABI conflicts) ──
-        500 => sys_ps(),
-        502 => sys_vga_write(a1 as usize, a2 as usize, a3),
-        503 => sys_bus_consume(a1),
-        504 => sys_bus_consume_intent(a1, a2 as u32),
-        510 => sys_net_ping(a1, a2 as u16),
-        511 => sys_gethostbyname(a1),
-        512 => sys_tcp_read(a1 as u32, a2, a3),
-        513 => sys_tcp_recv_blocking(a1 as u32, a2, a3),
-        514 => sys_socket_close(a1 as u32),
-        520 => sys_fb_fill_rect(a1, a2, a3),
-        521 => sys_fb_draw_char(a1, a2),
-        522 => sys_fb_draw_string(a1, a2, a3),
-        523 => sys_fb_get_info(a1),
-        530 => sys_rdtsc(),
-        540 => sys_mmap_file(a1, a2, a3),
-        541 => sys_mmap_prefetch(a1, a2, a3),            // Jalon 91: prefetch mmap pages
-        542 => sys_mmap_file_v2(a1, a2, a3),             // Jalon 91: mmap + immediate prefetch
-        543 => sys_spawn_thread_on_core(a1 as u32, a2, a3), // Jalon 92: SMP parallel thread
-        544 => sys_parallel_matmul_dispatch(a1, a2, a3), // Jalon 92: dispatch matmul work
-        545 => sys_parallel_matmul_result(a1),           // Jalon 92: collect matmul result
-        546 => sys_cpu_count(),                           // Jalon 92: get available CPU count
-        550 => sys_getprocs(a1, a2),
-        551 => sys_sysinfo(a1),
-        560 => sys_xhci_info(a1),
-
-        // ── AetherionOS custom IPC ──
-        570 => sys_bus_publish(a1, a2 as u32, a3, a4, a5),
-
-        // ── AetherionOS module loading ──
-        580 => sys_load_module(a1, a2, a3),
-
-        // ── AetherionOS in-RAM driver code generation ──
-        581 => sys_gen_driver(a1, a2),
-
-        // ── AetherionOS HID polling (moved from Linux #11) ──
-        590 => sys_poll_hid(),
-
-        // ── Jalon 129: Cognitive Pipe stdout capture ──
-        591 => sys_capture_stdout(a1, a2),               // capture_stdout(child_pid, enable)
-        592 => sys_read_captured(a1, a2),                 // read_captured(buf, max_len)
-
-        // ── POSIX filesystem operations ──
-        84  => sys_rmdir(a1),                        // rmdir(path)
-        85  => sys_creat(a1, a2),                    // creat(path, mode) — touch
-
-        _ => {
-            // Jalon 131: Enhanced Linuxulator warning for unimplemented syscalls
-            if nr < 600 {
-                crate::serial_write("[LINUXULATOR] WARNING: Unimplemented syscall NR=");
-                print_u64_raw(nr);
-                crate::serial_write(" from PID=");
-                print_u64_raw(current_pid);
-                crate::serial_write(" — returning ENOSYS (-38)\n");
-            }
-            ENOSYS
-        }
+    // J135-T1: Dispatch via static function table instead of giant match.
+    // The giant match produced a fragile jump table that mis-assembled under
+    // release optimisation and sent RIP into non-canonical land (#GP) or to
+    // address 0x1E (#PF). The static table below is a plain PIC-safe array
+    // of fn pointers living in .rodata; the lookup is a single bounds-check
+    // + indexed load + indirect-call. No jump table is generated.
+    if nr >= SYSCALL_TABLE_LEN as u64 {
+        return dispatch_unknown(nr, current_pid);
+    }
+    let handler_opt = SYSCALL_TABLE[nr as usize];
+    // J135-T1 probe: emit syscall number + handler presence to COM1 for tracing
+    #[cfg(feature = "sc_dispatch_trace")]
+    unsafe {
+        core::arch::asm!(
+            "mov dx, 0x3F8",
+            "mov al, 0x7B",  // '{'
+            "out dx, al",
+            out("dx") _, out("al") _,
+            options(nostack, preserves_flags),
+        );
+    }
+    match handler_opt {
+        Some(handler) => handler(a1, a2, a3, a4, a5),
+        None => dispatch_unknown(nr, current_pid),
     }
 }
+
+/// Handle an unmapped syscall number with a consistent ENOSYS return value.
+#[inline(never)]
+fn dispatch_unknown(nr: u64, current_pid: u64) -> u64 {
+    if nr < 600 {
+        crate::serial_write("[LINUXULATOR] WARNING: Unimplemented syscall NR=");
+        print_u64_raw(nr);
+        crate::serial_write(" from PID=");
+        print_u64_raw(current_pid);
+        crate::serial_write(" — returning ENOSYS (-38)\n");
+    }
+    ENOSYS
+}
+
+// ===== J135-T1: Static syscall function table =====
+//
+// Every handler below is a thin wrapper that takes (a1..a5) and returns u64.
+// All wrappers are `extern "Rust"` fn pointers stored in a `const` array of
+// size SYSCALL_TABLE_LEN. `None` slots mean "unimplemented → ENOSYS".
+// Numbering follows the original match arms exactly.
+
+type SyscallFn = fn(u64, u64, u64, u64, u64) -> u64;
+
+const SYSCALL_TABLE_LEN: usize = 640;
+
+// ---- POSIX/Linux syscalls (nr 0-439) ----
+fn sc_read(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_read(a1 as u32, a2, a3) }
+fn sc_write(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_write(a1, a2, a3) }
+fn sc_open(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_open(a1, a2 as u32) }
+fn sc_close(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_close(a1 as u32) }
+fn sc_stat(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_stat(a1, a2) }
+fn sc_fstat(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_fstat(a1 as u32, a2) }
+fn sc_poll(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_poll(a1, a2, a3) }
+fn sc_seek(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_seek(a1 as u32, a2 as i64, a3 as u32) }
+fn sc_mmap(a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 { sys_mmap_full(a1, a2, a3, a4, a5) }
+fn sc_mprotect(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_mprotect(a1, a2, a3) }
+fn sc_munmap(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_munmap(a1, a2) }
+fn sc_brk(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_brk(a1) }
+fn sc_rt_sigaction(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_rt_sigaction(a1, a2, a3) }
+fn sc_rt_sigprocmask(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_rt_sigprocmask(a1, a2, a3) }
+fn sc_zero(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { 0 }
+fn sc_ioctl(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_ioctl(a1 as u32, a2, a3) }
+fn sc_pread64(a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> u64 { sys_pread64(a1 as u32, a2, a3, a4) }
+fn sc_pwrite64(a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> u64 { sys_stub_pwrite64(a1 as u32, a2, a3, a4) }
+fn sc_readv(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_readv(a1 as u32, a2, a3) }
+fn sc_writev(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_writev(a1 as u32, a2, a3) }
+fn sc_access(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_access(a1, a2) }
+fn sc_pipe(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_pipe(a1) }
+fn sc_yield_(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_yield() }
+fn sc_dup(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_dup(a1 as u32) }
+fn sc_dup2(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_dup2(a1 as u32, a2 as u32) }
+fn sc_nanosleep(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_nanosleep(a1, a2) }
+fn sc_getpid(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_getpid() }
+fn sc_socket(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_socket(a1 as u32, a2 as u32, a3 as u32) }
+fn sc_connect(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_tcp_connect(a1 as u32, a2, a3) }
+fn sc_accept(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_accept(a1 as u32, a2, a3) }
+fn sc_sendto(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_sendto(a1 as u32, a2, a3) }
+fn sc_recvfrom(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_recvfrom(a1 as u32, a2, a3) }
+fn sc_setsockopt(a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 { sys_setsockopt(a1 as u32, a2, a3, a4, a5) }
+fn sc_shutdown(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_tcp_shutdown_syscall(a1 as u32) }
+fn sc_bind(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_bind(a1 as u32, a2 as u16) }
+fn sc_listen(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_listen(a1 as u32, a2) }
+fn sc_clone(a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 { sys_clone(a1, a2, a3, a4, a5) }
+fn sc_fork(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_fork() }
+fn sc_execve(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_execve(a1, a2, a3) }
+fn sc_exit(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_exit(a1) }
+fn sc_wait(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_wait(a1) }
+fn sc_kill(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_kill(a1, a2 as u32) }
+fn sc_uname(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_uname(a1) }
+fn sc_fcntl(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_fcntl(a1 as u32, a2, a3) }
+fn sc_flock(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_flock(a1, a2) }
+fn sc_getdents(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_getdents(a1 as u32, a2, a3) }
+fn sc_getcwd(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_getcwd(a1, a2) }
+fn sc_rmdir(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_rmdir(a1) }
+fn sc_creat(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_creat(a1, a2) }
+fn sc_mkdir(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_mkdir(a1, a2) }
+fn sc_unlink(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_unlink(a1) }
+fn sc_readlink(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_readlink(a1, a2, a3) }
+fn sc_gettimeofday(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_gettimeofday(a1, a2) }
+fn sc_getrlimit(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_getrlimit(a1, a2) }
+fn sc_getuid(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_getuid() }
+fn sc_getgid(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_getgid() }
+fn sc_geteuid(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_geteuid() }
+fn sc_getegid(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_getegid() }
+fn sc_getppid(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_getppid() }
+fn sc_sigaltstack(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_sigaltstack(a1, a2) }
+fn sc_arch_prctl(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_arch_prctl(a1, a2) }
+fn sc_gettid(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_gettid() }
+fn sc_time(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_time(a1) }
+fn sc_futex(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_futex(a1, a2, a3) }
+fn sc_set_tid_address(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_set_tid_address(a1) }
+fn sc_clock_gettime(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_clock_gettime(a1, a2) }
+fn sc_clock_getres(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_clock_gettime(0, a1) }
+fn sc_exit_group(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_exit_group(a1) }
+fn sc_openat(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_openat(a1, a2, a3) }
+fn sc_newfstatat(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_newfstatat(a1, a2, a3) }
+fn sc_epoll_wait(a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> u64 { sys_stub_epoll_wait(a1, a2, a3, a4) }
+fn sc_set_robust_list(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_set_robust_list(a1, a2) }
+fn sc_pipe2(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_pipe2(a1, a2) }
+fn sc_prlimit64(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_prlimit64(a1, a2, a3) }
+fn sc_getrandom(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_getrandom(a1, a2, a3) }
+fn sc_mkdirat(_a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_mkdir(a2, a3) }
+fn sc_unlinkat(_a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_unlink(a2) }
+fn sc_readlinkat(_a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> u64 { sys_readlink(a2, a3, a4) }
+fn sc_faccessat(_a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_access(a2, a3) }
+
+// ---- AetherionOS custom syscalls (nr 500+) ----
+fn sc_ps(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_ps() }
+fn sc_vga_write(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_vga_write(a1 as usize, a2 as usize, a3) }
+fn sc_bus_consume(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_bus_consume(a1) }
+fn sc_bus_consume_intent(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_bus_consume_intent(a1, a2 as u32) }
+fn sc_net_ping(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_net_ping(a1, a2 as u16) }
+fn sc_gethostbyname(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_gethostbyname(a1) }
+fn sc_tcp_read(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_tcp_read(a1 as u32, a2, a3) }
+fn sc_tcp_recv_blocking(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_tcp_recv_blocking(a1 as u32, a2, a3) }
+fn sc_socket_close(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_socket_close(a1 as u32) }
+fn sc_fb_fill_rect(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_fb_fill_rect(a1, a2, a3) }
+fn sc_fb_draw_char(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_fb_draw_char(a1, a2) }
+fn sc_fb_draw_string(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_fb_draw_string(a1, a2, a3) }
+fn sc_fb_get_info(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_fb_get_info(a1) }
+fn sc_rdtsc(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_rdtsc() }
+fn sc_mmap_file(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_mmap_file(a1, a2, a3) }
+fn sc_mmap_prefetch(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_mmap_prefetch(a1, a2, a3) }
+fn sc_mmap_file_v2(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_mmap_file_v2(a1, a2, a3) }
+fn sc_spawn_thread_on_core(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_spawn_thread_on_core(a1 as u32, a2, a3) }
+fn sc_parallel_matmul_dispatch(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_parallel_matmul_dispatch(a1, a2, a3) }
+fn sc_parallel_matmul_result(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_parallel_matmul_result(a1) }
+fn sc_cpu_count(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_cpu_count() }
+fn sc_getprocs(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_getprocs(a1, a2) }
+fn sc_sysinfo(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_sysinfo(a1) }
+fn sc_xhci_info(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_xhci_info(a1) }
+fn sc_bus_publish(a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 { sys_bus_publish(a1, a2 as u32, a3, a4, a5) }
+fn sc_load_module(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_load_module(a1, a2, a3) }
+fn sc_gen_driver(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_gen_driver(a1, a2) }
+fn sc_poll_hid(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_poll_hid() }
+fn sc_capture_stdout(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_capture_stdout(a1, a2) }
+fn sc_read_captured(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_read_captured(a1, a2) }
+
+static SYSCALL_TABLE: [Option<SyscallFn>; SYSCALL_TABLE_LEN] = {
+    let mut t: [Option<SyscallFn>; SYSCALL_TABLE_LEN] = [None; SYSCALL_TABLE_LEN];
+    // Linux x86_64 ABI
+    t[0]   = Some(sc_read);
+    t[1]   = Some(sc_write);
+    t[2]   = Some(sc_open);
+    t[3]   = Some(sc_close);
+    t[4]   = Some(sc_stat);
+    t[5]   = Some(sc_fstat);
+    t[7]   = Some(sc_poll);
+    t[8]   = Some(sc_seek);
+    t[9]   = Some(sc_mmap);
+    t[10]  = Some(sc_mprotect);
+    t[11]  = Some(sc_munmap);
+    t[12]  = Some(sc_brk);
+    t[13]  = Some(sc_rt_sigaction);
+    t[14]  = Some(sc_rt_sigprocmask);
+    t[15]  = Some(sc_zero);          // rt_sigreturn
+    t[16]  = Some(sc_ioctl);
+    t[17]  = Some(sc_pread64);
+    t[18]  = Some(sc_pwrite64);
+    t[19]  = Some(sc_readv);
+    t[20]  = Some(sc_writev);
+    t[21]  = Some(sc_access);
+    t[22]  = Some(sc_pipe);
+    t[23]  = Some(sc_zero);          // select
+    t[24]  = Some(sc_yield_);
+    t[25]  = Some(sc_zero);          // mremap
+    t[26]  = Some(sc_zero);          // msync
+    t[27]  = Some(sc_zero);          // mincore
+    t[28]  = Some(sc_zero);          // madvise
+    t[29]  = Some(sc_zero);          // shmget
+    t[30]  = Some(sc_zero);          // shmat
+    t[31]  = Some(sc_zero);          // shmctl
+    t[32]  = Some(sc_dup);
+    t[33]  = Some(sc_dup2);
+    t[34]  = Some(sc_zero);          // pause
+    t[35]  = Some(sc_nanosleep);
+    t[36]  = Some(sc_zero);          // getitimer
+    t[37]  = Some(sc_zero);          // alarm
+    t[38]  = Some(sc_zero);          // setitimer
+    t[39]  = Some(sc_getpid);
+    t[40]  = Some(sc_zero);          // sendfile
+    t[41]  = Some(sc_socket);
+    t[42]  = Some(sc_connect);
+    t[43]  = Some(sc_accept);
+    t[44]  = Some(sc_sendto);
+    t[45]  = Some(sc_recvfrom);
+    t[46]  = Some(sc_zero);          // recvmsg
+    t[47]  = Some(sc_shutdown);
+    t[48]  = Some(sc_zero);          // shutdown stub
+    t[49]  = Some(sc_bind);
+    t[50]  = Some(sc_listen);
+    t[51]  = Some(sc_zero);          // getsockname
+    t[52]  = Some(sc_zero);          // getpeername
+    t[53]  = Some(sc_zero);          // socketpair
+    t[54]  = Some(sc_setsockopt);
+    t[55]  = Some(sc_zero);          // getsockopt
+    t[56]  = Some(sc_clone);
+    t[57]  = Some(sc_fork);
+    t[58]  = Some(sc_zero);          // vfork
+    t[59]  = Some(sc_execve);
+    t[60]  = Some(sc_exit);
+    t[61]  = Some(sc_wait);
+    t[62]  = Some(sc_kill);
+    t[63]  = Some(sc_uname);
+    t[72]  = Some(sc_fcntl);
+    t[73]  = Some(sc_flock);
+    t[74]  = Some(sc_zero);          // fsync
+    t[75]  = Some(sc_zero);          // fdatasync
+    t[76]  = Some(sc_zero);          // truncate
+    t[77]  = Some(sc_zero);          // ftruncate
+    t[78]  = Some(sc_getdents);
+    t[79]  = Some(sc_getcwd);
+    t[80]  = Some(sc_zero);          // chdir
+    t[81]  = Some(sc_zero);          // fchdir
+    t[82]  = Some(sc_zero);          // rename
+    t[83]  = Some(sc_mkdir);
+    t[84]  = Some(sc_rmdir);
+    t[85]  = Some(sc_creat);
+    t[86]  = Some(sc_zero);          // symlink
+    t[87]  = Some(sc_unlink);
+    t[88]  = Some(sc_readlink);
+    t[89]  = Some(sc_zero);          // chmod
+    t[90]  = Some(sc_zero);          // fchmod
+    t[91]  = Some(sc_zero);          // chown
+    t[92]  = Some(sc_zero);          // fchown
+    t[93]  = Some(sc_zero);          // lchown
+    t[95]  = Some(sc_zero);          // umask
+    t[96]  = Some(sc_gettimeofday);
+    t[97]  = Some(sc_getrlimit);
+    t[99]  = Some(sc_zero);          // sysinfo stub
+    t[100] = Some(sc_zero);          // times
+    t[101] = Some(sc_zero);          // ptrace
+    t[102] = Some(sc_getuid);
+    t[104] = Some(sc_getgid);
+    t[105] = Some(sc_zero);          // setuid
+    t[106] = Some(sc_zero);          // setgid
+    t[107] = Some(sc_geteuid);
+    t[108] = Some(sc_getegid);
+    t[109] = Some(sc_zero);          // setpgid
+    t[110] = Some(sc_getppid);
+    t[111] = Some(sc_zero);          // getpgrp
+    t[112] = Some(sc_zero);          // setsid
+    t[113] = Some(sc_zero);          // setreuid
+    t[114] = Some(sc_zero);          // setregid
+    t[115] = Some(sc_zero);          // getgroups
+    t[116] = Some(sc_zero);          // setgroups
+    t[117] = Some(sc_zero);          // setresuid
+    t[118] = Some(sc_zero);          // getresuid
+    t[119] = Some(sc_zero);          // setresgid
+    t[120] = Some(sc_zero);          // getresgid
+    t[121] = Some(sc_zero);          // getpgid
+    t[122] = Some(sc_zero);          // setfsuid
+    t[123] = Some(sc_zero);          // setfsgid
+    t[124] = Some(sc_zero);          // getsid
+    t[125] = Some(sc_zero);          // capget
+    t[126] = Some(sc_zero);          // capset
+    t[130] = Some(sc_zero);          // rt_sigsuspend
+    t[131] = Some(sc_sigaltstack);
+    t[132] = Some(sc_zero);          // utime
+    t[137] = Some(sc_zero);          // statfs
+    t[138] = Some(sc_zero);          // fstatfs
+    t[140] = Some(sc_zero);          // getpriority
+    t[141] = Some(sc_zero);          // setpriority
+    t[142] = Some(sc_zero);          // sched_setparam
+    t[143] = Some(sc_zero);          // sched_getparam
+    t[144] = Some(sc_zero);          // sched_setscheduler
+    t[145] = Some(sc_zero);          // sched_getscheduler
+    t[146] = Some(sc_zero);          // sched_get_priority_max
+    t[147] = Some(sc_zero);          // sched_get_priority_min
+    t[157] = Some(sc_zero);          // prctl
+    t[158] = Some(sc_arch_prctl);
+    t[160] = Some(sc_zero);          // setrlimit
+    t[186] = Some(sc_gettid);
+    t[200] = Some(sc_zero);          // tkill
+    t[201] = Some(sc_time);
+    t[202] = Some(sc_futex);
+    t[203] = Some(sc_zero);          // sched_setaffinity
+    t[204] = Some(sc_yield_);        // sched_getaffinity → yield
+    t[206] = Some(sc_zero);          // io_setup
+    t[207] = Some(sc_zero);          // io_destroy
+    t[213] = Some(sc_zero);          // epoll_create
+    t[217] = Some(sc_zero);          // getdents64 (legacy alias)
+    t[218] = Some(sc_set_tid_address);
+    t[220] = Some(sc_zero);          // semtimedop
+    t[221] = Some(sc_zero);          // fadvise64
+    t[222] = Some(sc_zero);          // timer_create
+    t[223] = Some(sc_zero);          // timer_settime
+    t[224] = Some(sc_zero);          // timer_gettime
+    t[225] = Some(sc_zero);          // timer_getoverrun
+    t[226] = Some(sc_zero);          // timer_delete
+    t[227] = Some(sc_clock_gettime); // clock_settime redirect
+    t[228] = Some(sc_clock_gettime);
+    t[229] = Some(sc_clock_getres);
+    t[230] = Some(sc_nanosleep);     // clock_nanosleep redirect
+    t[231] = Some(sc_exit_group);
+    t[232] = Some(sc_epoll_wait);
+    t[233] = Some(sc_zero);          // epoll_ctl
+    t[234] = Some(sc_zero);          // tgkill
+    t[235] = Some(sc_zero);          // utimes
+    t[247] = Some(sc_zero);          // waitid
+    t[254] = Some(sc_zero);          // inotify_init
+    t[255] = Some(sc_zero);          // inotify_add_watch
+    t[256] = Some(sc_zero);          // inotify_rm_watch
+    t[257] = Some(sc_openat);
+    t[258] = Some(sc_mkdirat);
+    t[259] = Some(sc_zero);          // mknodat
+    t[260] = Some(sc_zero);          // fchownat
+    t[261] = Some(sc_zero);          // futimesat
+    t[262] = Some(sc_newfstatat);
+    t[263] = Some(sc_unlinkat);
+    t[264] = Some(sc_zero);          // renameat
+    t[265] = Some(sc_zero);          // linkat
+    t[266] = Some(sc_zero);          // symlinkat
+    t[267] = Some(sc_readlinkat);
+    t[268] = Some(sc_zero);          // fchmodat
+    t[269] = Some(sc_faccessat);
+    t[270] = Some(sc_zero);          // pselect6
+    t[271] = Some(sc_zero);          // ppoll
+    t[272] = Some(sc_zero);          // unshare
+    t[273] = Some(sc_set_robust_list);
+    t[274] = Some(sc_zero);          // get_robust_list
+    t[280] = Some(sc_zero);          // utimensat
+    t[281] = Some(sc_zero);          // epoll_pwait
+    t[282] = Some(sc_zero);          // signalfd
+    t[283] = Some(sc_zero);          // timerfd_create
+    t[284] = Some(sc_zero);          // eventfd
+    t[285] = Some(sc_zero);          // fallocate
+    t[286] = Some(sc_zero);          // timerfd_settime
+    t[287] = Some(sc_zero);          // timerfd_gettime
+    t[288] = Some(sc_zero);          // accept4
+    t[289] = Some(sc_zero);          // signalfd4
+    t[290] = Some(sc_zero);          // eventfd2
+    t[291] = Some(sc_zero);          // epoll_create1
+    t[292] = Some(sc_dup2);          // dup3 → dup2
+    t[293] = Some(sc_pipe2);
+    t[294] = Some(sc_zero);          // inotify_init1
+    t[295] = Some(sc_readv);         // preadv → readv
+    t[296] = Some(sc_writev);        // pwritev → writev
+    t[297] = Some(sc_zero);          // rt_tgsigqueueinfo
+    t[298] = Some(sc_zero);          // perf_event_open
+    t[302] = Some(sc_prlimit64);
+    t[303] = Some(sc_zero);          // name_to_handle_at
+    t[309] = Some(sc_zero);          // getcpu
+    t[314] = Some(sc_zero);          // sched_setattr
+    t[315] = Some(sc_zero);          // sched_getattr
+    t[316] = Some(sc_zero);          // renameat2
+    t[317] = Some(sc_zero);          // seccomp
+    t[318] = Some(sc_getrandom);
+    t[319] = Some(sc_zero);          // memfd_create
+    t[322] = Some(sc_zero);          // execveat
+    t[325] = Some(sc_zero);          // mlock2
+    t[326] = Some(sc_zero);          // copy_file_range
+    t[327] = Some(sc_readv);         // preadv2 → readv
+    t[328] = Some(sc_writev);        // pwritev2 → writev
+    t[332] = Some(sc_zero);          // statx
+    t[334] = Some(sc_zero);          // rseq
+    t[435] = Some(sc_zero);          // clone3
+    t[439] = Some(sc_zero);          // faccessat2
+
+    // AetherionOS custom syscalls (500+)
+    t[500] = Some(sc_ps);
+    t[502] = Some(sc_vga_write);
+    t[503] = Some(sc_bus_consume);
+    t[504] = Some(sc_bus_consume_intent);
+    t[510] = Some(sc_net_ping);
+    t[511] = Some(sc_gethostbyname);
+    t[512] = Some(sc_tcp_read);
+    t[513] = Some(sc_tcp_recv_blocking);
+    t[514] = Some(sc_socket_close);
+    t[520] = Some(sc_fb_fill_rect);
+    t[521] = Some(sc_fb_draw_char);
+    t[522] = Some(sc_fb_draw_string);
+    t[523] = Some(sc_fb_get_info);
+    t[530] = Some(sc_rdtsc);
+    t[540] = Some(sc_mmap_file);
+    t[541] = Some(sc_mmap_prefetch);
+    t[542] = Some(sc_mmap_file_v2);
+    t[543] = Some(sc_spawn_thread_on_core);
+    t[544] = Some(sc_parallel_matmul_dispatch);
+    t[545] = Some(sc_parallel_matmul_result);
+    t[546] = Some(sc_cpu_count);
+    t[550] = Some(sc_getprocs);
+    t[551] = Some(sc_sysinfo);
+    t[560] = Some(sc_xhci_info);
+    t[570] = Some(sc_bus_publish);
+    t[580] = Some(sc_load_module);
+    t[581] = Some(sc_gen_driver);
+    t[590] = Some(sc_poll_hid);
+    t[591] = Some(sc_capture_stdout);
+    t[592] = Some(sc_read_captured);
+
+    t
+};
 
 // ===== Linux ABI Stub Syscalls (Jalon 93: Full Linux Compatibility Layer) =====
 // These return sensible defaults so musl/glibc-linked static binaries don't crash.
