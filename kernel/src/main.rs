@@ -1910,6 +1910,49 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 serial_write("       [INFO] No libraries found in FAT32:/lib/\n");
             }
 
+            // ═══════════════════════════════════════════════════════════
+            // Jalon 134: Musl long-name aliases
+            // FAT32 driver only decodes 8.3 short names (ld-mus~1.1 etc.),
+            // so we map them to the real names that ELF PT_INTERP expects.
+            // ═══════════════════════════════════════════════════════════
+            {
+                let mut root = crate::fs::vfs::lock_root();
+                if let Some(fs::vfs::VfsNode::Directory(ref mut lib_dir)) = root.get_mut("lib") {
+                    // Look for the short name used by mtools and alias to full name
+                    let short_candidates = [
+                        "ld-mus~1.1", "ld-mus~1", "ld-musl-x86_64.so.1",
+                    ];
+                    let mut resolved: Option<alloc::vec::Vec<u8>> = None;
+                    for cand in &short_candidates {
+                        if let Some(fs::vfs::VfsNode::File(ref data)) = lib_dir.get(*cand) {
+                            resolved = Some(data.clone());
+                            break;
+                        }
+                    }
+                    if let Some(data) = resolved {
+                        // Install every well-known alias that musl binaries/ld.so may resolve
+                        let aliases = [
+                            "ld-musl-x86_64.so.1",
+                            "libc.musl-x86_64.so.1",
+                            "libc.so",
+                            "libc.so.6",
+                        ];
+                        for alias in &aliases {
+                            lib_dir.insert(
+                                alloc::string::String::from(*alias),
+                                fs::vfs::VfsNode::File(data.clone()),
+                            );
+                        }
+                        serial_println!(
+                            "       [J134] musl aliases installed: ld-musl-x86_64.so.1 + libc.musl-x86_64.so.1 + libc.so + libc.so.6 ({} bytes)",
+                            data.len()
+                        );
+                    } else {
+                        serial_write("       [J134] WARN: No ld-musl short name found in VFS /lib\n");
+                    }
+                }
+            }
+
             // Also create /lib64 -> /lib alias (many Linux binaries look for /lib64)
             {
                 let mut root = crate::fs::vfs::lock_root();
@@ -1934,6 +1977,83 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                         lib64_dir.insert(name, fs::vfs::VfsNode::File(data));
                     }
                 }
+            }
+
+            // ═══════════════════════════════════════════════════════════
+            // Jalon 134: Dynamic ELF boot-time detection
+            // If /bin/hello_dyn.elf exists on FAT32, parse its header and
+            // report PT_INTERP. This proves the dynamic-linker plumbing
+            // is wired correctly before we try to execute it.
+            // ═══════════════════════════════════════════════════════════
+            if let Some(dyn_bin) = fs::fat32::read_file_path("bin/hello_dyn.elf") {
+                serial_println!("       [J134] /bin/hello_dyn.elf found on FAT32 ({} bytes)", dyn_bin.len());
+                // Parse ELF header to detect PT_INTERP
+                if dyn_bin.len() >= 64 && &dyn_bin[0..4] == b"\x7fELF" {
+                    let e_type = u16::from_le_bytes([dyn_bin[16], dyn_bin[17]]);
+                    let e_entry = u64::from_le_bytes([
+                        dyn_bin[24], dyn_bin[25], dyn_bin[26], dyn_bin[27],
+                        dyn_bin[28], dyn_bin[29], dyn_bin[30], dyn_bin[31],
+                    ]);
+                    let e_phoff = u64::from_le_bytes([
+                        dyn_bin[32], dyn_bin[33], dyn_bin[34], dyn_bin[35],
+                        dyn_bin[36], dyn_bin[37], dyn_bin[38], dyn_bin[39],
+                    ]);
+                    let e_phnum = u16::from_le_bytes([dyn_bin[56], dyn_bin[57]]);
+                    let e_phentsize = u16::from_le_bytes([dyn_bin[54], dyn_bin[55]]);
+                    let type_str = match e_type {
+                        2 => "ET_EXEC",
+                        3 => "ET_DYN/PIE",
+                        _ => "OTHER",
+                    };
+                    serial_println!(
+                        "       [J134] hello_dyn.elf: type={} entry=0x{:X} phoff={} phnum={}",
+                        type_str, e_entry, e_phoff, e_phnum
+                    );
+                    // Walk program headers to find PT_INTERP
+                    let base_ph = e_phoff as usize;
+                    for i in 0..(e_phnum as usize) {
+                        let ph_off = base_ph + i * e_phentsize as usize;
+                        if ph_off + 32 > dyn_bin.len() { break; }
+                        let p_type = u32::from_le_bytes([
+                            dyn_bin[ph_off], dyn_bin[ph_off + 1],
+                            dyn_bin[ph_off + 2], dyn_bin[ph_off + 3],
+                        ]);
+                        if p_type == 3 /* PT_INTERP */ {
+                            let p_offset = u64::from_le_bytes([
+                                dyn_bin[ph_off + 8],  dyn_bin[ph_off + 9],
+                                dyn_bin[ph_off + 10], dyn_bin[ph_off + 11],
+                                dyn_bin[ph_off + 12], dyn_bin[ph_off + 13],
+                                dyn_bin[ph_off + 14], dyn_bin[ph_off + 15],
+                            ]) as usize;
+                            let p_filesz = u64::from_le_bytes([
+                                dyn_bin[ph_off + 32], dyn_bin[ph_off + 33],
+                                dyn_bin[ph_off + 34], dyn_bin[ph_off + 35],
+                                dyn_bin[ph_off + 36], dyn_bin[ph_off + 37],
+                                dyn_bin[ph_off + 38], dyn_bin[ph_off + 39],
+                            ]) as usize;
+                            let end = (p_offset + p_filesz).min(dyn_bin.len());
+                            let interp_bytes = &dyn_bin[p_offset..end];
+                            let interp_str = core::str::from_utf8(interp_bytes)
+                                .unwrap_or("<invalid utf8>")
+                                .trim_end_matches('\0');
+                            serial_println!(
+                                "       [J134] PT_INTERP detected: '{}' ({} bytes)",
+                                interp_str, p_filesz
+                            );
+                        }
+                    }
+                }
+                // Also mount in VFS for sys_execve lookup
+                let mut root = crate::fs::vfs::lock_root();
+                if let Some(fs::vfs::VfsNode::Directory(ref mut bin_dir)) = root.get_mut("bin") {
+                    bin_dir.insert(
+                        alloc::string::String::from("hello_dyn.elf"),
+                        fs::vfs::VfsNode::File(dyn_bin),
+                    );
+                    serial_println!("       [J134] /bin/hello_dyn.elf mounted in VFS");
+                }
+            } else {
+                serial_write("       [J134] INFO: /bin/hello_dyn.elf not present on FAT32\n");
             }
         } else {
             serial_write("       [SKIP] No FAT32 filesystem (no VirtIO-Block disk)\n");
@@ -2578,6 +2698,105 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         }
 
         } // end if !boot_conf_loaded (hardcoded agent fallback)
+
+        // ══════════════════════════════════════════════════════════
+        // STEP B-PRE: Jalon 134 — DYNAMIC ELF BOOT TEST
+        // Spawn /bin/hello_dyn.elf which uses the musl dynamic linker
+        // (PT_INTERP=/lib/ld-musl-x86_64.so.1). This exercises the full
+        // chain: PT_INTERP detection, load_interp_into_pml4, AuxV
+        // AT_BASE/AT_ENTRY, launch at ld.so entry point.
+        // Failure here is NON-FATAL: we only log and continue.
+        // ══════════════════════════════════════════════════════════
+        {
+            let dyn_path = "/bin/hello_dyn.elf";
+            let dyn_data_opt = crate::fs::vfs::file_read(dyn_path).ok();
+            if let Some(dyn_data) = dyn_data_opt {
+                serial_println!("  [J134] Attempting to spawn {} ({} bytes)", dyn_path, dyn_data.len());
+                match elf::load_elf_binary(&dyn_data) {
+                    Ok(result) => {
+                        let mut launch_entry = result.entry_point;
+                        let mut interp_base: u64 = 0;
+
+                        // Load interpreter into same PML4 if present
+                        if let Some(ref interp_path) = result.interp_path {
+                            serial_println!("  [J134] Dynamic binary: interpreter={}", interp_path);
+                            // Resolve interpreter from VFS
+                            let interp_data_opt = crate::fs::vfs::file_read(interp_path).ok();
+                            if let Some(interp_data) = interp_data_opt {
+                                serial_println!("  [J134] Interpreter loaded from VFS ({} bytes)", interp_data.len());
+                                const INTERP_BASE: u64 = 0x7FC0_0000_0000;
+                                match elf::load_interp_into_pml4(&interp_data, result.pml4_phys, INTERP_BASE) {
+                                    Ok(interp_result) => {
+                                        launch_entry = interp_result.entry_point;
+                                        interp_base = interp_result.base_vaddr;
+                                        serial_println!(
+                                            "  [J134] Interp injected: entry=0x{:X} base=0x{:X} main_entry=0x{:X}",
+                                            launch_entry, interp_base, result.entry_point
+                                        );
+                                    }
+                                    Err(e) => {
+                                        serial_println!("  [J134] ERROR load_interp_into_pml4: {}", e);
+                                    }
+                                }
+                            } else {
+                                serial_println!("  [J134] WARN: Interpreter '{}' not found in VFS", interp_path);
+                            }
+                        } else {
+                            serial_write("  [J134] INFO: Binary has no PT_INTERP (static)\n");
+                        }
+
+                        // Build System V stack with AT_ENTRY = main entry, AT_BASE = interp base
+                        let argv: alloc::vec::Vec<alloc::string::String> = alloc::vec![
+                            alloc::string::String::from(dyn_path),
+                        ];
+                        let envp: alloc::vec::Vec<alloc::string::String> = alloc::vec![
+                            alloc::string::String::from("PATH=/bin:/usr/bin"),
+                        ];
+                        let final_rsp = unsafe {
+                            elf::build_sysv_stack(
+                                result.pml4_phys,
+                                &argv,
+                                &envp,
+                                result.entry_point,
+                                interp_base,
+                                result.phdr_vaddr,
+                                result.phdr_count,
+                            )
+                        }.unwrap_or(result.stack_pointer);
+
+                        serial_println!(
+                            "  [J134] SysV stack: RSP=0x{:X}, AT_ENTRY=0x{:X}, AT_BASE=0x{:X}, launch=0x{:X}",
+                            final_rsp, result.entry_point, interp_base, launch_entry
+                        );
+
+                        // Spawn the process
+                        match process::spawn_userspace(
+                            dyn_path, 0,
+                            launch_entry, final_rsp, result.pml4_phys,
+                        ) {
+                            Ok(dyn_pid) => {
+                                if result.is_linux_abi {
+                                    process::set_abi(dyn_pid, compat::linux_abi::Abi::Linux);
+                                }
+                                scheduler::enqueue_process(dyn_pid);
+                                serial_println!(
+                                    "  [J134] hello_dyn.elf QUEUED: PID={} launch_rip=0x{:X} rsp=0x{:X}",
+                                    dyn_pid, launch_entry, final_rsp
+                                );
+                            }
+                            Err(e) => {
+                                serial_println!("  [J134] ERROR: spawn_userspace failed: {:?}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        serial_println!("  [J134] load_elf_binary failed: {:?}", e);
+                    }
+                }
+            } else {
+                serial_write("  [J134] SKIP: /bin/hello_dyn.elf not available in VFS\n");
+            }
+        }
 
         // ──────────────────────────────────────────────────────────
         // STEP B: Load and LAUNCH agent_visual_term.elf ALWAYS (Jalon 65)

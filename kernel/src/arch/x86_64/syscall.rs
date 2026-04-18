@@ -3073,6 +3073,30 @@ fn sys_execve(path_addr: u64, argv_addr: u64, envp_addr: u64) -> u64 {
             }
         }
     }
+    // ── Priority 2b: Jalon 134 — Try FAT32 for /bin/* (dynamic binaries) ──
+    else if resolved.starts_with("/bin/") {
+        let fat_path = &resolved[1..]; // strip leading '/', keep "bin/..."
+        match crate::fs::fat32::read_file_path(fat_path) {
+            Some(data) => {
+                crate::serial_println!("[EXEC] Loaded from FAT32:/{} ({} bytes)", fat_path, data.len());
+                data
+            }
+            None => {
+                // Last-chance: try flat filename in FAT32 root
+                let bare = &resolved[5..]; // strip "/bin/"
+                match crate::fs::fat32::read_file(bare) {
+                    Some(data) => {
+                        crate::serial_println!("[EXEC] Loaded from FAT32 root (bare): {} ({} bytes)", bare, data.len());
+                        data
+                    }
+                    None => {
+                        crate::serial_println!("[EXEC] File not found: {} (VFS+FAT32)", resolved);
+                        return ENOENT;
+                    }
+                }
+            }
+        }
+    }
     // ── Priority 3: Try FAT32 root for bare names (e.g. "busybox.elf") ──
     else {
         match crate::fs::fat32::read_file(&resolved) {

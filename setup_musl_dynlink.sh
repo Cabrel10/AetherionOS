@@ -11,7 +11,7 @@ cd "$REPO_DIR"
 
 DISK=disk.img
 WORKDIR=/tmp/musl_setup
-ALPINE_URL="https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64/musl-1.2.5-r0.apk"
+ALPINE_URL="https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64/musl-1.2.5-r3.apk"
 
 echo "=== Setting up musl dynamic linker for AetherionOS ==="
 
