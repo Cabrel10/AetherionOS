@@ -344,6 +344,11 @@ extern "x86-interrupt" fn device_not_available_handler(stack_frame: InterruptSta
 
 extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame, _error_code: u64) -> ! {
     use x86_64::registers::control::Cr2;
+    // KPTI: restore kernel CR3 before any data access
+    unsafe {
+        let kcr3 = crate::arch::x86_64::syscall::get_kernel_cr3();
+        if kcr3 != 0 { core::arch::asm!("mov cr3, {}", in(reg) kcr3, options(nostack)); }
+    }
     let cr2 = Cr2::read().as_u64();
     let cr3: u64;
     unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)); }
@@ -383,6 +388,11 @@ extern "x86-interrupt" fn stack_segment_fault_handler(stack_frame: InterruptStac
 }
 
 extern "x86-interrupt" fn general_protection_fault_handler(stack_frame: InterruptStackFrame, error_code: u64) {
+    // KPTI: restore kernel CR3 before any data access
+    unsafe {
+        let kcr3 = crate::arch::x86_64::syscall::get_kernel_cr3();
+        if kcr3 != 0 { core::arch::asm!("mov cr3, {}", in(reg) kcr3, options(nostack)); }
+    }
     // Check if this is a Ring 3 fault (CS selector in stack frame has RPL=3)
     let cs = stack_frame.code_segment;
     let is_ring3 = (cs & 0x3) == 3;
@@ -770,6 +780,19 @@ extern "x86-interrupt" fn page_fault_handler(
     error_code: PageFaultErrorCode,
 ) {
     use x86_64::registers::control::Cr2;
+
+    // KPTI: Ensure we are running with kernel CR3. If a fault occurs after
+    // CR3 was switched to the user PML4 (e.g. during IRETQ), the IST handler
+    // would otherwise run with user page tables and be unable to access kernel
+    // data structures. Switch back to kernel PML4 (0x1000) immediately.
+    unsafe {
+        let cr3: u64;
+        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
+        let kernel_cr3 = crate::arch::x86_64::syscall::get_kernel_cr3();
+        if kernel_cr3 != 0 && cr3 != kernel_cr3 {
+            core::arch::asm!("mov cr3, {}", in(reg) kernel_cr3, options(nostack));
+        }
+    }
 
     let accessed_address = Cr2::read();
     let addr_raw = accessed_address.as_u64();
@@ -1255,6 +1278,17 @@ fn set_pending_switch(old_pid: u64, new_pid: u64, rip: u64, rsp: u64, pml4: u64)
 // ===== IRQ Handlers =====
 
 extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFrame) {
+    // KPTI: restore kernel CR3 — timer IRQ may fire while user PML4 is active
+    unsafe {
+        let kcr3 = crate::arch::x86_64::syscall::get_kernel_cr3();
+        if kcr3 != 0 {
+            let cr3: u64;
+            core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
+            if cr3 != kcr3 {
+                core::arch::asm!("mov cr3, {}", in(reg) kcr3, options(nostack));
+            }
+        }
+    }
     // Jalon 69: Preemptive timer tick with safe context save.
     //
     // CRITICAL FIX: Save the current process's FULL context (RIP, RSP, RFLAGS)

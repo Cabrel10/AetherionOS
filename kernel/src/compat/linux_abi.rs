@@ -2113,6 +2113,68 @@ pub const INTENT_PROCESS_OUTPUT: u32 = 0xC001;
 pub const INTENT_PROCESS_EXIT: u32 = 0xC002;
 /// Jalon 129: Intent ID for captured tool stdout (full text in IPC buffer)
 pub const INTENT_TOOL_STDOUT: u32 = 0xC010;
+/// Jalon 136 (Task 5): Intent published when a forked command produces stdout/stderr.
+/// Payload = (child_pid << 32) | (len & 0xFFFF_FFFF). Full text in CAPTURED_TEXT_BUF.
+pub const INTENT_COMMAND_OUTPUT: u32 = 0xC011;
+/// Jalon 136 (Task 6): Intent to request execution of a shell command.
+/// Payload = pointer to CMD_REQUEST_BUF (kernel-side) OR encoded command hash.
+/// The MCP agent consumes this intent, fork/execves the command, captures output,
+/// and publishes INTENT_COMMAND_OUTPUT with the result.
+pub const INTENT_RUN_COMMAND: u32 = 0xC012;
+
+// ═══════════════════════════════════════════════════════════
+// Jalon 136 (Task 6): Command Request Buffer
+// Shared static buffer for INTENT_RUN_COMMAND: the LLM agent writes the
+// command string here, then publishes INTENT_RUN_COMMAND. The MCP agent
+// reads the command via sys_read_captured_cmd, forks busybox/sh to execute,
+// and publishes INTENT_COMMAND_OUTPUT with captured stdout.
+// ═══════════════════════════════════════════════════════════
+pub static mut CMD_REQUEST_BUF: [u8; 1024] = [0u8; 1024];
+pub static mut CMD_REQUEST_LEN: usize = 0;
+pub static mut CMD_REQUEST_REQUESTER_PID: u64 = 0;
+
+/// Publish a command run request from a user-space caller.
+/// Stores the command in CMD_REQUEST_BUF and publishes INTENT_RUN_COMMAND.
+pub fn publish_run_command(requester_pid: u64, cmd_buf: u64, cmd_len: u64) -> u64 {
+    if cmd_len == 0 || cmd_len > 1024 { return u64::MAX; }
+    let n = cmd_len as usize;
+    unsafe {
+        let src = cmd_buf as *const u8;
+        for i in 0..n {
+            CMD_REQUEST_BUF[i] = core::ptr::read_volatile(src.add(i));
+        }
+        CMD_REQUEST_LEN = n;
+        CMD_REQUEST_REQUESTER_PID = requester_pid;
+    }
+    let payload = (requester_pid << 32) | (n as u64);
+    let msg = crate::ipc::IntentMessage::new(
+        crate::ipc::ComponentId::Orchestrator,
+        crate::ipc::ComponentId::Worker,
+        INTENT_RUN_COMMAND,
+        crate::ipc::Priority::High,
+        payload,
+    );
+    let _ = crate::ipc::bus::publish(msg);
+    crate::serial_println!(
+        "[CMD-REQ] PID {} requested command execution (len={})",
+        requester_pid, n
+    );
+    0
+}
+
+/// Read the pending command request into a user-space buffer.
+/// Returns the number of bytes copied, or 0 if no request pending.
+pub fn read_command_request(dest_buf: u64, dest_len: u64) -> u64 {
+    unsafe {
+        if CMD_REQUEST_LEN == 0 { return 0; }
+        let n = core::cmp::min(CMD_REQUEST_LEN, dest_len as usize);
+        let dst = dest_buf as *mut u8;
+        for i in 0..n {
+            core::ptr::write_volatile(dst.add(i), CMD_REQUEST_BUF[i]);
+        }
+        n as u64
+    }
+}
 
 // ═══════════════════════════════════════════════════════════
 // Jalon 129: Static IPC buffer for stdout capture
@@ -2140,17 +2202,30 @@ pub fn cognitive_pipe_capture(pid: u64, fd: u32, buf_addr: u64, len: u64) {
     // Only capture if len > 0 and reasonable
     if len == 0 || len > 4096 { return; }
 
-    // Write a hash of the output to the bus payload
-    // (full text is available in the process's stdout VFS node)
-    let mut hash: u64 = 0xCBF2_9CE4_8422_2325; // FNV-1a offset basis
+    // ─── Jalon 136 (Task 5): Copy real text into CAPTURED_TEXT_BUF so the
+    // MCP / LLM agents can read it via sys_read_captured, AND publish both
+    // INTENT_PROCESS_OUTPUT (legacy hash) and INTENT_COMMAND_OUTPUT (new).
+    let n = len as usize;
+    unsafe {
+        let src = buf_addr as *const u8;
+        let copy_n = core::cmp::min(n, 4096);
+        for i in 0..copy_n {
+            CAPTURED_TEXT_BUF[i] = core::ptr::read_volatile(src.add(i));
+        }
+        CAPTURED_TEXT_LEN = copy_n;
+        CAPTURED_TEXT_PID = pid;
+    }
+
+    // FNV-1a hash of the first 256 bytes for legacy consumers
+    let mut hash: u64 = 0xCBF2_9CE4_8422_2325;
     let safe_len = core::cmp::min(len, 256) as usize;
     for i in 0..safe_len {
         let b = unsafe { core::ptr::read_volatile((buf_addr + i as u64) as *const u8) };
         hash ^= b as u64;
-        hash = hash.wrapping_mul(0x0100_0000_01B3); // FNV prime
+        hash = hash.wrapping_mul(0x0100_0000_01B3);
     }
 
-    // Publish INTENT_PROCESS_OUTPUT with payload = (pid << 32) | hash_lo
+    // Legacy: INTENT_PROCESS_OUTPUT with payload = (pid << 32) | hash_lo
     let payload = (pid << 32) | (hash & 0xFFFF_FFFF);
     let msg = crate::ipc::IntentMessage::new(
         crate::ipc::ComponentId::Worker,
@@ -2160,6 +2235,21 @@ pub fn cognitive_pipe_capture(pid: u64, fd: u32, buf_addr: u64, len: u64) {
         payload,
     );
     let _ = crate::ipc::bus::publish(msg);
+
+    // Jalon 136 (Task 5): INTENT_COMMAND_OUTPUT — payload = (pid << 32) | len
+    // Consumers can call sys_read_captured to fetch the text.
+    let out_payload = (pid << 32) | (n as u64 & 0xFFFF_FFFF);
+    let out_msg = crate::ipc::IntentMessage::new(
+        crate::ipc::ComponentId::Worker,
+        crate::ipc::ComponentId::Orchestrator,
+        INTENT_COMMAND_OUTPUT,
+        crate::ipc::Priority::High,
+        out_payload,
+    );
+    let _ = crate::ipc::bus::publish(out_msg);
+
+    // fd is intentionally 1 or 2 here; stored in high 8 bits of PID for consumers
+    let _ = fd; // silence unused warning when not needed
 }
 
 /// Notify the Cognitive Bus that a process has exited.

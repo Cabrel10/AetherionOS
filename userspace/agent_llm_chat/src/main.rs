@@ -1974,6 +1974,10 @@ fn generate_response(
     let limit = core::cmp::min(cfg.gen_tokens, cfg.max_seq_len.saturating_sub(plen));
     let mut sample_rng: u64 = 0xDEAD_BEEF_CAFE_67;
 
+    // Jalon 136 (Task 6b): accumulate decoded text to scan for EXEC: tokens.
+    let mut out_accum = [0u8; 2048];
+    let mut out_len: usize = 0;
+
     for g in 0..limit {
         let pos = plen + g;
         if pos >= cfg.max_seq_len { break; }
@@ -1984,6 +1988,13 @@ fn generate_response(
         let decoded_word = decode_token(safe_tok);
         sys_write(1, decoded_word);
         publish_decoded_token(safe_tok, pos);
+        // Accumulate for EXEC: detection
+        for &b in decoded_word.iter() {
+            if out_len < out_accum.len() {
+                out_accum[out_len] = b;
+                out_len += 1;
+            }
+        }
 
         let ch = if safe_tok >= 0x20 && safe_tok <= 0x7E {
             valid += 1;
@@ -2045,8 +2056,94 @@ fn generate_response(
     println("");
 
     sys_bus_publish(INTENT_GENERATION_DONE, 2, limit as u64);
+
+    // ═══════════════════════════════════════════════════════════
+    // Jalon 136 (Task 6b): EXEC: token detection
+    // If the generated output contains `EXEC:<command>\n`, publish
+    // INTENT_RUN_COMMAND with the command and await INTENT_COMMAND_OUTPUT.
+    // ═══════════════════════════════════════════════════════════
+    scan_and_exec(&out_accum[..out_len]);
+
     println("[LLM] Streaming inference COMPLETE");
     println("========================================");
+}
+
+/// Jalon 136 (Task 6b): Scan generated text for an `EXEC:` directive,
+/// publish INTENT_RUN_COMMAND, and display the returned INTENT_COMMAND_OUTPUT.
+fn scan_and_exec(text: &[u8]) {
+    let marker = b"EXEC:";
+    // Find first occurrence of "EXEC:"
+    let mut i = 0usize;
+    let mut found: Option<usize> = None;
+    while i + marker.len() <= text.len() {
+        if &text[i..i+marker.len()] == marker {
+            found = Some(i + marker.len());
+            break;
+        }
+        i += 1;
+    }
+    let start = match found { Some(s) => s, None => return };
+
+    // Extract command until newline or end of buffer, skipping leading spaces.
+    let mut cmd_start = start;
+    while cmd_start < text.len() && (text[cmd_start] == b' ' || text[cmd_start] == b'\t') {
+        cmd_start += 1;
+    }
+    let mut cmd_end = cmd_start;
+    while cmd_end < text.len() && text[cmd_end] != b'\n' && text[cmd_end] != b'\r' {
+        cmd_end += 1;
+    }
+    if cmd_end == cmd_start {
+        sys_write(1, b"\n[LLM] EXEC: directive with empty command, ignoring\n");
+        return;
+    }
+
+    sys_write(1, b"\n[LLM] EXEC: directive detected -> ");
+    sys_write(1, &text[cmd_start..cmd_end]);
+    sys_write(1, b"\n[LLM] Publishing INTENT_RUN_COMMAND...\n");
+
+    // Publish INTENT_RUN_COMMAND via syscall 593.
+    let r = sys_run_command(&text[cmd_start..cmd_end]);
+    if r != 0 {
+        sys_write(1, b"[LLM] sys_run_command failed\n");
+        return;
+    }
+
+    // Await INTENT_COMMAND_OUTPUT — cooperative polling with 10k-yield budget.
+    const INTENT_COMMAND_OUTPUT: u32 = 0xC011;
+    let mut msg_buf = [0u64; 8];
+    let mut attempts: u32 = 0;
+    loop {
+        let r = sys_bus_consume_intent(&mut msg_buf, INTENT_COMMAND_OUTPUT);
+        if r == 0 {
+            let payload = msg_buf[2];
+            let reporter_pid = payload >> 32;
+            let len = payload & 0xFFFF_FFFF;
+            sys_write(1, b"[LLM] INTENT_COMMAND_OUTPUT received (PID=");
+            print_u64(reporter_pid);
+            sys_write(1, b", len=");
+            print_u64(len);
+            sys_write(1, b")\n");
+            // Read captured text
+            let mut out = [0u8; 4096];
+            let got = sys_read_captured(&mut out);
+            if got > 0 {
+                sys_write(1, b"[LLM] Command result:\n----\n");
+                sys_write_fd(1, &out[..got as usize]);
+                if !out[..got as usize].ends_with(b"\n") { sys_write(1, b"\n"); }
+                sys_write(1, b"----\n");
+            } else {
+                sys_write(1, b"[LLM] (no captured text)\n");
+            }
+            return;
+        }
+        attempts += 1;
+        if attempts > 10_000 {
+            sys_write(1, b"[LLM] Timed out waiting for INTENT_COMMAND_OUTPUT\n");
+            return;
+        }
+        sys_yield();
+    }
 }
 
 /// Fallback: synthetic weights for testing without a model file

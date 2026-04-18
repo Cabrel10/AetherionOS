@@ -287,49 +287,9 @@ unsafe fn read_user_string(addr: u64) -> Option<alloc::string::String> {
 // we switch CR3 back to the user PML4 (gs:[48]).
 
 #[naked]
+#[no_mangle]
 unsafe extern "C" fn syscall_entry() {
     asm!(
-        // J135: EARLIEST POSSIBLE diagnostic — write 'S' to serial COM1 (0x3F8)
-        // BEFORE doing anything else. If we see 'S' in the serial output, we
-        // have confirmation that syscall_entry was entered. If we never see
-        // 'S', the fault happens during SYSCALL delivery itself (before any
-        // kernel instruction executes), pointing at an MSR/CR3/IDT problem
-        // rather than a bug in our asm. This uses no memory accesses — only
-        // I/O port writes + R11 scratch (r11 was clobbered by SYSCALL to hold
-        // RFLAGS which we'll restore later from the saved context anyway).
-        // Safe without a valid stack.
-        //
-        // WARNING: we MUST NOT clobber:
-        //   - RAX (syscall number)
-        //   - RDI/RSI/RDX/R10/R8/R9 (syscall args 1..6)
-        //   - RCX (user RIP, saved by SYSCALL)
-        //   - R11 (user RFLAGS, saved by SYSCALL) — we restore it from the
-        //     pushed context later, so we can use it here. Actually no, R11
-        //     holds user's RFLAGS that we push later. Don't clobber. Use a
-        //     different approach: write using port-only instructions with
-        //     immediate-style data loaded into a safe register.
-        //
-        // Simplest: use AL/DX but save them via XCHG with a free register.
-        // Actually, RAX holds the syscall number which we WILL preserve by
-        // saving it later; but we need it intact for the dispatcher. So we
-        // emit the byte using AL, then restore AL from RAX... no, we have
-        // no spare register.
-        //
-        // SOLUTION: Use the port 0xE9 (QEMU debug port) — it is NOT a real
-        // serial port so it doesn't go to the file-based log, but it shows
-        // up on QEMU stdout when `-debugcon stdio` is used. Still requires
-        // AL/DX though. Let's just use `xchg rax, [<scratch>]`? No — needs
-        // memory.
-        //
-        // FINAL APPROACH: skip this diagnostic. The fault state alone gives
-        // us enough info (RIP=LSTAR, GS=0, CR2=0xC). See below for analysis.
-
-        // J134c: NOP sled BEFORE swapgs so we can see if RIP actually moves.
-        // If the fault is reported AT swapgs but really on the next instruction,
-        // we'd see RIP at entry+3 instead of entry+0.
-        "nop",
-        "nop",
-        "nop",
         // 1. Switch to kernel GS
         "swapgs",
 
@@ -470,21 +430,6 @@ fn print_hex_raw(val: u64) {
 /// syscall automatically — no fxsave/fxrstor needed in the fast path.
 #[no_mangle]
 extern "C" fn syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
-    // J134c: trace every syscall from PID 19 (Visual Terminal) to pinpoint
-    // exactly which call sequence crashes the kernel path. Only log the
-    // first 10 to avoid serial flooding.
-    let pid = crate::scheduler::current_pid();
-    if pid == 19 {
-        static FIRST_10: core::sync::atomic::AtomicU32 =
-            core::sync::atomic::AtomicU32::new(0);
-        let c = FIRST_10.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if c < 10 {
-            crate::serial_println!(
-                "[SC#{} PID19] nr={} a1=0x{:X} a2=0x{:X} a3=0x{:X} a4=0x{:X} a5=0x{:X}",
-                c, nr, a1, a2, a3, a4, a5
-            );
-        }
-    }
     syscall_dispatch(nr, a1, a2, a3, a4, a5)
 }
 
@@ -494,14 +439,7 @@ extern "C" fn syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, 
 /// get Linux-specific behavior for certain syscalls (uname, arch_prctl, etc.)
 /// Syscall numbers match Linux x86_64 ABI for POSIX compatibility.
 fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
-    // Jalon 133: Debug trace — log first 10 syscalls from each PID > 19 (external binaries)
     let current_pid = crate::scheduler::current_pid();
-    if current_pid >= 20 {
-        crate::serial_println!(
-            "[SC] PID {} nr={} a1=0x{:X} a2=0x{:X} a3=0x{:X}",
-            current_pid, nr, a1, a2, a3
-        );
-    }
     // Jalon 105: Check if this process uses Linux ABI and route to Linux-specific handlers
     if current_pid != 0 {
         let is_linux = crate::process::with_process(current_pid, |p| {
@@ -526,17 +464,6 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         return dispatch_unknown(nr, current_pid);
     }
     let handler_opt = SYSCALL_TABLE[nr as usize];
-    // J135-T1 probe: emit syscall number + handler presence to COM1 for tracing
-    #[cfg(feature = "sc_dispatch_trace")]
-    unsafe {
-        core::arch::asm!(
-            "mov dx, 0x3F8",
-            "mov al, 0x7B",  // '{'
-            "out dx, al",
-            out("dx") _, out("al") _,
-            options(nostack, preserves_flags),
-        );
-    }
     match handler_opt {
         Some(handler) => handler(a1, a2, a3, a4, a5),
         None => dispatch_unknown(nr, current_pid),
@@ -679,6 +606,14 @@ fn sc_gen_driver(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_ge
 fn sc_poll_hid(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_poll_hid() }
 fn sc_capture_stdout(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_capture_stdout(a1, a2) }
 fn sc_read_captured(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_read_captured(a1, a2) }
+// Jalon 136 (Tasks 5/6): INTENT_RUN_COMMAND / INTENT_COMMAND_OUTPUT bridge.
+fn sc_run_command(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 {
+    let pid = crate::scheduler::current_pid();
+    crate::compat::linux_abi::publish_run_command(pid, a1, a2)
+}
+fn sc_read_cmd_request(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 {
+    crate::compat::linux_abi::read_command_request(a1, a2)
+}
 
 static SYSCALL_TABLE: [Option<SyscallFn>; SYSCALL_TABLE_LEN] = {
     let mut t: [Option<SyscallFn>; SYSCALL_TABLE_LEN] = [None; SYSCALL_TABLE_LEN];
@@ -932,6 +867,9 @@ static SYSCALL_TABLE: [Option<SyscallFn>; SYSCALL_TABLE_LEN] = {
     t[590] = Some(sc_poll_hid);
     t[591] = Some(sc_capture_stdout);
     t[592] = Some(sc_read_captured);
+    // Jalon 136: Command execution bridge
+    t[593] = Some(sc_run_command);       // run_command(buf, len) -> 0 on success
+    t[594] = Some(sc_read_cmd_request);  // read_cmd_request(buf, max_len) -> bytes_copied
 
     t
 };
@@ -4809,6 +4747,13 @@ pub fn set_user_cr3(user_pml4_phys: u64) {
     }
 }
 
+/// Get the kernel CR3 (PML4 physical address) from PER_CPU data.
+/// Used by fault handlers to restore kernel page tables before accessing
+/// kernel data structures (KPTI recovery).
+pub fn get_kernel_cr3() -> u64 {
+    unsafe { PER_CPU.kernel_cr3 }
+}
+
 /// Get the top of the kernel syscall stack.
 /// Used by kernel_main to switch to a fresh stack before the initial IRETQ,
 /// since the boot stack may be nearly exhausted after the long init sequence.
@@ -6143,16 +6088,14 @@ fn sys_brk(new_break: u64) -> u64 {
     const HEAP_MAX:  u64 = 0x0000_3002_0000_0000;  // 8 GiB limit (was 256 MiB)
 
     let current = crate::scheduler::current_pid();
+    // Phase 1.3 fix: When PID=0 (scheduler not yet switched), use HEAP_BASE
+    // instead of returning 0 which causes the user allocator to segfault.
     if current == 0 {
-        return 0;
+        if new_break == 0 { return HEAP_BASE; }
+        return HEAP_BASE;
     }
 
     let old_break = crate::process::get_heap_break(current).unwrap_or(HEAP_BASE);
-
-    crate::serial_println!(
-        "[SYSCALL] sys_brk(0x{:X}) PID={} old_break=0x{:X}",
-        new_break, current, old_break
-    );
 
     // brk(0) → return current break
     if new_break == 0 {
@@ -6161,10 +6104,6 @@ fn sys_brk(new_break: u64) -> u64 {
 
     // Validate range
     if new_break < HEAP_BASE || new_break > HEAP_MAX {
-        crate::serial_println!(
-            "[SYSCALL] brk: REJECTED 0x{:X} outside [{:X}, {:X}]",
-            new_break, HEAP_BASE, HEAP_MAX
-        );
         return old_break; // refuse out-of-range
     }
 

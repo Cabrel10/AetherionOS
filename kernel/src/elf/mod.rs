@@ -1672,6 +1672,7 @@ pub fn load_elf(path: &str) -> Result<u64, ElfError> {
 ///
 /// This function never returns.
 #[naked]
+#[no_mangle]
 pub unsafe extern "C" fn exec_trampoline() -> ! {
     core::arch::asm!(
         // The caller has already:
