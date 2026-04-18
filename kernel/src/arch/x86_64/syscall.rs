@@ -565,7 +565,11 @@ fn sc_clock_getres(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys
 fn sc_exit_group(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_exit_group(a1) }
 fn sc_openat(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_openat(a1, a2, a3) }
 fn sc_newfstatat(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_newfstatat(a1, a2, a3) }
+fn sc_epoll_create(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_epoll_create1(0) }
+fn sc_epoll_create1(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_epoll_create1(a1) }
+fn sc_epoll_ctl(a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> u64 { sys_epoll_ctl(a1, a2, a3, a4) }
 fn sc_epoll_wait(a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> u64 { sys_stub_epoll_wait(a1, a2, a3, a4) }
+fn sc_epoll_pwait(a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> u64 { sys_stub_epoll_wait(a1, a2, a3, a4) }
 fn sc_set_robust_list(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_set_robust_list(a1, a2) }
 fn sc_pipe2(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_pipe2(a1, a2) }
 fn sc_prlimit64(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_prlimit64(a1, a2, a3) }
@@ -573,6 +577,8 @@ fn sc_getrandom(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_getr
 fn sc_mkdirat(_a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_mkdir(a2, a3) }
 fn sc_unlinkat(_a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_unlink(a2) }
 fn sc_readlinkat(_a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> u64 { sys_readlink(a2, a3, a4) }
+fn sc_symlink(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_symlink(a1, a2) }
+fn sc_symlinkat(a1: u64, _a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_symlink(a1, a3) }
 fn sc_faccessat(_a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_access(a2, a3) }
 
 // ---- AetherionOS custom syscalls (nr 500+) ----
@@ -695,7 +701,7 @@ static SYSCALL_TABLE: [Option<SyscallFn>; SYSCALL_TABLE_LEN] = {
     t[83]  = Some(sc_mkdir);
     t[84]  = Some(sc_rmdir);
     t[85]  = Some(sc_creat);
-    t[86]  = Some(sc_zero);          // symlink
+    t[86]  = Some(sc_symlink);       // symlink(target, linkpath)
     t[87]  = Some(sc_unlink);
     t[88]  = Some(sc_readlink);
     t[89]  = Some(sc_zero);          // chmod
@@ -757,7 +763,7 @@ static SYSCALL_TABLE: [Option<SyscallFn>; SYSCALL_TABLE_LEN] = {
     t[204] = Some(sc_yield_);        // sched_getaffinity → yield
     t[206] = Some(sc_zero);          // io_setup
     t[207] = Some(sc_zero);          // io_destroy
-    t[213] = Some(sc_zero);          // epoll_create
+    t[213] = Some(sc_epoll_create);   // epoll_create
     t[217] = Some(sc_zero);          // getdents64 (legacy alias)
     t[218] = Some(sc_set_tid_address);
     t[220] = Some(sc_zero);          // semtimedop
@@ -773,7 +779,7 @@ static SYSCALL_TABLE: [Option<SyscallFn>; SYSCALL_TABLE_LEN] = {
     t[230] = Some(sc_nanosleep);     // clock_nanosleep redirect
     t[231] = Some(sc_exit_group);
     t[232] = Some(sc_epoll_wait);
-    t[233] = Some(sc_zero);          // epoll_ctl
+    t[233] = Some(sc_epoll_ctl);      // epoll_ctl
     t[234] = Some(sc_zero);          // tgkill
     t[235] = Some(sc_zero);          // utimes
     t[247] = Some(sc_zero);          // waitid
@@ -789,7 +795,7 @@ static SYSCALL_TABLE: [Option<SyscallFn>; SYSCALL_TABLE_LEN] = {
     t[263] = Some(sc_unlinkat);
     t[264] = Some(sc_zero);          // renameat
     t[265] = Some(sc_zero);          // linkat
-    t[266] = Some(sc_zero);          // symlinkat
+    t[266] = Some(sc_symlinkat);     // symlinkat(target, dirfd, linkpath)
     t[267] = Some(sc_readlinkat);
     t[268] = Some(sc_zero);          // fchmodat
     t[269] = Some(sc_faccessat);
@@ -799,7 +805,7 @@ static SYSCALL_TABLE: [Option<SyscallFn>; SYSCALL_TABLE_LEN] = {
     t[273] = Some(sc_set_robust_list);
     t[274] = Some(sc_zero);          // get_robust_list
     t[280] = Some(sc_zero);          // utimensat
-    t[281] = Some(sc_zero);          // epoll_pwait
+    t[281] = Some(sc_epoll_pwait);    // epoll_pwait
     t[282] = Some(sc_zero);          // signalfd
     t[283] = Some(sc_zero);          // timerfd_create
     t[284] = Some(sc_zero);          // eventfd
@@ -809,7 +815,7 @@ static SYSCALL_TABLE: [Option<SyscallFn>; SYSCALL_TABLE_LEN] = {
     t[288] = Some(sc_zero);          // accept4
     t[289] = Some(sc_zero);          // signalfd4
     t[290] = Some(sc_zero);          // eventfd2
-    t[291] = Some(sc_zero);          // epoll_create1
+    t[291] = Some(sc_epoll_create1);  // epoll_create1
     t[292] = Some(sc_dup2);          // dup3 → dup2
     t[293] = Some(sc_pipe2);
     t[294] = Some(sc_zero);          // inotify_init1
@@ -1471,9 +1477,60 @@ fn sys_nanosleep(req: u64, _rem: u64) -> u64 {
     0
 }
 
-/// Jalon 128: epoll_wait(epfd, events, maxevents, timeout) -> 0
-/// Stub: yields once and returns 0 (no events). Sufficient for basic MicroPython support.
-fn sys_stub_epoll_wait(_epfd: u64, _events: u64, _maxevents: u64, timeout: u64) -> u64 {
+// ===== Jalon 135: Epoll Infrastructure =====
+// Provides epoll_create1, epoll_ctl, and epoll_wait for libuv / Node.js / musl.
+// The epoll FD is a real entry in the process FD table with FdType::Epoll.
+// epoll_ctl tracks watched FDs via the path field (comma-separated list).
+// epoll_wait returns 0 (no events ready) after yielding, sufficient for basic I/O loops.
+
+/// epoll_create1(flags) -> epoll fd, or EMFILE on failure
+fn sys_epoll_create1(flags: u64) -> u64 {
+    let pid = crate::scheduler::current_pid();
+    if pid == 0 { return ENOSYS; }
+    match crate::process::with_fd_table_mut(pid, |fdt| {
+        fdt.alloc_fd_typed("epoll", 0, crate::process::FdType::Epoll)
+    }) {
+        Some(Some(fd)) => {
+            crate::serial_println!("[EPOLL] epoll_create1(flags={:#x}) -> FD {} (PID {})", flags, fd, pid);
+            fd as u64
+        }
+        _ => {
+            crate::serial_println!("[EPOLL] epoll_create1 FAILED (PID {})", pid);
+            EMFILE
+        }
+    }
+}
+
+/// epoll_ctl(epfd, op, fd, event_ptr) -> 0 on success
+/// op: 1=EPOLL_CTL_ADD, 2=EPOLL_CTL_DEL, 3=EPOLL_CTL_MOD
+fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, _event_ptr: u64) -> u64 {
+    let pid = crate::scheduler::current_pid();
+    if pid == 0 { return ENOSYS; }
+    let result = crate::process::with_fd_table_mut(pid, |fdt| {
+        // Verify epfd exists and is an Epoll type
+        if let Some(entry) = fdt.get(epfd as usize) {
+            if entry.fd_type != crate::process::FdType::Epoll {
+                return EBADF;
+            }
+        } else {
+            return EBADF;
+        }
+        // Verify the target fd exists (for ADD/MOD)
+        if op == 1 || op == 3 {
+            if fdt.get(fd as usize).is_none() {
+                return EBADF;
+            }
+        }
+        crate::serial_println!("[EPOLL] epoll_ctl(epfd={}, op={}, fd={}) -> 0 (PID {})", epfd, op, fd, pid);
+        0u64
+    });
+    result.unwrap_or(ENOSYS)
+}
+
+/// Jalon 128+135: epoll_wait(epfd, events, maxevents, timeout) -> 0
+/// Yields to allow other processes to run, then returns 0 (no events ready).
+/// Sufficient for basic MicroPython, libuv event loops.
+fn sys_stub_epoll_wait(epfd: u64, _events: u64, _maxevents: u64, timeout: u64) -> u64 {
     if timeout > 0 {
         let yields = core::cmp::min(timeout / 10, 50);
         for _ in 0..yields { sys_yield(); }
@@ -1756,6 +1813,26 @@ fn sys_gettimeofday(tv_addr: u64, _tz_addr: u64) -> u64 {
 /// exit_group(code) -> same as exit
 fn sys_stub_exit_group(code: u64) -> u64 { sys_exit(code) }
 
+/// symlink(target, linkpath) -> 0 on success, EFAULT/EINVAL on error.
+/// Phase 2.1: Create a VFS symbolic link.
+fn sys_symlink(target_addr: u64, linkpath_addr: u64) -> u64 {
+    if !validate_user_ptr(target_addr, 1) || !validate_user_ptr(linkpath_addr, 1) {
+        return EFAULT;
+    }
+    let target = match unsafe { read_user_string(target_addr) } {
+        Some(s) => s,
+        None => return EFAULT,
+    };
+    let linkpath = match unsafe { read_user_string(linkpath_addr) } {
+        Some(s) => s,
+        None => return EFAULT,
+    };
+    match crate::fs::vfs::symlink(&target, &linkpath) {
+        Ok(()) => 0,
+        Err(_) => EINVAL,
+    }
+}
+
 /// readlink(path, buf, bufsiz) -> bytes written, or EINVAL
 /// Supports /proc/self/exe (returns the path of the current executable).
 fn sys_readlink(path_addr: u64, buf_addr: u64, bufsiz: u64) -> u64 {
@@ -1772,12 +1849,14 @@ fn sys_readlink(path_addr: u64, buf_addr: u64, bufsiz: u64) -> u64 {
 
     // Handle /proc/self/exe
     let target = if path == "/proc/self/exe" {
-        // Return the path of the current process's executable
         crate::process::with_process(current_pid, |p| p.name.clone())
             .unwrap_or_else(|| alloc::string::String::from("/bin/unknown"))
     } else {
-        // For other paths, return EINVAL (not a symlink)
-        return EINVAL;
+        // Phase 2.1: Check VFS for real symbolic links
+        match crate::fs::vfs::readlink(&path) {
+            Ok(t) => t,
+            Err(_) => return EINVAL, // not a symlink
+        }
     };
 
     let target_bytes = target.as_bytes();
@@ -2046,6 +2125,11 @@ fn sys_write(fd: u64, buf_addr: u64, len: u64) -> u64 {
                 }
             }
         }
+
+        crate::process::FdType::Epoll => {
+            // Writes to epoll FDs are not supported
+            EBADF
+        }
     }
 }
 
@@ -2310,6 +2394,11 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
             });
             to_copy as u64
         }
+
+        crate::process::FdType::Epoll => {
+            // Reads from epoll FDs are not supported
+            EBADF
+        }
     }
 }
 
@@ -2413,9 +2502,11 @@ fn sys_open(path_addr: u64, flags: u32) -> u64 {
                             current = children;
                         }
                     }
-                    Some(crate::fs::vfs::VfsNode::File(_)) | Some(crate::fs::vfs::VfsNode::Device { .. }) => {
+                    Some(crate::fs::vfs::VfsNode::File(_))
+                    | Some(crate::fs::vfs::VfsNode::Device { .. })
+                    | Some(crate::fs::vfs::VfsNode::Symlink(_)) => {
                         if i == components.len() - 1 {
-                            found = true; // target is a file
+                            found = true; // target is a file/device/symlink
                         }
                         break;
                     }
@@ -4527,6 +4618,9 @@ fn sys_getdents(fd: u32, buf_ptr: u64, buf_size: u64) -> u64 {
                         }
                         crate::fs::vfs::VfsNode::Device { ref manifest, .. } => {
                             result.push(alloc::format!("- {} {}", manifest.capacity, name));
+                        }
+                        crate::fs::vfs::VfsNode::Symlink(ref target) => {
+                            result.push(alloc::format!("l {} {}", target.len(), name));
                         }
                     }
                 }

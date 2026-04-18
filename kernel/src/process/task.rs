@@ -27,6 +27,8 @@ pub enum FdType {
     Pipe,
     /// Terminal (stdin/stdout/stderr)
     Tty,
+    /// Epoll file descriptor for async I/O (Jalon 135)
+    Epoll,
 }
 
 /// A file descriptor entry

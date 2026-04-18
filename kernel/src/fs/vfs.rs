@@ -82,6 +82,8 @@ pub enum VfsNode {
         manifest: DeviceManifest,
         data: Vec<u8>,
     },
+    /// A symbolic link pointing to another path (Phase 2.1)
+    Symlink(String),
 }
 
 // ===== VFS Metrics =====
@@ -416,7 +418,7 @@ pub fn file_write(path: &str, data: &[u8]) -> Result<usize, VfsError> {
                 file_data.extend_from_slice(data);
                 bytes_written = data.len();
             }
-            VfsNode::Directory(_) => {
+            VfsNode::Directory(_) | VfsNode::Symlink(_) => {
                 VFS_METRICS.errors_count.fetch_add(1, Ordering::Relaxed);
                 return Err(VfsError::PermissionDenied);
             }
@@ -472,6 +474,10 @@ pub fn file_read(path: &str) -> Result<Vec<u8>, VfsError> {
             VfsNode::Directory(_) => {
                 VFS_METRICS.errors_count.fetch_add(1, Ordering::Relaxed);
                 return Err(VfsError::PermissionDenied);
+            }
+            VfsNode::Symlink(ref target) => {
+                // Follow symlink: read the target path's data
+                data = target.as_bytes().to_vec();
             }
         }
     }
@@ -625,6 +631,72 @@ pub fn unlink(path: &str) -> Result<(), VfsError> {
         }
         _ => Err(VfsError::NotFound),
     }
+}
+
+/// Create a symbolic link at `link_path` pointing to `target`.
+/// Phase 2.1: Required by npm, pip, and ld.so for resolving library paths.
+pub fn symlink(target: &str, link_path: &str) -> Result<(), VfsError> {
+    VFS_METRICS.operations_count.fetch_add(1, Ordering::Relaxed);
+    validate_path(link_path)?;
+
+    let components = path_components(link_path);
+    if components.is_empty() {
+        return Err(VfsError::InvalidPath);
+    }
+
+    let mut root = VFS_ROOT.lock();
+    let (parent_comps, link_name) = components.split_at(components.len() - 1);
+
+    let parent = if parent_comps.is_empty() {
+        &mut *root
+    } else {
+        let mut current = &mut *root;
+        for comp in parent_comps {
+            let node = current.get_mut(*comp).ok_or(VfsError::NotFound)?;
+            match node {
+                VfsNode::Directory(ref mut children) => current = children,
+                _ => return Err(VfsError::NotFound),
+            }
+        }
+        current
+    };
+
+    parent.insert(
+        String::from(link_name[0]),
+        VfsNode::Symlink(String::from(target)),
+    );
+    crate::serial_println!("[VFS] symlink: {} -> {}", link_path, target);
+    Ok(())
+}
+
+/// Read the target of a symbolic link at `path`.
+/// Returns the target string, or VfsError::NotFound if not a symlink.
+pub fn readlink(path: &str) -> Result<String, VfsError> {
+    VFS_METRICS.operations_count.fetch_add(1, Ordering::Relaxed);
+    validate_path(path)?;
+
+    let components = path_components(path);
+    if components.is_empty() {
+        return Err(VfsError::InvalidPath);
+    }
+
+    let root = VFS_ROOT.lock();
+    let mut current = &*root;
+    for (i, comp) in components.iter().enumerate() {
+        match current.get(*comp) {
+            Some(VfsNode::Directory(ref children)) => {
+                current = children;
+            }
+            Some(VfsNode::Symlink(target)) if i == components.len() - 1 => {
+                return Ok(target.clone());
+            }
+            _ if i == components.len() - 1 => {
+                return Err(VfsError::NotFound);
+            }
+            _ => return Err(VfsError::NotFound),
+        }
+    }
+    Err(VfsError::NotFound)
 }
 
 /// Create an empty file (touch) — creates if not exists, no-op if exists
