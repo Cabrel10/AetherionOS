@@ -27,6 +27,10 @@ const MAX_CPUS: usize = 16;
 
 // Index IST for double-fault (separate stack)
 const DOUBLE_FAULT_IST_INDEX: u16 = 0;
+// Jalon 134c: Index IST for #PF (page fault) - a dedicated stack so that a
+// PF taken while syscall_entry is still on user RSP has a trustworthy kernel
+// stack to run on. Required to diagnose/recover from SYSCALL-path faults.
+const PAGE_FAULT_IST_INDEX: u16 = 1;
 
 // Task State Segment - contains stack pointers for exceptions
 // RING3_INT_STACK: Dedicated kernel stack for Ring 3 -> Ring 0 transitions
@@ -45,12 +49,18 @@ const AP_RSP0_STACK_SIZE: usize = 16384; // 16 KiB per AP core
 /// Per-core double-fault IST stacks (20 KiB each)
 const AP_DF_STACK_SIZE: usize = 4096 * 5; // 20 KiB
 
+/// Per-core page-fault IST stacks (32 KiB each) - Jalon 134c
+const AP_PF_STACK_SIZE: usize = 4096 * 8; // 32 KiB
+
 /// Static per-core RSP0 stacks for AP cores (cores 1..MAX_CPUS-1)
 /// Only 15 AP cores need stacks; BSP (core 0) uses the lazy_static TSS.
 static mut AP_RSP0_STACKS: [[u8; AP_RSP0_STACK_SIZE]; MAX_CPUS] = [[0; AP_RSP0_STACK_SIZE]; MAX_CPUS];
 
 /// Static per-core double-fault stacks for AP cores
 static mut AP_DF_STACKS: [[u8; AP_DF_STACK_SIZE]; MAX_CPUS] = [[0; AP_DF_STACK_SIZE]; MAX_CPUS];
+
+/// Static per-core page-fault stacks for AP cores (Jalon 134c)
+static mut AP_PF_STACKS: [[u8; AP_PF_STACK_SIZE]; MAX_CPUS] = [[0; AP_PF_STACK_SIZE]; MAX_CPUS];
 
 /// Per-core TSS structures (runtime-initialized)
 static mut AP_TSS: [TaskStateSegment; MAX_CPUS] = {
@@ -86,6 +96,17 @@ lazy_static! {
             const STACK_SIZE: usize = 4096 * 5;  // 20KB stack for double-fault
             static mut STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
             let stack_start = VirtAddr::from_ptr(unsafe { &STACK });
+            stack_start + STACK_SIZE as u64  // Stack grows downwards
+        };
+
+        // Jalon 134c: IST[1]: Page-fault stack (dedicated kernel stack for #PF).
+        // Needed because SYSCALL does not swap RSP automatically, so a fault in
+        // syscall_entry before the `mov gs:0x0, rsp` would otherwise run on the
+        // user stack - unreliable for diagnostics and can cascade into #DF.
+        tss.interrupt_stack_table[PAGE_FAULT_IST_INDEX as usize] = {
+            const STACK_SIZE: usize = 4096 * 8;  // 32KB stack for page-fault
+            static mut PF_STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
+            let stack_start = VirtAddr::from_ptr(unsafe { &PF_STACK });
             stack_start + STACK_SIZE as u64  // Stack grows downwards
         };
 
@@ -153,7 +174,14 @@ pub fn init() {
         load_tss(GDT.1.tss_selector);
     }
 
-    crate::serial_println!("[GDT] Loaded: Kernel(R0) + User(R3) + TSS (BSP)");
+    // J134c: dump TSS IST entries for diagnostic
+    let ist0 = TSS.interrupt_stack_table[0].as_u64();
+    let ist1 = TSS.interrupt_stack_table[1].as_u64();
+    let rsp0 = TSS.privilege_stack_table[0].as_u64();
+    crate::serial_println!(
+        "[GDT] Loaded: Kernel(R0) + User(R3) + TSS (BSP) IST0=0x{:X} IST1=0x{:X} RSP0=0x{:X}",
+        ist0, ist1, rsp0
+    );
 }
 
 // =====================================================================
@@ -193,6 +221,11 @@ pub fn create_and_load_per_core_gdt(core_id: u8) {
         let df_stack_ptr = &AP_DF_STACKS[idx][0] as *const u8 as u64;
         let df_top = df_stack_ptr + AP_DF_STACK_SIZE as u64;
         tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = VirtAddr::new(df_top);
+
+        // Jalon 134c: IST[1]: Per-core page-fault stack
+        let pf_stack_ptr = &AP_PF_STACKS[idx][0] as *const u8 as u64;
+        let pf_top = pf_stack_ptr + AP_PF_STACK_SIZE as u64;
+        tss.interrupt_stack_table[PAGE_FAULT_IST_INDEX as usize] = VirtAddr::new(pf_top);
 
         // Step 2: Build per-core GDT
         // Use a fresh GDT with the same segment layout as BSP
@@ -260,6 +293,11 @@ pub fn load_for_ap() {
 /// Return the IST index for double-fault
 pub const fn double_fault_ist_index() -> u16 {
     DOUBLE_FAULT_IST_INDEX
+}
+
+/// Return the IST index for page-fault (Jalon 134c)
+pub const fn page_fault_ist_index() -> u16 {
+    PAGE_FAULT_IST_INDEX
 }
 
 /// Return the kernel code segment selector

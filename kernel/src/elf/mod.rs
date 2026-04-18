@@ -561,11 +561,17 @@ unsafe fn create_user_pml4() -> Result<u64, ElfError> {
     // Ring 3 code cannot access PML4[0], PML4[1] kernel pages, or PML4[256+]
     // because those entries don't have the USER_ACCESSIBLE bit set — KPTI-lite.
     let mut copied = 0usize;
+    let mut cloned_indices: [u16; 16] = [0xFFFF; 16];
+    let mut ci = 0usize;
     for i in 0..512usize {
         let entry = core::ptr::read_volatile(current_pml4_virt.add(i));
         if entry & 0x01 != 0 {
             core::ptr::write_volatile(new_pml4_virt.add(i), entry);
             copied += 1;
+            if ci < 16 {
+                cloned_indices[ci] = i as u16;
+                ci += 1;
+            }
         }
     }
 
@@ -576,6 +582,20 @@ unsafe fn create_user_pml4() -> Result<u64, ElfError> {
     crate::serial_println!(
         "[ELF] User PML4 created: phys=0x{:X} ({} entries cloned) PML4[0]=0x{:X} kernel={}",
         new_pml4_phys, copied, new_pml4_e0, has_kernel
+    );
+    // J134c: list which PML4 indices were cloned (LSTAR is at 0xFFFF8000... which is PML4[256])
+    crate::serial_println!(
+        "[ELF] Cloned PML4 indices: {} {} {} {} {} {} {} {} {} {} {} {} {} {} {} {}",
+        cloned_indices[0], cloned_indices[1], cloned_indices[2], cloned_indices[3],
+        cloned_indices[4], cloned_indices[5], cloned_indices[6], cloned_indices[7],
+        cloned_indices[8], cloned_indices[9], cloned_indices[10], cloned_indices[11],
+        cloned_indices[12], cloned_indices[13], cloned_indices[14], cloned_indices[15]
+    );
+    // J134c: verify specifically if PML4[256] (0xFFFF800000000000) is cloned
+    let pml4_256 = core::ptr::read_volatile(new_pml4_virt.add(256));
+    crate::serial_println!(
+        "[ELF] PML4[256] (phys-offset, LSTAR region) = 0x{:X} present={}",
+        pml4_256, (pml4_256 & 0x01) != 0
     );
 
     Ok(new_pml4_phys)
@@ -662,6 +682,29 @@ unsafe fn map_user_page(
     for level in 0..3 {
         let table_virt = phys_to_virt(table_phys) as *mut u64;
         let entry = core::ptr::read_volatile(table_virt.add(indices[level]));
+
+        // J135 CRITICAL FIX: Reject 1 GiB huge pages (PDPT PS=1) and 2 MiB huge pages (PD PS=1).
+        // These are kernel mappings (e.g., kernel .text at PD[2]=0x4000A3 with PS=1, covering
+        // phys 0x400000-0x5FFFFF). If we naively treat them as page tables and deep-copy them,
+        // we will corrupt kernel memory: the "copy" only duplicates the first 4 KiB of what the
+        // CPU actually maps as a 2 MiB frame, and the new PTE still has PS=1, so the MMU
+        // interprets the new frame as a 2 MiB page containing garbage that happens to include
+        // the syscall_entry region. This was the root cause of the CR2=0xC / 0x0 crash in
+        // syscall_entry: user ELF loading was writing user data into kernel .text.
+        //
+        // Fix: explicitly refuse to insert a user mapping on top of a kernel huge page.
+        // User ELFs live at 0x8000000000 (PML4[1]) and never need low identity-mapped kernel
+        // pages. If we ever need this path, we would have to SPLIT the 2 MiB page into 512
+        // individual 4 KiB PT entries — not attempted here.
+        if (entry & 0x01) != 0 && (entry & 0x80) != 0 {
+            // Huge-page encountered on the way to a user page — refuse.
+            // level == 1 -> 1 GiB PDPT entry, level == 2 -> 2 MiB PD entry.
+            crate::serial_println!(
+                "[ELF][J135] REFUSING huge-page split: vaddr=0x{:X} level={} entry=0x{:X} (kernel mapping)",
+                vaddr, level, entry
+            );
+            return Err(ElfError::AddressOutOfRange);
+        }
 
         if entry & 0x01 == 0 {
             // Entry not present - allocate a new page table

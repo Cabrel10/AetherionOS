@@ -73,14 +73,57 @@ impl MemoryManager {
         let mut usable_regions = [(0u64, 0u64); 32];
         let mut region_count = 0;
         
+        // J135: Dump ALL memory regions for diagnostic (helps identify kernel overlap with usable memory)
+        crate::serial_write("[MEMORY] Boot memory map (all regions):\n");
         for region in boot_info.memory_map.iter() {
             let start = region.range.start_addr();
             let end = region.range.end_addr();
-            
+            let typ = region.region_type;
+            {
+                use core::fmt::Write;
+                let mut s = arrayvec::ArrayString::<128>::new();
+                let _ = writeln!(s, "[MEMORY]   {:#x} - {:#x} ({:>4} KB) {:?}",
+                    start, end, (end - start) / 1024, typ);
+                crate::serial_write(&s);
+            }
+
             if region.region_type == MemoryRegionType::Usable && region_count < 32 {
-                usable_regions[region_count] = (start, end);
-                region_count += 1;
-                total_usable += end - start;
+                // J135 CRITICAL FIX: Exclude kernel .text/.rodata/.data/.bss physical region
+                // Kernel is loaded at phys 0x200000 - ~0xC10000 (actually mapped as 2MiB huge
+                // pages at PML4[0]->PDPT[0]->PD[2]=0x400000 .. PD[5]=0xC00000). If the
+                // bootloader marks this as Usable, the frame allocator will hand out frames
+                // inside the kernel image, and demand-paging or page-table copies will
+                // overwrite kernel .text. We carve this range out here defensively.
+                const KERNEL_RESERVED_START: u64 = 0x200000;
+                const KERNEL_RESERVED_END:   u64 = 0x1000000; // 16 MiB safety margin
+                if end <= KERNEL_RESERVED_START || start >= KERNEL_RESERVED_END {
+                    // Fully outside kernel — keep as is
+                    usable_regions[region_count] = (start, end);
+                    region_count += 1;
+                    total_usable += end - start;
+                } else {
+                    // Split the region into pre-kernel and post-kernel parts
+                    if start < KERNEL_RESERVED_START && region_count < 32 {
+                        let hi = KERNEL_RESERVED_START;
+                        usable_regions[region_count] = (start, hi);
+                        region_count += 1;
+                        total_usable += hi - start;
+                    }
+                    if end > KERNEL_RESERVED_END && region_count < 32 {
+                        let lo = KERNEL_RESERVED_END;
+                        usable_regions[region_count] = (lo, end);
+                        region_count += 1;
+                        total_usable += end - lo;
+                    }
+                    {
+                        use core::fmt::Write;
+                        let mut s = arrayvec::ArrayString::<160>::new();
+                        let _ = writeln!(s, "[MEMORY] J135: kernel carve-out {:#x}-{:#x} removed from usable region",
+                            core::cmp::max(start, KERNEL_RESERVED_START),
+                            core::cmp::min(end, KERNEL_RESERVED_END));
+                        crate::serial_write(&s);
+                    }
+                }
             }
         }
         
