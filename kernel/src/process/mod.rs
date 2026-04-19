@@ -76,6 +76,14 @@ unsafe impl Send for KbdBuffer {}
 
 static KBD_BUFFER: KbdBuffer = KbdBuffer::new();
 
+/// Check if there are pending bytes in the keyboard buffer (non-consuming peek).
+/// Used by epoll_wait to check stdin readiness without consuming data.
+pub fn kbd_has_pending() -> bool {
+    let rp = KBD_BUFFER.read_pos.load(Ordering::Relaxed);
+    let wp = KBD_BUFFER.write_pos.load(Ordering::Acquire);
+    rp != wp
+}
+
 /// PID of process blocked waiting for keyboard input (0 = none)
 static KBD_WAITER_PID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 

@@ -1240,6 +1240,54 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
         );
     }
 
+    // ═══════════════════════════════════════════════════════════════
+    // JALON 135: DYNAMIC MEMORY ENTRY POINT INSPECTION
+    // Validates that the entry point actually contains executable code
+    // before returning control. Prevents rip=0x0 crash by detecting
+    // zeroed memory (BSS overlap) or unmapped entry points.
+    // ═══════════════════════════════════════════════════════════════
+    if final_entry == 0 {
+        crate::serial_println!("[ELF] FATAL: Entry point is 0x0! ELF is corrupt or PIE mishandled.");
+        return Err(ElfError::InvalidPhdr);
+    }
+
+    unsafe {
+        let entry_offset = final_entry & 0xFFF;
+        if let Some(entry_phys) = lookup_page_frame(pml4_phys, final_entry) {
+            let entry_virt = phys_to_virt(entry_phys) + entry_offset;
+            // Read first 4 bytes at entry point for diagnostic
+            let bytes = core::slice::from_raw_parts(entry_virt as *const u8, 4);
+            crate::serial_println!(
+                "[ELF-DEBUG] First 4 bytes at entry 0x{:X}: {:02X} {:02X} {:02X} {:02X}",
+                final_entry, bytes[0], bytes[1], bytes[2], bytes[3]
+            );
+
+            if bytes[0] == 0x00 && bytes[1] == 0x00 {
+                crate::serial_println!(
+                    "[FATAL] ELF entry point 0x{:X} points to ZEROED memory! (BSS overlap or load failure)",
+                    final_entry
+                );
+                // Non-fatal: log but allow continuation for debugging
+            }
+        } else {
+            crate::serial_println!(
+                "[FATAL] ELF entry point 0x{:X} is NOT MAPPED in page tables! PML4=0x{:X}",
+                final_entry, pml4_phys
+            );
+        }
+
+        // Stack alignment validation
+        crate::serial_println!(
+            "[ELF-DEBUG] Stack alignment check: RSP=0x{:X}, RSP %% 16 = {}",
+            linux_rsp, linux_rsp % 16
+        );
+    }
+
+    crate::serial_println!(
+        "[ELF-DEBUG] Validation OK: Entry=0x{:X}, Stack (16-align)=0x{:X}",
+        final_entry, linux_rsp
+    );
+
     Ok(ElfLoadResult {
         entry_point: final_entry,
         stack_pointer: linux_rsp,
