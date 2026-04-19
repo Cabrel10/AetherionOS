@@ -1,5 +1,7 @@
-[target.x86_64-aetherion-user]
-rustflags = ["-C", "link-arg=-Tlinker.ld"]
+# AetherionOS Agent Build Configuration
+# Uses build-std for no_std environment. Linker.ld DISABLED (breaks .rodata).
+# [target.x86_64-aetherion-user]
+# rustflags = ["-C", "link-arg=-Tlinker.ld"]  # DISABLED: Breaks .rodata sections, causes rip=0x0 crash
 
 [unstable]
 build-std = ["core", "compiler_builtins", "alloc"]

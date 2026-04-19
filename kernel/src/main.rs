@@ -2758,6 +2758,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                         ];
                         let envp: alloc::vec::Vec<alloc::string::String> = alloc::vec![
                             alloc::string::String::from("PATH=/bin:/usr/bin"),
+                            alloc::string::String::from("LD_DEBUG=all"),  // Force ld-musl to log all symbol resolution to serial
                         ];
                         let final_rsp = unsafe {
                             elf::build_sysv_stack(
@@ -2914,20 +2915,50 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 );
 
                 unsafe {
-                    // Phase 1: Store user_cr3 in PER_CPU[48] so sysretq path
-                    // can restore it later.
-                    arch::x86_64::syscall::set_user_cr3(final_cr3);
+                    // ═══════════════════════════════════════════════════════
+                    // JALON 135: RING 3 IRETQ SAFETY — Validate entry memory
+                    // Before jumping to user code, verify the target address
+                    // actually contains executable code (not 0x00 / zeroed BSS).
+                    // This blocks the rip=0x0 crash at the source.
+                    // ═══════════════════════════════════════════════════════
+                    let first_byte = {
+                        let phys_opt = elf::lookup_page_frame_pub(final_cr3, final_rip);
+                        if let Some(phys) = phys_opt {
+                            let virt = elf::phys_to_virt(phys + (final_rip & 0xFFF));
+                            core::ptr::read_volatile(virt as *const u8)
+                        } else {
+                            0x00
+                        }
+                    };
 
-                    // Use exec_switch_cr3_and_ring3 which jumps to the trampoline
-                    // via PML4[256] (phys-offset). This address is present in BOTH
-                    // kernel and user PML4, avoiding the race condition where IRETQ
-                    // faults because the CR3 switch makes the current instruction
-                    // page inaccessible.
-                    elf::exec_switch_cr3_and_ring3(
-                        final_cr3,
-                        final_rip,
-                        final_rsp,
-                    );
+                    if first_byte == 0x00 {
+                        serial_println!(
+                            "[FATAL] Entry 0x{:X} contains 0x00! (rip=0x0 crash imminent — BLOCKED)",
+                            final_rip
+                        );
+                        serial_println!("  [FALLBACK] Aborting Ring 3 launch for safety. Trying hello.elf...");
+                        // Fall through to the fallback below instead of crashing
+                    } else {
+                        serial_println!(
+                            "[J135] Entry 0x{:X} validated: first_byte=0x{:02X} (OK)",
+                            final_rip, first_byte
+                        );
+
+                        // Phase 1: Store user_cr3 in PER_CPU[48] so sysretq path
+                        // can restore it later.
+                        arch::x86_64::syscall::set_user_cr3(final_cr3);
+
+                        // Use exec_switch_cr3_and_ring3 which jumps to the trampoline
+                        // via PML4[256] (phys-offset). This address is present in BOTH
+                        // kernel and user PML4, avoiding the race condition where IRETQ
+                        // faults because the CR3 switch makes the current instruction
+                        // page inaccessible.
+                        elf::exec_switch_cr3_and_ring3(
+                            final_cr3,
+                            final_rip,
+                            final_rsp,
+                        );
+                    }
                 }
             }
             Err(e) => {
@@ -2952,6 +2983,64 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                     Err(e2) => {
                         serial_println!("  [FAIL] hello.elf also failed: {}", e2);
                     }
+                }
+            }
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // STEP C: SERIAL CONSOLE FALLBACK (BusyBox sh)
+    // If agent_visual_term.elf crashes or the framebuffer is dead,
+    // we need a way to interact with the system. This spawns a
+    // BusyBox shell on the serial console (/dev/ttyS0) that reads
+    // PS/2 keyboard (fd 0) and writes to UART (fd 1, fd 2).
+    // This is a safety net: the system is never blind.
+    // ──────────────────────────────────────────────────────────
+    {
+        let sh_path = "/bin/sh.elf";
+        if let Ok(sh_data) = crate::fs::vfs::file_read(sh_path) {
+            serial_println!("  [FALLBACK] Launching {} as serial console ({} bytes)", sh_path, sh_data.len());
+            if let Ok(result) = crate::elf::load_elf_binary(&sh_data) {
+                let argv: alloc::vec::Vec<alloc::string::String> = alloc::vec![
+                    alloc::string::String::from(sh_path),
+                ];
+                let envp: alloc::vec::Vec<alloc::string::String> = alloc::vec![
+                    alloc::string::String::from("PATH=/bin:/disk/bin"),
+                ];
+                let rsp = unsafe {
+                    crate::elf::build_sysv_stack(
+                        result.pml4_phys, &argv, &envp, result.entry_point, 0, result.phdr_vaddr, result.phdr_count
+                    )
+                }.unwrap_or(result.stack_pointer);
+
+                if let Ok(sh_pid) = crate::process::spawn_userspace(sh_path, 0, result.entry_point, rsp, result.pml4_phys) {
+                    crate::process::set_abi(sh_pid, crate::compat::linux_abi::Abi::Linux);
+                    crate::scheduler::enqueue_process(sh_pid);
+                    serial_println!("[FALLBACK] Serial Shell QUEUED (PID {})", sh_pid);
+                }
+            } else {
+                serial_write("  [FALLBACK] sh.elf ELF load failed\n");
+            }
+        } else {
+            serial_write("  [FALLBACK] /bin/sh.elf not found in VFS — trying embedded SH_ELF\n");
+            // Try the embedded sh.elf binary
+            if let Ok(result) = crate::elf::load_elf_binary(SH_ELF) {
+                let argv: alloc::vec::Vec<alloc::string::String> = alloc::vec![
+                    alloc::string::String::from("/bin/sh"),
+                ];
+                let envp: alloc::vec::Vec<alloc::string::String> = alloc::vec![
+                    alloc::string::String::from("PATH=/bin:/disk/bin"),
+                ];
+                let rsp = unsafe {
+                    crate::elf::build_sysv_stack(
+                        result.pml4_phys, &argv, &envp, result.entry_point, 0, result.phdr_vaddr, result.phdr_count
+                    )
+                }.unwrap_or(result.stack_pointer);
+
+                if let Ok(sh_pid) = crate::process::spawn_userspace("/bin/sh", 0, result.entry_point, rsp, result.pml4_phys) {
+                    crate::process::set_abi(sh_pid, crate::compat::linux_abi::Abi::Linux);
+                    crate::scheduler::enqueue_process(sh_pid);
+                    serial_println!("[FALLBACK] Embedded Serial Shell QUEUED (PID {})", sh_pid);
                 }
             }
         }

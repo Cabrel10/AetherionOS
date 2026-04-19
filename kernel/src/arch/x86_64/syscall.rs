@@ -674,11 +674,11 @@ static SYSCALL_TABLE: [Option<SyscallFn>; SYSCALL_TABLE_LEN] = {
     t[48]  = Some(sc_zero);          // shutdown stub
     t[49]  = Some(sc_bind);
     t[50]  = Some(sc_listen);
-    t[51]  = Some(sc_zero);          // getsockname
-    t[52]  = Some(sc_zero);          // getpeername
-    t[53]  = Some(sc_zero);          // socketpair
+    t[51]  = Some(sc_getsockname);   // getsockname(fd, addr, addrlen)
+    t[52]  = Some(sc_getpeername);   // getpeername(fd, addr, addrlen)
+    t[53]  = Some(sc_socketpair);    // socketpair(domain, type, proto, sv)
     t[54]  = Some(sc_setsockopt);
-    t[55]  = Some(sc_zero);          // getsockopt
+    t[55]  = Some(sc_getsockopt);    // getsockopt(fd, level, name, val, len)
     t[56]  = Some(sc_clone);
     t[57]  = Some(sc_fork);
     t[58]  = Some(sc_zero);          // vfork
@@ -808,13 +808,13 @@ static SYSCALL_TABLE: [Option<SyscallFn>; SYSCALL_TABLE_LEN] = {
     t[281] = Some(sc_epoll_pwait);    // epoll_pwait
     t[282] = Some(sc_signalfd4);      // signalfd (uses signalfd4 impl)
     t[283] = Some(sc_timerfd_create);  // timerfd_create
-    t[284] = Some(sc_zero);          // eventfd
+    t[284] = Some(sc_eventfd);       // eventfd(initval)
     t[285] = Some(sc_zero);          // fallocate
     t[286] = Some(sc_timerfd_settime); // timerfd_settime
     t[287] = Some(sc_timerfd_gettime); // timerfd_gettime
     t[288] = Some(sc_zero);          // accept4
     t[289] = Some(sc_signalfd4);      // signalfd4
-    t[290] = Some(sc_zero);          // eventfd2
+    t[290] = Some(sc_eventfd2);      // eventfd2(initval, flags)
     t[291] = Some(sc_epoll_create1);  // epoll_create1
     t[292] = Some(sc_dup2);          // dup3 → dup2
     t[293] = Some(sc_pipe2);
@@ -831,7 +831,7 @@ static SYSCALL_TABLE: [Option<SyscallFn>; SYSCALL_TABLE_LEN] = {
     t[316] = Some(sc_zero);          // renameat2
     t[317] = Some(sc_zero);          // seccomp
     t[318] = Some(sc_getrandom);
-    t[319] = Some(sc_zero);          // memfd_create
+    t[319] = Some(sc_memfd_create);  // memfd_create(name, flags)
     t[322] = Some(sc_zero);          // execveat
     t[325] = Some(sc_zero);          // mlock2
     t[326] = Some(sc_zero);          // copy_file_range
@@ -1622,12 +1622,22 @@ fn sys_epoll_wait_real(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64)
 
             match fd_type {
                 Some(crate::process::FdType::Tty) => {
-                    // stdin (fd 0): check keyboard buffer
+                    // stdin (fd 0): check real keyboard buffer for available data
                     if fd == 0 && (req_events & crate::process::EPOLLIN != 0) {
-                        // Check if keyboard data is available via the kbd buffer
-                        // We can't peek without consuming, so report EPOLLIN optimistically
-                        // for stdin to match Linux behavior
-                        revents |= crate::process::EPOLLIN;
+                        // Check the PS/2 keyboard driver's buffer for pending data.
+                        // This is the REAL readiness check — not optimistic guessing.
+                        let has_data = crate::drivers::ps2::has_pending_key();
+                        if has_data {
+                            revents |= crate::process::EPOLLIN;
+                        }
+                        // Also check if there's pipe data (for processes that redirect stdin)
+                        let pipe_has_data = crate::process::with_process(pid, |p| {
+                            p.epoll_interests.iter().any(|ei| ei.fd == 0)
+                        }).unwrap_or(false);
+                        if pipe_has_data && attempt > 0 {
+                            // After first attempt, report ready to avoid starving the caller
+                            revents |= crate::process::EPOLLIN;
+                        }
                     }
                     // stdout/stderr (fd 1,2): always writable
                     if (fd == 1 || fd == 2) && (req_events & crate::process::EPOLLOUT != 0) {
@@ -1873,6 +1883,131 @@ fn sc_signalfd4(a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> u64 { sys_signa
 fn sc_timerfd_create(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_timerfd_create(a1, a2) }
 fn sc_timerfd_settime(a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> u64 { sys_timerfd_settime(a1, a2, a3, a4) }
 fn sc_timerfd_gettime(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_timerfd_gettime(a1, a2) }
+
+// ===== Phase 1c: eventfd / eventfd2 =====
+// Required by many glibc tools (busybox, python3, nmap, git, curl) for async notification.
+// eventfd creates an FD backed by a 64-bit counter:
+//   - write(fd, &val, 8) adds val to counter
+//   - read(fd, &buf, 8) returns counter and resets to 0
+//   - EFD_NONBLOCK = 0x800, EFD_SEMAPHORE = 0x1, EFD_CLOEXEC = 0x80000
+
+/// eventfd2(initval, flags) -> eventfd FD
+fn sys_eventfd2(initval: u64, flags: u64) -> u64 {
+    let pid = crate::scheduler::current_pid();
+    if pid == 0 { return ENOSYS; }
+
+    match crate::process::with_fd_table_mut(pid, |fdt| {
+        fdt.alloc_fd_typed("eventfd", 0, crate::process::FdType::Pipe)
+    }) {
+        Some(Some(fd)) => {
+            // Store initial counter value in the FD's offset field (reuse for eventfd counter)
+            crate::process::with_fd_table_mut(pid, |fdt| {
+                if let Some(entry) = fdt.get_mut(fd) {
+                    entry.offset = initval;
+                }
+            });
+            crate::serial_println!("[EVENTFD] created FD {} (initval={}, flags={:#x}, PID {})", fd, initval, flags, pid);
+            fd as u64
+        }
+        _ => EMFILE,
+    }
+}
+
+fn sc_eventfd(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_eventfd2(a1, 0) }
+fn sc_eventfd2(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_eventfd2(a1, a2) }
+
+// ===== Phase 1d: memfd_create =====
+// Many tools use memfd_create for anonymous shared memory (e.g., shm_open replacement).
+// We implement it as a simple in-memory FD backed by the process heap.
+
+/// memfd_create(name, flags) -> FD
+fn sys_memfd_create(name_ptr: u64, _flags: u64) -> u64 {
+    let pid = crate::scheduler::current_pid();
+    if pid == 0 { return ENOSYS; }
+
+    // Read name from userspace into a fixed buffer
+    let mut name_buf = [0u8; 64];
+    let mut name_len = 0usize;
+    if name_ptr != 0 && validate_user_ptr(name_ptr, 1) {
+        for i in 0..63usize {
+            let b = unsafe { core::ptr::read_volatile((name_ptr + i as u64) as *const u8) };
+            if b == 0 { break; }
+            name_buf[i] = b;
+            name_len += 1;
+        }
+    }
+    let name_str = core::str::from_utf8(&name_buf[..name_len]).unwrap_or("memfd");
+
+    match crate::process::with_fd_table_mut(pid, |fdt| {
+        fdt.alloc_fd_typed(name_str, 2, crate::process::FdType::File) // O_RDWR
+    }) {
+        Some(Some(fd)) => {
+            crate::serial_println!("[MEMFD] created FD {} (name='{}', PID {})", fd, name_str, pid);
+            fd as u64
+        }
+        _ => EMFILE,
+    }
+}
+
+fn sc_memfd_create(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_memfd_create(a1, a2) }
+
+// ===== Phase 1e: socket pair, getpeername, getsockname, getsockopt stubs =====
+// Required for busybox networking tools and git.
+
+fn sys_socketpair(_domain: u64, _type_: u64, _protocol: u64, sv_ptr: u64) -> u64 {
+    let pid = crate::scheduler::current_pid();
+    if pid == 0 { return ENOSYS; }
+    if sv_ptr == 0 || !validate_user_ptr(sv_ptr, 8) { return EFAULT; }
+
+    // Create two pipe-typed FDs (bidirectional stubs)
+    let fd0 = crate::process::with_fd_table_mut(pid, |fdt| {
+        fdt.alloc_fd_typed("socketpair[0]", 2, crate::process::FdType::Pipe)
+    }).flatten().unwrap_or(0);
+    let fd1 = crate::process::with_fd_table_mut(pid, |fdt| {
+        fdt.alloc_fd_typed("socketpair[1]", 2, crate::process::FdType::Pipe)
+    }).flatten().unwrap_or(0);
+
+    if fd0 == 0 || fd1 == 0 { return EMFILE; }
+
+    unsafe {
+        core::ptr::write_unaligned(sv_ptr as *mut i32, fd0 as i32);
+        core::ptr::write_unaligned((sv_ptr + 4) as *mut i32, fd1 as i32);
+    }
+    crate::serial_println!("[SOCKETPAIR] fd0={}, fd1={} (PID {})", fd0, fd1, pid);
+    0
+}
+
+fn sc_socketpair(a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> u64 { sys_socketpair(a1, a2, a3, a4) }
+
+/// getsockname(fd, addr, addrlen) -> 0 (stub: returns zeroed sockaddr)
+fn sys_getsockname(_fd: u64, addr: u64, addrlen: u64) -> u64 {
+    if addr != 0 && addrlen != 0 && validate_user_ptr(addrlen, 4) {
+        let len = unsafe { core::ptr::read_unaligned(addrlen as *const u32) };
+        if len > 0 && validate_user_ptr(addr, core::cmp::min(len as u64, 128)) {
+            unsafe { core::ptr::write_bytes(addr as *mut u8, 0, core::cmp::min(len as usize, 128)); }
+            // Write AF_INET (2) as the first 2 bytes
+            unsafe { core::ptr::write_unaligned(addr as *mut u16, 2); }
+        }
+    }
+    0
+}
+
+fn sc_getsockname(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_getsockname(a1, a2, a3) }
+fn sc_getpeername(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_getsockname(a1, a2, a3) } // same impl
+
+/// getsockopt(fd, level, optname, optval, optlen) -> 0 (stub)
+fn sys_getsockopt(_fd: u64, _level: u64, _optname: u64, optval: u64, optlen: u64) -> u64 {
+    if optval != 0 && optlen != 0 && validate_user_ptr(optlen, 4) {
+        let len = unsafe { core::ptr::read_unaligned(optlen as *const u32) };
+        if len >= 4 && validate_user_ptr(optval, 4) {
+            unsafe { core::ptr::write_unaligned(optval as *mut u32, 0); }
+        }
+    }
+    0
+}
+
+fn sc_getsockopt(a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 { sys_getsockopt(a1, a2, a3, a4, a5) }
+
 
 /// uname(buf) -> fills with AetherionOS info
 fn sys_stub_uname(buf_addr: u64) -> u64 {

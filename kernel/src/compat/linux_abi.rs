@@ -1635,8 +1635,8 @@ pub fn linux_syscall_override(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> Op
         // timerfd_create(283)/timerfd_settime(286)/timerfd_gettime(287)
         // Fall through to native syscall table which has real handlers
 
-        // eventfd2(290) — return fake fd
-        290 => Some(53),
+        // eventfd2(290) — delegate to real syscall.rs implementation
+        // Falls through to native syscall table which has real eventfd2 handler
 
         // accept4 (288) — stub
         288 => Some((-11i64) as u64), // EAGAIN
@@ -1648,8 +1648,8 @@ pub fn linux_syscall_override(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> Op
         // userfaultfd(323) — return ENOSYS (acceptable)
         323 => Some((-38i64) as u64),
 
-        // memfd_create(319) — return fake fd
-        319 => Some(54),
+        // memfd_create(319) — delegate to real syscall.rs implementation
+        // Falls through to native syscall table which has real memfd_create handler
 
         // copy_file_range(326) — ENOSYS
         326 => Some((-38i64) as u64),

@@ -156,6 +156,13 @@ pub fn init() {
     crate::serial_println!("[PS/2] ──────────────────────────────────────");
 }
 
+/// Check if there are pending keystrokes in the keyboard buffer.
+/// This is a non-consuming check used by epoll_wait for stdin readiness.
+/// Delegates to the kernel's KbdBuffer ring buffer which is filled by IRQ1.
+pub fn has_pending_key() -> bool {
+    crate::process::kbd_has_pending()
+}
+
 /// Wait until the input buffer is empty (bit 1 of status register is 0).
 /// Timeout after ~100µs to prevent infinite hang on broken hardware.
 fn wait_input_buffer() {
