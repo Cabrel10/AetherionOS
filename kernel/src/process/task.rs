@@ -328,6 +328,10 @@ pub struct Process {
     pub gs_base: u64,
     /// Jalon 131: Robust futex list head pointer (for musl thread cleanup).
     pub robust_list_head: u64,
+    /// Per-process epoll interest list: tracks which FDs are monitored by epoll instances.
+    pub epoll_interests: Vec<EpollInterest>,
+    /// Active timerfd descriptors for PIT-based timer expiry.
+    pub timer_fds: Vec<TimerFdState>,
 }
 
 /// Virtual Memory Area — describes a file-backed memory mapping
@@ -346,6 +350,43 @@ pub struct VirtualMemoryArea {
     pub size: u64,
     /// Is this mapping writable? (false = read-only for model files)
     pub writable: bool,
+}
+
+// ===== Epoll Infrastructure (Phase 1: Real Epoll) =====
+
+/// EPOLLIN/EPOLLOUT/EPOLLERR constants (Linux ABI)
+pub const EPOLLIN: u32  = 0x001;
+pub const EPOLLOUT: u32 = 0x004;
+pub const EPOLLERR: u32 = 0x008;
+pub const EPOLLHUP: u32 = 0x010;
+pub const EPOLLET: u32  = 1 << 31; // Edge-triggered
+
+/// An epoll interest entry: tracks one FD being monitored by an epoll instance.
+#[derive(Debug, Clone)]
+pub struct EpollInterest {
+    /// The epoll FD that owns this interest
+    pub epfd: u32,
+    /// The target FD being monitored
+    pub fd: u32,
+    /// Event mask (EPOLLIN, EPOLLOUT, etc.)
+    pub events: u32,
+    /// User data (returned in epoll_event.data)
+    pub data: u64,
+}
+
+/// TimerFd state: tracks an active timerfd descriptor.
+#[derive(Debug, Clone)]
+pub struct TimerFdState {
+    /// The FD number for this timer
+    pub fd: u32,
+    /// Interval in nanoseconds (0 = one-shot)
+    pub interval_ns: u64,
+    /// Next expiry time (TSC value)
+    pub next_expiry_tsc: u64,
+    /// Number of expirations since last read
+    pub expirations: u64,
+    /// Is this timer armed?
+    pub armed: bool,
 }
 
 impl Process {
@@ -394,6 +435,8 @@ impl Process {
             fs_base: 0,
             gs_base: 0,
             robust_list_head: 0,
+            epoll_interests: Vec::new(),
+            timer_fds: Vec::new(),
         }
     }
 

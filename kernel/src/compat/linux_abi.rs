@@ -742,46 +742,26 @@ pub fn linux_getrandom(buf: u64, buflen: u64, _flags: u64) -> u64 {
 }
 
 /// =========================================================================
-/// Jalon 110a: Functional epoll subsystem
+/// Jalon 110a → Phase 1: Real epoll subsystem (delegated to syscall.rs)
 /// =========================================================================
-/// Simple epoll emulation: epoll_create returns a dummy FD, epoll_ctl stores
-/// interest entries, epoll_wait returns immediately with 0 events (non-blocking).
-/// This is sufficient for tools like nmap and BusyBox that probe epoll support.
+/// Linux ABI epoll calls now delegate to the unified per-process epoll
+/// implementation in syscall.rs. The old global EPOLL_TABLE has been removed.
 
-use alloc::vec::Vec;
-use spin::Mutex;
+use spin::Mutex; // Still needed by ANON_VMA_TABLE below
 
-/// Global epoll instance table (up to 16 instances)
-static EPOLL_TABLE: Mutex<[EpollInstance; 16]> = Mutex::new([EpollInstance::empty(); 16]);
-static EPOLL_NEXT_FD: Mutex<u64> = Mutex::new(100); // epoll FDs start at 100
-
-#[derive(Clone, Copy)]
-struct EpollInstance {
-    active: bool,
-    fd: u64,
-    interest_count: u32,
-}
-
-impl EpollInstance {
-    const fn empty() -> Self {
-        EpollInstance { active: false, fd: 0, interest_count: 0 }
-    }
-}
-
-/// epoll_create1(flags) -> fd
+/// epoll_create1(flags) -> fd (delegates to syscall.rs sys_epoll_create1)
 pub fn linux_epoll_create1(_flags: u64) -> u64 {
-    let mut table = EPOLL_TABLE.lock();
-    let mut next_fd = EPOLL_NEXT_FD.lock();
-    for i in 0..16 {
-        if !table[i].active {
-            table[i] = EpollInstance { active: true, fd: *next_fd, interest_count: 0 };
-            let fd = *next_fd;
-            *next_fd += 1;
-            crate::serial_println!("[LINUX-ABI] epoll_create1: fd={}", fd);
-            return fd;
+    let pid = crate::scheduler::current_pid();
+    if pid == 0 { return (-38i64) as u64; } // ENOSYS
+    match crate::process::with_fd_table_mut(pid, |fdt| {
+        fdt.alloc_fd_typed("epoll", 0, crate::process::FdType::Epoll)
+    }) {
+        Some(Some(fd)) => {
+            crate::serial_println!("[LINUX-ABI] epoll_create1 -> FD {} (PID {})", fd, pid);
+            fd as u64
         }
+        _ => (-24i64) as u64, // EMFILE
     }
-    (-24i64) as u64 // EMFILE — too many open files
 }
 
 /// epoll_create(size) -> fd (legacy, size is ignored)
@@ -790,44 +770,81 @@ pub fn linux_epoll_create(_size: u64) -> u64 {
 }
 
 /// epoll_ctl(epfd, op, fd, event) -> 0 on success
-pub fn linux_epoll_ctl(epfd: u64, op: u64, _fd: u64, _event: u64) -> u64 {
-    let mut table = EPOLL_TABLE.lock();
-    for i in 0..16 {
-        if table[i].active && table[i].fd == epfd {
-            match op {
-                1 => { table[i].interest_count += 1; }  // EPOLL_CTL_ADD
-                2 => { }                                   // EPOLL_CTL_DEL
-                3 => { }                                   // EPOLL_CTL_MOD
-                _ => { return (-22i64) as u64; }           // EINVAL
-            }
-            return 0;
+/// Delegates to per-process interest tracking (same as native syscall.rs path)
+pub fn linux_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u64 {
+    let pid = crate::scheduler::current_pid();
+    if pid == 0 { return (-38i64) as u64; }
+
+    // Verify epfd is an Epoll type
+    let is_epoll = crate::process::with_fd_table(pid, |fdt| {
+        fdt.get(epfd as usize).map(|e| e.fd_type == crate::process::FdType::Epoll).unwrap_or(false)
+    }).unwrap_or(false);
+    if !is_epoll { return (-9i64) as u64; } // EBADF
+
+    match op {
+        1 => { // EPOLL_CTL_ADD
+            // Read epoll_event from user space: { u32 events, u64 data }
+            let (events, data) = if event_ptr != 0 && crate::arch::x86_64::syscall::validate_user_ptr_pub(event_ptr, 12) {
+                unsafe {
+                    let ev = core::ptr::read_unaligned(event_ptr as *const u32);
+                    let d = core::ptr::read_unaligned((event_ptr + 4) as *const u64);
+                    (ev, d)
+                }
+            } else {
+                (crate::process::EPOLLIN | crate::process::EPOLLOUT, fd) // default
+            };
+            crate::process::with_process_mut(pid, |p| {
+                let already = p.epoll_interests.iter().any(|ei| ei.epfd == epfd as u32 && ei.fd == fd as u32);
+                if !already {
+                    p.epoll_interests.push(crate::process::EpollInterest {
+                        epfd: epfd as u32,
+                        fd: fd as u32,
+                        events,
+                        data,
+                    });
+                }
+            });
+            0
         }
+        2 => { // EPOLL_CTL_DEL
+            crate::process::with_process_mut(pid, |p| {
+                p.epoll_interests.retain(|ei| !(ei.epfd == epfd as u32 && ei.fd == fd as u32));
+            });
+            0
+        }
+        3 => { // EPOLL_CTL_MOD
+            let (events, data) = if event_ptr != 0 && crate::arch::x86_64::syscall::validate_user_ptr_pub(event_ptr, 12) {
+                unsafe {
+                    let ev = core::ptr::read_unaligned(event_ptr as *const u32);
+                    let d = core::ptr::read_unaligned((event_ptr + 4) as *const u64);
+                    (ev, d)
+                }
+            } else {
+                return (-22i64) as u64; // EINVAL
+            };
+            crate::process::with_process_mut(pid, |p| {
+                if let Some(ei) = p.epoll_interests.iter_mut()
+                    .find(|ei| ei.epfd == epfd as u32 && ei.fd == fd as u32) {
+                    ei.events = events;
+                    ei.data = data;
+                }
+            });
+            0
+        }
+        _ => (-22i64) as u64, // EINVAL
     }
-    (-9i64) as u64 // EBADF
 }
 
-/// epoll_wait(epfd, events, maxevents, timeout) -> number of ready FDs
-/// Returns 0 (no events) for non-blocking, or after timeout.
-pub fn linux_epoll_wait(epfd: u64, _events: u64, _maxevents: u64, timeout: u64) -> u64 {
-    let table = EPOLL_TABLE.lock();
-    let found = table.iter().any(|e| e.active && e.fd == epfd);
-    drop(table);
-    if !found { return (-9i64) as u64; } // EBADF
-
-    // If timeout == 0, return immediately (non-blocking poll)
-    // If timeout > 0, yield a few times then return 0
-    if timeout > 0 && timeout != (-1i64) as u64 {
-        for _ in 0..core::cmp::min(timeout / 10, 5) {
-            crate::scheduler::yield_to_next(crate::scheduler::current_pid());
-        }
-    }
-    0 // No events ready
+/// epoll_wait — delegates to the real implementation
+pub fn linux_epoll_wait(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64) -> u64 {
+    crate::arch::x86_64::syscall::epoll_wait_real_pub(epfd, events_ptr, maxevents, timeout)
 }
 
 /// epoll_pwait(epfd, events, maxevents, timeout, sigmask) -> same as epoll_wait
 pub fn linux_epoll_pwait(epfd: u64, events: u64, maxevents: u64, timeout: u64, _sigmask: u64) -> u64 {
     linux_epoll_wait(epfd, events, maxevents, timeout)
 }
+
 
 /// ppoll(fds, nfds, tmo_p, sigmask) -> same as poll  
 pub fn linux_ppoll(fds: u64, nfds: u64, _tmo_p: u64, _sigmask: u64) -> u64 {
@@ -1611,13 +1628,12 @@ pub fn linux_syscall_override(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> Op
         276 => Some((-38i64) as u64),
         278 => Some((-38i64) as u64),
 
-        // signalfd4(289) — return fake fd
-        289 => Some(51),
+        // signalfd4(289) — delegate to real syscall.rs implementation (falls through)
+        // 289 => None means it falls through to the native syscall table
+        // which has sc_signalfd4 wired up
 
         // timerfd_create(283)/timerfd_settime(286)/timerfd_gettime(287)
-        283 => Some(52), // timerfd fd
-        286 => Some(0),  // settime
-        287 => Some(0),  // gettime
+        // Fall through to native syscall table which has real handlers
 
         // eventfd2(290) — return fake fd
         290 => Some(53),

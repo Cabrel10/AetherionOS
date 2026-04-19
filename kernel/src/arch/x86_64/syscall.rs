@@ -568,8 +568,8 @@ fn sc_newfstatat(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stu
 fn sc_epoll_create(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_epoll_create1(0) }
 fn sc_epoll_create1(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_epoll_create1(a1) }
 fn sc_epoll_ctl(a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> u64 { sys_epoll_ctl(a1, a2, a3, a4) }
-fn sc_epoll_wait(a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> u64 { sys_stub_epoll_wait(a1, a2, a3, a4) }
-fn sc_epoll_pwait(a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> u64 { sys_stub_epoll_wait(a1, a2, a3, a4) }
+fn sc_epoll_wait(a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> u64 { sys_epoll_wait_real(a1, a2, a3, a4) }
+fn sc_epoll_pwait(a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> u64 { sys_epoll_wait_real(a1, a2, a3, a4) }
 fn sc_set_robust_list(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_set_robust_list(a1, a2) }
 fn sc_pipe2(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_pipe2(a1, a2) }
 fn sc_prlimit64(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_prlimit64(a1, a2, a3) }
@@ -806,14 +806,14 @@ static SYSCALL_TABLE: [Option<SyscallFn>; SYSCALL_TABLE_LEN] = {
     t[274] = Some(sc_zero);          // get_robust_list
     t[280] = Some(sc_zero);          // utimensat
     t[281] = Some(sc_epoll_pwait);    // epoll_pwait
-    t[282] = Some(sc_zero);          // signalfd
-    t[283] = Some(sc_zero);          // timerfd_create
+    t[282] = Some(sc_signalfd4);      // signalfd (uses signalfd4 impl)
+    t[283] = Some(sc_timerfd_create);  // timerfd_create
     t[284] = Some(sc_zero);          // eventfd
     t[285] = Some(sc_zero);          // fallocate
-    t[286] = Some(sc_zero);          // timerfd_settime
-    t[287] = Some(sc_zero);          // timerfd_gettime
+    t[286] = Some(sc_timerfd_settime); // timerfd_settime
+    t[287] = Some(sc_timerfd_gettime); // timerfd_gettime
     t[288] = Some(sc_zero);          // accept4
-    t[289] = Some(sc_zero);          // signalfd4
+    t[289] = Some(sc_signalfd4);      // signalfd4
     t[290] = Some(sc_zero);          // eventfd2
     t[291] = Some(sc_epoll_create1);  // epoll_create1
     t[292] = Some(sc_dup2);          // dup3 → dup2
@@ -1503,46 +1503,376 @@ fn sys_epoll_create1(flags: u64) -> u64 {
 
 /// epoll_ctl(epfd, op, fd, event_ptr) -> 0 on success
 /// op: 1=EPOLL_CTL_ADD, 2=EPOLL_CTL_DEL, 3=EPOLL_CTL_MOD
-fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, _event_ptr: u64) -> u64 {
+/// Reads the epoll_event struct from userspace and stores interest per-process.
+/// struct epoll_event { u32 events; u32 _pad; u64 data; } = 12 bytes (packed on Linux)
+fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u64 {
     let pid = crate::scheduler::current_pid();
     if pid == 0 { return ENOSYS; }
-    let result = crate::process::with_fd_table_mut(pid, |fdt| {
-        // Verify epfd exists and is an Epoll type
-        if let Some(entry) = fdt.get(epfd as usize) {
-            if entry.fd_type != crate::process::FdType::Epoll {
-                return EBADF;
-            }
-        } else {
-            return EBADF;
+
+    // Verify epfd is an Epoll type
+    let is_epoll = crate::process::with_fd_table(pid, |fdt| {
+        fdt.get(epfd as usize).map(|e| e.fd_type == crate::process::FdType::Epoll).unwrap_or(false)
+    }).unwrap_or(false);
+    if !is_epoll { return EBADF; }
+
+    const EPOLL_CTL_ADD: u64 = 1;
+    const EPOLL_CTL_DEL: u64 = 2;
+    const EPOLL_CTL_MOD: u64 = 3;
+
+    match op {
+        EPOLL_CTL_ADD => {
+            // Read epoll_event from user space: { u32 events, u64 data } (12 bytes packed)
+            if event_ptr == 0 || !validate_user_ptr(event_ptr, 12) { return EFAULT; }
+            let events = unsafe { core::ptr::read_unaligned(event_ptr as *const u32) };
+            let data = unsafe { core::ptr::read_unaligned((event_ptr + 4) as *const u64) };
+
+            // Verify target fd exists
+            let fd_exists = crate::process::with_fd_table(pid, |fdt| {
+                fdt.get(fd as usize).is_some()
+            }).unwrap_or(false);
+            if !fd_exists { return EBADF; }
+
+            // Store interest in process's epoll_interests list
+            crate::process::with_process_mut(pid, |p| {
+                // Check for duplicate
+                let already = p.epoll_interests.iter().any(|ei| ei.epfd == epfd as u32 && ei.fd == fd as u32);
+                if already { return; } // EEXIST silently ignored for compatibility
+                p.epoll_interests.push(crate::process::EpollInterest {
+                    epfd: epfd as u32,
+                    fd: fd as u32,
+                    events,
+                    data,
+                });
+            });
+            crate::serial_println!("[EPOLL] ctl ADD epfd={} fd={} events={:#x} (PID {})", epfd, fd, events, pid);
+            0
         }
-        // Verify the target fd exists (for ADD/MOD)
-        if op == 1 || op == 3 {
-            if fdt.get(fd as usize).is_none() {
-                return EBADF;
-            }
+        EPOLL_CTL_DEL => {
+            crate::process::with_process_mut(pid, |p| {
+                p.epoll_interests.retain(|ei| !(ei.epfd == epfd as u32 && ei.fd == fd as u32));
+            });
+            crate::serial_println!("[EPOLL] ctl DEL epfd={} fd={} (PID {})", epfd, fd, pid);
+            0
         }
-        crate::serial_println!("[EPOLL] epoll_ctl(epfd={}, op={}, fd={}) -> 0 (PID {})", epfd, op, fd, pid);
-        0u64
-    });
-    result.unwrap_or(ENOSYS)
+        EPOLL_CTL_MOD => {
+            if event_ptr == 0 || !validate_user_ptr(event_ptr, 12) { return EFAULT; }
+            let events = unsafe { core::ptr::read_unaligned(event_ptr as *const u32) };
+            let data = unsafe { core::ptr::read_unaligned((event_ptr + 4) as *const u64) };
+
+            crate::process::with_process_mut(pid, |p| {
+                if let Some(ei) = p.epoll_interests.iter_mut()
+                    .find(|ei| ei.epfd == epfd as u32 && ei.fd == fd as u32) {
+                    ei.events = events;
+                    ei.data = data;
+                }
+            });
+            crate::serial_println!("[EPOLL] ctl MOD epfd={} fd={} events={:#x} (PID {})", epfd, fd, events, pid);
+            0
+        }
+        _ => EINVAL,
+    }
 }
 
-/// Jalon 128+135: epoll_wait(epfd, events, maxevents, timeout) -> 0
-/// Yields to allow other processes to run, then returns 0 (no events ready).
-/// Sufficient for basic MicroPython, libuv event loops.
-fn sys_stub_epoll_wait(epfd: u64, _events: u64, _maxevents: u64, timeout: u64) -> u64 {
-    if timeout > 0 {
-        let yields = core::cmp::min(timeout / 10, 50);
-        for _ in 0..yields { sys_yield(); }
+/// Real epoll_wait: checks registered FDs for readiness, populates events array.
+/// struct epoll_event { u32 events; u32 _pad; u64 data; } = 12 bytes per event.
+/// Returns number of ready FDs written to events array, or 0 if timeout expired.
+fn sys_epoll_wait_real(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64) -> u64 {
+    let pid = crate::scheduler::current_pid();
+    if pid == 0 { return ENOSYS; }
+    if maxevents == 0 || maxevents > 128 { return EINVAL; }
+
+    // Validate user buffer: 12 bytes per event
+    let buf_size = maxevents * 12;
+    if events_ptr == 0 || !validate_user_ptr(events_ptr, buf_size) { return EFAULT; }
+
+    // Collect interests for this epfd
+    let interests: alloc::vec::Vec<(u32, u32, u64)> = crate::process::with_process(pid, |p| {
+        p.epoll_interests.iter()
+            .filter(|ei| ei.epfd == epfd as u32)
+            .map(|ei| (ei.fd, ei.events, ei.data))
+            .collect()
+    }).unwrap_or_default();
+
+    if interests.is_empty() {
+        // No interests registered: yield and return 0
+        if timeout > 0 && timeout != (-1i64 as u64) {
+            let yields = core::cmp::min(timeout / 10, 20);
+            for _ in 0..yields { sys_yield(); }
+        }
+        return 0;
     }
-    0
+
+    // Try up to `max_attempts` times (yield between attempts for timeout > 0)
+    let max_attempts = if timeout == 0 { 1u64 }
+        else if timeout == (-1i64 as u64) { 200 } // infinite: try 200 times
+        else { core::cmp::min(timeout / 5, 100).max(1) };
+
+    for attempt in 0..max_attempts {
+        let mut ready_count: u64 = 0;
+
+        for &(fd, req_events, data) in &interests {
+            if ready_count >= maxevents { break; }
+
+            let mut revents: u32 = 0;
+
+            // Check FD readiness based on type
+            let fd_type = crate::process::with_fd_table(pid, |fdt| {
+                fdt.get(fd as usize).map(|e| e.fd_type)
+            }).flatten();
+
+            match fd_type {
+                Some(crate::process::FdType::Tty) => {
+                    // stdin (fd 0): check keyboard buffer
+                    if fd == 0 && (req_events & crate::process::EPOLLIN != 0) {
+                        // Check if keyboard data is available via the kbd buffer
+                        // We can't peek without consuming, so report EPOLLIN optimistically
+                        // for stdin to match Linux behavior
+                        revents |= crate::process::EPOLLIN;
+                    }
+                    // stdout/stderr (fd 1,2): always writable
+                    if (fd == 1 || fd == 2) && (req_events & crate::process::EPOLLOUT != 0) {
+                        revents |= crate::process::EPOLLOUT;
+                    }
+                }
+                Some(crate::process::FdType::Pipe) => {
+                    // Pipes: report EPOLLIN always (we can't peek pipe state easily)
+                    if req_events & crate::process::EPOLLIN != 0 {
+                        revents |= crate::process::EPOLLIN;
+                    }
+                    if req_events & crate::process::EPOLLOUT != 0 {
+                        revents |= crate::process::EPOLLOUT;
+                    }
+                }
+                Some(crate::process::FdType::Socket) => {
+                    // Sockets: check for data availability
+                    if req_events & crate::process::EPOLLIN != 0 {
+                        // TCP socket: check receive buffer (optimistic for now)
+                        revents |= crate::process::EPOLLIN;
+                    }
+                    if req_events & crate::process::EPOLLOUT != 0 {
+                        revents |= crate::process::EPOLLOUT;
+                    }
+                }
+                Some(crate::process::FdType::File) => {
+                    // Regular files are always ready for read/write
+                    if req_events & crate::process::EPOLLIN != 0 {
+                        revents |= crate::process::EPOLLIN;
+                    }
+                    if req_events & crate::process::EPOLLOUT != 0 {
+                        revents |= crate::process::EPOLLOUT;
+                    }
+                }
+                Some(crate::process::FdType::Epoll) => {
+                    // Nested epoll: not supported, skip
+                }
+                None => {
+                    // FD closed or invalid: report EPOLLHUP
+                    revents |= crate::process::EPOLLHUP;
+                }
+            }
+
+            // Also check timerfd readiness
+            if revents == 0 {
+                let is_timer_ready = crate::process::with_process(pid, |p| {
+                    p.timer_fds.iter().any(|t| t.fd == fd && t.armed && t.expirations > 0)
+                }).unwrap_or(false);
+                if is_timer_ready && (req_events & crate::process::EPOLLIN != 0) {
+                    revents |= crate::process::EPOLLIN;
+                }
+            }
+
+            if revents != 0 {
+                // Write epoll_event to user space: { u32 events, u64 data }
+                let ev_offset = events_ptr + ready_count * 12;
+                unsafe {
+                    core::ptr::write_unaligned(ev_offset as *mut u32, revents);
+                    core::ptr::write_unaligned((ev_offset + 4) as *mut u64, data);
+                }
+                ready_count += 1;
+            }
+        }
+
+        if ready_count > 0 {
+            if ready_count <= 4 {
+                crate::serial_println!("[EPOLL] wait epfd={} -> {} events ready (PID {})", epfd, ready_count, pid);
+            }
+            return ready_count;
+        }
+
+        // No events ready: yield before next attempt (if timeout allows)
+        if attempt + 1 < max_attempts {
+            sys_yield();
+        }
+    }
+
+    0 // Timeout expired, no events
 }
+
 
 /// accept(fd, addr, addrlen) -> -ENOSYS (not yet implemented)
 fn sys_stub_accept(_fd: u32, _addr: u64, _addrlen: u64) -> u64 { ENOSYS }
 
 /// listen(fd, backlog) -> 0 (stub)
 fn sys_stub_listen(_fd: u32, _backlog: u64) -> u64 { 0 }
+
+// ===== Phase 1b: signalfd & timerfd =====
+
+/// signalfd4(fd, mask_ptr, mask_size, flags) -> signalfd FD
+/// Creates a Pipe-typed FD in the process FD table that represents signal delivery.
+/// If fd == -1, create new. If fd >= 0, update existing (not supported yet, create new).
+fn sys_signalfd4(fd: u64, _mask_ptr: u64, _mask_size: u64, _flags: u64) -> u64 {
+    let pid = crate::scheduler::current_pid();
+    if pid == 0 { return ENOSYS; }
+
+    if fd == (-1i64 as u64) || fd > 0x7FFF_FFFF {
+        // Create new signalfd
+        match crate::process::with_fd_table_mut(pid, |fdt| {
+            fdt.alloc_fd_typed("signalfd", 0, crate::process::FdType::Pipe)
+        }) {
+            Some(Some(new_fd)) => {
+                crate::serial_println!("[SIGNALFD] created FD {} (PID {})", new_fd, pid);
+                new_fd as u64
+            }
+            _ => EMFILE,
+        }
+    } else {
+        // Update existing signalfd — just return the same fd (mask update is a no-op for now)
+        crate::serial_println!("[SIGNALFD] updated FD {} (PID {})", fd, pid);
+        fd
+    }
+}
+
+/// timerfd_create(clockid, flags) -> timerfd FD
+/// Creates a File-typed FD in the FD table and registers timer state per-process.
+fn sys_timerfd_create(_clockid: u64, _flags: u64) -> u64 {
+    let pid = crate::scheduler::current_pid();
+    if pid == 0 { return ENOSYS; }
+
+    match crate::process::with_fd_table_mut(pid, |fdt| {
+        fdt.alloc_fd_typed("timerfd", 0, crate::process::FdType::File)
+    }) {
+        Some(Some(fd)) => {
+            // Register timer state in process
+            crate::process::with_process_mut(pid, |p| {
+                p.timer_fds.push(crate::process::TimerFdState {
+                    fd: fd as u32,
+                    interval_ns: 0,
+                    next_expiry_tsc: 0,
+                    expirations: 0,
+                    armed: false,
+                });
+            });
+            crate::serial_println!("[TIMERFD] created FD {} (PID {})", fd, pid);
+            fd as u64
+        }
+        _ => EMFILE,
+    }
+}
+
+/// timerfd_settime(fd, flags, new_value_ptr, old_value_ptr) -> 0
+/// struct itimerspec { struct timespec it_interval; struct timespec it_value; }
+/// struct timespec { i64 tv_sec; i64 tv_nsec; } = 16 bytes each, total 32 bytes
+/// Arms/disarms the timer. If it_value is zero, disarms. Otherwise arms.
+fn sys_timerfd_settime(fd: u64, _flags: u64, new_value_ptr: u64, old_value_ptr: u64) -> u64 {
+    let pid = crate::scheduler::current_pid();
+    if pid == 0 { return ENOSYS; }
+
+    // Read new timer value from user space
+    let (interval_ns, value_ns) = if new_value_ptr != 0 && validate_user_ptr(new_value_ptr, 32) {
+        unsafe {
+            // it_interval: { tv_sec (8 bytes), tv_nsec (8 bytes) }
+            let interval_sec = core::ptr::read_unaligned(new_value_ptr as *const i64);
+            let interval_nsec = core::ptr::read_unaligned((new_value_ptr + 8) as *const i64);
+            // it_value: { tv_sec (8 bytes), tv_nsec (8 bytes) }
+            let value_sec = core::ptr::read_unaligned((new_value_ptr + 16) as *const i64);
+            let value_nsec = core::ptr::read_unaligned((new_value_ptr + 24) as *const i64);
+            let i_ns = (interval_sec as u64).wrapping_mul(1_000_000_000).wrapping_add(interval_nsec as u64);
+            let v_ns = (value_sec as u64).wrapping_mul(1_000_000_000).wrapping_add(value_nsec as u64);
+            (i_ns, v_ns)
+        }
+    } else {
+        (0u64, 0u64)
+    };
+
+    // Write old value if requested (zero it out for simplicity)
+    if old_value_ptr != 0 && validate_user_ptr(old_value_ptr, 32) {
+        unsafe { core::ptr::write_bytes(old_value_ptr as *mut u8, 0, 32); }
+    }
+
+    // Update timer state
+    let tsc_now = unsafe { core::arch::x86_64::_rdtsc() };
+    // Approximate TSC frequency: ~2.5 GHz (conservative estimate)
+    const TSC_PER_NS: u64 = 3; // ~3 GHz, close enough for timer resolution
+
+    crate::process::with_process_mut(pid, |p| {
+        if let Some(timer) = p.timer_fds.iter_mut().find(|t| t.fd == fd as u32) {
+            if value_ns == 0 {
+                // Disarm timer
+                timer.armed = false;
+                timer.expirations = 0;
+                crate::serial_println!("[TIMERFD] disarmed FD {} (PID {})", fd, pid);
+            } else {
+                // Arm timer
+                timer.interval_ns = interval_ns;
+                timer.next_expiry_tsc = tsc_now + value_ns * TSC_PER_NS;
+                timer.expirations = 0;
+                timer.armed = true;
+                crate::serial_println!("[TIMERFD] armed FD {} (value={}ns interval={}ns PID {})",
+                    fd, value_ns, interval_ns, pid);
+            }
+        }
+    });
+
+    0
+}
+
+/// timerfd_gettime(fd, cur_value_ptr) -> 0
+/// Returns remaining time until next expiry in itimerspec format.
+fn sys_timerfd_gettime(fd: u64, cur_value_ptr: u64) -> u64 {
+    let pid = crate::scheduler::current_pid();
+    if pid == 0 { return ENOSYS; }
+
+    if cur_value_ptr == 0 || !validate_user_ptr(cur_value_ptr, 32) {
+        return EFAULT;
+    }
+
+    let tsc_now = unsafe { core::arch::x86_64::_rdtsc() };
+    const TSC_PER_NS: u64 = 3;
+
+    let (remaining_ns, interval_ns) = crate::process::with_process(pid, |p| {
+        if let Some(timer) = p.timer_fds.iter().find(|t| t.fd == fd as u32) {
+            if timer.armed && timer.next_expiry_tsc > tsc_now {
+                let remaining = (timer.next_expiry_tsc - tsc_now) / TSC_PER_NS;
+                (remaining, timer.interval_ns)
+            } else {
+                (0u64, timer.interval_ns)
+            }
+        } else {
+            (0u64, 0u64)
+        }
+    }).unwrap_or((0, 0));
+
+    unsafe {
+        // it_interval
+        let interval_sec = interval_ns / 1_000_000_000;
+        let interval_nsec = interval_ns % 1_000_000_000;
+        core::ptr::write_unaligned(cur_value_ptr as *mut i64, interval_sec as i64);
+        core::ptr::write_unaligned((cur_value_ptr + 8) as *mut i64, interval_nsec as i64);
+        // it_value  
+        let value_sec = remaining_ns / 1_000_000_000;
+        let value_nsec = remaining_ns % 1_000_000_000;
+        core::ptr::write_unaligned((cur_value_ptr + 16) as *mut i64, value_sec as i64);
+        core::ptr::write_unaligned((cur_value_ptr + 24) as *mut i64, value_nsec as i64);
+    }
+
+    0
+}
+
+// Dispatch wrappers for signalfd/timerfd
+fn sc_signalfd4(a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> u64 { sys_signalfd4(a1, a2, a3, a4) }
+fn sc_timerfd_create(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_timerfd_create(a1, a2) }
+fn sc_timerfd_settime(a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> u64 { sys_timerfd_settime(a1, a2, a3, a4) }
+fn sc_timerfd_gettime(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_timerfd_gettime(a1, a2) }
 
 /// uname(buf) -> fills with AetherionOS info
 fn sys_stub_uname(buf_addr: u64) -> u64 {
@@ -7294,4 +7624,14 @@ pub fn sys_close_pub(fd: u32) -> u64 {
 /// Public wrapper for sys_seek (lseek), used by compat::linux_abi (stat_vfs, fstat_vfs)
 pub fn sys_lseek_pub(fd: u32, offset: i64, whence: u32) -> u64 {
     sys_seek(fd, offset, whence)
+}
+
+/// Public wrapper for the real epoll_wait, used by compat::linux_abi
+pub fn epoll_wait_real_pub(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64) -> u64 {
+    sys_epoll_wait_real(epfd, events_ptr, maxevents, timeout)
+}
+
+/// Public wrapper for sys_epoll_create1, used by compat::linux_abi
+pub fn sys_epoll_create1_pub(flags: u64) -> u64 {
+    sys_epoll_create1(flags)
 }

@@ -17,7 +17,8 @@ use spin::Mutex;
 use lazy_static::lazy_static;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-pub use task::{AgentRole, Process, ProcessState, FdTable, FdType, FileDescriptor, MAX_FDS, VirtualMemoryArea};
+pub use task::{AgentRole, Process, ProcessState, FdTable, FdType, FileDescriptor, MAX_FDS, VirtualMemoryArea,
+    EpollInterest, TimerFdState, EPOLLIN, EPOLLOUT, EPOLLERR, EPOLLHUP, EPOLLET};
 pub use crate::arch::x86_64::context::TaskContext;
 
 // ===== Keyboard Input Buffer =====
