@@ -149,61 +149,61 @@ static AGENT_BENCH_ELF: &[u8] = include_bytes!("../../userspace/agent_bench/targ
 static AGENT_TOKENIZER_ELF: &[u8] = include_bytes!("../../userspace/agent_tokenizer/target/x86_64-aetherion-user/release/agent_tokenizer");
 
 /// agent_inference - Jalon 47 GGUF Tensor Metadata Inspector (Ring 3)
-static AGENT_INFERENCE_ELF: &[u8] = include_bytes!("../../userspace/agent_inference/target/x86_64-aetherion-user/release/agent_inference");
+static AGENT_INFERENCE_ELF: &[u8] = include_bytes!("../../bin_cache/agent_inference");
 
 /// agent_llama - Jalon 49 Bare-Metal LLM Transformer Math (Ring 3)
-static AGENT_LLAMA_ELF: &[u8] = include_bytes!("../../userspace/agent_llama/target/x86_64-aetherion-user/release/agent_llama");
+static AGENT_LLAMA_ELF: &[u8] = include_bytes!("../../bin_cache/agent_llama");
 
 /// agent_llm_chat - Jalon 50 LLM Chat via Cognitive Bus (Ring 3)
-static AGENT_LLM_CHAT_ELF: &[u8] = include_bytes!("../../userspace/agent_llm_chat/target/x86_64-aetherion-user/release/agent_llm_chat");
+static AGENT_LLM_CHAT_ELF: &[u8] = include_bytes!("../../bin_cache/agent_llm_chat");
 
 /// agent_mt_matmul - Jalon 51 Multithreaded MatMul (Ring 3)
-static AGENT_MT_MATMUL_ELF: &[u8] = include_bytes!("../../userspace/agent_mt_matmul/target/x86_64-aetherion-user/release/agent_mt_matmul");
+static AGENT_MT_MATMUL_ELF: &[u8] = include_bytes!("../../bin_cache/agent_mt_matmul");
 
 /// agent_chunk_reader - Jalon 53 Sequential Chunk Reader (Ring 3)
-static AGENT_CHUNK_READER_ELF: &[u8] = include_bytes!("../../userspace/agent_chunk_reader/target/x86_64-aetherion-user/release/agent_chunk_reader");
+static AGENT_CHUNK_READER_ELF: &[u8] = include_bytes!("../../bin_cache/agent_chunk_reader");
 
 /// agent_weight_loader - Jalon 54 GGUF Weight Loader (Ring 3)
-static AGENT_WEIGHT_LOADER_ELF: &[u8] = include_bytes!("../../userspace/agent_weight_loader/target/x86_64-aetherion-user/release/agent_weight_loader");
+static AGENT_WEIGHT_LOADER_ELF: &[u8] = include_bytes!("../../bin_cache/agent_weight_loader");
 
 /// agent_orchestrator - Jalon 56 Agent Orchestrator (Ring 3)
-static AGENT_ORCHESTRATOR_ELF: &[u8] = include_bytes!("../../userspace/agent_orchestrator/target/x86_64-aetherion-user/release/agent_orchestrator");
+static AGENT_ORCHESTRATOR_ELF: &[u8] = include_bytes!("../../bin_cache/agent_orchestrator");
 
 /// agent_state - Jalon 57 Persistent State Reader (Ring 3)
-static AGENT_STATE_ELF: &[u8] = include_bytes!("../../userspace/agent_state/target/x86_64-aetherion-user/release/agent_state");
+static AGENT_STATE_ELF: &[u8] = include_bytes!("../../bin_cache/agent_state");
 
 /// agent_http - Jalon 58 HTTP Client Agent (Ring 3)
-static AGENT_HTTP_ELF: &[u8] = include_bytes!("../../userspace/agent_http/target/x86_64-aetherion-user/release/agent_http");
+static AGENT_HTTP_ELF: &[u8] = include_bytes!("../../bin_cache/agent_http");
 
 /// agent_visual_term - Jalon 59 Interactive Visual Terminal (Ring 3)
-static AGENT_VISUAL_TERM_ELF: &[u8] = include_bytes!("../../userspace/agent_visual_term/target/x86_64-aetherion-user/release/agent_visual_term");
+static AGENT_VISUAL_TERM_ELF: &[u8] = include_bytes!("../../bin_cache/agent_visual_term");
 
 /// agent_q4_dequant - Jalon 61 Q4_K_M Dequantizer (Ring 3)
-static AGENT_Q4_DEQUANT_ELF: &[u8] = include_bytes!("../../userspace/agent_q4_dequant/target/x86_64-aetherion-user/release/agent_q4_dequant");
+static AGENT_Q4_DEQUANT_ELF: &[u8] = include_bytes!("../../bin_cache/agent_q4_dequant");
 
 /// agent_llama_core - Jalon 62/63 LLaMA Transformer Core (Ring 3)
-static AGENT_LLAMA_CORE_ELF: &[u8] = include_bytes!("../../userspace/agent_llama_core/target/x86_64-aetherion-user/release/agent_llama_core");
+static AGENT_LLAMA_CORE_ELF: &[u8] = include_bytes!("../../bin_cache/agent_llama_core");
 
 /// wget_real - Jalon 78 TCP Socket Validation (Ring 3 C app)
 static WGET_REAL_ELF: &[u8] = include_bytes!("../../userspace/c_apps/wget_real.elf");
 
 /// agent_mcp - Level 8 MCP (Model Context Protocol) Security Agent (Ring 3)
-static AGENT_MCP_ELF: &[u8] = include_bytes!("../../userspace/agent_mcp/target/x86_64-aetherion-user/release/agent_mcp");
+static AGENT_MCP_ELF: &[u8] = include_bytes!("../../bin_cache/agent_mcp");
 
 /// agent_validator - Immune System: JSON coherence validator (Ring 3)
-static AGENT_VALIDATOR_ELF: &[u8] = include_bytes!("../../userspace/agent_validator/target/x86_64-aetherion-user/release/agent_validator");
+static AGENT_VALIDATOR_ELF: &[u8] = include_bytes!("../../bin_cache/agent_validator");
 
 /// agent_clock - Jalon 112a: Clock Sensor Agent (Ring 3)
 /// Publishes INTENT_TIMER_TICK (0x112A) every second for uptime tracking.
-static AGENT_CLOCK_ELF: &[u8] = include_bytes!("../../userspace/agent_clock/target/x86_64-aetherion-user/release/agent_clock");
+static AGENT_CLOCK_ELF: &[u8] = include_bytes!("../../bin_cache/agent_clock");
 
 /// agent_memory - Jalon 111a: Episodic Memory Agent (Ring 3)
 /// Logs all Cognitive Bus traffic to /disk/var/memory.db for persistence.
-static AGENT_MEMORY_ELF: &[u8] = include_bytes!("../../userspace/agent_memory/target/x86_64-aetherion-user/release/agent_memory");
+static AGENT_MEMORY_ELF: &[u8] = include_bytes!("../../bin_cache/agent_memory");
 
 /// agent_autonomous - Jalon 113-114: Autonomous AGI Execution Agent (Ring 3)
 /// HTTP/DNS/FS/MCP/NetScan/Crawl/API — real autonomous operations.
-static AGENT_AUTONOMOUS_ELF: &[u8] = include_bytes!("../../userspace/agent_autonomous/target/x86_64-aetherion-user/release/agent_autonomous");
+static AGENT_AUTONOMOUS_ELF: &[u8] = include_bytes!("../../bin_cache/agent_autonomous");
 
 /// Busybox 1.35.0 - statically linked x86_64 musl Linux binary
 /// Jalon 94-95: Native Linux binary execution via Linuxulator
