@@ -1723,15 +1723,40 @@ pub fn load_elf(path: &str) -> Result<u64, ElfError> {
 #[no_mangle]
 pub unsafe extern "C" fn exec_trampoline() -> ! {
     core::arch::asm!(
-        // The caller has already:
-        //   - Disabled interrupts (cli)
-        //   - Relocated RSP to the physical-offset mapping
-        // Register convention:
-        //   r8  = new PML4 physical address
+        // Jalon 140: KPTI-safe Ring 3 entry trampoline.
+        //
+        // Register convention (set by caller):
+        //   r8  = new PML4 physical address (user CR3)
         //   r9  = user RSP
         //   r10 = user RIP
+        //   r11 = physical-offset base (phys_off)
+        //
+        // This function is called at its phys_off+phys address, which is
+        // mapped in BOTH the kernel and user PML4 (via PML4[256]).
+        //
+        // CRITICAL: Build the IRETQ frame BEFORE switching CR3.
+        // The kernel stack is only accessible under the kernel PML4.
+        // After CR3 switch, the kernel stack (PML4[1]) may not be mapped.
+        // The IRETQ frame uses r9 (user RSP) and r10 (user RIP) which
+        // are in registers, not on the stack.
+        //
+        // Strategy: Build IRETQ frame on a mini-stack in the phys_off region.
+        // Use r11 (phys_off) + a fixed low physical address as the stack.
+        // Physical address 0x7000 is in low conventional memory (always mapped).
 
-        // Switch to new address space
+        // Set RSP to a safe stack in the physical-offset region.
+        // phys_off + 0x7000 is always mapped (low conventional memory).
+        // We only need 40 bytes (5 pushes × 8 bytes).
+        "lea rsp, [r11 + 0x7000]",
+
+        // Build IRETQ frame BEFORE CR3 switch (stack is in phys_off region)
+        "push 0x1B",     // SS  = User Data (RPL=3)
+        "push r9",       // RSP = user stack
+        "push 0x202",    // RFLAGS (IF=1)
+        "push 0x23",     // CS  = User Code (RPL=3)
+        "push r10",      // RIP = entry point
+
+        // Now switch to user address space
         "mov cr3, r8",
 
         // Swap GS: kernel GS -> user GS
@@ -1746,57 +1771,137 @@ pub unsafe extern "C" fn exec_trampoline() -> ! {
         "xor rdi, rdi",
         "xor rbp, rbp",
         "xor r8, r8",
+        "xor r9, r9",
+        "xor r10, r10",
         "xor r11, r11",
         "xor r12, r12",
         "xor r13, r13",
         "xor r14, r14",
         "xor r15, r15",
-        // Build IRETQ frame
-        "push 0x1B",     // SS  = User Data (RPL=3)
-        "push r9",       // RSP = user stack
-        "push 0x202",    // RFLAGS (IF=1)
-        "push 0x23",     // CS  = User Code (RPL=3)
-        "push r10",      // RIP = entry point
+
+        // IRETQ: reads the frame already on the stack (in phys_off region,
+        // which is present in the user PML4 via PML4[256])
         "iretq",
         options(noreturn),
     );
 }
 
-/// Execute a CR3 switch + jump to Ring 3 safely, even when the new PML4
-/// has user ELF segments that overlap kernel .text (e.g., BusyBox at 0x400000).
+// ===== Global IRETQ Trampoline =====
+//
+// Jalon 142: Heap-allocated KPTI trampoline. Allocated once during init,
+// lives on the kernel heap (PML4[1] region), which is cloned into every
+// user PML4. This eliminates the per-call virt_to_phys_via_cr3 walk and
+// avoids the phys_off mapping confusion that caused the 0x80002001 crash.
+//
+// Machine code sequence (17 bytes):
+//   mov cr3, r8      (3 bytes: 41 0F 22 D8... actually 4)
+//   swapgs            (3 bytes: 0F 01 F8)
+//   iretq             (2 bytes: 48 CF)
+//
+// The caller pushes the IRETQ frame on phys_off+0x7000 BEFORE jumping here.
+// Register r8 must contain the new PML4 physical address.
+
+/// Address of the global IRETQ trampoline (heap-allocated, set once during init).
+static GLOBAL_IRETQ_TRAMPOLINE: AtomicU64 = AtomicU64::new(0);
+
+/// Initialize the global IRETQ trampoline. Must be called once during kernel
+/// boot after the heap is available. The trampoline is a small code buffer
+/// on the kernel heap (PML4[1]) containing: mov cr3,r8 + swapgs + iretq.
+pub fn init_global_iretq_trampoline() {
+    let buf = alloc::vec![0u8; 64]; // 64 bytes, heap-allocated (RWX in identity-mapped region)
+    let ptr = buf.leak().as_mut_ptr(); // leak intentionally — lives forever
+    unsafe {
+        // mov cr3, r8   => 41 0F 22 D8
+        // REX.B = 0x41 (r8 uses the B extension for rm field)
+        // Opcode: 0x0F 0x22 (MOV to CRn)
+        // ModRM: 0xD8 = 11 011 000 (mod=11, reg=3=CR3, rm=0+REX.B=r8)
+        *ptr.add(0) = 0x41; // REX.B (r8 is extended register in rm field)
+        *ptr.add(1) = 0x0F;
+        *ptr.add(2) = 0x22;
+        *ptr.add(3) = 0xD8; // ModRM: CR3, r8
+        // swapgs         => 0F 01 F8
+        *ptr.add(4) = 0x0F;
+        *ptr.add(5) = 0x01;
+        *ptr.add(6) = 0xF8;
+        // iretq           => 48 CF
+        *ptr.add(7) = 0x48;
+        *ptr.add(8) = 0xCF;
+    }
+    let addr = ptr as u64;
+    GLOBAL_IRETQ_TRAMPOLINE.store(addr, Ordering::SeqCst);
+    crate::serial_println!("[KPTI] Global IRETQ trampoline at 0x{:X}", addr);
+}
+
+/// Get the address of the global IRETQ trampoline.
+#[inline]
+pub fn iretq_trampoline_addr() -> u64 {
+    GLOBAL_IRETQ_TRAMPOLINE.load(Ordering::SeqCst)
+}
+
+/// Execute a CR3 switch + jump to Ring 3 safely using the KPTI trampoline.
 ///
-/// Strategy: We call exec_trampoline via its physical-offset mapping address.
-/// PML4[256] (physical memory offset at 0xFFFF800000000000) is present in BOTH
-/// the old and new PML4, so the trampoline code remains accessible during and
-/// after the CR3 switch.
+/// Jalon 142: Two strategies available:
+/// 1. Global heap trampoline (GLOBAL_IRETQ_TRAMPOLINE) — small code buffer on
+///    the kernel heap (PML4[136], cloned into every user PML4).
+/// 2. exec_trampoline naked function — at kernel VA in PML4[1], also cloned.
+///
+/// We use the global heap trampoline. The IRETQ frame is built on phys_off+0x7000
+/// (PML4[256], always mapped in both page tables).
 pub unsafe fn exec_switch_cr3_and_ring3(
     new_pml4_phys: u64,
     user_entry: u64,
     user_rsp: u64,
 ) -> ! {
-    // Compute the physical address of exec_trampoline
-    let trampoline_virt = exec_trampoline as *const () as u64;
-    // Convert identity-mapped VA to physical address
-    // Kernel is identity-mapped, so phys = virt for low addresses
-    let trampoline_phys = trampoline_virt; // identity mapping: phys == virt
-    // Compute the high-half virtual address via physical memory offset
+    // Use the global heap trampoline. It contains:
+    //   mov cr3, r8   (switch to user page tables)
+    //   swapgs         (swap kernel/user GS)
+    //   iretq          (pop IRETQ frame → ring 3)
+    let trampoline = iretq_trampoline_addr();
+    if trampoline == 0 {
+        crate::serial_println!("[FATAL] GLOBAL_IRETQ_TRAMPOLINE not initialized!");
+        loop { core::arch::asm!("cli; hlt"); }
+    }
     let phys_off = phys_offset();
-    let trampoline_high = trampoline_phys + phys_off;
 
-    // Load arguments into the registers expected by the trampoline:
-    //   r8  = new CR3
-    //   r9  = user RSP
-    //   r10 = user RIP
-    // Then jump to the trampoline at its high-address mapping.
+    // Build IRETQ frame on the phys_off mini-stack (phys_off + 0x7000).
+    // PML4[256] is mapped in both kernel and user page tables.
+    //
+    // CRITICAL: The inline asm uses ONLY explicit register operands.
+    // rcx = trampoline address, r8 = CR3, r9 = user RSP, r10 = user RIP,
+    // r11 = phys_off. No other registers are used as operands to prevent
+    // the compiler from clobbering the trampoline address.
     core::arch::asm!(
         "cli",
-        "add rsp, {phys_off}",
-        "jmp {trampoline}",
-        phys_off = in(reg) phys_off,
-        trampoline = in(reg) trampoline_high,
+        // Set RSP to phys_off + 0x7000 (mini-stack in phys_off region)
+        "lea rsp, [r11 + 0x7000]",
+        // Build IRETQ frame BEFORE CR3 switch
+        "push 0x1B",    // SS  = User Data (RPL=3)
+        "push r9",      // RSP = user stack pointer
+        "push 0x202",   // RFLAGS (IF=1)
+        "push 0x23",    // CS  = User Code (RPL=3)
+        "push r10",     // RIP = user entry point
+        // Zero all GPRs EXCEPT r8 (needed by trampoline for mov cr3)
+        // and rcx (trampoline address for jmp)
+        "xor rax, rax",
+        "xor rbx, rbx",
+        "xor rdx, rdx",
+        "xor rsi, rsi",
+        "xor rdi, rdi",
+        "xor rbp, rbp",
+        "xor r9, r9",
+        "xor r10, r10",
+        "xor r11, r11",
+        "xor r12, r12",
+        "xor r13, r13",
+        "xor r14, r14",
+        "xor r15, r15",
+        // Jump to the global trampoline (does: mov cr3,r8 → swapgs → iretq)
+        "jmp rcx",
         in("r8") new_pml4_phys,
         in("r9") user_rsp,
         in("r10") user_entry,
+        in("r11") phys_off,
+        in("rcx") trampoline,
         options(noreturn),
     );
 }

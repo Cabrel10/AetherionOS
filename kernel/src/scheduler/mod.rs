@@ -492,8 +492,8 @@ pub fn tick_preemptive() -> Option<(u64, u64, u64, u64, u64, u64)> {
         return None;
     }
     let tick_num = TICK_COUNTER.fetch_add(1, Ordering::Relaxed);
-    // Only schedule every 10 ticks (~100ms with standard PIT)
-    if tick_num % 10 != 0 {
+    // Schedule every 3 ticks (~165ms at 18.2 Hz PIT) for responsive preemption
+    if tick_num % 3 != 0 {
         return None;
     }
     // Try to acquire the lock; if contended, skip

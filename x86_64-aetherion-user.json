@@ -14,7 +14,7 @@
     "features": "+sse,+sse2,-avx,-avx2,-fma,-mmx,-soft-float",
     "pre-link-args": {
         "ld.lld": [
-            "--image-base=0x8000000000",
+            "--image-base=0x400000",
             "-z", "max-page-size=4096"
         ]
     }
