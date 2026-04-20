@@ -2864,6 +2864,11 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                 serial_write("[WATCHDOG] Jalon 100: Kernel Watchdog ACTIVE (auto-respawn on crash)\n");
                 serial_write("========================================\n");
 
+                // Jalon 143: Disable preemption (CLI) before Ring-3 transition.
+                // The timer IRQ could fire between GS swap and IRETQ, corrupting
+                // the per-CPU state. Interrupts re-enabled by RFLAGS=0x202 in IRETQ.
+                unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+
                 // Prepare GS for the trampoline: the exec_trampoline does swapgs,
                 // so GS_BASE must be PER_CPU (kernel state) and KERNEL_GS_BASE=0.
                 // After swapgs in trampoline: GS_BASE=0 (user), KERNEL_GS_BASE=PER_CPU.
@@ -2949,9 +2954,48 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
                             final_rip, first_byte
                         );
 
+                        // Jalon 143: Dump first 16 bytes at entry point
+                        let phys_opt2 = elf::lookup_page_frame_pub(final_cr3, final_rip);
+                        if let Some(phys2) = phys_opt2 {
+                            let virt2 = elf::phys_to_virt(phys2 + (final_rip & 0xFFF));
+                            let max_bytes = 16usize.min(4096 - (final_rip & 0xFFF) as usize);
+                            let b = core::slice::from_raw_parts(virt2 as *const u8, max_bytes);
+                            serial_println!(
+                                "[ELF-DEBUG] Entry 0x{:X} first 16 bytes: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                                final_rip,
+                                b.get(0).copied().unwrap_or(0),  b.get(1).copied().unwrap_or(0),
+                                b.get(2).copied().unwrap_or(0),  b.get(3).copied().unwrap_or(0),
+                                b.get(4).copied().unwrap_or(0),  b.get(5).copied().unwrap_or(0),
+                                b.get(6).copied().unwrap_or(0),  b.get(7).copied().unwrap_or(0),
+                                b.get(8).copied().unwrap_or(0),  b.get(9).copied().unwrap_or(0),
+                                b.get(10).copied().unwrap_or(0), b.get(11).copied().unwrap_or(0),
+                                b.get(12).copied().unwrap_or(0), b.get(13).copied().unwrap_or(0),
+                                b.get(14).copied().unwrap_or(0), b.get(15).copied().unwrap_or(0),
+                            );
+                        }
+
+                        // Jalon 143: Verify stack is mapped in user PML4
+                        let stack_phys = elf::lookup_page_frame_pub(final_cr3, final_rsp.wrapping_sub(8));
+                        if stack_phys.is_none() {
+                            serial_println!(
+                                "[FATAL] User stack at 0x{:X} NOT MAPPED in PML4=0x{:X}!",
+                                final_rsp, final_cr3
+                            );
+                        } else {
+                            serial_println!(
+                                "[ELF-DEBUG] Stack 0x{:X} -> phys 0x{:X} (OK)",
+                                final_rsp, stack_phys.unwrap()
+                            );
+                        }
+
                         // Phase 1: Store user_cr3 in PER_CPU[48] so sysretq path
                         // can restore it later.
                         arch::x86_64::syscall::set_user_cr3(final_cr3);
+
+                        serial_println!(
+                            "[ELF-DEBUG] Launching PID {} via exec_switch_cr3_and_ring3: CR3=0x{:X} RIP=0x{:X} RSP=0x{:X}",
+                            pid, final_cr3, final_rip, final_rsp
+                        );
 
                         // Use exec_switch_cr3_and_ring3 which jumps to the trampoline
                         // via PML4[256] (phys-offset). This address is present in BOTH
