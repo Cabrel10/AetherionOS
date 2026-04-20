@@ -830,6 +830,32 @@ extern "x86-interrupt" fn page_fault_handler(
             let pid = crate::scheduler::current_pid();
             crate::serial_println!("[PF-DEEP] PID={} user_mode={}", pid, is_user_mode);
 
+            // Jalon 143: Detect phys_off + user_addr pattern in RIP/CR2.
+            // If RIP is in the phys_off region (0xFFFF8000...) with low bits
+            // matching a user address, the IRETQ or CR3 switch failed and the
+            // CPU resolved the user RIP through kernel page tables.
+            {
+                let phys_off_base: u64 = 0xFFFF_8000_0000_0000;
+                if rip >= phys_off_base {
+                    let user_addr_in_rip = rip.wrapping_sub(phys_off_base);
+                    if user_addr_in_rip < 0x0000_8000_0000_0000 {
+                        crate::serial_println!(
+                            "[ELF-DEBUG] CRITICAL: RIP=0x{:X} is phys_off+0x{:X}! CR3 switch likely failed.",
+                            rip, user_addr_in_rip
+                        );
+                    }
+                }
+                if addr_raw >= phys_off_base {
+                    let user_addr_in_cr2 = addr_raw.wrapping_sub(phys_off_base);
+                    if user_addr_in_cr2 < 0x0000_8000_0000_0000 {
+                        crate::serial_println!(
+                            "[ELF-DEBUG] CR2=0x{:X} is phys_off+0x{:X} -- data access through kernel mapping.",
+                            addr_raw, user_addr_in_cr2
+                        );
+                    }
+                }
+            }
+
             // J134c: Page-table walk for the faulting RIP to detect missing mappings
             // in the current CR3. We translate RIP virtual -> physical using CR3.
             unsafe {

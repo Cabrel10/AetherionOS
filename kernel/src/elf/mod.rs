@@ -1762,7 +1762,12 @@ pub unsafe extern "C" fn exec_trampoline() -> ! {
         // Swap GS: kernel GS -> user GS
         "swapgs",
 
-        // Zero all GPRs to prevent kernel state leaks
+        // Zero all GPRs to prevent kernel state leaks.
+        // CRITICAL FIX (Jalon 143): Do NOT zero r8 here!
+        // Although mov cr3,r8 has already executed, zeroing r8 before IRETQ
+        // can cause speculative execution issues on some microarchitectures
+        // where the CR3 write is not fully retired. Keeping r8 = PML4 phys
+        // is harmless (Ring 3 code cannot read CR3 anyway).
         "xor rax, rax",
         "xor rbx, rbx",
         "xor rcx, rcx",
@@ -1770,7 +1775,7 @@ pub unsafe extern "C" fn exec_trampoline() -> ! {
         "xor rsi, rsi",
         "xor rdi, rdi",
         "xor rbp, rbp",
-        "xor r8, r8",
+        // r8 intentionally NOT zeroed -- contains PML4 phys, harmless
         "xor r9, r9",
         "xor r10, r10",
         "xor r11, r11",
@@ -1855,7 +1860,7 @@ pub unsafe fn exec_switch_cr3_and_ring3(
     // Use the global heap trampoline. It contains:
     //   mov cr3, r8   (switch to user page tables)
     //   swapgs         (swap kernel/user GS)
-    //   iretq          (pop IRETQ frame → ring 3)
+    //   iretq          (pop IRETQ frame -> ring 3)
     let trampoline = iretq_trampoline_addr();
     if trampoline == 0 {
         crate::serial_println!("[FATAL] GLOBAL_IRETQ_TRAMPOLINE not initialized!");
@@ -1863,15 +1868,70 @@ pub unsafe fn exec_switch_cr3_and_ring3(
     }
     let phys_off = phys_offset();
 
+    // Jalon 143: Pre-IRETQ UART diagnostics
+    crate::serial_println!(
+        "[ELF-DEBUG] exec_switch_cr3_and_ring3: CR3=0x{:X} RIP=0x{:X} RSP=0x{:X} tramp=0x{:X} phys_off=0x{:X}",
+        new_pml4_phys, user_entry, user_rsp, trampoline, phys_off
+    );
+
+    // Jalon 143: Verify trampoline code is intact (9 bytes: mov cr3,r8 + swapgs + iretq)
+    let tramp_ptr = trampoline as *const u8;
+    let t0 = core::ptr::read_volatile(tramp_ptr.add(0));
+    let t1 = core::ptr::read_volatile(tramp_ptr.add(1));
+    let t7 = core::ptr::read_volatile(tramp_ptr.add(7));
+    let t8 = core::ptr::read_volatile(tramp_ptr.add(8));
+    if t0 != 0x41 || t1 != 0x0F || t7 != 0x48 || t8 != 0xCF {
+        crate::serial_println!(
+            "[FATAL] Trampoline code corrupted! Expected 41 0F ... 48 CF, got {:02X} {:02X} ... {:02X} {:02X}",
+            t0, t1, t7, t8
+        );
+        loop { core::arch::asm!("cli; hlt"); }
+    }
+
+    // Jalon 143: Verify user entry point is mapped in the target PML4
+    let entry_phys = lookup_page_frame_pub(new_pml4_phys, user_entry);
+    if entry_phys.is_none() {
+        crate::serial_println!(
+            "[FATAL] User entry 0x{:X} NOT MAPPED in target PML4 0x{:X}!",
+            user_entry, new_pml4_phys
+        );
+        loop { core::arch::asm!("cli; hlt"); }
+    }
+    crate::serial_println!(
+        "[ELF-DEBUG] Entry 0x{:X} -> phys frame 0x{:X} (OK)",
+        user_entry, entry_phys.unwrap()
+    );
+
+    // Jalon 143: Verify trampoline is accessible from user PML4
+    let tramp_phys = lookup_page_frame_pub(new_pml4_phys, trampoline);
+    if tramp_phys.is_none() {
+        crate::serial_println!(
+            "[FATAL] Trampoline at 0x{:X} NOT MAPPED in target PML4 0x{:X}! CR3 switch will fault.",
+            trampoline, new_pml4_phys
+        );
+        loop { core::arch::asm!("cli; hlt"); }
+    }
+
+    // Jalon 143: Volatile read all inputs to prevent LLVM from
+    // reordering or eliminating the register assignments.
+    let r8_val  = core::ptr::read_volatile(&new_pml4_phys);
+    let r9_val  = core::ptr::read_volatile(&user_rsp);
+    let r10_val = core::ptr::read_volatile(&user_entry);
+    let r11_val = core::ptr::read_volatile(&phys_off);
+    let rcx_val = core::ptr::read_volatile(&trampoline);
+
     // Build IRETQ frame on the phys_off mini-stack (phys_off + 0x7000).
     // PML4[256] is mapped in both kernel and user page tables.
-    //
-    // CRITICAL: The inline asm uses ONLY explicit register operands.
-    // rcx = trampoline address, r8 = CR3, r9 = user RSP, r10 = user RIP,
-    // r11 = phys_off. No other registers are used as operands to prevent
-    // the compiler from clobbering the trampoline address.
     core::arch::asm!(
         "cli",
+        // UART trace: emit 'T' (0x54) to confirm we reached the asm block
+        "2: mov dx, 0x3FD",
+        "in al, dx",
+        "test al, 0x20",
+        "jz 2b",
+        "mov dx, 0x3F8",
+        "mov al, 0x54",  // 'T' for Trampoline
+        "out dx, al",
         // Set RSP to phys_off + 0x7000 (mini-stack in phys_off region)
         "lea rsp, [r11 + 0x7000]",
         // Build IRETQ frame BEFORE CR3 switch
@@ -1881,7 +1941,8 @@ pub unsafe fn exec_switch_cr3_and_ring3(
         "push 0x23",    // CS  = User Code (RPL=3)
         "push r10",     // RIP = user entry point
         // Zero all GPRs EXCEPT r8 (needed by trampoline for mov cr3)
-        // and rcx (trampoline address for jmp)
+        // and rcx (trampoline address for jmp).
+        // Jalon 143: Do NOT zero r8 -- it carries the PML4 phys addr.
         "xor rax, rax",
         "xor rbx, rbx",
         "xor rdx, rdx",
@@ -1895,13 +1956,13 @@ pub unsafe fn exec_switch_cr3_and_ring3(
         "xor r13, r13",
         "xor r14, r14",
         "xor r15, r15",
-        // Jump to the global trampoline (does: mov cr3,r8 → swapgs → iretq)
+        // Jump to the global trampoline (does: mov cr3,r8 -> swapgs -> iretq)
         "jmp rcx",
-        in("r8") new_pml4_phys,
-        in("r9") user_rsp,
-        in("r10") user_entry,
-        in("r11") phys_off,
-        in("rcx") trampoline,
+        in("r8") r8_val,
+        in("r9") r9_val,
+        in("r10") r10_val,
+        in("r11") r11_val,
+        in("rcx") rcx_val,
         options(noreturn),
     );
 }
