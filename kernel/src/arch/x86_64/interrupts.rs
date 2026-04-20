@@ -151,7 +151,7 @@ pub extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: Interrupt
     let mut port = Port::new(0x60);
     // SAFETY: Port 0x60 is the PS/2 keyboard data port. Reading inside
     // the keyboard IRQ handler retrieves the pending scancode byte.
-    let scancode: u8 = unsafe { port.read() };
+    let _scancode: u8 = unsafe { port.read() };
 
     // Silent — stub handler, real handler is in idt.rs
 

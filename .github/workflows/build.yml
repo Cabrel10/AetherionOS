@@ -1,0 +1,171 @@
+name: AetherionOS Build
+
+on:
+  push:
+    branches: [main, genspark_ai_developer]
+    paths:
+      - 'kernel/**'
+      - 'userspace/**'
+      - 'sdk/**'
+      - 'bin_cache/**'
+      - 'x86_64-aetherion*.json'
+      - 'scripts/**'
+      - '.github/workflows/build.yml'
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: "1"
+  RUSTUP_TOOLCHAIN: nightly-2023-08-01
+
+jobs:
+  # ─── Quick check: compilation only ───────────────────────────
+  check:
+    name: Cargo Check (kernel lib)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust nightly-2023-08-01
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2023-08-01
+          components: rust-src, llvm-tools-preview
+          targets: x86_64-unknown-none
+
+      - name: Cache Cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/src
+            kernel/target
+          key: ${{ runner.os }}-cargo-check-${{ hashFiles('kernel/Cargo.lock', 'kernel/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-check-
+
+      - name: Ensure include_bytes! stubs
+        run: bash scripts/full_build.sh --kernel --check 2>&1 || true
+
+      - name: cargo check --lib
+        working-directory: kernel
+        run: |
+          cargo check --lib --target ../x86_64-aetherion.json 2>&1
+          echo "=== Re-run to confirm stability ==="
+          cargo check --lib --target ../x86_64-aetherion.json 2>&1
+
+  # ─── Full build: bootimage ──────────────────────────────────
+  build:
+    name: Cargo Bootimage (release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system packages
+        run: sudo apt-get update && sudo apt-get install -y gcc nasm mtools
+
+      - name: Install Rust nightly-2023-08-01
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2023-08-01
+          components: rust-src, llvm-tools-preview
+          targets: x86_64-unknown-none
+
+      - name: Install cargo-bootimage
+        run: cargo install bootimage --version 0.10.3
+
+      - name: Cache Cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/src
+            kernel/target
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('kernel/Cargo.lock', 'kernel/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-
+
+      - name: Ensure include_bytes! stubs exist
+        run: |
+          # Create minimal stub ELF for any missing binaries
+          cat > /tmp/stub.S << 'ASM'
+          .global _start
+          _start:
+              mov $60, %rax
+              xor %edi, %edi
+              syscall
+          ASM
+          as -o /tmp/stub.o /tmp/stub.S && ld -o /tmp/stub.elf /tmp/stub.o
+          rm -f /tmp/stub.o /tmp/stub.S
+
+          # Fill in missing include_bytes! targets
+          grep 'include_bytes!' kernel/src/main.rs | \
+            sed 's/.*include_bytes!("\(.*\)").*/\1/' | while read -r p; do
+            actual="kernel/src/$p"
+            if [ ! -f "$actual" ] || [ ! -s "$actual" ]; then
+              mkdir -p "$(dirname "$actual")"
+              cp /tmp/stub.elf "$actual"
+              echo "  stub: $actual"
+            fi
+          done
+
+      - name: Build C userspace apps
+        run: |
+          if [ -f scripts/build_c.sh ]; then
+            bash scripts/build_c.sh 2>&1 || echo "[WARN] C build had errors (non-fatal)"
+          fi
+
+      - name: cargo bootimage --release
+        working-directory: kernel
+        run: |
+          cargo bootimage --release --target ../x86_64-aetherion.json 2>&1
+
+      - name: Verify bootimage artifact
+        run: |
+          BOOTIMAGE="kernel/target/x86_64-aetherion/release/bootimage-aetherion-kernel.bin"
+          if [ ! -f "$BOOTIMAGE" ]; then
+            echo "::error::Bootimage not found at $BOOTIMAGE"
+            exit 1
+          fi
+          SIZE=$(stat -c%s "$BOOTIMAGE")
+          echo "Bootimage size: $SIZE bytes ($(numfmt --to=iec $SIZE))"
+          file "$BOOTIMAGE"
+
+      - name: Upload bootimage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootimage-aetherion-kernel
+          path: kernel/target/x86_64-aetherion/release/bootimage-aetherion-kernel.bin
+          retention-days: 7
+
+  # ─── C apps build check ─────────────────────────────────────
+  c-apps:
+    name: Build C Userspace Apps
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y gcc nasm mtools
+
+      - name: Build C apps
+        run: |
+          if [ -f scripts/build_c.sh ]; then
+            bash scripts/build_c.sh 2>&1
+          else
+            echo "No build_c.sh found, skipping"
+          fi
+
+      - name: Verify ELF outputs
+        run: |
+          echo "=== Built ELF files ==="
+          find userspace/c_apps -name "*.elf" -exec file {} \;
+          COUNT=$(find userspace/c_apps -name "*.elf" | wc -l)
+          echo "Total: $COUNT ELF files"

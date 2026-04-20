@@ -22,7 +22,7 @@
 // SAFETY: All DMA buffers must be physically contiguous and aligned.
 // Transfer Rings use producer/consumer semantics with cycle bits.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 // ── USB Descriptor Types ──
 const DESC_DEVICE: u8 = 1;

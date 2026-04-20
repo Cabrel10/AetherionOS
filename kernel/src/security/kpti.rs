@@ -135,7 +135,7 @@ pub fn init() {
     crate::serial_println!("[KPTI] PCID support: {}", if pcid { "YES" } else { "NO" });
 
     // Check Meltdown vulnerability
-    let vulnerable = is_meltdown_vulnerable();
+    let _vulnerable = is_meltdown_vulnerable();
 
     // Store kernel CR3
     let cr3: u64;

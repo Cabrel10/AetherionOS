@@ -21,7 +21,6 @@
 //!   - Asterinas: github.com/asterinas/asterinas
 //!   - Linux syscall table: arch/x86/entry/syscalls/syscall_64.tbl
 
-use alloc::string::String;
 
 // ═══════════════════════════════════════════════════════════
 // ABI Enum — stored in Process struct to route syscalls
@@ -100,7 +99,7 @@ pub fn detect_linux_elf(elf_data: &[u8]) -> bool {
         ]);
 
         let mut has_pt_interp = false;
-        let mut has_gnu_note = false;
+        let has_gnu_note = false;
         let mut has_pt_load = false;
 
         // Scan program headers
@@ -174,7 +173,6 @@ pub fn detect_linux_elf(elf_data: &[u8]) -> bool {
                     let note = &elf_data[p_offset..p_offset + p_filesz];
                     // GNU ABI note: namesz=4, name="GNU\0", type=1
                     if note.len() >= 16 && &note[12..16] == b"GNU\0" {
-                        has_gnu_note = true;
                         crate::serial_println!("[LINUX-ABI] Detected Linux ELF via GNU PT_NOTE");
                         return true;
                     }
@@ -448,7 +446,7 @@ pub fn linux_rseq(_rseq: u64, _rseq_len: u64, _flags: u64) -> u64 {
 }
 
 /// Linux prlimit64 — get/set resource limits
-pub fn linux_prlimit64(pid: u64, resource: u64, new_rlim: u64, old_rlim: u64) -> u64 {
+pub fn linux_prlimit64(_pid: u64, _resource: u64, _new_rlim: u64, old_rlim: u64) -> u64 {
     // If old_rlim is provided, return generous limits
     if old_rlim != 0 && crate::arch::x86_64::syscall::validate_user_ptr_pub(old_rlim, 16) {
         let infinity: u64 = 0xFFFF_FFFF_FFFF_FFFF;
@@ -549,7 +547,7 @@ pub fn linux_prctl(option: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 {
 pub fn linux_mprotect(_addr: u64, _len: u64, _prot: u64) -> u64 { 0 }
 
 /// Linux mmap(addr, length, prot, flags, fd, offset) — basic implementation
-pub fn linux_mmap(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, _offset: u64) -> u64 {
+pub fn linux_mmap(addr: u64, length: u64, prot: u64, flags: u64, _fd: u64, _offset: u64) -> u64 {
     let map_anon = flags & 0x20 != 0;
     if map_anon {
         // Anonymous mapping: just use brk-style allocation
@@ -568,12 +566,12 @@ pub fn linux_readlink(path: u64, buf: u64, bufsiz: u64) -> u64 {
     if !crate::arch::x86_64::syscall::validate_user_ptr_pub(buf, bufsiz) { return (-14i64) as u64; }
     // Read path from user space
     let mut path_buf = [0u8; 128];
-    let mut plen = 0;
+    let mut _plen = 0;
     for i in 0..128 {
         let b = unsafe { core::ptr::read_volatile((path + i) as *const u8) };
         if b == 0 { break; }
         path_buf[i as usize] = b;
-        plen = i as usize + 1;
+        _plen = i as usize + 1;
     }
     let reply = b"/bin/busybox.elf";
     let copy_len = reply.len().min(bufsiz as usize);
@@ -587,7 +585,7 @@ pub fn linux_readlinkat(_dirfd: u64, path: u64, buf: u64, bufsiz: u64) -> u64 {
 }
 
 /// Linux ioctl — basic terminal support
-pub fn linux_ioctl(fd: u64, cmd: u64, arg: u64) -> u64 {
+pub fn linux_ioctl(_fd: u64, cmd: u64, arg: u64) -> u64 {
     const TCGETS: u64 = 0x5401;
     const TIOCGWINSZ: u64 = 0x5413;
     const FIONREAD: u64 = 0x541B;
@@ -635,7 +633,7 @@ pub fn linux_getdents64(fd: u64, dirp: u64, count: u64) -> u64 {
 }
 
 /// Linux fstat(fd, statbuf) — file status
-pub fn linux_fstat(fd: u64, buf: u64) -> u64 {
+pub fn linux_fstat(_fd: u64, buf: u64) -> u64 {
     if !crate::arch::x86_64::syscall::validate_user_ptr_pub(buf, 144) { return (-14i64) as u64; }
     let stat = LinuxStat::default();
     unsafe {
@@ -646,8 +644,8 @@ pub fn linux_fstat(fd: u64, buf: u64) -> u64 {
 }
 
 /// Linux stat/lstat — stub
-pub fn linux_stat(path: u64, buf: u64) -> u64 { linux_fstat(0, buf) }
-pub fn linux_lstat(path: u64, buf: u64) -> u64 { linux_fstat(0, buf) }
+pub fn linux_stat(_path: u64, buf: u64) -> u64 { linux_fstat(0, buf) }
+pub fn linux_lstat(_path: u64, buf: u64) -> u64 { linux_fstat(0, buf) }
 
 /// Linux newfstatat(dirfd, path, statbuf, flag)
 pub fn linux_newfstatat(_dirfd: u64, _path: u64, buf: u64, _flag: u64) -> u64 {
@@ -655,13 +653,13 @@ pub fn linux_newfstatat(_dirfd: u64, _path: u64, buf: u64, _flag: u64) -> u64 {
 }
 
 /// Linux access(pathname, mode) — check file accessibility
-pub fn linux_access(path: u64, _mode: u64) -> u64 { 0 } // always accessible
+pub fn linux_access(_path: u64, _mode: u64) -> u64 { 0 } // always accessible
 
 /// Linux faccessat(dirfd, pathname, mode, flags)
 pub fn linux_faccessat(_dirfd: u64, _path: u64, _mode: u64, _flags: u64) -> u64 { 0 }
 
 /// Linux fcntl(fd, cmd, arg)
-pub fn linux_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
+pub fn linux_fcntl(fd: u64, cmd: u64, _arg: u64) -> u64 {
     const F_GETFD: u64 = 1;
     const F_SETFD: u64 = 2;
     const F_GETFL: u64 = 3;
@@ -2361,9 +2359,9 @@ impl AnonVma {
 }
 
 /// Enhanced mmap with proper MAP_ANONYMOUS support for interpreters
-pub fn linux_mmap_enhanced(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, offset: u64) -> u64 {
+pub fn linux_mmap_enhanced(addr: u64, length: u64, prot: u64, flags: u64, fd: u64, _offset: u64) -> u64 {
     let map_anonymous = flags & 0x20 != 0;  // MAP_ANONYMOUS
-    let map_private = flags & 0x02 != 0;    // MAP_PRIVATE
+    let _map_private = flags & 0x02 != 0;    // MAP_PRIVATE
     let map_fixed = flags & 0x10 != 0;      // MAP_FIXED
 
     if length == 0 { return (-22i64) as u64; } // EINVAL
