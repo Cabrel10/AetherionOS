@@ -470,13 +470,13 @@ fn try_demand_map_user_page(page_addr: u64, is_instruction_fetch: bool) -> bool 
 }
 
 /// Helper: validate that a saved RIP is in a valid userspace range.
-/// Supports both AetherionOS ELF range (0x8000000000+) and Linux ABI range (0x400000+).
+/// With the image-base relocated to 0x400000, all user ELF binaries
+/// (AetherionOS agents AND Linux/musl binaries) are in the canonical
+/// user-space range 0x400000 .. 0x0000_8000_0000_0000.
+/// The interpreter (ld-musl) lives at 0x7FC0_0000_0000+.
 #[inline]
 fn is_valid_user_rip(rip: u64) -> bool {
-    // AetherionOS native ELF range
-    (rip >= 0x0000_0080_0000_0000 && rip < 0x0000_0090_0000_0000)
-    // Linux ABI ELF range (busybox, musl, etc.)
-    || (rip >= 0x0000_0000_0040_0000 && rip < 0x0000_0080_0000_0000)
+    rip >= 0x0000_0000_0040_0000 && rip < 0x0000_8000_0000_0000
 }
 
 /// Helper: kill current Ring 3 process and IRETQ to next ready one.
@@ -564,49 +564,61 @@ fn kill_user_and_switch(current_pid: u64, addr_raw: u64) {
                     let f_rip  = unsafe { core::ptr::read_volatile(&rcx) }; // rcx = saved user RIP
                     let f_rax  = unsafe { core::ptr::read_volatile(&wait_result) };
 
+                    // Jalon 141: Use phys_off mini-stack for IRETQ frame.
+                    // Build the IRETQ frame on phys_off+0x7000 (accessible in both
+                    // kernel and user PML4 via PML4[256]). Then switch CR3, restore
+                    // callee-saved regs, set RAX, and IRETQ.
+                    //
+                    // GS state: reset_gs_bases set GS=0, KERNEL_GS=PER_CPU.
+                    // We do NOT swapgs — user mode inherits GS=0 (correct for user),
+                    // KERNEL_GS=PER_CPU (ready for next syscall entry swapgs).
+                    let phys_off = crate::elf::phys_offset();
+                    let mini_stack = phys_off + 0x7000;
+
                     unsafe {
-                        // Phase 1: Switch CR3 and build IRETQ frame on kernel stack
                         core::arch::asm!(
                             "cli",
-                            "mov cr3, {pml4}",   // Switch to parent's page tables
-                            "mov rax, {rax_val}", // Pre-load RAX with wait result
+                            // Set up mini-stack in phys_off region
+                            "mov rsp, {stack}",
+                            // Build IRETQ frame BEFORE CR3 switch
                             "push 0x1B",          // SS (Ring 3 data)
                             "push {rsp_val}",     // RSP (parent user stack)
                             "push 0x202",         // RFLAGS (IF=1)
                             "push 0x23",          // CS (Ring 3 code)
                             "push {rip_val}",     // RIP (parent return addr)
-                            pml4 = in(reg) f_pml4,
-                            rsp_val = in(reg) f_rsp,
-                            rip_val = in(reg) f_rip,
-                            rax_val = in(reg) f_rax,
-                            options(preserves_flags),
-                        );
-                        // Phase 2: Restore callee-saved registers from saved_regs
-                        core::arch::asm!(
+                            // NOW switch CR3 to parent's page tables
+                            "mov cr3, {pml4}",
+                            // Restore callee-saved registers
                             "mov r15, {v_r15}",
                             "mov r14, {v_r14}",
                             "mov r13, {v_r13}",
                             "mov r12, {v_r12}",
                             "mov rbx, {v_rbx}",
                             "mov rbp, {v_rbp}",
+                            // Set RAX = wait result
+                            "mov rax, {rax_val}",
+                            // Zero other regs to prevent leaks
+                            "xor rcx, rcx",
+                            "xor rdx, rdx",
+                            "xor rsi, rsi",
+                            "xor rdi, rdi",
+                            "xor r8, r8",
+                            "xor r9, r9",
+                            "xor r10, r10",
+                            "xor r11, r11",
+                            // IRETQ from phys_off stack (accessible in user PML4)
+                            "iretq",
+                            stack = in(reg) mini_stack,
+                            pml4 = in(reg) f_pml4,
+                            rsp_val = in(reg) f_rsp,
+                            rip_val = in(reg) f_rip,
+                            rax_val = in(reg) f_rax,
                             v_r15 = in(reg) r15,
                             v_r14 = in(reg) r14,
                             v_r13 = in(reg) r13,
                             v_r12 = in(reg) r12,
                             v_rbx = in(reg) rbx,
                             v_rbp = in(reg) rbp,
-                        );
-                        // Phase 3: swapgs + iretq (GS=0 currently, KERNEL_GS=PER_CPU)
-                        // After swapgs: GS=PER_CPU, KERNEL_GS=0.
-                        // On next syscall entry, the CPU swapgs again → GS=0, KERNEL_GS=PER_CPU.
-                        // Wait — that's wrong. We need: user mode has GS=0 (user).
-                        // reset_gs_bases set GS=0, KERNEL_GS=PER_CPU.
-                        // swapgs swaps them: GS=PER_CPU, KERNEL_GS=0.
-                        // On next syscall: swapgs → GS=0, KERNEL_GS=PER_CPU — WRONG.
-                        // So we should NOT swapgs here. GS is already 0 (user) and
-                        // KERNEL_GS is PER_CPU (ready for next syscall entry swapgs).
-                        core::arch::asm!(
-                            "iretq",
                             options(noreturn),
                         );
                     }
@@ -713,57 +725,29 @@ fn kill_user_and_switch(current_pid: u64, addr_raw: u64) {
             );
         }
 
-        // Reset GS bases before IRETQ to Ring 3 (use per-core variant for SMP)
-        let core_id = crate::arch::x86_64::apic::current_core() as u8;
-        crate::arch::x86_64::syscall::reset_gs_bases_for_core(core_id);
-
-        // ── Jalon 109: Non-nesting IRETQ via syscall stack ──
-        // We read the kernel syscall RSP from the per-CPU struct directly
-        // (via its known virtual address) rather than using gs:[0], because
-        // the current GS base may point at user-space (GS and KERNEL_GS_BASE
-        // were just reset by reset_gs_bases_for_core — KERNEL_GS_BASE is
-        // correct but GS_BASE may still be 0/user until the next swapgs).
-        let syscall_rsp = crate::arch::x86_64::syscall::get_kernel_rsp_for_core(core_id);
-        if syscall_rsp == 0 {
-            // Fallback: no valid syscall stack — idle
-            crate::serial_println!("[SIGSEGV] No kernel RSP for core {}, idle", core_id);
-            crate::scheduler::set_current_pid(0);
-            unsafe { core::arch::asm!("sti"); }
-            loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
+        // Jalon 141: Use the KPTI-safe trampoline for the SIGSEGV recovery switch.
+        // Set GS_BASE=PER_CPU, KERNEL_GS_BASE=0 so the trampoline's swapgs
+        // produces the correct user-mode GS state (GS=0, KGS=PER_CPU).
+        unsafe {
+            let per_cpu = crate::arch::x86_64::syscall::get_per_cpu_addr();
+            core::arch::asm!(
+                "wrmsr",
+                in("ecx") 0xC000_0101u32,
+                in("eax") (per_cpu & 0xFFFF_FFFF) as u32,
+                in("edx") (per_cpu >> 32) as u32,
+                options(nostack),
+            );
+            core::arch::asm!(
+                "wrmsr",
+                in("ecx") 0xC000_0102u32,
+                in("eax") 0u32,
+                in("edx") 0u32,
+                options(nostack),
+            );
         }
 
-        // Jalon 109c: FORCE explicit GPR allocation to prevent LLVM from
-        // coalescing registers. Generic in(reg) allows the optimizer to
-        // assign the same physical register to cr3 and rip, causing the
-        // PML4 physical address to be pushed as the return RIP.
-        // Hardcoded: r8=kstack, r9=cr3, r10=rsp, r11=rflags, r12=rip
-        let final_rip = unsafe { core::ptr::read_volatile(&rip) };
-        let final_rsp = unsafe { core::ptr::read_volatile(&rsp) };
-        let final_rfl = unsafe { core::ptr::read_volatile(&rfl) };
-        let final_cr3 = unsafe { core::ptr::read_volatile(&cr3) };
-        let final_kstack = unsafe { core::ptr::read_volatile(&syscall_rsp) };
-
         unsafe {
-            core::arch::asm!(
-                "cli",
-                // Load a fresh kernel stack (r8 = kernel stack top)
-                "mov rsp, r8",
-                // Switch to the target process address space (r9 = PML4)
-                "mov cr3, r9",
-                // Build IRETQ frame on the clean syscall stack
-                "push 0x1B",           // SS (Ring 3 data)
-                "push r10",            // RSP (user stack, guaranteed in r10)
-                "push r11",            // RFLAGS (guaranteed in r11)
-                "push 0x23",           // CS (Ring 3 code)
-                "push r12",            // RIP (entry point, guaranteed in r12)
-                "iretq",
-                in("r8") final_kstack,
-                in("r9") final_cr3,
-                in("r10") final_rsp,
-                in("r11") final_rfl,
-                in("r12") final_rip,
-                options(noreturn),
-            );
+            crate::elf::exec_switch_cr3_and_ring3(cr3, rip, rsp);
         }
     }
 
@@ -983,8 +967,8 @@ extern "x86-interrupt" fn page_fault_handler(
     // beyond the file-backed pages. When the allocator touches a BSS page that wasn't
     // pre-mapped, we demand-map it here instead of killing the process.
     // Jalon 96 fix: detect instruction-fetch faults to avoid mapping code pages as NX.
-    const ELF_DEMAND_LOW: u64 = 0x0000_0080_0000_0000; // 0x8000000000
-    const ELF_DEMAND_HIGH: u64 = 0x0000_0080_1000_0000; // +256 MiB guard
+    const ELF_DEMAND_LOW: u64 = 0x0000_0000_0040_0000; // 0x400000 (new user image base)
+    const ELF_DEMAND_HIGH: u64 = 0x0000_0000_1040_0000; // +256 MiB guard
     if is_user_mode
         && addr_raw >= ELF_DEMAND_LOW
         && addr_raw < ELF_DEMAND_HIGH
@@ -1319,17 +1303,76 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
         }
     }
 
-    // Let the scheduler decide if a switch is needed
-    // Context switches happen cooperatively via sys_yield().
-    // The timer ISR saves preempt state so that when a process calls yield,
-    // the scheduler knows which process to switch to. True preemptive
-    // switching from ISR context requires modifying the IRET frame directly
-    // (Phase D future work).
-    if let Some((old_pid, new_pid, new_rip, new_rsp, _new_rflags, new_pml4)) =
-        crate::scheduler::tick_preemptive()
+    // Jalon 140: TRUE preemptive scheduling — switch processes in the timer ISR.
+    // When tick_preemptive() returns a switch request, we perform it immediately
+    // by sending EOI, updating the current PID, and jumping to the new process
+    // via the KPTI-safe trampoline. This ensures that even processes that never
+    // call syscalls (e.g., framebuffer loops) get preempted.
+    let preempt_result = crate::scheduler::tick_preemptive();
+    // Jalon 140 diag: emit '.' on every 100th tick to prove timer fires in Ring 3
+    {
+        static TIMER_DIAG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let n = TIMER_DIAG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n == 50 {
+            // One-shot: print scheduler state after 50 timer interrupts
+            crate::serial_println!(
+                "[TIMER-DIAG] 50 ticks, cpid={}, preempt_result={}",
+                current_pid,
+                if preempt_result.is_some() { "Some" } else { "None" }
+            );
+        }
+    }
+    if let Some((old_pid, new_pid, new_rip, new_rsp, _new_rflags, new_pml4)) = preempt_result
     {
         if new_pid != old_pid && new_pml4 != 0 && new_rip != 0 {
-            set_pending_switch(old_pid, new_pid, new_rip, new_rsp, new_pml4);
+            // Jalon 140: Log preemptive context switch (compact, ISR-safe)
+            crate::serial_println!(
+                "[PREEMPT] PID {}->{}  RIP=0x{:X} RSP=0x{:X} CR3=0x{:X}",
+                old_pid, new_pid, new_rip, new_rsp, new_pml4
+            );
+
+            // Send EOI BEFORE the switch (we won't return to this handler)
+            unsafe {
+                super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET);
+            }
+
+            // Update scheduler state: new process is now current
+            crate::scheduler::set_current_pid(new_pid);
+
+            // Set user CR3 for KPTI
+            crate::arch::x86_64::syscall::set_user_cr3(new_pml4);
+
+            // Jalon 140 FIX: Set up GS state identical to the boot sequence
+            // before calling the trampoline. The trampoline does swapgs to
+            // transition from kernel→user GS. We need:
+            //   GS_BASE      = &PER_CPU  (kernel mode value)
+            //   KERNEL_GS_BASE = 0       (will become GS_BASE after swapgs = user mode)
+            // After trampoline's swapgs: GS_BASE=0 (user), KERNEL_GS_BASE=PER_CPU ✓
+            unsafe {
+                let per_cpu_addr = crate::arch::x86_64::syscall::get_per_cpu_addr();
+                // Set IA32_GS_BASE = PER_CPU
+                core::arch::asm!(
+                    "wrmsr",
+                    in("ecx") 0xC000_0101u32, // IA32_GS_BASE
+                    in("eax") (per_cpu_addr & 0xFFFF_FFFF) as u32,
+                    in("edx") (per_cpu_addr >> 32) as u32,
+                    options(nostack),
+                );
+                // Set IA32_KERNEL_GS_BASE = 0
+                core::arch::asm!(
+                    "wrmsr",
+                    in("ecx") 0xC000_0102u32, // IA32_KERNEL_GS_BASE
+                    in("eax") 0u32,
+                    in("edx") 0u32,
+                    options(nostack),
+                );
+            }
+
+            // Jump to the new process (never returns)
+            unsafe {
+                crate::elf::exec_switch_cr3_and_ring3(new_pml4, new_rip, new_rsp);
+            }
+            // unreachable
         }
     }
 
@@ -1347,36 +1390,41 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
 pub fn check_pending_switch() -> bool {
     if let Some((_old_pid, _new_pid, new_rip, new_rsp, new_pml4)) = take_pending_switch() {
         if new_pml4 != 0 && new_rip != 0 {
-            // Jalon 109c: FORCE explicit GPR allocation (r8=CR3, r9=RSP, r10=RIP)
-            // Prevents LLVM from coalescing PML4 and RIP into the same register.
-            let f_rip = unsafe { core::ptr::read_volatile(&new_rip) };
-            let f_rsp = unsafe { core::ptr::read_volatile(&new_rsp) };
-            let f_cr3 = unsafe { core::ptr::read_volatile(&new_pml4) };
-            // Perform the actual context switch via IRETQ.
-            // Jalon 134b: DO NOT swapgs before iretq.
-            // At this point in kernel context, GS_BASE=0 (reset_gs_bases'd) and
-            // KERNEL_GS_BASE=&PER_CPU. On entering Ring 3, GS_BASE remains 0,
-            // KERNEL_GS_BASE stays &PER_CPU. The next SYSCALL entry will
-            // swapgs once, correctly making GS=&PER_CPU for kernel access.
-            // A swapgs HERE would invert the roles, leaving GS=&PER_CPU in
-            // Ring 3 and then the next syscall would swapgs again, setting
-            // GS=0 in kernel mode → every gs:[N] access faults with CR2=N.
-            // This was the root cause of the [PF-NULLPTR] addr=0xC/0x18 bug.
+            // Jalon 141: Use the KPTI-safe trampoline (phys_off region) for the
+            // context switch. The trampoline handles CR3 switch, swapgs, GPR zeroing,
+            // and IRETQ — all from an address accessible in both page tables.
+            //
+            // GS state: reset_gs_bases was already called by the caller, so
+            // GS_BASE=0, KERNEL_GS_BASE=PER_CPU. The trampoline's swapgs will
+            // swap them: GS_BASE=PER_CPU, KERNEL_GS_BASE=0. But we want user mode
+            // to have GS_BASE=0, KERNEL_GS_BASE=PER_CPU. So we need to set up:
+            //   GS_BASE = PER_CPU (kernel state)
+            //   KERNEL_GS_BASE = 0
+            // Then trampoline swapgs → GS_BASE=0, KERNEL_GS_BASE=PER_CPU. ✓
+            //
+            // The caller (kill_user_and_switch/reset_gs_bases_for_core) set:
+            //   GS_BASE=0, KERNEL_GS_BASE=PER_CPU
+            // We need to swap first: set GS_BASE=PER_CPU, KERNEL_GS_BASE=0
+            // so trampoline swapgs produces the correct result.
             unsafe {
+                let per_cpu = crate::arch::x86_64::syscall::get_per_cpu_addr();
                 core::arch::asm!(
-                    "cli",
-                    "mov cr3, r8",              // Switch page tables (r8 = PML4)
-                    "push 0x1B",                // SS (Ring 3 data)
-                    "push r9",                  // RSP (user stack, guaranteed in r9)
-                    "push 0x202",               // RFLAGS (IF=1)
-                    "push 0x23",                // CS (Ring 3 code)
-                    "push r10",                 // RIP (entry point, guaranteed in r10)
-                    "iretq",                    // IRETQ to new process
-                    in("r8") f_cr3,
-                    in("r9") f_rsp,
-                    in("r10") f_rip,
-                    options(noreturn)
+                    "wrmsr",
+                    in("ecx") 0xC000_0101u32,
+                    in("eax") (per_cpu & 0xFFFF_FFFF) as u32,
+                    in("edx") (per_cpu >> 32) as u32,
+                    options(nostack),
                 );
+                core::arch::asm!(
+                    "wrmsr",
+                    in("ecx") 0xC000_0102u32,
+                    in("eax") 0u32,
+                    in("edx") 0u32,
+                    options(nostack),
+                );
+            }
+            unsafe {
+                crate::elf::exec_switch_cr3_and_ring3(new_pml4, new_rip, new_rsp);
             }
         }
     }

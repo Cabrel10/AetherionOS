@@ -161,6 +161,46 @@ static AP_SYSCALL_READY: [core::sync::atomic::AtomicBool; MAX_CPUS] = {
     [INIT; MAX_CPUS]
 };
 
+// ===== Global SYSRETQ Trampoline (Jalon 142) =====
+//
+// Heap-allocated trampoline for SYSRETQ context switches.
+// Contains: mov cr3, rdx → swapgs → sysretq (8 bytes).
+// Allocated once during init, eliminates per-switch allocations.
+
+static GLOBAL_SYSRET_TRAMPOLINE: AtomicU64 = AtomicU64::new(0);
+
+/// Initialize the global SYSRETQ trampoline. Call once during kernel boot
+/// after the heap is available.
+pub fn init_global_sysret_trampoline() {
+    let buf = alloc::vec![0u8; 64];
+    let ptr = buf.leak().as_mut_ptr();
+    unsafe {
+        // mov cr3, rdx   => 0F 22 DA
+        // (rdx is not an extended register, no REX needed)
+        // ModRM: 11 011 010 = 0xDA (mod=11, reg=3=CR3, rm=2=rdx)
+        *ptr.add(0) = 0x0F;
+        *ptr.add(1) = 0x22;
+        *ptr.add(2) = 0xDA;
+        // swapgs           => 0F 01 F8
+        *ptr.add(3) = 0x0F;
+        *ptr.add(4) = 0x01;
+        *ptr.add(5) = 0xF8;
+        // sysretq           => 48 0F 07
+        *ptr.add(6) = 0x48;
+        *ptr.add(7) = 0x0F;
+        *ptr.add(8) = 0x07;
+    }
+    let addr = ptr as u64;
+    GLOBAL_SYSRET_TRAMPOLINE.store(addr, AtomicOrdering::SeqCst);
+    crate::serial_println!("[KPTI] Global SYSRETQ trampoline at 0x{:X}", addr);
+}
+
+/// Get the address of the global SYSRETQ trampoline.
+#[inline]
+pub fn sysret_trampoline_addr() -> u64 {
+    GLOBAL_SYSRET_TRAMPOLINE.load(AtomicOrdering::SeqCst)
+}
+
 // ===== MSR helpers =====
 
 #[inline]
@@ -3324,65 +3364,14 @@ fn sys_yield() -> u64 {
         PER_CPU.user_cr3 = new_pml4;
 
         if is_first_run {
-            // First-run: use heap-allocated trampoline (same approach as execve).
-            // The trampoline is at PML4[136] (kernel heap, 0x444444440000+)
-            // which survives the CR3 switch to any user PML4.
-            let f_cr3 = core::ptr::read_unaligned(&new_pml4);
-            let f_rsp = core::ptr::read_unaligned(&new_rsp);
-            let f_rip = core::ptr::read_unaligned(&new_rip);
-
-            // Allocate heap trampoline: mov cr3,r8 + swapgs + iretq
-            let trampoline_buf = alloc::vec![0u8; 64];
-            let trampoline_ptr = trampoline_buf.as_ptr() as *mut u8;
-            let trampoline_addr = trampoline_ptr as u64;
-            // mov cr3, r8   (41 0F 22 D8)
-            *trampoline_ptr.add(0) = 0x41;
-            *trampoline_ptr.add(1) = 0x0F;
-            *trampoline_ptr.add(2) = 0x22;
-            *trampoline_ptr.add(3) = 0xD8;
-            // swapgs         (0F 01 F8)
-            *trampoline_ptr.add(4) = 0x0F;
-            *trampoline_ptr.add(5) = 0x01;
-            *trampoline_ptr.add(6) = 0xF8;
-            // iretq           (48 CF)
-            *trampoline_ptr.add(7) = 0x48;
-            *trampoline_ptr.add(8) = 0xCF;
-
-            asm!(
-                "cli",
-                // Build IRETQ frame on the current (kernel) stack
-                "push 0x1B",    // SS (Ring 3 data)
-                "push r9",      // RSP (user stack)
-                "push 0x202",   // RFLAGS (IF=1)
-                "push 0x23",    // CS (Ring 3 code)
-                "push r10",     // RIP (entry point)
-                // Zero GPRs to prevent kernel state leaks
-                "xor rax, rax",
-                "xor rbx, rbx",
-                "xor rdx, rdx",
-                "xor rsi, rsi",
-                "xor rdi, rdi",
-                "xor rbp, rbp",
-                "xor r9, r9",
-                "xor r10, r10",
-                "xor r11, r11",
-                "xor r12, r12",
-                "xor r13, r13",
-                "xor r14, r14",
-                "xor r15, r15",
-                // Jump to heap trampoline (does: mov cr3 → swapgs → iretq)
-                "jmp rcx",
-                in("rcx") trampoline_addr,
-                in("r8") f_cr3,
-                in("r9") f_rsp,
-                in("r10") f_rip,
-                options(noreturn),
-            );
-            // trampoline_buf leaked intentionally
+            // Jalon 142: First-run process — use the global IRETQ trampoline
+            // via exec_switch_cr3_and_ring3 (which uses the phys_off mini-stack).
+            crate::elf::exec_switch_cr3_and_ring3(new_pml4, new_rip, new_rsp);
+            // unreachable
         }
 
         // Resumed process: restore callee-saved registers and return via sysretq.
-        // KPTI: Use heap-allocated trampoline for the CR3 switch + sysretq.
+        // Jalon 142: Use the global SYSRETQ trampoline (no per-switch allocation).
 
         let r15 = new_regs[0];
         let r14 = new_regs[1];
@@ -3393,23 +3382,11 @@ fn sys_yield() -> u64 {
         // new_regs[6] = r11 (user RFLAGS) — goes into R11 for sysretq
         // new_regs[7] = rcx (user RIP)   — goes into RCX for sysretq
 
-        // Allocate heap trampoline: mov cr3,rdx + swapgs + sysretq
-        // Uses rdx for CR3 (already loaded by inline asm)
-        let sysret_trampoline_buf = alloc::vec![0u8; 64];
-        let sysret_ptr = sysret_trampoline_buf.as_ptr() as *mut u8;
-        let sysret_trampoline = sysret_ptr as u64;
-        // mov cr3, rdx   (0F 22 DA)
-        *sysret_ptr.add(0) = 0x0F;
-        *sysret_ptr.add(1) = 0x22;
-        *sysret_ptr.add(2) = 0xDA;
-        // swapgs           (0F 01 F8)
-        *sysret_ptr.add(3) = 0x0F;
-        *sysret_ptr.add(4) = 0x01;
-        *sysret_ptr.add(5) = 0xF8;
-        // sysretq           (48 0F 07)
-        *sysret_ptr.add(6) = 0x48;
-        *sysret_ptr.add(7) = 0x0F;
-        *sysret_ptr.add(8) = 0x07;
+        let sysret_trampoline = sysret_trampoline_addr();
+        if sysret_trampoline == 0 {
+            // Fallback: if trampoline isn't initialized, use IRETQ path
+            crate::elf::exec_switch_cr3_and_ring3(new_pml4, new_rip, new_rsp);
+        }
 
         let rip_v: u64 = new_rip;
         let rfl_v: u64 = new_rflags;
@@ -3428,7 +3405,7 @@ fn sys_yield() -> u64 {
             "mov rcx, rax",           // RCX = user RIP
             "mov r11, rdi",           // R11 = user RFLAGS
             "mov rsp, rsi",           // RSP = user stack
-            // Step 3: Jump to heap trampoline that does: mov cr3 → swapgs → sysretq
+            // Step 3: Jump to global trampoline that does: mov cr3 → swapgs → sysretq
             // r8 holds the trampoline address, rdx holds the CR3 value
             "jmp r8",
             // Explicit register bindings
@@ -3446,7 +3423,6 @@ fn sys_yield() -> u64 {
             rbp = in(reg) rbp,
             options(noreturn),
         );
-        // sysret_trampoline_buf leaked intentionally
     }
 }
 
@@ -5320,6 +5296,13 @@ pub fn get_kernel_stack_top() -> u64 {
     unsafe {
         (&SYSCALL_STACK.0 as *const u8 as u64) + KERNEL_SYSCALL_STACK_SIZE as u64
     }
+}
+
+/// Get the address of the BSP's PER_CPU structure.
+/// Used by the timer ISR to set up GS_BASE correctly before context switching
+/// to a new Ring 3 process via the trampoline.
+pub fn get_per_cpu_addr() -> u64 {
+    unsafe { &PER_CPU as *const PerCpuData as u64 }
 }
 
 /// Ensure GS_BASE = 0 (user) and KERNEL_GS_BASE = PER_CPU (kernel).

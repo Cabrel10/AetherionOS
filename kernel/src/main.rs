@@ -1522,6 +1522,11 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         // whose ELF segments overlap kernel .text (e.g., BusyBox at 0x400000).
         // Without this, syscall/interrupt handlers are unreachable after CR3 switch.
         arch::x86_64::syscall::relocate_lstar_for_kpti();
+
+        // Jalon 142: Initialize global KPTI trampolines (heap-allocated).
+        // Must be called after heap init so alloc::vec works.
+        elf::init_global_iretq_trampoline();
+        arch::x86_64::syscall::init_global_sysret_trampoline();
         // IDT relocation deferred to just before first user process launch.
         // The timer ISR must work at identity-mapped addresses during boot tests.
         // arch::x86_64::idt::relocate_idt_for_kpti(phys_offset);
