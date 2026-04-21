@@ -1,6 +1,11 @@
 [build]
 target = "x86_64-unknown-none"
 
+# Linker script for the kernel binary (Limine protocol, upper-half mapping)
+# This applies ONLY to x86_64-unknown-none, not to host build scripts
+[target.x86_64-unknown-none]
+rustflags = ["-C", "link-arg=-Tkernel/linker-x86_64.ld"]
+
 [unstable]
 build-std = ["core", "compiler_builtins", "alloc"]
 build-std-features = ["compiler-builtins-mem"]

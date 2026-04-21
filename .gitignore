@@ -65,3 +65,4 @@ bin_cache/
 disk.img
 models/
 /tmp/
+.agent_target/

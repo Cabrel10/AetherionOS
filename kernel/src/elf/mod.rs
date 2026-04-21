@@ -1153,13 +1153,19 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
         };
 
         // Compute AuxV entries
+        // NOTE: AT_BASE is set to 0 here because the interpreter has not been
+        // loaded yet at this stage. For dynamic binaries (with PT_INTERP), the
+        // caller MUST use build_sysv_stack() to rebuild the stack with the
+        // correct AT_BASE = interpreter load address after loading the interpreter
+        // via load_interp_into_pml4().
+        let at_base_value: u64 = 0; // Updated by build_sysv_stack for dynamic binaries
         let auxv: [(u64, u64); 14] = [
             (AT_PAGESZ,  4096),
             (AT_PHDR,    computed_phdr_vaddr),   // Correct phdr address in memory
             (AT_PHENT,   56),                    // sizeof(Elf64_Phdr)
             (AT_PHNUM,   phdrs.len() as u64),
-            (AT_ENTRY,   entry),
-            (AT_BASE,    0),                     // No interpreter (static binary)
+            (AT_ENTRY,   entry + pie_base),      // Real entry point (with PIE offset)
+            (AT_BASE,    at_base_value),          // 0 for now; rebuilt for dynamic binaries
             (AT_FLAGS,   0),
             (AT_UID,     0),
             (AT_EUID,    0),

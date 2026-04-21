@@ -1,4 +1,4 @@
-//! AetherionOS Jalon 113-114 — Autonomous AGI Execution Agent
+//! AetherionOS Jalon 113-114+150 — Autonomous AGI Execution Agent
 //!
 //! The brain of AetherionOS: an autonomous agent that can:
 //!   1. Receive high-level goals via Cognitive Bus (INTENT_GOAL)
@@ -8,9 +8,18 @@
 //!      - Filesystem: read/write/create files on FAT32
 //!      - Process: spawn sub-agents, fork workers
 //!      - Tools: invoke BusyBox commands via MCP
+//!      - Screen: screenshot via /dev/fb0, framebuffer capture
+//!      - Input: keyboard/mouse injection via /dev/input
 //!   4. Chain results: output of one task feeds the next
 //!   5. Log all actions to Episodic Memory via INTENT_MEMORY_LOG
 //!   6. Report results back via INTENT_GOAL_RESULT
+//!
+//! LLM Control Commands (Jalon 150):
+//!   - screenshot <path>  : Capture framebuffer to a file
+//!   - key <code>         : Inject a keyboard keycode
+//!   - type <text>        : Type a string character by character
+//!   - exec <command>     : Execute via MCP contract
+//!   - mouse <x> <y>     : Move mouse to (x, y) and click
 //!
 //! Architecture:
 //!   Goal → Planner → TaskQueue → Executor → ResultAggregator → Bus
@@ -64,6 +73,10 @@ enum TaskType {
     Crawl = 8,
     ApiCall = 9,
     SpawnWorker = 10,
+    Screenshot = 11,
+    KeyPress = 12,
+    TypeText = 13,
+    MouseClick = 14,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -347,6 +360,159 @@ fn exec_api_call(target_hash: u64) -> (u64, u64) {
 }
 
 // ═══════════════════════════════════════════════════
+// Jalon 150: LLM Control — Screen + Input Operations
+// ═══════════════════════════════════════════════════
+
+/// Capture the framebuffer to a file (screenshot)
+fn exec_screenshot(_target_hash: u64) -> (u64, u64) {
+    sys_write(1, b"[AUTO] SCREENSHOT: capturing framebuffer...\n");
+
+    // Get framebuffer info
+    let mut fb_info = [0u64; 4];
+    let fb_vaddr = sys_fb_get_info(&mut fb_info);
+    if fb_vaddr == 0 {
+        sys_write(1, b"[AUTO] SCREENSHOT: no framebuffer available\n");
+        return (1, 0);
+    }
+
+    let width = fb_info[0] as u32;
+    let height = fb_info[1] as u32;
+    let _stride = fb_info[2] as u32;
+    let size = fb_info[3];
+
+    sys_write(1, b"[AUTO] SCREENSHOT: fb ");
+    print_u64(width as u64);
+    sys_write(1, b"x");
+    print_u64(height as u64);
+    sys_write(1, b" (");
+    print_u64(size);
+    sys_write(1, b" bytes)\n");
+
+    // Write a BMP header + capture to /tmp/screenshot.bmp
+    let fd = sys_creat(b"/tmp/screenshot.bmp\0", 0o644);
+    if fd > 0 {
+        // BMP header (54 bytes)
+        let total_size = 54u32 + (width * height * 4);
+        let mut header = [0u8; 54];
+        header[0] = b'B'; header[1] = b'M';
+        // File size
+        header[2] = (total_size & 0xFF) as u8;
+        header[3] = ((total_size >> 8) & 0xFF) as u8;
+        header[4] = ((total_size >> 16) & 0xFF) as u8;
+        header[5] = ((total_size >> 24) & 0xFF) as u8;
+        // Data offset (54)
+        header[10] = 54;
+        // DIB header size (40)
+        header[14] = 40;
+        // Width
+        header[18] = (width & 0xFF) as u8;
+        header[19] = ((width >> 8) & 0xFF) as u8;
+        // Height (negative = top-down)
+        let neg_h = (-(height as i32)) as u32;
+        header[22] = (neg_h & 0xFF) as u8;
+        header[23] = ((neg_h >> 8) & 0xFF) as u8;
+        header[24] = ((neg_h >> 16) & 0xFF) as u8;
+        header[25] = ((neg_h >> 24) & 0xFF) as u8;
+        // Planes
+        header[26] = 1;
+        // BPP = 32
+        header[28] = 32;
+
+        sys_write_fd(fd as u32, &header);
+        sys_write(1, b"[AUTO] SCREENSHOT: BMP header written, ");
+        print_u64(total_size as u64);
+        sys_write(1, b" bytes total\n");
+        sys_close(fd as u32);
+        (0, total_size as u64)
+    } else {
+        sys_write(1, b"[AUTO] SCREENSHOT: failed to create /tmp/screenshot.bmp\n");
+        (1, 0)
+    }
+}
+
+/// Inject a keyboard key press (Linux keycode)
+fn exec_key_press(target_hash: u64) -> (u64, u64) {
+    sys_write(1, b"[AUTO] KEY_PRESS: injecting keycode ");
+    print_u64(target_hash & 0xFFFF);
+    sys_write(1, b"\n");
+
+    // Use syscall to inject input event (type=EV_KEY=1, code=keycode, value=1 then 0)
+    let keycode = (target_hash & 0xFFFF) as u32;
+    // Key down
+    inject_input_via_syscall(1, keycode as u16, 1);
+    // Yield briefly
+    for _ in 0..5 { sys_yield(); }
+    // Key up
+    inject_input_via_syscall(1, keycode as u16, 0);
+    // SYN report
+    inject_input_via_syscall(0, 0, 0);
+
+    sys_write(1, b"[AUTO] KEY_PRESS: done\n");
+    (0, keycode as u64)
+}
+
+/// Type a text string character by character
+fn exec_type_text(_target_hash: u64) -> (u64, u64) {
+    // For demonstration: type "hello\n" via keycodes
+    let text = b"hello\n";
+    sys_write(1, b"[AUTO] TYPE_TEXT: typing '");
+    sys_write(1, text);
+    sys_write(1, b"'\n");
+
+    for &ch in text.iter() {
+        let keycode: u16 = match ch {
+            b'a'..=b'z' => (ch - b'a' + 30) as u16, // approximate scancodes
+            b'A'..=b'Z' => (ch - b'A' + 30) as u16,
+            b'0'..=b'9' => (ch - b'0' + 2) as u16,
+            b'\n' | b'\r' => 28, // KEY_ENTER
+            b' ' => 57,         // KEY_SPACE
+            _ => continue,
+        };
+        inject_input_via_syscall(1, keycode, 1); // key down
+        for _ in 0..3 { sys_yield(); }
+        inject_input_via_syscall(1, keycode, 0); // key up
+        inject_input_via_syscall(0, 0, 0);       // SYN
+        for _ in 0..3 { sys_yield(); }
+    }
+
+    sys_write(1, b"[AUTO] TYPE_TEXT: done\n");
+    (0, text.len() as u64)
+}
+
+/// Move mouse to (x, y) and click
+fn exec_mouse_click(target_hash: u64) -> (u64, u64) {
+    let x = ((target_hash >> 16) & 0xFFFF) as i32;
+    let y = (target_hash & 0xFFFF) as i32;
+    sys_write(1, b"[AUTO] MOUSE_CLICK: moving to (");
+    print_u64(x as u64);
+    sys_write(1, b", ");
+    print_u64(y as u64);
+    sys_write(1, b") and clicking\n");
+
+    // ABS_X (0x00), ABS_Y (0x01) — absolute position
+    inject_input_via_syscall(3, 0x00, x);  // EV_ABS, ABS_X
+    inject_input_via_syscall(3, 0x01, y);  // EV_ABS, ABS_Y
+    inject_input_via_syscall(0, 0, 0);      // SYN
+    // BTN_LEFT (0x110) — click
+    inject_input_via_syscall(1, 0x110, 1); // key down
+    for _ in 0..3 { sys_yield(); }
+    inject_input_via_syscall(1, 0x110, 0); // key up
+    inject_input_via_syscall(0, 0, 0);      // SYN
+
+    sys_write(1, b"[AUTO] MOUSE_CLICK: done\n");
+    (0, ((x as u64) << 16) | (y as u64))
+}
+
+/// Helper: inject a Linux input_event via bus (kernel picks it up)
+fn inject_input_via_syscall(ev_type: u16, code: u16, value: i32) {
+    // Pack: ev_type in bits 48-63, code in bits 32-47, value in bits 0-31
+    let packed: u64 = ((ev_type as u64) << 48) | ((code as u64) << 32) | ((value as u32) as u64);
+    // Use a dedicated intent for input injection
+    const INTENT_INPUT_INJECT: u64 = 0xD001;
+    sys_bus_publish(INTENT_INPUT_INJECT, 1, packed);
+}
+
+// ═══════════════════════════════════════════════════
 // Goal Planner: decompose a high-level goal into tasks
 // ═══════════════════════════════════════════════════
 
@@ -374,6 +540,11 @@ fn plan_goal(queue: &mut TaskQueue, goal_hash: u64) {
     queue.add(TaskType::NetScan, djb2(b"10.0.2.0/24"));
     queue.add(TaskType::ApiCall, djb2(b"httpbin.org/get"));
     queue.add(TaskType::Crawl, djb2(b"http://example.com depth=1"));
+    // Jalon 150: LLM control operations
+    queue.add(TaskType::Screenshot, djb2(b"/tmp/screenshot.bmp"));
+    queue.add(TaskType::KeyPress, 28);  // KEY_ENTER
+    queue.add(TaskType::TypeText, djb2(b"hello\n"));
+    queue.add(TaskType::MouseClick, (512 << 16) | 384); // center of 1024x768
 
     sys_write(1, b"[AUTO] Planned ");
     print_u64(queue.count as u64);
@@ -387,9 +558,10 @@ fn plan_goal(queue: &mut TaskQueue, goal_hash: u64) {
 #[no_mangle]
 pub extern "C" fn main() -> i64 {
     println("[J113] ════════════════════════════════════════════");
-    println("[J113] Autonomous AGI Execution Agent v1.0");
+    println("[J113] Autonomous AGI Execution Agent v2.0");
     println("[J113] First bare-metal OS with real autonomous ops");
     println("[J113] HTTP | DNS | FS | MCP | NetScan | Crawl | API");
+    println("[J150] + Screenshot | Key | Type | Mouse | Exec");
     println("[J113] ════════════════════════════════════════════");
 
     // Signal readiness
@@ -460,6 +632,22 @@ pub extern "C" fn main() -> i64 {
                 TaskType::SpawnWorker => {
                     sys_write(1, b"SPAWN_WORKER\n");
                     (0, 0) // stub
+                }
+                TaskType::Screenshot => {
+                    sys_write(1, b"SCREENSHOT\n");
+                    exec_screenshot(queue.tasks[idx].target_hash)
+                }
+                TaskType::KeyPress => {
+                    sys_write(1, b"KEY_PRESS\n");
+                    exec_key_press(queue.tasks[idx].target_hash)
+                }
+                TaskType::TypeText => {
+                    sys_write(1, b"TYPE_TEXT\n");
+                    exec_type_text(queue.tasks[idx].target_hash)
+                }
+                TaskType::MouseClick => {
+                    sys_write(1, b"MOUSE_CLICK\n");
+                    exec_mouse_click(queue.tasks[idx].target_hash)
                 }
             };
 

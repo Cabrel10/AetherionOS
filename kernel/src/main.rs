@@ -63,6 +63,8 @@ mod framebuffer;
 mod font;
 mod codegen;
 mod compat;
+#[cfg(feature = "limine")]
+mod boot;
 
 // ===== Configuration =====
 const KERNEL_VERSION: &str = "3.1.0-j109-112-enriched-bus-clock-sensor";
@@ -2370,6 +2372,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         Some(fb) => {
             serial_println!("       [OK] Framebuffer: {}x{} @ 0x{:X} ({} KB)",
                 fb.width, fb.height, fb.phys_addr, fb.size / 1024);
+            // Register /dev/fb0 and /sys/class/backlight in VFS
+            framebuffer::register_vfs_nodes();
         }
         None => {
             serial_write("       [SKIP] No VBE-compatible framebuffer detected\n");
