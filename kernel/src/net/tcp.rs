@@ -344,7 +344,7 @@ pub fn tcp_connect(remote_ip: Ipv4Addr, remote_port: u16) -> Result<u16, i64> {
     // Build and send SYN
     // SAFETY: Accessing global NET_CONFIG
     let our_ip = unsafe {
-        match &super::NET_CONFIG {
+        match &*core::ptr::addr_of!(super::NET_CONFIG) {
             Some(c) => c.our_ip,
             None => return Err(-5),
         }
@@ -420,7 +420,7 @@ pub fn tcp_send(local_port: u16, remote_ip: Ipv4Addr, remote_port: u16, data: &[
 
     // SAFETY: Accessing global NET_CONFIG
     let our_ip = unsafe {
-        match &super::NET_CONFIG {
+        match &*core::ptr::addr_of!(super::NET_CONFIG) {
             Some(c) => c.our_ip,
             None => return Err(-5),
         }
@@ -510,7 +510,7 @@ pub fn tcp_close(local_port: u16, remote_ip: Ipv4Addr, remote_port: u16) -> Resu
 
     // SAFETY: Accessing global NET_CONFIG
     let our_ip = unsafe {
-        match &super::NET_CONFIG {
+        match &*core::ptr::addr_of!(super::NET_CONFIG) {
             Some(c) => c.our_ip,
             None => return Err(-5),
         }
@@ -572,7 +572,7 @@ pub fn process_tcp(ip_pkt: &ipv4::Ipv4Packet) {
 
     // SAFETY: Accessing global NET_CONFIG
     let our_ip = unsafe {
-        match &super::NET_CONFIG {
+        match &*core::ptr::addr_of!(super::NET_CONFIG) {
             Some(c) => c.our_ip,
             None => return,
         }

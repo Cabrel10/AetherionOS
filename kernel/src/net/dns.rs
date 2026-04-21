@@ -197,7 +197,7 @@ pub fn resolve(domain: &str) -> Result<Ipv4Addr, i64> {
     // Get DNS server address
     // SAFETY: NET_CONFIG is initialized at boot
     let dns_server = unsafe {
-        match &super::NET_CONFIG {
+        match &*core::ptr::addr_of!(super::NET_CONFIG) {
             Some(c) => c.dns,
             None => return Err(-5),
         }

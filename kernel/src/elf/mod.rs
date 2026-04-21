@@ -384,7 +384,7 @@ pub unsafe fn free_user_page_table(pml4_phys: u64) {
 
     crate::serial_println!(
         "[GC] Freed {} frames from PML4 0x{:X} (freelist: {}/{})",
-        freed_count, pml4_phys, ELF_POOL.freelist_count, FREELIST_MAX
+        freed_count, pml4_phys, (*core::ptr::addr_of!(ELF_POOL)).freelist_count, FREELIST_MAX
     );
 }
 
@@ -673,7 +673,8 @@ unsafe fn map_user_page(
     if CURRENT_LOAD_PML4 != pml4_phys {
         CURRENT_LOAD_PML4 = pml4_phys;
         OWNED_COUNT = 0;
-        for t in OWNED_TABLES.iter_mut() { *t = 0; }
+        let owned_ptr = core::ptr::addr_of_mut!(OWNED_TABLES);
+        for t in (*owned_ptr).iter_mut() { *t = 0; }
     }
 
     let mut table_phys = pml4_phys;
@@ -715,7 +716,7 @@ unsafe fn map_user_page(
                 new_table | 0x07, // P | W | U
             );
             // Track this table as owned by current load
-            if OWNED_COUNT < OWNED_TABLES.len() {
+            if OWNED_COUNT < (*core::ptr::addr_of!(OWNED_TABLES)).len() {
                 OWNED_TABLES[OWNED_COUNT] = new_table;
                 OWNED_COUNT += 1;
             }
@@ -752,7 +753,7 @@ unsafe fn map_user_page(
                 core::ptr::copy_nonoverlapping(src_virt, dst_virt, 512);
                 let new_entry = new_table | (entry & 0xFFF) | 0x07; // P|W|U
                 core::ptr::write_volatile(table_virt.add(indices[level]), new_entry);
-                if OWNED_COUNT < OWNED_TABLES.len() {
+                if OWNED_COUNT < (*core::ptr::addr_of!(OWNED_TABLES)).len() {
                     OWNED_TABLES[OWNED_COUNT] = new_table;
                     OWNED_COUNT += 1;
                 }
@@ -1719,10 +1720,10 @@ pub fn load_elf(path: &str) -> Result<u64, ElfError> {
 ///   r10 = user RIP (entry point for iretq)
 ///
 /// This function never returns.
-#[naked]
+#[unsafe(naked)]
 #[no_mangle]
-pub unsafe extern "C" fn exec_trampoline() -> ! {
-    core::arch::asm!(
+pub extern "C" fn exec_trampoline() -> ! {
+    core::arch::naked_asm!(
         // Jalon 140: KPTI-safe Ring 3 entry trampoline.
         //
         // Register convention (set by caller):
@@ -1787,7 +1788,6 @@ pub unsafe extern "C" fn exec_trampoline() -> ! {
         // IRETQ: reads the frame already on the stack (in phys_off region,
         // which is present in the user PML4 via PML4[256])
         "iretq",
-        options(noreturn),
     );
 }
 
@@ -1896,13 +1896,13 @@ pub unsafe fn exec_switch_cr3_and_ring3(
 ///   rdi = new PML4 physical address (CR3)
 ///   rsi = user entry point (RIP)
 ///   rdx = user stack pointer (RSP)
-#[naked]
-pub unsafe extern "C" fn exec_switch_cr3_and_ring3_naked(
+#[unsafe(naked)]
+pub extern "C" fn exec_switch_cr3_and_ring3_naked(
     _new_pml4_phys: u64,
     _user_entry: u64,
     _user_rsp: u64,
 ) -> ! {
-    core::arch::asm!(
+    core::arch::naked_asm!(
         "cli",
         "push 0x1B",       // SS  = User Data (RPL=3)
         "push rdx",        // RSP = user stack pointer
@@ -1927,7 +1927,6 @@ pub unsafe extern "C" fn exec_switch_cr3_and_ring3_naked(
         "xor r15, r15",
         "xor rbp, rbp",
         "iretq",
-        options(noreturn)
     )
 }
 

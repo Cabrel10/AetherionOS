@@ -35,8 +35,8 @@
 #![no_main]
 #![feature(abi_x86_interrupt)]
 #![feature(alloc_error_handler)]
-#![feature(panic_info_message)]
-#![feature(naked_functions)]
+// panic_info_message stabilized in nightly-2026
+// naked_functions stabilized in nightly-2026
 #![allow(dead_code)]
 
 use core::panic::PanicInfo;
@@ -44,7 +44,7 @@ use core::fmt::Write;
 use lazy_static::lazy_static;
 use spin::Mutex;
 use uart_16550::SerialPort;
-use bootloader::BootInfo;
+use bootloader_api::BootInfo;
 
 // ===== Modules =====
 mod arch;
@@ -341,9 +341,7 @@ fn panic(info: &PanicInfo) -> ! {
     // Build the entire message in one buffer, then write atomically.
     let mut full = arrayvec::ArrayString::<512>::new();
     let _ = write!(full, "\n[KERNEL-PANIC] ");
-    if let Some(msg) = info.message() {
-        let _ = write!(full, "{}", msg);
-    }
+    let _ = write!(full, "{}", info.message());
     if let Some(loc) = info.location() {
         let _ = write!(full, " at {}:{}", loc.file(), loc.line());
     }
@@ -1287,11 +1285,20 @@ fn exec_command(path: &str) {
 }
 
 // ===== Entry Point =====
-bootloader::entry_point!(kernel_main);
+use bootloader_api::{BootloaderConfig, config::Mapping};
+
+pub static BOOTLOADER_CONFIG: BootloaderConfig = {
+    let mut config = BootloaderConfig::new_default();
+    config.mappings.physical_memory = Some(Mapping::Dynamic);
+    config.kernel_stack_size = 128 * 1024; // 128 KiB
+    config
+};
+
+bootloader_api::entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 // verify_elf_rodata_pages removed — diagnostic served, reduces kernel_main stack pressure
 
-fn kernel_main(boot_info: &'static BootInfo) -> ! {
+fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // === Banner ===
     serial_write("\n╔══════════════════════════════════════════════════╗\n");
     serial_write("║  AetherionOS Kernel Boot Sequence                ║\n");
@@ -1492,7 +1499,14 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     serial_write("\n[13/15] ELF Loader (Couche 11)...\n");
     {
         // Set physical memory offset for ELF loader
-        let phys_offset = boot_info.physical_memory_offset;
+        // bootloader_api 0.11: physical_memory_offset is Optional<u64>
+        let phys_offset = match boot_info.physical_memory_offset {
+            bootloader_api::info::Optional::Some(off) => off,
+            bootloader_api::info::Optional::None => {
+                serial_write("       [FATAL] No physical_memory_offset from bootloader!\n");
+                panic!("physical_memory_offset not provided");
+            }
+        };
         elf::set_phys_mem_offset(phys_offset);
 
         // Initialize ELF frame pool using frames from our allocator
