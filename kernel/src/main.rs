@@ -2812,6 +2812,58 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         }
 
         // ──────────────────────────────────────────────────────────
+        // STEP B0: SERIAL CONSOLE (BusyBox sh) — launched FIRST (Jalon 146)
+        // The serial shell on /dev/ttyS0 must be available before the
+        // visual terminal so BusyBox is reachable even if GUI crashes.
+        // ──────────────────────────────────────────────────────────
+        {
+            let sh_path = "/bin/sh.elf";
+            if let Ok(sh_data) = crate::fs::vfs::file_read(sh_path) {
+                serial_println!("  [J146] Pre-launching {} as serial console ({} bytes)", sh_path, sh_data.len());
+                if let Ok(result) = crate::elf::load_elf_binary(&sh_data) {
+                    let argv: alloc::vec::Vec<alloc::string::String> = alloc::vec![
+                        alloc::string::String::from(sh_path),
+                    ];
+                    let envp: alloc::vec::Vec<alloc::string::String> = alloc::vec![
+                        alloc::string::String::from("PATH=/bin:/disk/bin"),
+                    ];
+                    let rsp = unsafe {
+                        crate::elf::build_sysv_stack(
+                            result.pml4_phys, &argv, &envp, result.entry_point, 0, result.phdr_vaddr, result.phdr_count
+                        )
+                    }.unwrap_or(result.stack_pointer);
+                    if let Ok(sh_pid) = crate::process::spawn_userspace(sh_path, 0, result.entry_point, rsp, result.pml4_phys) {
+                        crate::process::set_abi(sh_pid, crate::compat::linux_abi::Abi::Linux);
+                        crate::scheduler::enqueue_process(sh_pid);
+                        serial_println!("[J146] Serial Shell QUEUED FIRST (PID {})", sh_pid);
+                    }
+                } else {
+                    serial_write("  [J146] sh.elf ELF load failed\n");
+                }
+            } else {
+                serial_write("  [J146] /bin/sh.elf not in VFS, trying embedded SH_ELF\n");
+                if let Ok(result) = crate::elf::load_elf_binary(SH_ELF) {
+                    let argv: alloc::vec::Vec<alloc::string::String> = alloc::vec![
+                        alloc::string::String::from("/bin/sh"),
+                    ];
+                    let envp: alloc::vec::Vec<alloc::string::String> = alloc::vec![
+                        alloc::string::String::from("PATH=/bin:/disk/bin"),
+                    ];
+                    let rsp = unsafe {
+                        crate::elf::build_sysv_stack(
+                            result.pml4_phys, &argv, &envp, result.entry_point, 0, result.phdr_vaddr, result.phdr_count
+                        )
+                    }.unwrap_or(result.stack_pointer);
+                    if let Ok(sh_pid) = crate::process::spawn_userspace("/bin/sh", 0, result.entry_point, rsp, result.pml4_phys) {
+                        crate::process::set_abi(sh_pid, crate::compat::linux_abi::Abi::Linux);
+                        crate::scheduler::enqueue_process(sh_pid);
+                        serial_println!("[J146] Embedded Serial Shell QUEUED FIRST (PID {})", sh_pid);
+                    }
+                }
+            }
+        }
+
+        // ──────────────────────────────────────────────────────────
         // STEP B: Load and LAUNCH agent_visual_term.elf ALWAYS (Jalon 65)
         // Interactive terminal: displays UI, reads keyboard, shows prompt.
         // Always loaded — it's the primary user interface.
@@ -3037,63 +3089,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
         }
     }
 
-    // ──────────────────────────────────────────────────────────
-    // STEP C: SERIAL CONSOLE FALLBACK (BusyBox sh)
-    // If agent_visual_term.elf crashes or the framebuffer is dead,
-    // we need a way to interact with the system. This spawns a
-    // BusyBox shell on the serial console (/dev/ttyS0) that reads
-    // PS/2 keyboard (fd 0) and writes to UART (fd 1, fd 2).
-    // This is a safety net: the system is never blind.
-    // ──────────────────────────────────────────────────────────
-    {
-        let sh_path = "/bin/sh.elf";
-        if let Ok(sh_data) = crate::fs::vfs::file_read(sh_path) {
-            serial_println!("  [FALLBACK] Launching {} as serial console ({} bytes)", sh_path, sh_data.len());
-            if let Ok(result) = crate::elf::load_elf_binary(&sh_data) {
-                let argv: alloc::vec::Vec<alloc::string::String> = alloc::vec![
-                    alloc::string::String::from(sh_path),
-                ];
-                let envp: alloc::vec::Vec<alloc::string::String> = alloc::vec![
-                    alloc::string::String::from("PATH=/bin:/disk/bin"),
-                ];
-                let rsp = unsafe {
-                    crate::elf::build_sysv_stack(
-                        result.pml4_phys, &argv, &envp, result.entry_point, 0, result.phdr_vaddr, result.phdr_count
-                    )
-                }.unwrap_or(result.stack_pointer);
-
-                if let Ok(sh_pid) = crate::process::spawn_userspace(sh_path, 0, result.entry_point, rsp, result.pml4_phys) {
-                    crate::process::set_abi(sh_pid, crate::compat::linux_abi::Abi::Linux);
-                    crate::scheduler::enqueue_process(sh_pid);
-                    serial_println!("[FALLBACK] Serial Shell QUEUED (PID {})", sh_pid);
-                }
-            } else {
-                serial_write("  [FALLBACK] sh.elf ELF load failed\n");
-            }
-        } else {
-            serial_write("  [FALLBACK] /bin/sh.elf not found in VFS — trying embedded SH_ELF\n");
-            // Try the embedded sh.elf binary
-            if let Ok(result) = crate::elf::load_elf_binary(SH_ELF) {
-                let argv: alloc::vec::Vec<alloc::string::String> = alloc::vec![
-                    alloc::string::String::from("/bin/sh"),
-                ];
-                let envp: alloc::vec::Vec<alloc::string::String> = alloc::vec![
-                    alloc::string::String::from("PATH=/bin:/disk/bin"),
-                ];
-                let rsp = unsafe {
-                    crate::elf::build_sysv_stack(
-                        result.pml4_phys, &argv, &envp, result.entry_point, 0, result.phdr_vaddr, result.phdr_count
-                    )
-                }.unwrap_or(result.stack_pointer);
-
-                if let Ok(sh_pid) = crate::process::spawn_userspace("/bin/sh", 0, result.entry_point, rsp, result.pml4_phys) {
-                    crate::process::set_abi(sh_pid, crate::compat::linux_abi::Abi::Linux);
-                    crate::scheduler::enqueue_process(sh_pid);
-                    serial_println!("[FALLBACK] Embedded Serial Shell QUEUED (PID {})", sh_pid);
-                }
-            }
-        }
-    }
+    // STEP C: Removed — serial shell now launched in STEP B0 (Jalon 146)
 
     // === Boot Complete (only reached if Ring 3 jump fails) ===
     serial_write("\n========================================\n");

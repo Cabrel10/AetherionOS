@@ -24,7 +24,7 @@
 // After loading BSP's CR3, the AP has both PML4[0] (identity) and
 // PML4[256] (phys_offset) available, so kernel virtual addresses work.
 
-use core::sync::atomic::{AtomicU32, AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 
 // -- MSR Addresses --
 const IA32_APIC_BASE_MSR: u32 = 0x1B;

@@ -531,7 +531,7 @@ fn kill_user_and_switch(current_pid: u64, addr_raw: u64) {
                     let r12 = saved_regs[3];
                     let rbx = saved_regs[4];
                     let rbp = saved_regs[5];
-                    let r11 = saved_regs[6]; // RFLAGS for sysretq
+                    let _r11 = saved_regs[6]; // RFLAGS for sysretq
                     let rcx = saved_regs[7]; // RIP for sysretq
 
                     crate::serial_println!(
@@ -681,7 +681,7 @@ fn kill_user_and_switch(current_pid: u64, addr_raw: u64) {
 
     if next != 0 && next != current_pid {
         // Get the next process's saved state
-        let (rip, rsp, rfl, cr3) =
+        let (rip, rsp, _rfl, cr3) =
             if let Some((saved_rip, saved_rsp, saved_rfl, saved_pml4, _regs)) =
                 crate::process::get_preempt_state(next)
             {
@@ -1015,7 +1015,7 @@ extern "x86-interrupt" fn page_fault_handler(
     if is_user_mode {
         let current_pid = crate::scheduler::current_pid();
         if current_pid != 0 {
-            if let Some((file_path, file_offset, writable)) = crate::process::find_vma(current_pid, addr_raw) {
+            if let Some((_file_path, _file_offset, _writable)) = crate::process::find_vma(current_pid, addr_raw) {
                 // Readahead: map the faulting page + up to 7 adjacent pages
                 // This reduces page-fault overhead for sequential model weight access
                 const READAHEAD_PAGES: u64 = 8; // 32 KiB readahead window
@@ -1157,9 +1157,11 @@ extern "x86-interrupt" fn page_fault_handler(
             let current_pid = crate::scheduler::current_pid();
             if current_pid != 0 {
                 if addr_raw < 0x1000 {
-                    crate::serial_println!(
-                        "[PF-NULLPTR] PID {} KERNEL NULL deref addr=0x{:X} rip={:?} (KERNEL BUG!)",
-                        current_pid, addr_raw, stack_frame.instruction_pointer
+                    // Jalon 146: NULL dereference in kernel mode is a KERNEL BUG.
+                    // Panic immediately instead of silently killing the user process.
+                    panic!(
+                        "[PF-NULLPTR] PID {} KERNEL NULL deref addr=0x{:X} rip=0x{:X} — KERNEL BUG!",
+                        current_pid, addr_raw, stack_frame.instruction_pointer.as_u64()
                     );
                 } else {
                     crate::serial_println!(

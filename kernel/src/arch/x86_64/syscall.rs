@@ -1485,7 +1485,7 @@ fn sys_nanosleep(req: u64, _rem: u64) -> u64 {
         (s, ns)
     };
 
-    let freq_hz = unsafe { TSC_FREQ_HZ.load(core::sync::atomic::Ordering::Relaxed) };
+    let freq_hz = TSC_FREQ_HZ.load(core::sync::atomic::Ordering::Relaxed);
     let freq = if freq_hz > 100_000_000 { freq_hz } else { 2_000_000_000u64 };
 
     // Calculate total cycles to sleep
@@ -2276,7 +2276,7 @@ fn sys_clock_gettime(clk_id: u64, tp_addr: u64) -> u64 {
     unsafe { asm!("rdtsc", "shl rdx, 32", "or rax, rdx", out("rax") tsc, out("rdx") _); }
 
     // Get calibrated frequency (set during boot, default 2 GHz for QEMU)
-    let freq_hz = unsafe { TSC_FREQ_HZ.load(core::sync::atomic::Ordering::Relaxed) };
+    let freq_hz = TSC_FREQ_HZ.load(core::sync::atomic::Ordering::Relaxed);
     let freq = if freq_hz > 100_000_000 { freq_hz } else { 2_000_000_000u64 };
 
     let total_ns = tsc / (freq / 1_000_000_000).max(1);
@@ -2303,7 +2303,7 @@ fn sys_gettimeofday(tv_addr: u64, _tz_addr: u64) -> u64 {
     }
     let tsc: u64;
     unsafe { asm!("rdtsc", "shl rdx, 32", "or rax, rdx", out("rax") tsc, out("rdx") _); }
-    let freq_hz = unsafe { TSC_FREQ_HZ.load(core::sync::atomic::Ordering::Relaxed) };
+    let freq_hz = TSC_FREQ_HZ.load(core::sync::atomic::Ordering::Relaxed);
     let freq = if freq_hz > 100_000_000 { freq_hz } else { 2_000_000_000u64 };
     let total_us = tsc / (freq / 1_000_000).max(1);
     let secs = total_us / 1_000_000 + 1_735_689_600;
@@ -3658,19 +3658,32 @@ fn read_user_string_array(array_addr: u64, max: usize) -> alloc::vec::Vec<alloc:
 fn sys_execve(path_addr: u64, argv_addr: u64, envp_addr: u64) -> u64 {
     let current_pid = crate::scheduler::current_pid();
 
-    // Jalon 133: Sanitize argv/envp addresses — AetherionOS native execve() (syscall1)
+    // Jalon 146: Sanitize argv/envp addresses — AetherionOS native execve() (syscall1)
     // only passes the path in RDI; RSI/RDX may contain garbage register values.
     // Treat any address in the NULL page (< 0x1000) as 0 (no argv/envp provided).
-    let argv_addr = if argv_addr < 0x1000 { 0 } else { argv_addr };
-    let envp_addr = if envp_addr < 0x1000 { 0 } else { envp_addr };
+    // Also reject non-canonical addresses via validate_user_ptr.
+    let argv_addr = if argv_addr < 0x1000 || !validate_user_ptr(argv_addr, 8) {
+        if argv_addr != 0 && argv_addr < 0x1000 {
+            crate::serial_println!("[EXECVE] PID {} argv_addr=0x{:X} in NULL page, treating as NULL", current_pid, argv_addr);
+        }
+        0
+    } else { argv_addr };
+    let envp_addr = if envp_addr < 0x1000 || !validate_user_ptr(envp_addr, 8) {
+        if envp_addr != 0 && envp_addr < 0x1000 {
+            crate::serial_println!("[EXECVE] PID {} envp_addr=0x{:X} in NULL page, treating as NULL", current_pid, envp_addr);
+        }
+        0
+    } else { envp_addr };
 
     if !validate_user_ptr(path_addr, 1) {
+        crate::serial_println!("[EXECVE] PID {} path_addr=0x{:X} INVALID", current_pid, path_addr);
         return EFAULT;
     }
 
     let path = match unsafe { read_user_string(path_addr) } {
-        Some(p) => p,
-        None => {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            crate::serial_println!("[EXECVE] PID {} path_addr=0x{:X} read failed or empty", current_pid, path_addr);
             return EFAULT;
         }
     };
@@ -3887,7 +3900,7 @@ fn sys_execve(path_addr: u64, argv_addr: u64, envp_addr: u64) -> u64 {
 
             // Replace the current process's address space and state
             // Jalon 94: Free the OLD page table before replacing
-            let old_pml4 = crate::process::with_process(current_pid, |p| p.pml4_phys).unwrap_or(0);
+            let _old_pml4 = crate::process::with_process(current_pid, |p| p.pml4_phys).unwrap_or(0);
             crate::process::with_process_mut(current_pid, |p| {
                 p.pml4_phys = result.pml4_phys;
                 p.entry_point = launch_entry;  // Use interpreter entry for dynamic binaries
@@ -6758,7 +6771,7 @@ fn sys_capture_stdout(child_pid: u64, enable: u64) -> u64 {
 /// Returns the number of bytes read into the user buffer, or 0 if no data.
 fn sys_read_captured(buf_addr: u64, max_len: u64) -> u64 {
     if !validate_user_ptr(buf_addr, max_len) { return EFAULT; }
-    let (pid, data) = crate::compat::linux_abi::read_captured_text();
+    let (_pid, data) = crate::compat::linux_abi::read_captured_text();
     if data.is_empty() { return 0; }
     let copy_len = core::cmp::min(data.len(), max_len as usize);
     unsafe {
