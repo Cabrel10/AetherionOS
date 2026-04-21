@@ -1,6 +1,4 @@
+# Enable artifact dependencies (bindeps) for the boot crate
+# to reference the kernel binary
 [unstable]
-build-std = ["core", "compiler_builtins", "alloc"]
-build-std-features = ["compiler-builtins-mem"]
-
-[build]
-target = "x86_64-unknown-none"
+bindeps = true

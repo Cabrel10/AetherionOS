@@ -8,9 +8,9 @@ description = "Aetherion OS Kernel - Couche 8: Priority Scheduler + GPU VRAM Stu
 
 [dependencies]
 
-# Bootloader 0.9.23 - CRITICAL: feature "map_physical_memory" for physical_memory_offset
-# Will be replaced by bootloader 0.11.x in FRONT 2
-bootloader = { version = "=0.9.23", features = ["map_physical_memory"] }
+# Bootloader API 0.11 — kernel-side types (BootInfo, entry_point! macro)
+# The actual bootloader binary is built via the boot/ crate
+bootloader_api = "0.11"
 
 # Serial port for debug
 uart_16550 = "0.2"
@@ -50,5 +50,4 @@ lto = false
 opt-level = 2
 codegen-units = 4     # More CUs = less memory per unit
 
-[package.metadata.bootloader]
-physical-memory-offset = "0xFFFF800000000000"
+# [package.metadata.bootloader] removed — config now in boot/ crate BootloaderConfig

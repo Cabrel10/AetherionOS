@@ -7,7 +7,7 @@ name = "aetherion-kernel"
 version = "0.9.0"
 dependencies = [
  "arrayvec",
- "bootloader",
+ "bootloader_api",
  "crossbeam-queue",
  "lazy_static",
  "linked_list_allocator",
@@ -52,10 +52,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "bootloader"
-version = "0.9.23"
+name = "bootloader_api"
+version = "0.11.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6e02311b16c9819e7c72866d379cdd3026c3b7b25c1edf161f548f8e887e7ff"
+checksum = "5c074a3d1075b26ed77e502d6af8ab1263abbdc3d026c166e46480f973287293"
 
 [[package]]
 name = "cfg-if"
