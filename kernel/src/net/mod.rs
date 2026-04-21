@@ -292,7 +292,7 @@ fn process_arp(data: &[u8]) {
     }
 
     unsafe {
-        let our_ip = match &NET_CONFIG {
+        let our_ip = match &*core::ptr::addr_of!(NET_CONFIG) {
             Some(c) => c.our_ip,
             None => return,
         };

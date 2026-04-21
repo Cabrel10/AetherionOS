@@ -5154,10 +5154,10 @@ pub fn init() {
 
     unsafe {
         // Prepare per-CPU data with kernel stack
-        let stack_top = (&SYSCALL_STACK.0 as *const u8 as u64)
+        let stack_top = (core::ptr::addr_of!(SYSCALL_STACK) as *const u8 as u64)
             + KERNEL_SYSCALL_STACK_SIZE as u64;
-        PER_CPU.kernel_rsp = stack_top;
-        PER_CPU.user_rsp = 0;
+        (*core::ptr::addr_of_mut!(PER_CPU)).kernel_rsp = stack_top;
+        (*core::ptr::addr_of_mut!(PER_CPU)).user_rsp = 0;
 
         // KPTI: Store the kernel's CR3 in per-CPU data.
         // After execve, user PML4[0] may have user ELF pages that overwrite
@@ -5165,8 +5165,8 @@ pub fn init() {
         // access to kernel code.
         let kernel_cr3: u64;
         core::arch::asm!("mov {}, cr3", out(reg) kernel_cr3, options(nomem, nostack));
-        PER_CPU.kernel_cr3 = kernel_cr3 & !0xFFF;
-        PER_CPU.user_cr3 = 0; // will be set during execve
+        (*core::ptr::addr_of_mut!(PER_CPU)).kernel_cr3 = kernel_cr3 & !0xFFF;
+        (*core::ptr::addr_of_mut!(PER_CPU)).user_cr3 = 0; // will be set during execve
 
         crate::serial_println!(
             "[SYSCALL] Kernel syscall stack: top=0x{:X}, size={} bytes",
@@ -5174,11 +5174,11 @@ pub fn init() {
         );
         crate::serial_println!(
             "[SYSCALL] KPTI: kernel_cr3=0x{:X}",
-            PER_CPU.kernel_cr3
+            (*core::ptr::addr_of!(PER_CPU)).kernel_cr3
         );
 
         // Set KERNEL_GS_BASE to &PER_CPU (swapped in by swapgs)
-        let per_cpu_addr = &PER_CPU as *const PerCpuData as u64;
+        let per_cpu_addr = core::ptr::addr_of!(PER_CPU) as u64;
         wrmsr(IA32_KERNEL_GS_BASE, per_cpu_addr);
         crate::serial_println!("[SYSCALL] KERNEL_GS_BASE = 0x{:X}", per_cpu_addr);
 
@@ -5305,16 +5305,14 @@ pub fn get_kernel_cr3() -> u64 {
 /// Used by kernel_main to switch to a fresh stack before the initial IRETQ,
 /// since the boot stack may be nearly exhausted after the long init sequence.
 pub fn get_kernel_stack_top() -> u64 {
-    unsafe {
-        (&SYSCALL_STACK.0 as *const u8 as u64) + KERNEL_SYSCALL_STACK_SIZE as u64
-    }
+    (core::ptr::addr_of!(SYSCALL_STACK) as *const u8 as u64) + KERNEL_SYSCALL_STACK_SIZE as u64
 }
 
 /// Get the address of the BSP's PER_CPU structure.
 /// Used by the timer ISR to set up GS_BASE correctly before context switching
 /// to a new Ring 3 process via the trampoline.
 pub fn get_per_cpu_addr() -> u64 {
-    unsafe { &PER_CPU as *const PerCpuData as u64 }
+    core::ptr::addr_of!(PER_CPU) as u64
 }
 
 /// Ensure GS_BASE = 0 (user) and KERNEL_GS_BASE = PER_CPU (kernel).
@@ -5322,7 +5320,7 @@ pub fn get_per_cpu_addr() -> u64 {
 /// that syscall_entry's first swapgs will work correctly.
 pub fn reset_gs_bases() {
     unsafe {
-        let per_cpu_addr = &PER_CPU as *const PerCpuData as u64;
+        let per_cpu_addr = core::ptr::addr_of!(PER_CPU) as u64;
         wrmsr(IA32_KERNEL_GS_BASE, per_cpu_addr);
         wrmsr(IA32_GS_BASE, 0);
         crate::serial_println!(
@@ -5476,11 +5474,11 @@ pub fn reset_gs_bases_for_core(core_id: u8) {
     unsafe {
         if idx == 0 || idx >= MAX_CPUS {
             // BSP: use the global PER_CPU
-            let per_cpu_addr = &PER_CPU as *const PerCpuData as u64;
+            let per_cpu_addr = core::ptr::addr_of!(PER_CPU) as u64;
             wrmsr(IA32_KERNEL_GS_BASE, per_cpu_addr);
         } else {
             // AP: use the per-core PerCpuData
-            let per_cpu_addr = &AP_PER_CPU[idx] as *const PerCpuData as u64;
+            let per_cpu_addr = core::ptr::addr_of!(AP_PER_CPU[idx]) as u64;
             wrmsr(IA32_KERNEL_GS_BASE, per_cpu_addr);
         }
         wrmsr(IA32_GS_BASE, 0);

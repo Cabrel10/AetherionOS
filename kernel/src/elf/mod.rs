@@ -384,7 +384,7 @@ pub unsafe fn free_user_page_table(pml4_phys: u64) {
 
     crate::serial_println!(
         "[GC] Freed {} frames from PML4 0x{:X} (freelist: {}/{})",
-        freed_count, pml4_phys, ELF_POOL.freelist_count, FREELIST_MAX
+        freed_count, pml4_phys, (*core::ptr::addr_of!(ELF_POOL)).freelist_count, FREELIST_MAX
     );
 }
 
@@ -673,7 +673,8 @@ unsafe fn map_user_page(
     if CURRENT_LOAD_PML4 != pml4_phys {
         CURRENT_LOAD_PML4 = pml4_phys;
         OWNED_COUNT = 0;
-        for t in OWNED_TABLES.iter_mut() { *t = 0; }
+        let owned_ptr = core::ptr::addr_of_mut!(OWNED_TABLES);
+        for t in (*owned_ptr).iter_mut() { *t = 0; }
     }
 
     let mut table_phys = pml4_phys;
@@ -715,7 +716,7 @@ unsafe fn map_user_page(
                 new_table | 0x07, // P | W | U
             );
             // Track this table as owned by current load
-            if OWNED_COUNT < OWNED_TABLES.len() {
+            if OWNED_COUNT < (*core::ptr::addr_of!(OWNED_TABLES)).len() {
                 OWNED_TABLES[OWNED_COUNT] = new_table;
                 OWNED_COUNT += 1;
             }
@@ -752,7 +753,7 @@ unsafe fn map_user_page(
                 core::ptr::copy_nonoverlapping(src_virt, dst_virt, 512);
                 let new_entry = new_table | (entry & 0xFFF) | 0x07; // P|W|U
                 core::ptr::write_volatile(table_virt.add(indices[level]), new_entry);
-                if OWNED_COUNT < OWNED_TABLES.len() {
+                if OWNED_COUNT < (*core::ptr::addr_of!(OWNED_TABLES)).len() {
                     OWNED_TABLES[OWNED_COUNT] = new_table;
                     OWNED_COUNT += 1;
                 }

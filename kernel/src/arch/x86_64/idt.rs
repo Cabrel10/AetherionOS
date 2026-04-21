@@ -211,7 +211,7 @@ pub fn relocate_idt_for_kpti(phys_offset: u64) {
 
         // Copy the entire IDT into our KPTI_IDT buffer
         let src = idt_base as *const u8;
-        let dst = KPTI_IDT.entries.as_mut_ptr();
+        let dst = core::ptr::addr_of_mut!(KPTI_IDT).cast::<u8>();
         core::ptr::copy_nonoverlapping(src, dst, core::cmp::min((idt_limit + 1) as usize, 256 * 16));
 
         // Patch each entry: add phys_offset to the handler address
@@ -270,7 +270,7 @@ pub fn relocate_idt_for_kpti(phys_offset: u64) {
         );
 
         // Load the new IDT
-        let new_idt_base = KPTI_IDT.entries.as_ptr() as u64;
+        let new_idt_base = core::ptr::addr_of!(KPTI_IDT) as u64;
         let new_idtr: [u8; 10] = {
             let limit_bytes = idt_limit.to_le_bytes();
             let base_bytes = new_idt_base.to_le_bytes();

@@ -95,7 +95,7 @@ lazy_static! {
         tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
             const STACK_SIZE: usize = 4096 * 5;  // 20KB stack for double-fault
             static mut STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
-            let stack_start = VirtAddr::from_ptr(unsafe { &STACK });
+            let stack_start = VirtAddr::from_ptr(&raw const STACK as *const u8);
             stack_start + STACK_SIZE as u64  // Stack grows downwards
         };
 
@@ -106,7 +106,7 @@ lazy_static! {
         tss.interrupt_stack_table[PAGE_FAULT_IST_INDEX as usize] = {
             const STACK_SIZE: usize = 4096 * 8;  // 32KB stack for page-fault
             static mut PF_STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
-            let stack_start = VirtAddr::from_ptr(unsafe { &PF_STACK });
+            let stack_start = VirtAddr::from_ptr(&raw const PF_STACK as *const u8);
             stack_start + STACK_SIZE as u64  // Stack grows downwards
         };
 
@@ -116,7 +116,7 @@ lazy_static! {
         // timer ticks, etc.) write to RSP=0 causing immediate double fault.
         tss.privilege_stack_table[0] = {
             static mut RING3_STACK: [u8; RING3_INT_STACK_SIZE] = [0; RING3_INT_STACK_SIZE];
-            let stack_start = VirtAddr::from_ptr(unsafe { &RING3_STACK });
+            let stack_start = VirtAddr::from_ptr(&raw const RING3_STACK as *const u8);
             stack_start + RING3_INT_STACK_SIZE as u64
         };
 
