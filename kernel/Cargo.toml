@@ -8,9 +8,9 @@ description = "Aetherion OS Kernel - Couche 8: Priority Scheduler + GPU VRAM Stu
 
 [dependencies]
 
-# Bootloader 0.9.23 - compatible with nightly-2023-08-01
-# CRITICAL: La feature "map_physical_memory" est REQUISE pour physical_memory_offset
-bootloader = { version = "=0.9.23", features = ["map_physical_memory"] }
+# Bootloader API 0.11 — kernel-side types (BootInfo, entry_point! macro)
+# The actual bootloader binary is built via the boot/ crate
+bootloader_api = "0.11"
 
 # Serial port for debug
 uart_16550 = "0.2"
@@ -22,8 +22,8 @@ spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
 lazy_static = { version = "1.4", features = ["spin_no_std"] }
 
 # x86_64 architecture support - GDT, IDT, TSS
-# PINNED to 0.14.11 for nightly-2023-08-01 compatibility (Step trait)
-x86_64 = "=0.14.11"
+# Upgraded to 0.15.4 for nightly-2026 compatibility (Step trait change)
+x86_64 = "0.15.4"
 
 # PIC 8259 Programmable Interrupt Controller
 pic8259 = "0.10.4"
@@ -40,15 +40,5 @@ linked_list_allocator = "0.10.5"
 # Cognitive Bus - Lock-free MPMC queue (no_std compatible)
 crossbeam-queue = { version = "0.3", default-features = false, features = ["alloc"] }
 
-[profile.dev]
-panic = "abort"
-opt-level = 1
-
-[profile.release]
-panic = "abort"
-lto = false
-opt-level = 2
-codegen-units = 4     # More CUs = less memory per unit
-
-[package.metadata.bootloader]
-physical-memory-offset = "0xFFFF800000000000"
+# Profiles are defined in workspace root Cargo.toml
+# [package.metadata.bootloader] removed — config now in boot/ crate BootloaderConfig

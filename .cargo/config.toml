@@ -1,0 +1,4 @@
+# Enable artifact dependencies (bindeps) for the boot crate
+# to reference the kernel binary
+[unstable]
+bindeps = true

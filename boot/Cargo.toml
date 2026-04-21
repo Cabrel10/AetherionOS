@@ -1,0 +1,20 @@
+[package]
+name = "aetherion-boot"
+version = "0.10.0"
+edition = "2021"
+authors = ["MORNINGSTAR <morningstar@aetherion.dev>"]
+description = "AetherionOS Boot Runner - Builds kernel and launches QEMU"
+
+[dependencies]
+
+[build-dependencies]
+# The kernel crate as an artifact binary dependency
+# Cargo builds it with the target specified in kernel/.cargo/config.toml
+aetherion-kernel = { path = "../kernel", artifact = "bin", target = "x86_64-unknown-none" }
+
+# bootloader 0.11 creates BIOS/UEFI disk images from the kernel ELF
+# NOTE: This crate compiles 4 sub-crates (BIOS boot sector, stage-2, stage-4, UEFI)
+# and requires ~2GB RAM. On memory-constrained systems, use:
+#   CARGO_BUILD_JOBS=1 cargo build -p aetherion-boot
+# Or use the alternative script: scripts/build-kernel-only.sh
+bootloader = { version = "0.11", features = ["bios"] }

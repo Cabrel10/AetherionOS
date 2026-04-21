@@ -368,7 +368,7 @@ pub fn wake_application_processors() {
             cpu_idx, target_apic_id, core_idx);
 
         // 7a: Patch this AP's dedicated stack into the mailbox
-        let ap_stack_raw = unsafe { &AP_STACKS[core_idx][0] as *const u8 as u64 };
+        let ap_stack_raw = unsafe { core::ptr::addr_of!(AP_STACKS[core_idx][0]) as u64 };
         let stack_top_virt = ap_stack_raw + AP_STACK_SIZE as u64;
 
         // Use temporary low-memory stack (0x7000) for trampoline; real stack at 0x80F8

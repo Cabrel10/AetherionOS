@@ -95,7 +95,7 @@ lazy_static! {
         tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
             const STACK_SIZE: usize = 4096 * 5;  // 20KB stack for double-fault
             static mut STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
-            let stack_start = VirtAddr::from_ptr(unsafe { &STACK });
+            let stack_start = VirtAddr::from_ptr(&raw const STACK as *const u8);
             stack_start + STACK_SIZE as u64  // Stack grows downwards
         };
 
@@ -106,7 +106,7 @@ lazy_static! {
         tss.interrupt_stack_table[PAGE_FAULT_IST_INDEX as usize] = {
             const STACK_SIZE: usize = 4096 * 8;  // 32KB stack for page-fault
             static mut PF_STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
-            let stack_start = VirtAddr::from_ptr(unsafe { &PF_STACK });
+            let stack_start = VirtAddr::from_ptr(&raw const PF_STACK as *const u8);
             stack_start + STACK_SIZE as u64  // Stack grows downwards
         };
 
@@ -116,7 +116,7 @@ lazy_static! {
         // timer ticks, etc.) write to RSP=0 causing immediate double fault.
         tss.privilege_stack_table[0] = {
             static mut RING3_STACK: [u8; RING3_INT_STACK_SIZE] = [0; RING3_INT_STACK_SIZE];
-            let stack_start = VirtAddr::from_ptr(unsafe { &RING3_STACK });
+            let stack_start = VirtAddr::from_ptr(&raw const RING3_STACK as *const u8);
             stack_start + RING3_INT_STACK_SIZE as u64
         };
 
@@ -127,15 +127,15 @@ lazy_static! {
     static ref GDT: (GlobalDescriptorTable, Selectors) = {
         let mut gdt = GlobalDescriptorTable::new();
         // Entry 1: Kernel code segment (Ring 0)
-        let code_selector = gdt.add_entry(Descriptor::kernel_code_segment());
+        let code_selector = gdt.append(Descriptor::kernel_code_segment());
         // Entry 2: Kernel data segment (Ring 0)
-        let data_selector = gdt.add_entry(Descriptor::kernel_data_segment());
+        let data_selector = gdt.append(Descriptor::kernel_data_segment());
         // Entry 3: User data segment (Ring 3) - must come before user code for sysret
-        let user_data_selector = gdt.add_entry(Descriptor::user_data_segment());
+        let user_data_selector = gdt.append(Descriptor::user_data_segment());
         // Entry 4: User code segment (Ring 3)
-        let user_code_selector = gdt.add_entry(Descriptor::user_code_segment());
+        let user_code_selector = gdt.append(Descriptor::user_code_segment());
         // Entry 5-6: TSS segment for exceptions
-        let tss_selector = gdt.add_entry(Descriptor::tss_segment(&TSS));
+        let tss_selector = gdt.append(Descriptor::tss_segment(&TSS));
         (gdt, Selectors {
             code_selector,
             data_selector,
@@ -233,14 +233,14 @@ pub fn create_and_load_per_core_gdt(core_id: u8) {
         *gdt = GlobalDescriptorTable::new();
 
         // Same segment order as BSP: kernel code, kernel data, user data, user code, TSS
-        let _code_sel = gdt.add_entry(Descriptor::kernel_code_segment());
-        let _data_sel = gdt.add_entry(Descriptor::kernel_data_segment());
-        let _udata_sel = gdt.add_entry(Descriptor::user_data_segment());
-        let _ucode_sel = gdt.add_entry(Descriptor::user_code_segment());
+        let _code_sel = gdt.append(Descriptor::kernel_code_segment());
+        let _data_sel = gdt.append(Descriptor::kernel_data_segment());
+        let _udata_sel = gdt.append(Descriptor::user_data_segment());
+        let _ucode_sel = gdt.append(Descriptor::user_code_segment());
 
         // TSS descriptor uses tss_segment_unchecked to avoid the &'static requirement
         let tss_ptr = tss as *const TaskStateSegment;
-        let tss_sel = gdt.add_entry(Descriptor::tss_segment_unchecked(tss_ptr));
+        let tss_sel = gdt.append(Descriptor::tss_segment_unchecked(tss_ptr));
         AP_TSS_SELECTORS[idx] = tss_sel.0;
 
         // Step 3: Load GDT using load_unsafe (does not require &'static self)

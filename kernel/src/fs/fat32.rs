@@ -945,7 +945,7 @@ pub fn init() -> bool {
 
 /// Check if FAT32 is mounted
 pub fn is_mounted() -> bool {
-    unsafe { FAT32_FS.is_some() }
+    unsafe { (*core::ptr::addr_of!(FAT32_FS)).is_some() }
 }
 
 /// List root directory entries

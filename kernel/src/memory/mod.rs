@@ -1,13 +1,13 @@
 // memory/mod.rs - Couche 2: Gestion mémoire et ressources
 // ACHA-OS Memory Management Subsystem
-// Adapté pour bootloader 0.9.23
+// Adapted for bootloader_api 0.11
 
 pub mod frame;
 pub mod paging;
 pub mod heap;
 pub mod resource_tag;
 
-use bootloader::bootinfo::{BootInfo, MemoryRegionType};
+use bootloader_api::info::{BootInfo, MemoryRegionKind, Optional};
 use x86_64::VirtAddr;
 
 /// Erreurs mémoire
@@ -50,8 +50,14 @@ pub struct MemoryManager {
 impl MemoryManager {
     /// Crée un nouveau MemoryManager à partir des infos de boot
     pub fn new(boot_info: &BootInfo) -> MemoryResult<Self> {
-        // 1. Récupérer l'offset depuis BootInfo
-        let physical_memory_offset = boot_info.physical_memory_offset;
+        // 1. Récupérer l'offset depuis BootInfo (bootloader_api 0.11: Optional<u64>)
+        let physical_memory_offset = match boot_info.physical_memory_offset {
+            Optional::Some(off) => off,
+            Optional::None => {
+                crate::serial_write("[MEMORY] ERROR: physical_memory_offset not provided by bootloader\n");
+                return Err(MemoryError::OutOfMemory);
+            }
+        };
         
         if physical_memory_offset == 0 {
             crate::serial_write("[MEMORY] ERROR: physical_memory_offset is 0\n");
@@ -69,40 +75,36 @@ impl MemoryManager {
         }
         
         // 2. Calculer les régions de mémoire utilisable
+        // bootloader_api 0.11: memory_regions (not memory_map),
+        //   region.start/end (not range.start_addr()/end_addr()),
+        //   MemoryRegionKind::Usable (not MemoryRegionType::Usable)
         let mut total_usable = 0u64;
         let mut usable_regions = [(0u64, 0u64); 32];
         let mut region_count = 0;
         
-        // J135: Dump ALL memory regions for diagnostic (helps identify kernel overlap with usable memory)
+        // J135: Dump ALL memory regions for diagnostic
         crate::serial_write("[MEMORY] Boot memory map (all regions):\n");
-        for region in boot_info.memory_map.iter() {
-            let start = region.range.start_addr();
-            let end = region.range.end_addr();
-            let typ = region.region_type;
+        for region in boot_info.memory_regions.iter() {
+            let start = region.start;
+            let end = region.end;
+            let kind = region.kind;
             {
                 use core::fmt::Write;
                 let mut s = arrayvec::ArrayString::<128>::new();
                 let _ = writeln!(s, "[MEMORY]   {:#x} - {:#x} ({:>4} KB) {:?}",
-                    start, end, (end - start) / 1024, typ);
+                    start, end, (end - start) / 1024, kind);
                 crate::serial_write(&s);
             }
 
-            if region.region_type == MemoryRegionType::Usable && region_count < 32 {
-                // J135 CRITICAL FIX: Exclude kernel .text/.rodata/.data/.bss physical region
-                // Kernel is loaded at phys 0x200000 - ~0xC10000 (actually mapped as 2MiB huge
-                // pages at PML4[0]->PDPT[0]->PD[2]=0x400000 .. PD[5]=0xC00000). If the
-                // bootloader marks this as Usable, the frame allocator will hand out frames
-                // inside the kernel image, and demand-paging or page-table copies will
-                // overwrite kernel .text. We carve this range out here defensively.
+            if region.kind == MemoryRegionKind::Usable && region_count < 32 {
+                // J135 CRITICAL FIX: Exclude kernel physical region
                 const KERNEL_RESERVED_START: u64 = 0x200000;
                 const KERNEL_RESERVED_END:   u64 = 0x1000000; // 16 MiB safety margin
                 if end <= KERNEL_RESERVED_START || start >= KERNEL_RESERVED_END {
-                    // Fully outside kernel — keep as is
                     usable_regions[region_count] = (start, end);
                     region_count += 1;
                     total_usable += end - start;
                 } else {
-                    // Split the region into pre-kernel and post-kernel parts
                     if start < KERNEL_RESERVED_START && region_count < 32 {
                         let hi = KERNEL_RESERVED_START;
                         usable_regions[region_count] = (start, hi);

@@ -292,7 +292,9 @@ pub fn get_info_string() -> String {
     let ver_minor = (version & 0xFF) as u8;
     unsafe {
         format!("xHCI v{}.{:02} {} ports {} slots",
-            ver_major, ver_minor, XHCI_MAX_PORTS, XHCI_MAX_SLOTS)
+            ver_major, ver_minor,
+            *core::ptr::addr_of!(XHCI_MAX_PORTS),
+            *core::ptr::addr_of!(XHCI_MAX_SLOTS))
     }
 }
 

@@ -90,15 +90,15 @@ lazy_static! {
 
         // IRQ Handlers (PIC 8259)
         // Timer (IRQ 0 -> vector 32)
-        idt[super::interrupts::PIC1_OFFSET as usize]
+        idt[super::interrupts::PIC1_OFFSET as u8]
             .set_handler_fn(timer_interrupt_handler);
 
         // Keyboard (IRQ 1 -> vector 33)
-        idt[super::interrupts::PIC1_OFFSET as usize + 1]
+        idt[(super::interrupts::PIC1_OFFSET + 1) as u8]
             .set_handler_fn(keyboard_interrupt_handler);
 
         // Mouse (IRQ 12 -> vector 44)
-        idt[super::interrupts::PIC2_OFFSET as usize + 4]
+        idt[(super::interrupts::PIC2_OFFSET + 4) as u8]
             .set_handler_fn(mouse_interrupt_handler);
 
         idt
@@ -211,7 +211,7 @@ pub fn relocate_idt_for_kpti(phys_offset: u64) {
 
         // Copy the entire IDT into our KPTI_IDT buffer
         let src = idt_base as *const u8;
-        let dst = KPTI_IDT.entries.as_mut_ptr();
+        let dst = core::ptr::addr_of_mut!(KPTI_IDT).cast::<u8>();
         core::ptr::copy_nonoverlapping(src, dst, core::cmp::min((idt_limit + 1) as usize, 256 * 16));
 
         // Patch each entry: add phys_offset to the handler address
@@ -270,7 +270,7 @@ pub fn relocate_idt_for_kpti(phys_offset: u64) {
         );
 
         // Load the new IDT
-        let new_idt_base = KPTI_IDT.entries.as_ptr() as u64;
+        let new_idt_base = core::ptr::addr_of!(KPTI_IDT) as u64;
         let new_idtr: [u8; 10] = {
             let limit_bytes = idt_limit.to_le_bytes();
             let base_bytes = new_idt_base.to_le_bytes();
@@ -319,7 +319,7 @@ extern "x86-interrupt" fn bound_range_exceeded_handler(stack_frame: InterruptSta
 
 extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
     let cs = stack_frame.code_segment;
-    let is_ring3 = (cs & 0x3) == 3;
+    let is_ring3 = (cs.0 & 0x3) == 3;
     crate::serial_println!("[EXCEPTION] #UD Invalid opcode at {:?} ring3={}", stack_frame.instruction_pointer, is_ring3);
     if is_ring3 {
         let current_pid = crate::scheduler::current_pid();
@@ -349,7 +349,7 @@ extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame,
         let kcr3 = crate::arch::x86_64::syscall::get_kernel_cr3();
         if kcr3 != 0 { core::arch::asm!("mov cr3, {}", in(reg) kcr3, options(nostack)); }
     }
-    let cr2 = Cr2::read().as_u64();
+    let cr2 = Cr2::read().map(|v| v.as_u64()).unwrap_or(0);
     let cr3: u64;
     unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)); }
     let gsb: u64;
@@ -366,7 +366,7 @@ extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame,
     }
     crate::serial_println!("[DF] DOUBLE FAULT rip={:?} rsp=0x{:X} cs=0x{:X} rflags=0x{:X}",
         stack_frame.instruction_pointer, stack_frame.stack_pointer.as_u64(),
-        stack_frame.code_segment, stack_frame.cpu_flags);
+        stack_frame.code_segment.0, stack_frame.cpu_flags.bits());
     crate::serial_println!("[DF] CR2=0x{:X} CR3=0x{:X} GS_BASE=0x{:X} KERNEL_GS_BASE=0x{:X}",
         cr2, cr3, gsb, kgsb);
     panic!("Double fault - possible stack overflow or PF-in-PF cascade");
@@ -395,7 +395,7 @@ extern "x86-interrupt" fn general_protection_fault_handler(stack_frame: Interrup
     }
     // Check if this is a Ring 3 fault (CS selector in stack frame has RPL=3)
     let cs = stack_frame.code_segment;
-    let is_ring3 = (cs & 0x3) == 3;
+    let is_ring3 = (cs.0 & 0x3) == 3;
 
     crate::serial_println!(
         "[EXCEPTION] #GP code=0x{:X} rip={:?} ring3={}",
@@ -778,8 +778,7 @@ extern "x86-interrupt" fn page_fault_handler(
         }
     }
 
-    let accessed_address = Cr2::read();
-    let addr_raw = accessed_address.as_u64();
+    let addr_raw = Cr2::read().map(|v| v.as_u64()).unwrap_or(0);
     let is_user_mode = error_code.contains(PageFaultErrorCode::USER_MODE);
     let page_addr = addr_raw & !0xFFF;
 
@@ -796,8 +795,8 @@ extern "x86-interrupt" fn page_fault_handler(
         let n = DEEP_COUNT.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
         if n < 8 {
             let rip = stack_frame.instruction_pointer.as_u64();
-            let cs  = stack_frame.code_segment;
-            let rfl = stack_frame.cpu_flags;
+            let cs  = stack_frame.code_segment.0 as u64;
+            let rfl = stack_frame.cpu_flags.bits();
             let rsp = stack_frame.stack_pointer.as_u64();
             let err = error_code.bits();
             let cr3: u64;
@@ -1179,7 +1178,7 @@ extern "x86-interrupt" fn page_fault_handler(
     // Jalon 109: Downgraded from panic! to hlt-loop so the other core survives.
     {
         let rip_val = stack_frame.instruction_pointer.as_u64();
-        let cs_val = stack_frame.code_segment;
+        let cs_val = stack_frame.code_segment.0 as u64;
         let err = error_code.bits();
         let hex = b"0123456789ABCDEF";
         let mut msg = [b' '; 128];
@@ -1201,7 +1200,7 @@ extern "x86-interrupt" fn page_fault_handler(
         msg[pos..pos+mid2.len()].copy_from_slice(mid2);
         pos += mid2.len();
         // CS (4 hex digits)
-        v = cs_val as u64;
+        v = cs_val;
         for i in (0..4).rev() { msg[pos + i] = hex[(v & 0xF) as usize]; v >>= 4; }
         pos += 4;
         let mid3 = b" ERR=0x";
@@ -1321,12 +1320,12 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
     if current_pid != 0 {
         let irq_rip = stack_frame.instruction_pointer.as_u64();
         let irq_rsp = stack_frame.stack_pointer.as_u64();
-        let irq_rflags = stack_frame.cpu_flags;
+        let irq_rflags = stack_frame.cpu_flags.bits();
         let cs = stack_frame.code_segment;
         
         // Only save if this was a Ring 3 interrupt (CS RPL == 3)
         // Jalon 109: Accept both AetherionOS ELF range and Linux ABI range
-        if (cs & 0x3) == 3 && is_valid_user_rip(irq_rip) {
+        if (cs.0 & 0x3) == 3 && is_valid_user_rip(irq_rip) {
             crate::process::save_preempt_state(current_pid, irq_rip, irq_rsp, irq_rflags);
         }
     }
