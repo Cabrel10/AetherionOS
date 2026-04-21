@@ -4,43 +4,63 @@
 
 ### Rust Toolchain
 ```bash
-# Install exact nightly version
-rustup install nightly-2023-08-01
-rustup default nightly-2023-08-01
+# Install exact nightly version (pinned in rust-toolchain.toml)
+rustup install nightly-2026-04-21
+rustup default nightly-2026-04-21
 
 # Required components
 rustup component add rust-src
 rustup component add llvm-tools-preview
+rustup component add rustfmt
 rustup target add x86_64-unknown-none
-
-# Build tools
-cargo install bootimage
 ```
 
 ### System Packages (Ubuntu/Debian)
 ```bash
-sudo apt-get install gcc nasm mtools qemu-system-x86
+sudo apt-get install gcc nasm mtools qemu-system-x86 xorriso
 ```
 
 ### Toolchain Versions (Pinned)
 | Tool | Version | Notes |
 |------|---------|-------|
-| Rust | nightly-2023-08-01 | Pinned in `kernel/rust-toolchain.toml` |
-| bootimage | 0.10.3 | Legacy; migration to bootloader v0.11 planned |
+| Rust | nightly-2026-04-21 | Pinned in `rust-toolchain.toml` |
+| bootloader_api | 0.11 | Kernel-side boot protocol types |
+| bootloader | 0.11 | Boot image builder (needs >= 2 GB RAM) |
+| limine | 0.6.3 | Alternative boot protocol (optional) |
 | QEMU | 6.0+ | For testing with `-serial stdio` |
 | GCC | 9+ | For C userspace apps |
+| xorriso | any | For Limine ISO creation (optional) |
 
 ## Quick Build
 
+### Kernel Only (Fastest)
 ```bash
-# Full build (userspace + kernel)
-bash scripts/full_build.sh
+# Check compilation (no binary output)
+cargo check -p aetherion-kernel --lib
 
-# Kernel only (uses stubs for missing userspace binaries)
-bash scripts/full_build.sh --kernel
+# Build kernel ELF
+cargo build -p aetherion-kernel --target x86_64-unknown-none
 
-# Check compilation only (fastest)
-bash scripts/full_build.sh --kernel --check
+# Build kernel (resource-constrained machines)
+CARGO_BUILD_JOBS=1 cargo build -p aetherion-kernel --target x86_64-unknown-none
+```
+
+### Boot Image (BIOS via bootloader 0.11)
+```bash
+# Requires >= 2 GB RAM
+bash scripts/build-boot-011.sh
+
+# Or manually:
+CARGO_BUILD_JOBS=1 cargo build -p aetherion-boot
+```
+
+### Limine ISO (Alternative boot)
+```bash
+# Switch to Limine branch
+git checkout migrate/limine
+
+# Build ISO (requires xorriso + Limine binaries)
+bash scripts/build-limine.sh
 ```
 
 ## Build Architecture
@@ -48,90 +68,132 @@ bash scripts/full_build.sh --kernel --check
 ### Directory Layout
 ```
 AetherionOS/
-  kernel/                    # Kernel crate (bare-metal, no_std)
-    src/main.rs              # Entry point, includes ~48 ELF binaries via include_bytes!
-    Cargo.toml               # Dependencies: bootloader 0.9.23, x86_64, etc.
-    rust-toolchain.toml      # Pins nightly-2023-08-01
-  userspace/
-    c_apps/                  # C apps (cat, ls, sh, wget, etc.)
-    agent_*/                 # Rust agents (each is a separate crate)
-    rust_sdk/                # Shared Rust SDK for userspace agents
-    hello.elf, shell.elf     # Pre-built or stub ELF binaries
-    busybox.elf              # BusyBox binary (external)
-  bin_cache/                 # Compiled agent binaries for kernel embedding
-  sdk/c/                     # C SDK (aetherion.h, crt0, libc stubs)
-  x86_64-aetherion.json      # Kernel target spec
-  x86_64-aetherion-user.json # Userspace target spec
+  Cargo.toml                  # Workspace root (resolver = "2")
+  .cargo/config.toml          # bindeps = true
+  rust-toolchain.toml         # nightly-2026-04-21
+  kernel/                     # Kernel crate (bare-metal, no_std)
+    Cargo.toml                # bootloader_api 0.11, limine 0.6 (optional)
+    .cargo/config.toml        # target = x86_64-unknown-none, build-std
+    src/
+      main.rs                 # Entry point (bootloader_api::entry_point!)
+      lib.rs                  # Library interface for tests
+      boot/                   # Boot protocol abstraction
+        mod.rs                # Feature-gated boot modules
+        limine_entry.rs       # Limine entry point (--features limine)
+      arch/x86_64/            # Architecture (GDT, IDT, APIC, syscalls)
+      memory/                 # Memory management (frames, paging, heap)
+      process/                # Process manager + scheduler
+      fs/                     # VFS + FAT32
+      net/                    # TCP/IP, DNS, HTTP
+      elf/                    # ELF64 loader with per-process paging
+      ipc/                    # Cognitive Bus (lock-free MPMC)
+      drivers/                # PS/2, USB xHCI, etc.
+      security/               # TPM, KPTI, stack protector
+      compat/                 # Linuxulator (Linux ABI)
+    linker-x86_64.ld          # Limine linker script
+  boot/                       # Boot runner crate (host-side)
+    Cargo.toml                # bootloader 0.11 + kernel artifact dep
+    build.rs                  # Creates BIOS disk image
+    src/main.rs               # QEMU launcher
+  userspace/                  # Userspace binaries
+    c_apps/                   # C apps (cat, ls, sh, wget, etc.)
+    agent_*/                  # Rust agents
+    hello.elf, shell.elf      # Pre-built ELF binaries
+  bin_cache/                  # Compiled agent binaries
+  third_party/
+    limine/                   # Pre-built Limine binaries (optional)
   scripts/
-    full_build.sh            # Main build script
-    build_c.sh               # C apps build
-    build_all_agents.sh      # Rust agents build
+    build-boot-011.sh         # Full boot image build
+    build-kernel-only.sh      # Kernel ELF only
+    build-limine.sh           # Limine ISO build
+  docs/
+    ROADMAP_UEFI.md           # UEFI boot roadmap
+  MIGRATION_LOG.md            # Jalon 148 migration details
 ```
 
 ### Build Order
 1. **C SDK** (`sdk/c/`) -> `libaetherion.a`
 2. **C apps** (`userspace/c_apps/`) -> `*.elf` (linked against C SDK)
-3. **Rust agents** (`userspace/agent_*/`) -> `bin_cache/` and `target/` binaries
-4. **Kernel** (`kernel/`) -> `bootimage-aetherion-kernel.bin`
+3. **Rust agents** (`userspace/agent_*/`) -> `bin_cache/` binaries
+4. **Kernel** (`kernel/`) -> kernel ELF (embeds all userspace via `include_bytes!`)
+5. **Boot image** (`boot/`) -> `target/aetherion-boot.img` or ISO
 
 The kernel embeds all userspace binaries via `include_bytes!` macros in `main.rs`.
-This means **all userspace binaries must exist before the kernel can compile**.
+This means **all userspace binaries must exist before the kernel binary can compile**.
+(`cargo check --lib` works without them since lib.rs doesn't include the binaries.)
+
+## Boot Protocols
+
+### 1. Bootloader 0.11 (Default)
+```
+Firmware (BIOS/UEFI) -> bootloader 0.11 -> kernel_main(BootInfo)
+```
+- Entry: `bootloader_api::entry_point!(kernel_main)`
+- Config: `BootloaderConfig { Mapping::Dynamic, 128 KiB stack }`
+- Build: `cargo build -p aetherion-boot`
+
+### 2. Limine (Feature Flag)
+```
+Firmware (BIOS/UEFI) -> Limine -> kmain() [reads HHDM/Memmap/FB/RSDP]
+```
+- Entry: `#[no_mangle] unsafe extern "C" fn kmain()`
+- Config: `limine.conf` in ISO root
+- Build: `bash scripts/build-limine.sh` on `migrate/limine` branch
+- Linker: `kernel/linker-x86_64.ld` (base 0xffffffff80000000)
+
+### 3. UEFI (Planned — Jalon 150+)
+See `docs/ROADMAP_UEFI.md` for details.
+
+## Testing with QEMU
+
+### Bootloader 0.11 (BIOS)
+```bash
+qemu-system-x86_64 \
+    -drive format=raw,file=target/aetherion-boot.img \
+    -serial stdio -m 4G -smp 2 -no-reboot
+```
+
+### Limine (BIOS ISO)
+```bash
+qemu-system-x86_64 \
+    -cdrom target/aetherion-limine.iso \
+    -serial stdio -m 4G -smp 2 -no-reboot
+```
+
+### Expected Boot Output
+- Banner: `AetherionOS Kernel Boot Sequence`
+- GDT, IDT, PIC initialization logs
+- Memory manager initialization
+- Shell prompt: `$`
+
+### Validation Checklist
+- [ ] No `PANIC` or `SIGSEGV` in output
+- [ ] Shell prompt `$` appears on serial
+- [ ] `exec /bin/hello.elf` prints test message
+- [ ] `cargo check --lib`: 0 errors, 0 warnings
 
 ## Anti-Corruption Measures
 
-The sandbox environment can corrupt files with NUL bytes during parallel builds.
+The sandbox environment can corrupt files during parallel builds.
 Apply these mitigations:
 
 ```bash
-# 1. Use tmpfs for kernel build target (prevents disk corruption)
-sudo mkdir -p /mnt/aetherion-build
-sudo mount -t tmpfs -o size=3g,mode=1777 tmpfs /mnt/aetherion-build
-cd kernel && rm -rf target && ln -s /mnt/aetherion-build target
-
-# 2. Pre-fetch and lock Cargo registry
-cd kernel && CARGO_BUILD_JOBS=1 cargo fetch
-chmod -R a-w ~/.cargo/registry/src/
-
-# 3. Always use single-threaded builds
+# 1. Always use single-threaded builds on constrained machines
 export CARGO_BUILD_JOBS=1
 
-# 4. Harden git against index corruption
-cd /path/to/repo
+# 2. Pre-fetch and lock Cargo registry
+cargo fetch
+chmod -R a-w ~/.cargo/registry/src/
+
+# 3. Harden git
 git config core.fsync objects,derived-metadata,reference
 git config core.preloadIndex false
 ```
 
-## Testing with QEMU
-
-```bash
-# Basic boot test (60s timeout)
-timeout 60 qemu-system-x86_64 \
-  -enable-kvm -cpu host -smp 2 -m 1024M \
-  -drive format=raw,file=kernel/target/x86_64-aetherion/release/bootimage-aetherion-kernel.bin \
-  -display none -serial stdio -no-reboot
-
-# With disk image (for FAT32 filesystem)
-timeout 60 qemu-system-x86_64 \
-  -enable-kvm -cpu host -smp 2 -m 1024M \
-  -drive format=raw,file=kernel/target/x86_64-aetherion/release/bootimage-aetherion-kernel.bin \
-  -drive format=raw,file=disk.img,if=virtio \
-  -display none -serial stdio -no-reboot
-```
-
-### Expected Boot Output
-- `[BOOT] AetherionOS Couche 19 READY`
-- BusyBox shell on `/dev/ttyS0` (serial console)
-- `agent_visual_term` launched for graphical output
-
-### What to Check
-- No `PANIC` or `SIGSEGV` in output
-- `execve` syscall logs showing binary loading
-- `ld-musl` dynamic linker messages for `hello_dyn.elf`
-- BusyBox interactive shell prompt
-
 ## Known Technical Debt
 
-1. **bootimage crate** (0.10.3): Obsolete, unmaintained. Migration to `bootloader` v0.11 planned but requires entry point changes.
-2. **Nightly pinning** (2023-08-01): 2.5 years behind upstream. Update requires auditing all `asm!` blocks and `core::intrinsics` usage.
-3. **include_bytes! embedding**: ~48 binaries embedded in kernel image. Should migrate to initramfs/VFS for smaller kernel and faster builds.
-4. **Stub binaries**: `full_build.sh` creates placeholder ELFs for agents that fail to compile. These are valid ELFs that call `exit(0)` but provide no functionality.
+1. **include_bytes! embedding**: ~48 binaries embedded in kernel. Should migrate to initramfs.
+2. **Stub binaries**: Placeholder ELFs in sandbox for missing userspace apps.
+3. **Bootloader 0.11 RAM**: Disk image creation needs >= 2 GB RAM.
+4. **Limine memory init**: Full memory manager adaptation for Limine pending.
+5. **1 unused-import warning**: In `process/mod.rs` (non-critical).

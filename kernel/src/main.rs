@@ -63,6 +63,8 @@ mod framebuffer;
 mod font;
 mod codegen;
 mod compat;
+#[cfg(feature = "limine")]
+mod boot;
 
 // ===== Configuration =====
 const KERNEL_VERSION: &str = "3.1.0-j109-112-enriched-bus-clock-sensor";
