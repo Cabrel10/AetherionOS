@@ -40,5 +40,12 @@ linked_list_allocator = "0.10.5"
 # Cognitive Bus - Lock-free MPMC queue (no_std compatible)
 crossbeam-queue = { version = "0.3", default-features = false, features = ["alloc"] }
 
+# Limine boot protocol (optional, for Limine boot path)
+limine = { version = "0.6", optional = true }
+
+[features]
+default = []
+limine = ["dep:limine"]
+
 # Profiles are defined in workspace root Cargo.toml
 # [package.metadata.bootloader] removed — config now in boot/ crate BootloaderConfig

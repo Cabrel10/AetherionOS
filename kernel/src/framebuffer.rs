@@ -166,6 +166,74 @@ pub fn init(width: u32, height: u32) -> Option<FramebufferInfo> {
     })
 }
 
+/// Initialize framebuffer from Limine boot protocol GOP data.
+/// Called by limine_entry.rs when booting via Limine.
+/// Unlike init() which programs Bochs VBE registers, this simply records
+/// the framebuffer info that Limine already set up via UEFI GOP or BIOS VBE.
+pub fn init_from_limine(phys_addr: u64, width: u32, height: u32, pitch: u32, bpp: u32) -> Option<FramebufferInfo> {
+    crate::serial_println!(
+        "[FB] Limine GOP framebuffer: phys=0x{:X}, {}x{}, pitch={}, bpp={}",
+        phys_addr, width, height, pitch, bpp
+    );
+
+    let stride = pitch; // Limine gives us pitch in bytes
+    let size = (stride as u64) * (height as u64);
+
+    FB_PHYS_ADDR.store(phys_addr, Ordering::SeqCst);
+    FB_WIDTH.store(width, Ordering::SeqCst);
+    FB_HEIGHT.store(height, Ordering::SeqCst);
+    FB_STRIDE.store(stride, Ordering::SeqCst);
+    FB_SIZE.store(size, Ordering::SeqCst);
+
+    crate::serial_println!(
+        "[FB] Limine framebuffer ready: {}x{}x{}, {} KB",
+        width, height, bpp, size / 1024
+    );
+
+    Some(FramebufferInfo {
+        phys_addr,
+        width,
+        height,
+        stride,
+        bpp,
+        size,
+    })
+}
+
+/// Register /dev/fb0 and /sys/class/backlight in the VFS.
+/// This makes the framebuffer accessible to userspace programs (TinyX, etc.).
+pub fn register_vfs_nodes() {
+    let info = match get_info() {
+        Some(i) => i,
+        None => {
+            crate::serial_println!("[FB] No framebuffer to register in VFS");
+            return;
+        }
+    };
+
+    // Create /dev/fb0 — a pseudo-file that exposes framebuffer metadata
+    // Real mmap is handled by map_fb_for_user() via a syscall
+    let fb_info_str = alloc::format!(
+        "phys_addr=0x{:X}\nwidth={}\nheight={}\nstride={}\nbpp={}\nsize={}\n",
+        info.phys_addr, info.width, info.height, info.stride, info.bpp, info.size
+    );
+    let _ = crate::fs::vfs::file_write("/dev/fb0", fb_info_str.as_bytes());
+
+    // Create /sys/class/backlight/panel0/
+    let _ = crate::fs::vfs::mkdir("/sys/class");
+    let _ = crate::fs::vfs::mkdir("/sys/class/backlight");
+    let _ = crate::fs::vfs::mkdir("/sys/class/backlight/panel0");
+    let _ = crate::fs::vfs::file_write("/sys/class/backlight/panel0/brightness", b"100");
+    let _ = crate::fs::vfs::file_write("/sys/class/backlight/panel0/max_brightness", b"255");
+    let _ = crate::fs::vfs::file_write("/sys/class/backlight/panel0/actual_brightness", b"100");
+    let _ = crate::fs::vfs::file_write("/sys/class/backlight/panel0/type", b"raw");
+
+    crate::serial_println!(
+        "[FB] VFS: /dev/fb0 registered ({}x{}), /sys/class/backlight/panel0 created",
+        info.width, info.height
+    );
+}
+
 /// Get current framebuffer info (None if not initialized)
 pub fn get_info() -> Option<FramebufferInfo> {
     let phys = FB_PHYS_ADDR.load(Ordering::SeqCst);

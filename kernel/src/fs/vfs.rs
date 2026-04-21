@@ -820,6 +820,14 @@ pub fn init() -> Result<(), VfsError> {
         dev_dir.insert(String::from("stdout"), VfsNode::File(Vec::new()));
         dev_dir.insert(String::from("stderr"), VfsNode::File(Vec::new()));
 
+        // /dev/input — Linux input event devices for keyboard/mouse injection
+        let mut input_dir = BTreeMap::new();
+        // event0 = keyboard, event1 = mouse/touchpad
+        input_dir.insert(String::from("event0"), VfsNode::File(Vec::new())); // keyboard
+        input_dir.insert(String::from("event1"), VfsNode::File(Vec::new())); // mouse
+        input_dir.insert(String::from("mice"),   VfsNode::File(Vec::new())); // legacy mouse
+        dev_dir.insert(String::from("input"), VfsNode::Directory(input_dir));
+
         root.insert(String::from("dev"), VfsNode::Directory(dev_dir));
 
         // Create /tmp directory
@@ -835,7 +843,33 @@ pub fn init() -> Result<(), VfsError> {
         self_dir.insert(String::from("exe"), VfsNode::File(Vec::new()));
         // /proc/self/maps — empty (tools like ASLR checkers read this)
         self_dir.insert(String::from("maps"), VfsNode::File(Vec::new()));
+        // /proc/self/status — process status (APK reads this)
+        self_dir.insert(String::from("status"), VfsNode::File(
+            b"Name:\tinit\nState:\tR (running)\nPid:\t1\nPPid:\t0\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n".to_vec()));
+        // /proc/self/cmdline — null-separated (busybox reads this)
+        self_dir.insert(String::from("cmdline"), VfsNode::File(b"/bin/init\0".to_vec()));
+        // /proc/self/fd — file descriptor directory (empty)
+        self_dir.insert(String::from("fd"), VfsNode::Directory(BTreeMap::new()));
         proc_dir.insert(String::from("self"), VfsNode::Directory(self_dir));
+        // /proc/version — kernel version string (APK, uname -a)
+        proc_dir.insert(String::from("version"), VfsNode::File(
+            b"Linux version 6.18.0-aetherion (morningstar@aetherion.dev) (gcc 13.2.0) #1 SMP PREEMPT AetherionOS\n".to_vec()));
+        // /proc/cpuinfo — minimal CPU info (musl/Python reads this)
+        proc_dir.insert(String::from("cpuinfo"), VfsNode::File(
+            b"processor\t: 0\nvendor_id\t: AetherionOS\nmodel name\t: AetherionOS Virtual CPU\ncpu MHz\t\t: 2000.000\ncache size\t: 4096 KB\nflags\t\t: fpu sse sse2 avx\nbogomips\t: 4000.00\n\n".to_vec()));
+        // /proc/meminfo — memory stats (APK/free/top need this)
+        proc_dir.insert(String::from("meminfo"), VfsNode::File(
+            b"MemTotal:        4096000 kB\nMemFree:         2048000 kB\nMemAvailable:    3072000 kB\nBuffers:          128000 kB\nCached:           512000 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\n".to_vec()));
+        // /proc/filesystems — needed by mount
+        proc_dir.insert(String::from("filesystems"), VfsNode::File(
+            b"nodev\ttmpfs\nnodev\tproc\nnodev\tsysfs\nnodev\tdevtmpfs\n".to_vec()));
+        // /proc/mounts — current mount table (APK reads this)
+        proc_dir.insert(String::from("mounts"), VfsNode::File(
+            b"none / tmpfs rw,relatime 0 0\nproc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\nsysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0\ndevtmpfs /dev devtmpfs rw,nosuid 0 0\n".to_vec()));
+        // /proc/uptime — system uptime (seconds idle_seconds)
+        proc_dir.insert(String::from("uptime"), VfsNode::File(b"100.00 50.00\n".to_vec()));
+        // /proc/loadavg — load averages
+        proc_dir.insert(String::from("loadavg"), VfsNode::File(b"0.00 0.00 0.00 1/1 1\n".to_vec()));
         root.insert(String::from("proc"), VfsNode::Directory(proc_dir));
 
         // Create /sys directory
@@ -843,6 +877,47 @@ pub fn init() -> Result<(), VfsError> {
             String::from("sys"),
             VfsNode::Directory(BTreeMap::new()),
         );
+
+        // Create standard filesystem directories
+        // /bin — user executables
+        root.insert(String::from("bin"), VfsNode::Directory(BTreeMap::new()));
+        // /lib — shared libraries (musl ld.so lives here)
+        root.insert(String::from("lib"), VfsNode::Directory(BTreeMap::new()));
+        // /usr/bin, /usr/lib — secondary hierarchy
+        let mut usr_dir = BTreeMap::new();
+        usr_dir.insert(String::from("bin"), VfsNode::Directory(BTreeMap::new()));
+        usr_dir.insert(String::from("lib"), VfsNode::Directory(BTreeMap::new()));
+        usr_dir.insert(String::from("local"), VfsNode::Directory({
+            let mut local = BTreeMap::new();
+            local.insert(String::from("bin"), VfsNode::Directory(BTreeMap::new()));
+            local.insert(String::from("lib"), VfsNode::Directory(BTreeMap::new()));
+            local
+        }));
+        root.insert(String::from("usr"), VfsNode::Directory(usr_dir));
+        // /root — root user home
+        root.insert(String::from("root"), VfsNode::Directory(BTreeMap::new()));
+        // /var — variable data
+        let mut var_dir = BTreeMap::new();
+        var_dir.insert(String::from("tmp"), VfsNode::Directory(BTreeMap::new()));
+        var_dir.insert(String::from("log"), VfsNode::Directory(BTreeMap::new()));
+        var_dir.insert(String::from("cache"), VfsNode::Directory({
+            let mut cache = BTreeMap::new();
+            cache.insert(String::from("apk"), VfsNode::Directory(BTreeMap::new()));
+            cache
+        }));
+        root.insert(String::from("var"), VfsNode::Directory(var_dir));
+        // /run — runtime data
+        root.insert(String::from("run"), VfsNode::Directory(BTreeMap::new()));
+        // /data — persistent storage mount point (FAT32 disk, ~2 GiB)
+        // When a FAT32 disk is available, mount_device("/data", ...) binds it here.
+        // /var and /home are symlinked or bind-mounted to /data/var, /data/home.
+        let mut data_dir = BTreeMap::new();
+        data_dir.insert(String::from("var"), VfsNode::Directory(BTreeMap::new()));
+        data_dir.insert(String::from("home"), VfsNode::Directory(BTreeMap::new()));
+        data_dir.insert(String::from("apk"), VfsNode::Directory(BTreeMap::new()));
+        root.insert(String::from("data"), VfsNode::Directory(data_dir));
+        // /home — user home directories (initially empty, backed by /data/home when disk available)
+        root.insert(String::from("home"), VfsNode::Directory(BTreeMap::new()));
 
         // ── Jalon 94: Create /etc directory with Linux compatibility files ──
         // Tools like nmap, wget, curl probe /etc/resolv.conf, /etc/protocols, etc.
@@ -879,6 +954,28 @@ pub fn init() -> Result<(), VfsError> {
         // /etc/nsswitch.conf — name service switch (musl reads this)
         etc_dir.insert(String::from("nsswitch.conf"),
             VfsNode::File(b"passwd: files\ngroup: files\nhosts: files dns\n".to_vec()));
+
+        // /etc/os-release — OS identification (APK, systemd, etc.)
+        etc_dir.insert(String::from("os-release"),
+            VfsNode::File(b"NAME=\"AetherionOS\"\nID=aetherion\nVERSION_ID=1.0\nPRETTY_NAME=\"AetherionOS 1.0\"\n".to_vec()));
+
+        // /etc/apk/repositories — APK mirror list (Alpine 3.21)
+        let mut apk_dir = BTreeMap::new();
+        apk_dir.insert(String::from("repositories"),
+            VfsNode::File(b"https://dl-cdn.alpinelinux.org/alpine/v3.21/main\nhttps://dl-cdn.alpinelinux.org/alpine/v3.21/community\n".to_vec()));
+        apk_dir.insert(String::from("arch"),
+            VfsNode::File(b"x86_64\n".to_vec()));
+        // Create /etc/apk/keys/ for package verification
+        apk_dir.insert(String::from("keys"), VfsNode::Directory(BTreeMap::new()));
+        etc_dir.insert(String::from("apk"), VfsNode::Directory(apk_dir));
+
+        // /etc/ld-musl-x86_64.path — musl dynamic linker search path
+        etc_dir.insert(String::from("ld-musl-x86_64.path"),
+            VfsNode::File(b"/lib\n/usr/lib\n/usr/local/lib\n".to_vec()));
+
+        // /etc/shadow — root with no password (minimal)
+        etc_dir.insert(String::from("shadow"),
+            VfsNode::File(b"root::19000:0:99999:7:::\nnobody:!:19000:0:99999:7:::\n".to_vec()));
 
         root.insert(String::from("etc"), VfsNode::Directory(etc_dir));
     }

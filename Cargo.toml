@@ -1,8 +1,42 @@
 [workspace]
 resolver = "2"
-members = ["kernel", "boot"]
+members = ["kernel"]
+exclude = [
+    "userspace/agent_ai_native",
+    "userspace/agent_autonomous",
+    "userspace/agent_bench",
+    "userspace/agent_chunk_reader",
+    "userspace/agent_clock",
+    "userspace/agent_gguf",
+    "userspace/agent_gui_test",
+    "userspace/agent_http",
+    "userspace/agent_inference",
+    "userspace/agent_input",
+    "userspace/agent_llama",
+    "userspace/agent_llama_core",
+    "userspace/agent_llm_chat",
+    "userspace/agent_mcp",
+    "userspace/agent_memory",
+    "userspace/agent_mt_matmul",
+    "userspace/agent_multipart",
+    "userspace/agent_net",
+    "userspace/agent_orchestrator",
+    "userspace/agent_q4_dequant",
+    "userspace/agent_rust",
+    "userspace/agent_saga",
+    "userspace/agent_sse",
+    "userspace/agent_state",
+    "userspace/agent_sysinfo",
+    "userspace/agent_terminal",
+    "userspace/agent_tokenizer",
+    "userspace/agent_validator",
+    "userspace/agent_visual_term",
+    "userspace/agent_weight_loader",
+    "userspace/agent_wm",
+    "userspace/rust_sdk",
+]
 
-# Default to building the boot runner
+# Limine is the default bootloader — built via scripts/build-limine.sh
 [workspace.package]
 edition = "2021"
 authors = ["MORNINGSTAR <morningstar@aetherion.dev>"]

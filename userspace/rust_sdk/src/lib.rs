@@ -23,7 +23,7 @@
 
 #![no_std]
 #![feature(alloc_error_handler)]
-#![feature(naked_functions)]
+// naked_functions is stable since Rust 1.88
 
 extern crate alloc;
 
@@ -1179,10 +1179,10 @@ pub extern "C" fn _aetherion_runtime_init() {
     ALLOCATOR.ensure_init();
 }
 
-#[naked]
+#[unsafe(naked)]
 #[no_mangle]
 pub unsafe extern "C" fn _start() -> ! {
-    core::arch::asm!(
+    core::arch::naked_asm!(
         // RSP is 16-byte aligned here (from IRETQ).
         // CALL pushes 8-byte return address -> RSP becomes 8 mod 16.
         // This is exactly what the x86_64 SysV ABI expects on function entry.
@@ -1198,6 +1198,5 @@ pub unsafe extern "C" fn _start() -> ! {
         // Unreachable: halt loop as safety net
         "2: hlt",
         "jmp 2b",
-        options(noreturn),
     )
 }

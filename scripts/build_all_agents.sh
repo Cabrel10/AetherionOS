@@ -36,11 +36,18 @@ if [ ! -f "$PROJECT_DIR/$TARGET.json" ]; then
     exit 1
 fi
 
+# Copy target JSON to SDK and verify
+TARGET_JSON="$PROJECT_DIR/$TARGET.json"
+cp "$TARGET_JSON" "$SDK_DIR/$TARGET.json"
+
 # Verify SDK compiles
 echo "[SDK] Verifying rust_sdk compiles..."
 cd "$SDK_DIR"
-RUST_TARGET_PATH="$PROJECT_DIR" CARGO_BUILD_JOBS=1 \
-    cargo check --release --target "$TARGET" 2>&1 | tail -3
+CARGO_BUILD_JOBS=1 \
+    cargo check --release --target "$TARGET.json" \
+    -Z build-std=core,compiler_builtins,alloc \
+    -Z build-std-features=compiler-builtins-mem \
+    -Z json-target-spec 2>&1 | tail -3
 if [ ${PIPESTATUS[0]} -ne 0 ]; then
     echo "[FATAL] rust_sdk does not compile. Fix SDK first."
     exit 1
@@ -66,10 +73,16 @@ for agent_dir in $AGENTS; do
     
     cd "$agent_dir"
     
+    # Copy target JSON to agent directory
+    cp "$TARGET_JSON" "$agent_dir/$TARGET.json"
+    
     # Build with single job, shared target dir (caches core/alloc/SDK)
-    BUILD_OUTPUT=$(RUST_TARGET_PATH="$PROJECT_DIR" CARGO_BUILD_JOBS=1 \
+    BUILD_OUTPUT=$(CARGO_BUILD_JOBS=1 \
         CARGO_TARGET_DIR="$SHARED_TARGET" \
-        cargo build --release --target "$TARGET" 2>&1)
+        cargo build --release --target "$TARGET.json" \
+        -Z build-std=core,compiler_builtins,alloc \
+        -Z build-std-features=compiler-builtins-mem \
+        -Z json-target-spec 2>&1)
     BUILD_EXIT=$?
     
     if [ $BUILD_EXIT -eq 0 ]; then
