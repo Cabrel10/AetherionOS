@@ -6,8 +6,8 @@
 #![feature(abi_x86_interrupt)]
 #![feature(custom_test_frameworks)]
 #![feature(alloc_error_handler)]
-#![feature(panic_info_message)]
-#![feature(naked_functions)]
+// panic_info_message is stabilized in nightly-2026
+// naked_functions is stabilized in nightly-2026
 #![allow(dead_code)]
 #![test_runner(crate::test_runner)]
 #![reexport_test_harness_main = "test_main"]

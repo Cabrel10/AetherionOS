@@ -1719,10 +1719,10 @@ pub fn load_elf(path: &str) -> Result<u64, ElfError> {
 ///   r10 = user RIP (entry point for iretq)
 ///
 /// This function never returns.
-#[naked]
+#[unsafe(naked)]
 #[no_mangle]
-pub unsafe extern "C" fn exec_trampoline() -> ! {
-    core::arch::asm!(
+pub extern "C" fn exec_trampoline() -> ! {
+    core::arch::naked_asm!(
         // Jalon 140: KPTI-safe Ring 3 entry trampoline.
         //
         // Register convention (set by caller):
@@ -1787,7 +1787,6 @@ pub unsafe extern "C" fn exec_trampoline() -> ! {
         // IRETQ: reads the frame already on the stack (in phys_off region,
         // which is present in the user PML4 via PML4[256])
         "iretq",
-        options(noreturn),
     );
 }
 
@@ -1896,13 +1895,13 @@ pub unsafe fn exec_switch_cr3_and_ring3(
 ///   rdi = new PML4 physical address (CR3)
 ///   rsi = user entry point (RIP)
 ///   rdx = user stack pointer (RSP)
-#[naked]
-pub unsafe extern "C" fn exec_switch_cr3_and_ring3_naked(
+#[unsafe(naked)]
+pub extern "C" fn exec_switch_cr3_and_ring3_naked(
     _new_pml4_phys: u64,
     _user_entry: u64,
     _user_rsp: u64,
 ) -> ! {
-    core::arch::asm!(
+    core::arch::naked_asm!(
         "cli",
         "push 0x1B",       // SS  = User Data (RPL=3)
         "push rdx",        // RSP = user stack pointer
@@ -1927,7 +1926,6 @@ pub unsafe extern "C" fn exec_switch_cr3_and_ring3_naked(
         "xor r15, r15",
         "xor rbp, rbp",
         "iretq",
-        options(noreturn)
     )
 }
 

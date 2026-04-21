@@ -35,8 +35,8 @@
 #![no_main]
 #![feature(abi_x86_interrupt)]
 #![feature(alloc_error_handler)]
-#![feature(panic_info_message)]
-#![feature(naked_functions)]
+// panic_info_message stabilized in nightly-2026
+// naked_functions stabilized in nightly-2026
 #![allow(dead_code)]
 
 use core::panic::PanicInfo;
@@ -341,9 +341,7 @@ fn panic(info: &PanicInfo) -> ! {
     // Build the entire message in one buffer, then write atomically.
     let mut full = arrayvec::ArrayString::<512>::new();
     let _ = write!(full, "\n[KERNEL-PANIC] ");
-    if let Some(msg) = info.message() {
-        let _ = write!(full, "{}", msg);
-    }
+    let _ = write!(full, "{}", info.message());
     if let Some(loc) = info.location() {
         let _ = write!(full, " at {}:{}", loc.file(), loc.line());
     }

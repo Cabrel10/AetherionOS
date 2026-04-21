@@ -326,10 +326,10 @@ unsafe fn read_user_string(addr: u64) -> Option<alloc::string::String> {
 // (gs:[40]) so the full kernel address space is available. Before sysretq,
 // we switch CR3 back to the user PML4 (gs:[48]).
 
-#[naked]
+#[unsafe(naked)]
 #[no_mangle]
-unsafe extern "C" fn syscall_entry() {
-    asm!(
+extern "C" fn syscall_entry() {
+    core::arch::naked_asm!(
         // 1. Switch to kernel GS
         "swapgs",
 
@@ -418,7 +418,6 @@ unsafe extern "C" fn syscall_entry() {
         "sysretq",
 
         handler = sym syscall_handler_rust,
-        options(noreturn),
     );
 }
 

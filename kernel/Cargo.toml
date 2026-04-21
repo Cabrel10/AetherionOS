@@ -8,8 +8,8 @@ description = "Aetherion OS Kernel - Couche 8: Priority Scheduler + GPU VRAM Stu
 
 [dependencies]
 
-# Bootloader 0.9.23 - compatible with nightly-2023-08-01
-# CRITICAL: La feature "map_physical_memory" est REQUISE pour physical_memory_offset
+# Bootloader 0.9.23 - CRITICAL: feature "map_physical_memory" for physical_memory_offset
+# Will be replaced by bootloader 0.11.x in FRONT 2
 bootloader = { version = "=0.9.23", features = ["map_physical_memory"] }
 
 # Serial port for debug
@@ -22,8 +22,8 @@ spin = { version = "0.9", default-features = false, features = ["spin_mutex"] }
 lazy_static = { version = "1.4", features = ["spin_no_std"] }
 
 # x86_64 architecture support - GDT, IDT, TSS
-# PINNED to 0.14.11 for nightly-2023-08-01 compatibility (Step trait)
-x86_64 = "=0.14.11"
+# Upgraded to 0.15.4 for nightly-2026 compatibility (Step trait change)
+x86_64 = "0.15.4"
 
 # PIC 8259 Programmable Interrupt Controller
 pic8259 = "0.10.4"
