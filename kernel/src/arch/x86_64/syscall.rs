@@ -2183,7 +2183,7 @@ fn sys_stub_uname(buf_addr: u64) -> u64 {
     // machine (offset 260)
     buf[260..266].copy_from_slice(b"x86_64");
     // domainname (offset 325)
-    buf[325..330].copy_from_slice(b"(none)");
+    buf[325..331].copy_from_slice(b"(none)");
     unsafe { copy_to_user(buf_addr, &buf); }
     0
 }
