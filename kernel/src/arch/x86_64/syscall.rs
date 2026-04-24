@@ -6326,20 +6326,21 @@ fn sys_bus_consume_intent(buf_addr: u64, target_intent: u32) -> u64 {
 
     match crate::ipc::bus::consume_intent(target_intent) {
         Ok(msg) => {
-            unsafe {
-                let ptr = buf_addr as *mut u32;
-                core::ptr::write_unaligned(ptr.add(0), msg.source as u32);
-                core::ptr::write_unaligned(ptr.add(1), msg.destination as u32);
-                core::ptr::write_unaligned(ptr.add(2), msg.intent_id);
-                core::ptr::write_unaligned(ptr.add(3), msg.priority as u32);
-
-                let ptr64 = buf_addr as *mut u64;
-                core::ptr::write_unaligned(ptr64.add(2), msg.payload);
-                core::ptr::write_unaligned(ptr64.add(3), msg.timestamp);
-                // Jalon 109: write session and correlation IDs
-                core::ptr::write_unaligned(ptr64.add(4), msg.session_id);
-                core::ptr::write_unaligned(ptr64.add(5), msg.correlation_id);
-            }
+            // Build a 48-byte kernel buffer then copy_to_user (KPTI-safe)
+            let mut kbuf = [0u8; 48];
+            let src = msg.source as u32;
+            let dst_id = msg.destination as u32;
+            let intent = msg.intent_id;
+            let prio = msg.priority as u32;
+            kbuf[0..4].copy_from_slice(&src.to_ne_bytes());
+            kbuf[4..8].copy_from_slice(&dst_id.to_ne_bytes());
+            kbuf[8..12].copy_from_slice(&intent.to_ne_bytes());
+            kbuf[12..16].copy_from_slice(&prio.to_ne_bytes());
+            kbuf[16..24].copy_from_slice(&msg.payload.to_ne_bytes());
+            kbuf[24..32].copy_from_slice(&msg.timestamp.to_ne_bytes());
+            kbuf[32..40].copy_from_slice(&msg.session_id.to_ne_bytes());
+            kbuf[40..48].copy_from_slice(&msg.correlation_id.to_ne_bytes());
+            unsafe { copy_to_user(buf_addr, &kbuf) };
 
             let cc = BUS_CON_COUNT.fetch_add(1, AtomicOrdering::Relaxed) + 1;
             let consume_pid = crate::scheduler::current_pid();
@@ -7101,13 +7102,16 @@ fn sys_fb_get_info(info_buf: u64) -> u64 {
     };
 
     if info_buf != 0 && validate_user_ptr(info_buf, 32) {
-        unsafe {
-            let buf = info_buf as *mut u64;
-            core::ptr::write_unaligned(buf, info.width as u64);
-            core::ptr::write_unaligned(buf.add(1), info.height as u64);
-            core::ptr::write_unaligned(buf.add(2), info.stride as u64);
-            core::ptr::write_unaligned(buf.add(3), info.bpp as u64);
-        }
+        let data: [u64; 4] = [
+            info.width as u64,
+            info.height as u64,
+            info.stride as u64,
+            info.bpp as u64,
+        ];
+        let bytes = unsafe { core::slice::from_raw_parts(
+            data.as_ptr() as *const u8, 32,
+        ) };
+        unsafe { copy_to_user(info_buf, bytes) };
     }
     1
 }
