@@ -344,7 +344,8 @@ pub fn linux_arch_prctl(code: u64, addr: u64) -> u64 {
                 ((hi as u64) << 32) | (lo as u64)
             };
             if addr != 0 && crate::arch::x86_64::syscall::validate_user_ptr_pub(addr, 8) {
-                unsafe { core::ptr::write_volatile(addr as *mut u64, fs_base); }
+                let buf = fs_base.to_le_bytes();
+                unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(addr, &buf); }
             }
             0
         }
@@ -355,7 +356,8 @@ pub fn linux_arch_prctl(code: u64, addr: u64) -> u64 {
         }
         ARCH_GET_GS => {
             if addr != 0 && crate::arch::x86_64::syscall::validate_user_ptr_pub(addr, 8) {
-                unsafe { core::ptr::write_volatile(addr as *mut u64, 0); }
+                let buf = 0u64.to_le_bytes();
+                unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(addr, &buf); }
             }
             0
         }
@@ -450,12 +452,10 @@ pub fn linux_prlimit64(_pid: u64, _resource: u64, _new_rlim: u64, old_rlim: u64)
     // If old_rlim is provided, return generous limits
     if old_rlim != 0 && crate::arch::x86_64::syscall::validate_user_ptr_pub(old_rlim, 16) {
         let infinity: u64 = 0xFFFF_FFFF_FFFF_FFFF;
-        unsafe {
-            // rlim_cur
-            core::ptr::write_volatile(old_rlim as *mut u64, infinity);
-            // rlim_max
-            core::ptr::write_volatile((old_rlim + 8) as *mut u64, infinity);
-        }
+        let mut buf = [0u8; 16];
+        buf[0..8].copy_from_slice(&infinity.to_le_bytes());
+        buf[8..16].copy_from_slice(&infinity.to_le_bytes());
+        unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(old_rlim, &buf); }
     }
     0
 }
@@ -478,18 +478,20 @@ pub fn linux_setresuid(_ruid: u64, _euid: u64, _suid: u64) -> u64 { 0 }
 pub fn linux_setresgid(_rgid: u64, _egid: u64, _sgid: u64) -> u64 { 0 }
 /// Linux getresuid(ruid, euid, suid)
 pub fn linux_getresuid(ruid: u64, euid: u64, suid: u64) -> u64 {
+    let zero_buf = 0u32.to_le_bytes();
     for addr in [ruid, euid, suid] {
         if addr != 0 && crate::arch::x86_64::syscall::validate_user_ptr_pub(addr, 4) {
-            unsafe { core::ptr::write_volatile(addr as *mut u32, 0); }
+            unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(addr, &zero_buf); }
         }
     }
     0
 }
 /// Linux getresgid(rgid, egid, sgid)
 pub fn linux_getresgid(rgid: u64, egid: u64, sgid: u64) -> u64 {
+    let zero_buf = 0u32.to_le_bytes();
     for addr in [rgid, egid, sgid] {
         if addr != 0 && crate::arch::x86_64::syscall::validate_user_ptr_pub(addr, 4) {
-            unsafe { core::ptr::write_volatile(addr as *mut u32, 0); }
+            unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(addr, &zero_buf); }
         }
     }
     0
@@ -499,19 +501,19 @@ pub fn linux_setgroups(_size: u64, _list: u64) -> u64 { 0 }
 /// Linux getgroups(size, list) — return 1 group (root=0)
 pub fn linux_getgroups(size: u64, list: u64) -> u64 {
     if size > 0 && list != 0 && crate::arch::x86_64::syscall::validate_user_ptr_pub(list, 4) {
-        unsafe { core::ptr::write_volatile(list as *mut u32, 0); }
+        let zero_buf = 0u32.to_le_bytes();
+        unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(list, &zero_buf); }
     }
     1 // one group
 }
 /// Linux capget/capset — stub (return all caps)
 pub fn linux_capget(_hdr: u64, data: u64) -> u64 {
     if data != 0 && crate::arch::x86_64::syscall::validate_user_ptr_pub(data, 24) {
-        unsafe {
-            // Full capabilities (all bits set)
-            core::ptr::write_volatile(data as *mut u32, 0xFFFF_FFFF); // effective
-            core::ptr::write_volatile((data + 4) as *mut u32, 0xFFFF_FFFF); // permitted
-            core::ptr::write_volatile((data + 8) as *mut u32, 0xFFFF_FFFF); // inheritable
-        }
+        let mut buf = [0u8; 12];
+        buf[0..4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // effective
+        buf[4..8].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // permitted
+        buf[8..12].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // inheritable
+        unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(data, &buf); }
     }
     0
 }
@@ -699,31 +701,31 @@ pub fn linux_ioctl(_fd: u64, cmd: u64, arg: u64) -> u64 {
     const FIONREAD: u64 = 0x541B;
     match cmd {
         TCGETS => {
-            // Return fake termios struct (80 bytes)
+            // Return fake termios struct (60 bytes)
             if arg != 0 && crate::arch::x86_64::syscall::validate_user_ptr_pub(arg, 60) {
-                unsafe {
-                    core::ptr::write_bytes(arg as *mut u8, 0, 60);
-                    // c_cflag: CS8 | CREAD | CLOCAL
-                    core::ptr::write_volatile((arg + 8) as *mut u32, 0x0000_00BF);
-                }
+                let mut buf = [0u8; 60];
+                // c_cflag at offset 8: CS8 | CREAD | CLOCAL
+                buf[8..12].copy_from_slice(&0x0000_00BFu32.to_le_bytes());
+                unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(arg, &buf); }
             }
             0
         }
         TIOCGWINSZ => {
             // Return terminal size: 80x25
             if arg != 0 && crate::arch::x86_64::syscall::validate_user_ptr_pub(arg, 8) {
-                unsafe {
-                    core::ptr::write_volatile(arg as *mut u16, 25);       // rows
-                    core::ptr::write_volatile((arg + 2) as *mut u16, 80); // cols
-                    core::ptr::write_volatile((arg + 4) as *mut u16, 640);// xpixel
-                    core::ptr::write_volatile((arg + 6) as *mut u16, 480);// ypixel
-                }
+                let mut buf = [0u8; 8];
+                buf[0..2].copy_from_slice(&25u16.to_le_bytes());  // rows
+                buf[2..4].copy_from_slice(&80u16.to_le_bytes());  // cols
+                buf[4..6].copy_from_slice(&640u16.to_le_bytes()); // xpixel
+                buf[6..8].copy_from_slice(&480u16.to_le_bytes()); // ypixel
+                unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(arg, &buf); }
             }
             0
         }
         FIONREAD => {
             if arg != 0 && crate::arch::x86_64::syscall::validate_user_ptr_pub(arg, 4) {
-                unsafe { core::ptr::write_volatile(arg as *mut u32, 0); }
+                let buf = 0u32.to_le_bytes();
+                unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(arg, &buf); }
             }
             0
         }
@@ -803,10 +805,10 @@ pub fn linux_clock_gettime(_clockid: u64, tp: u64) -> u64 {
         };
         let secs = tsc / 2_000_000_000;
         let nsecs = ((tsc % 2_000_000_000) * 1_000_000_000) / 2_000_000_000;
-        unsafe {
-            core::ptr::write_volatile(tp as *mut u64, secs);
-            core::ptr::write_volatile((tp + 8) as *mut u64, nsecs);
-        }
+        let mut buf = [0u8; 16];
+        buf[0..8].copy_from_slice(&secs.to_le_bytes());
+        buf[8..16].copy_from_slice(&nsecs.to_le_bytes());
+        unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(tp, &buf); }
     }
     0
 }
@@ -822,10 +824,10 @@ pub fn linux_gettimeofday(tv: u64, _tz: u64) -> u64 {
         };
         let secs = tsc / 2_000_000_000;
         let usecs = ((tsc % 2_000_000_000) * 1_000_000) / 2_000_000_000;
-        unsafe {
-            core::ptr::write_volatile(tv as *mut u64, secs);
-            core::ptr::write_volatile((tv + 8) as *mut u64, usecs);
-        }
+        let mut buf = [0u8; 16];
+        buf[0..8].copy_from_slice(&secs.to_le_bytes());
+        buf[8..16].copy_from_slice(&usecs.to_le_bytes());
+        unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(tv, &buf); }
     }
     0
 }
@@ -840,10 +842,13 @@ pub fn linux_getrandom(buf: u64, buflen: u64, _flags: u64) -> u64 {
         v
     };
     let mut rng = tsc;
-    for i in 0..buflen {
+    let total = buflen as usize;
+    let mut rand_buf = alloc::vec![0u8; total];
+    for i in 0..total {
         rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-        unsafe { core::ptr::write_volatile((buf + i) as *mut u8, (rng >> 33) as u8); }
+        rand_buf[i] = (rng >> 33) as u8;
     }
+    unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(buf, &rand_buf); }
     buflen
 }
 
@@ -989,17 +994,16 @@ pub fn linux_ioctl_extended(fd: u64, cmd: u64, arg: u64) -> u64 {
         TCGETS | TCGETA => {
             // Return termios struct (cooked mode, CS8)
             if arg != 0 && crate::arch::x86_64::syscall::validate_user_ptr_pub(arg, 60) {
-                unsafe {
-                    core::ptr::write_bytes(arg as *mut u8, 0, 60);
-                    // c_iflag: ICRNL | IXON
-                    core::ptr::write_volatile(arg as *mut u32, 0x0500);
-                    // c_oflag: OPOST | ONLCR
-                    core::ptr::write_volatile((arg + 4) as *mut u32, 0x0005);
-                    // c_cflag: CS8 | CREAD | CLOCAL | B38400
-                    core::ptr::write_volatile((arg + 8) as *mut u32, 0x00BF);
-                    // c_lflag: ISIG | ICANON | ECHO | ECHOE | ECHOK | IEXTEN
-                    core::ptr::write_volatile((arg + 12) as *mut u32, 0x8A3B);
-                }
+                let mut buf = [0u8; 60];
+                // c_iflag: ICRNL | IXON
+                buf[0..4].copy_from_slice(&0x0500u32.to_le_bytes());
+                // c_oflag: OPOST | ONLCR
+                buf[4..8].copy_from_slice(&0x0005u32.to_le_bytes());
+                // c_cflag: CS8 | CREAD | CLOCAL | B38400
+                buf[8..12].copy_from_slice(&0x00BFu32.to_le_bytes());
+                // c_lflag: ISIG | ICANON | ECHO | ECHOE | ECHOK | IEXTEN
+                buf[12..16].copy_from_slice(&0x8A3Bu32.to_le_bytes());
+                unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(arg, &buf); }
             }
             0
         }
@@ -1008,12 +1012,12 @@ pub fn linux_ioctl_extended(fd: u64, cmd: u64, arg: u64) -> u64 {
         }
         TIOCGWINSZ => {
             if arg != 0 && crate::arch::x86_64::syscall::validate_user_ptr_pub(arg, 8) {
-                unsafe {
-                    core::ptr::write_volatile(arg as *mut u16, 25);       // rows
-                    core::ptr::write_volatile((arg + 2) as *mut u16, 80); // cols  
-                    core::ptr::write_volatile((arg + 4) as *mut u16, 640);// xpixel
-                    core::ptr::write_volatile((arg + 6) as *mut u16, 480);// ypixel
-                }
+                let mut buf = [0u8; 8];
+                buf[0..2].copy_from_slice(&25u16.to_le_bytes());  // rows
+                buf[2..4].copy_from_slice(&80u16.to_le_bytes());  // cols
+                buf[4..6].copy_from_slice(&640u16.to_le_bytes()); // xpixel
+                buf[6..8].copy_from_slice(&480u16.to_le_bytes()); // ypixel
+                unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(arg, &buf); }
             }
             0
         }
@@ -1022,14 +1026,16 @@ pub fn linux_ioctl_extended(fd: u64, cmd: u64, arg: u64) -> u64 {
             // Return current process group (= PID)
             if arg != 0 && crate::arch::x86_64::syscall::validate_user_ptr_pub(arg, 4) {
                 let pid = crate::scheduler::current_pid();
-                unsafe { core::ptr::write_volatile(arg as *mut u32, pid as u32); }
+                let buf = (pid as u32).to_le_bytes();
+                unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(arg, &buf); }
             }
             0
         }
         TIOCSPGRP => 0, // Accept PGRP set silently
         FIONREAD => {
             if arg != 0 && crate::arch::x86_64::syscall::validate_user_ptr_pub(arg, 4) {
-                unsafe { core::ptr::write_volatile(arg as *mut u32, 0); }
+                let buf = 0u32.to_le_bytes();
+                unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(arg, &buf); }
             }
             0
         }
@@ -1058,20 +1064,20 @@ pub fn linux_ioctl_extended(fd: u64, cmd: u64, arg: u64) -> u64 {
         // EVIOCGVERSION = 0x80044501
         0x80044501 => {
             if arg != 0 && crate::arch::x86_64::syscall::validate_user_ptr_pub(arg, 4) {
-                unsafe { core::ptr::write_volatile(arg as *mut u32, 0x010001); } // EV_VERSION 1.0.1
+                let buf = 0x010001u32.to_le_bytes();
+                unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(arg, &buf); }
             }
             0
         }
         // EVIOCGID = 0x80084502
         0x80084502 => {
             if arg != 0 && crate::arch::x86_64::syscall::validate_user_ptr_pub(arg, 8) {
-                unsafe {
-                    // struct input_id { bustype, vendor, product, version }
-                    core::ptr::write_volatile(arg as *mut u16, 0x0003);       // BUS_USB
-                    core::ptr::write_volatile((arg + 2) as *mut u16, 0x045E); // Microsoft
-                    core::ptr::write_volatile((arg + 4) as *mut u16, 0x0001); // Generic
-                    core::ptr::write_volatile((arg + 6) as *mut u16, 0x0100); // v1.0
-                }
+                let mut buf = [0u8; 8];
+                buf[0..2].copy_from_slice(&0x0003u16.to_le_bytes()); // BUS_USB
+                buf[2..4].copy_from_slice(&0x045Eu16.to_le_bytes()); // Microsoft
+                buf[4..6].copy_from_slice(&0x0001u16.to_le_bytes()); // Generic
+                buf[6..8].copy_from_slice(&0x0100u16.to_le_bytes()); // v1.0
+                unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(arg, &buf); }
             }
             0
         }

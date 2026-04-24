@@ -407,6 +407,16 @@ unsafe fn copy_to_user(user_dst: u64, src: &[u8]) -> usize {
     written
 }
 
+/// Public wrapper for copy_to_user (for use from linux_abi module)
+pub unsafe fn copy_to_user_pub(user_dst: u64, src: &[u8]) -> usize {
+    copy_to_user(user_dst, src)
+}
+
+/// Public wrapper for copy_from_user (for use from linux_abi module)
+pub unsafe fn copy_from_user_pub(dst: &mut [u8], user_src: u64, len: usize) -> usize {
+    copy_from_user(dst, user_src, len)
+}
+
 /// Read a null-terminated string from user space (max 256 bytes)
 unsafe fn read_user_string(addr: u64) -> Option<alloc::string::String> {
     if !validate_user_ptr(addr, 1) { return None; }
@@ -1180,9 +1190,11 @@ fn sys_futex(uaddr: u64, op: u64, val: u64) -> u64 {
                 return EFAULT;
             }
 
-            // Read the current value at uaddr
-            let current_val = unsafe {
-                core::ptr::read_unaligned(uaddr as *const u32)
+            // Read the current value at uaddr via HHDM
+            let current_val = {
+                let mut fbuf = [0u8; 4];
+                unsafe { copy_from_user(&mut fbuf, uaddr, 4); }
+                u32::from_le_bytes(fbuf)
             };
 
             if current_val != val as u32 {
@@ -1267,36 +1279,23 @@ fn sys_futex(uaddr: u64, op: u64, val: u64) -> u64 {
 /// stat(path, buf) -> 0 (fills minimal stat struct)
 fn sys_stub_stat(_path_addr: u64, buf_addr: u64) -> u64 {
     if !validate_user_ptr(buf_addr, 144) { return EFAULT; }
-    // Zero the struct (144 bytes = sizeof(struct stat) on x86_64)
-    unsafe {
-        let dst = buf_addr as *mut u8;
-        for i in 0..144 { core::ptr::write_unaligned(dst.add(i), 0); }
-        // st_mode at offset 24: S_IFREG | 0644 = 0o100644 = 33188
-        let mode_ptr = (buf_addr + 24) as *mut u32;
-        core::ptr::write_unaligned(mode_ptr, 0o100644);
-        // st_blksize at offset 56: 4096
-        let blk_ptr = (buf_addr + 56) as *mut u64;
-        core::ptr::write_unaligned(blk_ptr, 4096);
-    }
+    let mut buf = [0u8; 144];
+    // st_mode at offset 24: S_IFREG | 0644 = 0o100644 = 33188
+    buf[24..28].copy_from_slice(&0o100644u32.to_le_bytes());
+    // st_blksize at offset 56: 4096
+    buf[56..64].copy_from_slice(&4096u64.to_le_bytes());
+    unsafe { copy_to_user(buf_addr, &buf); }
     0
 }
 
 /// fstat(fd, buf) -> 0
 fn sys_stub_fstat(fd: u32, buf_addr: u64) -> u64 {
     if !validate_user_ptr(buf_addr, 144) { return EFAULT; }
-    unsafe {
-        let dst = buf_addr as *mut u8;
-        for i in 0..144 { core::ptr::write_unaligned(dst.add(i), 0); }
-        let mode_ptr = (buf_addr + 24) as *mut u32;
-        if fd <= 2 {
-            // TTY: S_IFCHR | 0620 = 0o20620 = 8592
-            core::ptr::write_unaligned(mode_ptr, 0o20620);
-        } else {
-            core::ptr::write_unaligned(mode_ptr, 0o100644);
-        }
-        let blk_ptr = (buf_addr + 56) as *mut u64;
-        core::ptr::write_unaligned(blk_ptr, 4096);
-    }
+    let mut buf = [0u8; 144];
+    let mode: u32 = if fd <= 2 { 0o20620 } else { 0o100644 };
+    buf[24..28].copy_from_slice(&mode.to_le_bytes());
+    buf[56..64].copy_from_slice(&4096u64.to_le_bytes());
+    unsafe { copy_to_user(buf_addr, &buf); }
     0
 }
 
@@ -1323,11 +1322,15 @@ fn sys_poll(fds_addr: u64, nfds: u64, timeout: u64) -> u64 {
     // Read and process each pollfd
     for i in 0..nfds {
         let pfd_addr = fds_addr + i * 8;
-        let fd_raw = unsafe { core::ptr::read_unaligned(pfd_addr as *const i32) };
-        let events = unsafe { core::ptr::read_unaligned((pfd_addr + 4) as *const i16) };
+        // Read pollfd from user memory via HHDM
+        let mut pfd_buf = [0u8; 8];
+        unsafe { copy_from_user(&mut pfd_buf, pfd_addr, 8); }
+        let fd_raw = i32::from_le_bytes([pfd_buf[0], pfd_buf[1], pfd_buf[2], pfd_buf[3]]);
+        let events = i16::from_le_bytes([pfd_buf[4], pfd_buf[5]]);
 
         // Clear revents
-        unsafe { core::ptr::write_unaligned((pfd_addr + 6) as *mut i16, 0); }
+        let zero_revents: [u8; 2] = [0, 0];
+        unsafe { copy_to_user(pfd_addr + 6, &zero_revents); }
 
         if fd_raw < 0 { continue; } // Negative FD = skip
 
@@ -1395,7 +1398,8 @@ fn sys_poll(fds_addr: u64, nfds: u64, timeout: u64) -> u64 {
 
         // Write revents back
         if revents != 0 {
-            unsafe { core::ptr::write_unaligned((pfd_addr + 6) as *mut i16, revents); }
+            let rev_bytes = revents.to_le_bytes();
+            unsafe { copy_to_user(pfd_addr + 6, &rev_bytes); }
             ready_count += 1;
         }
     }
@@ -1574,10 +1578,11 @@ fn sys_stub_readv(fd: u32, iov_addr: u64, iovcnt: u64) -> u64 {
     if !validate_user_ptr(iov_addr, iovcnt * 16) { return EFAULT; }
     let mut total: u64 = 0;
     for i in 0..core::cmp::min(iovcnt, 16) as usize {
-        let base_ptr = (iov_addr + (i * 16) as u64) as *const u64;
-        let len_ptr = (iov_addr + (i * 16 + 8) as u64) as *const u64;
-        let base = unsafe { core::ptr::read_unaligned(base_ptr) };
-        let len = unsafe { core::ptr::read_unaligned(len_ptr) };
+        let iov_entry_addr = iov_addr + (i * 16) as u64;
+        let mut iov_buf = [0u8; 16];
+        unsafe { copy_from_user(&mut iov_buf, iov_entry_addr, 16); }
+        let base = u64::from_le_bytes([iov_buf[0], iov_buf[1], iov_buf[2], iov_buf[3], iov_buf[4], iov_buf[5], iov_buf[6], iov_buf[7]]);
+        let len = u64::from_le_bytes([iov_buf[8], iov_buf[9], iov_buf[10], iov_buf[11], iov_buf[12], iov_buf[13], iov_buf[14], iov_buf[15]]);
         if len > 0 && validate_user_ptr(base, len) {
             let n = sys_read(fd, base, len);
             if (n as i64) < 0 { return n; }
@@ -1596,9 +1601,11 @@ fn sys_nanosleep(req: u64, _rem: u64) -> u64 {
         sys_yield();
         return 0;
     }
-    let (secs, nsecs) = unsafe {
-        let s = core::ptr::read_unaligned(req as *const u64);
-        let ns = core::ptr::read_unaligned((req + 8) as *const u64);
+    let (secs, nsecs) = {
+        let mut buf = [0u8; 16];
+        unsafe { copy_from_user(&mut buf, req, 16); }
+        let s = u64::from_le_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]);
+        let ns = u64::from_le_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]);
         (s, ns)
     };
 
@@ -1680,8 +1687,10 @@ fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u64 {
         EPOLL_CTL_ADD => {
             // Read epoll_event from user space: { u32 events, u64 data } (12 bytes packed)
             if event_ptr == 0 || !validate_user_ptr(event_ptr, 12) { return EFAULT; }
-            let events = unsafe { core::ptr::read_unaligned(event_ptr as *const u32) };
-            let data = unsafe { core::ptr::read_unaligned((event_ptr + 4) as *const u64) };
+            let mut ev_buf = [0u8; 12];
+            unsafe { copy_from_user(&mut ev_buf, event_ptr, 12); }
+            let events = u32::from_le_bytes([ev_buf[0], ev_buf[1], ev_buf[2], ev_buf[3]]);
+            let data = u64::from_le_bytes([ev_buf[4], ev_buf[5], ev_buf[6], ev_buf[7], ev_buf[8], ev_buf[9], ev_buf[10], ev_buf[11]]);
 
             // Verify target fd exists
             let fd_exists = crate::process::with_fd_table(pid, |fdt| {
@@ -1713,8 +1722,10 @@ fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u64 {
         }
         EPOLL_CTL_MOD => {
             if event_ptr == 0 || !validate_user_ptr(event_ptr, 12) { return EFAULT; }
-            let events = unsafe { core::ptr::read_unaligned(event_ptr as *const u32) };
-            let data = unsafe { core::ptr::read_unaligned((event_ptr + 4) as *const u64) };
+            let mut ev_buf = [0u8; 12];
+            unsafe { copy_from_user(&mut ev_buf, event_ptr, 12); }
+            let events = u32::from_le_bytes([ev_buf[0], ev_buf[1], ev_buf[2], ev_buf[3]]);
+            let data = u64::from_le_bytes([ev_buf[4], ev_buf[5], ev_buf[6], ev_buf[7], ev_buf[8], ev_buf[9], ev_buf[10], ev_buf[11]]);
 
             crate::process::with_process_mut(pid, |p| {
                 if let Some(ei) = p.epoll_interests.iter_mut()
@@ -1849,12 +1860,12 @@ fn sys_epoll_wait_real(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64)
             }
 
             if revents != 0 {
-                // Write epoll_event to user space: { u32 events, u64 data }
+                // Write epoll_event to user space: { u32 events, u64 data } via HHDM
                 let ev_offset = events_ptr + ready_count * 12;
-                unsafe {
-                    core::ptr::write_unaligned(ev_offset as *mut u32, revents);
-                    core::ptr::write_unaligned((ev_offset + 4) as *mut u64, data);
-                }
+                let mut ev_buf = [0u8; 12];
+                ev_buf[0..4].copy_from_slice(&revents.to_le_bytes());
+                ev_buf[4..12].copy_from_slice(&data.to_le_bytes());
+                unsafe { copy_to_user(ev_offset, &ev_buf); }
                 ready_count += 1;
             }
         }
@@ -1946,24 +1957,23 @@ fn sys_timerfd_settime(fd: u64, _flags: u64, new_value_ptr: u64, old_value_ptr: 
 
     // Read new timer value from user space
     let (interval_ns, value_ns) = if new_value_ptr != 0 && validate_user_ptr(new_value_ptr, 32) {
-        unsafe {
-            // it_interval: { tv_sec (8 bytes), tv_nsec (8 bytes) }
-            let interval_sec = core::ptr::read_unaligned(new_value_ptr as *const i64);
-            let interval_nsec = core::ptr::read_unaligned((new_value_ptr + 8) as *const i64);
-            // it_value: { tv_sec (8 bytes), tv_nsec (8 bytes) }
-            let value_sec = core::ptr::read_unaligned((new_value_ptr + 16) as *const i64);
-            let value_nsec = core::ptr::read_unaligned((new_value_ptr + 24) as *const i64);
-            let i_ns = (interval_sec as u64).wrapping_mul(1_000_000_000).wrapping_add(interval_nsec as u64);
-            let v_ns = (value_sec as u64).wrapping_mul(1_000_000_000).wrapping_add(value_nsec as u64);
-            (i_ns, v_ns)
-        }
+        let mut tbuf = [0u8; 32];
+        unsafe { copy_from_user(&mut tbuf, new_value_ptr, 32); }
+        let interval_sec = i64::from_le_bytes([tbuf[0],tbuf[1],tbuf[2],tbuf[3],tbuf[4],tbuf[5],tbuf[6],tbuf[7]]);
+        let interval_nsec = i64::from_le_bytes([tbuf[8],tbuf[9],tbuf[10],tbuf[11],tbuf[12],tbuf[13],tbuf[14],tbuf[15]]);
+        let value_sec = i64::from_le_bytes([tbuf[16],tbuf[17],tbuf[18],tbuf[19],tbuf[20],tbuf[21],tbuf[22],tbuf[23]]);
+        let value_nsec = i64::from_le_bytes([tbuf[24],tbuf[25],tbuf[26],tbuf[27],tbuf[28],tbuf[29],tbuf[30],tbuf[31]]);
+        let i_ns = (interval_sec as u64).wrapping_mul(1_000_000_000).wrapping_add(interval_nsec as u64);
+        let v_ns = (value_sec as u64).wrapping_mul(1_000_000_000).wrapping_add(value_nsec as u64);
+        (i_ns, v_ns)
     } else {
         (0u64, 0u64)
     };
 
     // Write old value if requested (zero it out for simplicity)
     if old_value_ptr != 0 && validate_user_ptr(old_value_ptr, 32) {
-        unsafe { core::ptr::write_bytes(old_value_ptr as *mut u8, 0, 32); }
+        let zero_buf = [0u8; 32];
+        unsafe { copy_to_user(old_value_ptr, &zero_buf); }
     }
 
     // Update timer state
@@ -2019,17 +2029,17 @@ fn sys_timerfd_gettime(fd: u64, cur_value_ptr: u64) -> u64 {
         }
     }).unwrap_or((0, 0));
 
-    unsafe {
-        // it_interval
+    {
         let interval_sec = interval_ns / 1_000_000_000;
         let interval_nsec = interval_ns % 1_000_000_000;
-        core::ptr::write_unaligned(cur_value_ptr as *mut i64, interval_sec as i64);
-        core::ptr::write_unaligned((cur_value_ptr + 8) as *mut i64, interval_nsec as i64);
-        // it_value  
         let value_sec = remaining_ns / 1_000_000_000;
         let value_nsec = remaining_ns % 1_000_000_000;
-        core::ptr::write_unaligned((cur_value_ptr + 16) as *mut i64, value_sec as i64);
-        core::ptr::write_unaligned((cur_value_ptr + 24) as *mut i64, value_nsec as i64);
+        let mut buf = [0u8; 32];
+        buf[0..8].copy_from_slice(&(interval_sec as i64).to_le_bytes());
+        buf[8..16].copy_from_slice(&(interval_nsec as i64).to_le_bytes());
+        buf[16..24].copy_from_slice(&(value_sec as i64).to_le_bytes());
+        buf[24..32].copy_from_slice(&(value_nsec as i64).to_le_bytes());
+        unsafe { copy_to_user(cur_value_ptr, &buf); }
     }
 
     0
@@ -2126,9 +2136,11 @@ fn sys_socketpair(_domain: u64, _type_: u64, _protocol: u64, sv_ptr: u64) -> u64
 
     if fd0 == 0 || fd1 == 0 { return EMFILE; }
 
-    unsafe {
-        core::ptr::write_unaligned(sv_ptr as *mut i32, fd0 as i32);
-        core::ptr::write_unaligned((sv_ptr + 4) as *mut i32, fd1 as i32);
+    {
+        let mut buf = [0u8; 8];
+        buf[0..4].copy_from_slice(&(fd0 as i32).to_le_bytes());
+        buf[4..8].copy_from_slice(&(fd1 as i32).to_le_bytes());
+        unsafe { copy_to_user(sv_ptr, &buf); }
     }
     crate::serial_println!("[SOCKETPAIR] fd0={}, fd1={} (PID {})", fd0, fd1, pid);
     0
@@ -2139,11 +2151,15 @@ fn sc_socketpair(a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> u64 { sys_sock
 /// getsockname(fd, addr, addrlen) -> 0 (stub: returns zeroed sockaddr)
 fn sys_getsockname(_fd: u64, addr: u64, addrlen: u64) -> u64 {
     if addr != 0 && addrlen != 0 && validate_user_ptr(addrlen, 4) {
-        let len = unsafe { core::ptr::read_unaligned(addrlen as *const u32) };
+        let mut len_buf = [0u8; 4];
+        unsafe { copy_from_user(&mut len_buf, addrlen, 4); }
+        let len = u32::from_le_bytes(len_buf);
         if len > 0 && validate_user_ptr(addr, core::cmp::min(len as u64, 128)) {
-            unsafe { core::ptr::write_bytes(addr as *mut u8, 0, core::cmp::min(len as usize, 128)); }
-            // Write AF_INET (2) as the first 2 bytes
-            unsafe { core::ptr::write_unaligned(addr as *mut u16, 2); }
+            let size = core::cmp::min(len as usize, 128);
+            let mut buf = [0u8; 128];
+            // AF_INET (2) as the first 2 bytes
+            buf[0..2].copy_from_slice(&2u16.to_le_bytes());
+            unsafe { copy_to_user(addr, &buf[..size]); }
         }
     }
     0
@@ -2155,9 +2171,12 @@ fn sc_getpeername(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_ge
 /// getsockopt(fd, level, optname, optval, optlen) -> 0 (stub)
 fn sys_getsockopt(_fd: u64, _level: u64, _optname: u64, optval: u64, optlen: u64) -> u64 {
     if optval != 0 && optlen != 0 && validate_user_ptr(optlen, 4) {
-        let len = unsafe { core::ptr::read_unaligned(optlen as *const u32) };
+        let mut len_buf = [0u8; 4];
+        unsafe { copy_from_user(&mut len_buf, optlen, 4); }
+        let len = u32::from_le_bytes(len_buf);
         if len >= 4 && validate_user_ptr(optval, 4) {
-            unsafe { core::ptr::write_unaligned(optval as *mut u32, 0); }
+            let zero_val = 0u32.to_le_bytes();
+            unsafe { copy_to_user(optval, &zero_val); }
         }
     }
     0
@@ -2247,11 +2266,8 @@ fn sys_stub_fcntl(_fd: u32, cmd: u64, _arg: u64) -> u64 {
 /// getcwd(buf, size) -> writes "/" and returns buf
 fn sys_stub_getcwd(buf_addr: u64, size: u64) -> u64 {
     if size < 2 || !validate_user_ptr(buf_addr, size) { return EFAULT; }
-    unsafe {
-        let dst = buf_addr as *mut u8;
-        core::ptr::write_unaligned(dst, b'/');
-        core::ptr::write_unaligned(dst.add(1), 0);
-    }
+    let data: [u8; 2] = [b'/', 0];
+    unsafe { copy_to_user(buf_addr, &data); }
     buf_addr
 }
 
@@ -2487,12 +2503,7 @@ fn sys_readlink(path_addr: u64, buf_addr: u64, bufsiz: u64) -> u64 {
     let target_bytes = target.as_bytes();
     let copy_len = core::cmp::min(target_bytes.len(), bufsiz as usize);
 
-    unsafe {
-        let dst = buf_addr as *mut u8;
-        for i in 0..copy_len {
-            core::ptr::write_volatile(dst.add(i), target_bytes[i]);
-        }
-    }
+    unsafe { copy_to_user(buf_addr, &target_bytes[..copy_len]); }
 
     copy_len as u64
 }
@@ -2533,30 +2544,25 @@ fn sys_getrandom(buf_addr: u64, buflen: u64, _flags: u64) -> u64 {
     if s0 == 0 { s0 = 0xDEAD_BEEF_CAFE_BABE; }
     if s1 == 0 { s1 = 0x0123_4567_89AB_CDEF; }
 
-    unsafe {
-        let dst = buf_addr as *mut u8;
-        let mut i = 0usize;
-        while i < buflen as usize {
-            // Xorshift128+ iteration
-            let mut t = s0;
-            let s = s1;
-            s0 = s;
-            t ^= t << 23;
-            t ^= t >> 18;
-            t ^= s ^ (s >> 5);
-            s1 = t;
-            let val = t.wrapping_add(s);
-
-            // Write up to 8 bytes per iteration
-            let remaining = buflen as usize - i;
-            let bytes = val.to_le_bytes();
-            let to_write = core::cmp::min(remaining, 8);
-            for j in 0..to_write {
-                core::ptr::write_unaligned(dst.add(i + j), bytes[j]);
-            }
-            i += to_write;
-        }
+    // Generate random bytes into a kernel buffer, then copy to user
+    let total = buflen as usize;
+    let mut rand_buf = alloc::vec![0u8; total];
+    let mut i = 0usize;
+    while i < total {
+        let mut t = s0;
+        let s = s1;
+        s0 = s;
+        t ^= t << 23;
+        t ^= t >> 18;
+        t ^= s ^ (s >> 5);
+        s1 = t;
+        let val = t.wrapping_add(s);
+        let bytes = val.to_le_bytes();
+        let to_write = core::cmp::min(total - i, 8);
+        rand_buf[i..i + to_write].copy_from_slice(&bytes[..to_write]);
+        i += to_write;
     }
+    unsafe { copy_to_user(buf_addr, &rand_buf); }
     buflen
 }
 
@@ -5019,12 +5025,11 @@ fn sys_pipe(pipefd_ptr: u64) -> u64 {
     
     match (read_fd, write_fd) {
         (Some(rfd), Some(wfd)) => {
-            // Write [read_fd, write_fd] to user memory as two i32 values
-            let user_ptr = pipefd_ptr as *mut i32;
-            unsafe {
-                core::ptr::write_unaligned(user_ptr, rfd as i32);
-                core::ptr::write_unaligned(user_ptr.add(1), wfd as i32);
-            }
+            // Write [read_fd, write_fd] to user memory via HHDM copy_to_user
+            let mut buf = [0u8; 8];
+            buf[0..4].copy_from_slice(&(rfd as i32).to_le_bytes());
+            buf[4..8].copy_from_slice(&(wfd as i32).to_le_bytes());
+            unsafe { copy_to_user(pipefd_ptr, &buf); }
             crate::serial_println!("[SYSCALL] pipe: created pipe_id={}, read_fd={}, write_fd={}", pipe_id, rfd, wfd);
             0
         }
