@@ -525,28 +525,27 @@ fn plan_goal(queue: &mut TaskQueue, goal_hash: u64) {
     sys_write(1, b"...\n");
 
     // Default autonomous demonstration sequence:
-    // 1. DNS resolve
-    // 2. HTTP GET (fetch a web page)
-    // 3. FS read (list local models)
-    // 4. Execute tool via MCP
-    // 5. FS write (save results)
-    // 6. Network scan
-    // 7. API call
-    // 8. Web crawl
+    // Phase 1: AGI Desktop Manipulation (Jalon 150) — runs first to prove concept
+    // Phase 2: Network operations — DNS, HTTP, etc.
+    // Phase 3: Filesystem and tools
 
-    queue.add(TaskType::DnsResolve, djb2(b"google.com"));
-    queue.add(TaskType::HttpGet, djb2(b"http://example.com"));
-    queue.add(TaskType::FsRead, djb2(b"/disk/models"));
-    queue.add(TaskType::ExecTool, djb2(b"busybox ls -la /disk/"));
-    queue.add(TaskType::FsWrite, djb2(b"/disk/var/autonomous.log"));
-    queue.add(TaskType::NetScan, djb2(b"10.0.2.0/24"));
-    queue.add(TaskType::ApiCall, djb2(b"httpbin.org/get"));
-    queue.add(TaskType::Crawl, djb2(b"http://example.com depth=1"));
-    // Jalon 150: LLM control operations
+    // === Phase 1: LLM Control / Desktop Manipulation ===
     queue.add(TaskType::Screenshot, djb2(b"/tmp/screenshot.bmp"));
     queue.add(TaskType::KeyPress, 28);  // KEY_ENTER
     queue.add(TaskType::TypeText, djb2(b"hello\n"));
     queue.add(TaskType::MouseClick, (512 << 16) | 384); // center of 1024x768
+
+    // === Phase 2: Network Operations ===
+    queue.add(TaskType::DnsResolve, djb2(b"google.com"));
+    queue.add(TaskType::FsRead, djb2(b"/disk/models"));
+    queue.add(TaskType::ExecTool, djb2(b"busybox ls -la /disk/"));
+    queue.add(TaskType::FsWrite, djb2(b"/disk/var/autonomous.log"));
+
+    // === Phase 3: Advanced Network (may require TCP fixes) ===
+    queue.add(TaskType::HttpGet, djb2(b"http://example.com"));
+    queue.add(TaskType::NetScan, djb2(b"10.0.2.0/24"));
+    queue.add(TaskType::ApiCall, djb2(b"httpbin.org/get"));
+    queue.add(TaskType::Crawl, djb2(b"http://example.com depth=1"));
 
     sys_write(1, b"[AUTO] Planned ");
     print_u64(queue.count as u64);
