@@ -1432,15 +1432,15 @@ fn set_pending_switch(old_pid: u64, new_pid: u64, rip: u64, rsp: u64, pml4: u64)
 // ===== IRQ Handlers =====
 
 extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFrame) {
-    // KPTI: restore kernel CR3 — timer IRQ may fire while user PML4 is active
+    // KPTI: Save current CR3 and switch to kernel CR3 for safe kernel data access.
+    // CRITICAL: We MUST restore the saved CR3 before IRET, otherwise user code
+    // resumes with kernel page tables and immediately faults (the BusyBox OOM bug).
+    let saved_timer_cr3: u64;
     unsafe {
+        core::arch::asm!("mov {}, cr3", out(reg) saved_timer_cr3, options(nomem, nostack));
         let kcr3 = crate::arch::x86_64::syscall::get_kernel_cr3();
-        if kcr3 != 0 {
-            let cr3: u64;
-            core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
-            if cr3 != kcr3 {
-                core::arch::asm!("mov cr3, {}", in(reg) kcr3, options(nostack));
-            }
+        if kcr3 != 0 && saved_timer_cr3 != kcr3 {
+            core::arch::asm!("mov cr3, {}", in(reg) kcr3, options(nostack));
         }
     }
     // Jalon 69: Preemptive timer tick with safe context save.
@@ -1548,6 +1548,14 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
 
     unsafe {
         super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET);
+        // KPTI: Restore the CR3 that was active when the timer fired.
+        // Without this, IRET returns to user code with kernel page tables,
+        // causing an immediate page fault and infinite loop.
+        let current_cr3: u64;
+        core::arch::asm!("mov {}, cr3", out(reg) current_cr3, options(nomem, nostack));
+        if current_cr3 != saved_timer_cr3 {
+            core::arch::asm!("mov cr3, {}", in(reg) saved_timer_cr3, options(nostack));
+        }
     }
 }
 
