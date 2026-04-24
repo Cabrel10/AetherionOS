@@ -1443,11 +1443,16 @@ fn sys_poll(fds_addr: u64, nfds: u64, timeout: u64) -> u64 {
     let timeout_i = timeout as i64;
     if ready_count == 0 && timeout != 0 {
         // Enable interrupts so keyboard IRQ can fire while we yield
-        let max_iterations = if timeout_i < 0 { 50000u64 } else { (timeout / 10).min(5000) };
-        for iter in 0..max_iterations {
-            // Enable IRQs briefly to let keyboard data arrive
-            unsafe { core::arch::asm!("sti; pause; cli", options(nomem, nostack)); }
-            sys_yield();
+        // For infinite timeout (-1): loop for ~10 seconds
+        // For finite timeout: loop proportionally
+        let max_iterations = if timeout_i < 0 { 5_000_000u64 } else { (timeout * 500).min(5_000_000) };
+        for _iter in 0..max_iterations {
+            // Enable IRQs briefly to let keyboard data arrive, then pause
+            unsafe {
+                core::arch::asm!("sti", options(nomem, nostack));
+                core::arch::asm!("pause; pause; pause; pause", options(nomem, nostack));
+                core::arch::asm!("cli", options(nomem, nostack));
+            }
 
             // Re-check stdin for POLLIN (keyboard OR serial)
             let serial_ready: bool = unsafe {
@@ -1471,10 +1476,6 @@ fn sys_poll(fds_addr: u64, nfds: u64, timeout: u64) -> u64 {
                     }
                 }
                 if ready_count > 0 { break; }
-            }
-            // Avoid burning CPU: extra pauses
-            if iter % 100 == 0 {
-                for _ in 0..10 { unsafe { core::arch::asm!("pause", options(nomem, nostack)); } }
             }
         }
     }
@@ -2726,6 +2727,20 @@ fn sys_write(fd: u64, buf_addr: u64, len: u64) -> u64 {
                     }
                     asm!("sti", options(nomem, nostack));
                 }
+                // Detect ESC[6n (cursor position query) and inject response
+                // ESC[6n = bytes [0x1B, 0x5B, 0x36, 0x6E]
+                if copied >= 4 {
+                    for w in kbuf[..copied].windows(4) {
+                        if w == [0x1B, 0x5B, 0x36, 0x6E] {
+                            // Inject ESC[1;1R into keyboard buffer as response
+                            let response = [0x1B, b'[', b'1', b';', b'1', b'R'];
+                            for &byte in &response {
+                                crate::process::kbd_push_byte(byte);
+                            }
+                            break;
+                        }
+                    }
+                }
                 // Jalon 118: Pipe Cognitif — capture child process stdout/stderr
                 // If this process is a child (PID > 10), publish output to Cognitive Bus
                 if current_pid > 10 && (fd == 1 || fd == 2) {
@@ -2942,8 +2957,8 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
                 }
 
                 attempts += 1;
-                if attempts >= 200000 {
-                    // After extended wait — return 0 (EOF)
+                if attempts >= 5_000_000 {
+                    // After ~10 seconds of waiting — return 0 (EOF)
                     return 0;
                 }
             }
@@ -3431,12 +3446,15 @@ fn sys_yield() -> u64 {
     let current = crate::scheduler::current_pid();
     if current == 0 { return 0; }
 
-    // Debug: log entry with real PID
-    let ysc_entry = YIELD_COUNT.load(AtomicOrdering::Relaxed);
-    if ysc_entry < 3 {
-        crate::serial_write("[YIELD-ENTRY] cur=");
-        print_u64_raw(current);
-        crate::serial_write("\n");
+    // Debug: log entry with real PID (throttled — first 3 only)
+    {
+        static YIELD_LOG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let n = YIELD_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n < 3 {
+            crate::serial_write("[YIELD-ENTRY] cur=");
+            print_u64_raw(current);
+            crate::serial_write("\n");
+        }
     }
 
     // Save current process's user-mode state
@@ -3467,8 +3485,8 @@ fn sys_yield() -> u64 {
     // If scheduler picked the same process (or none), just return normally
     // (sysretq in syscall_entry will restore our registers)
     if next == 0 || next == current {
-        // Debug: log yield-to-self
-        let ysc = YIELD_COUNT.load(AtomicOrdering::Relaxed);
+        // Debug: log yield-to-self (throttled)
+        let ysc = YIELD_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
         if ysc < 5 {
             crate::serial_write("[YIELD-SELF] pid=");
             print_u64_raw(current);
