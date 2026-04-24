@@ -1376,9 +1376,14 @@ fn sys_poll(fds_addr: u64, nfds: u64, timeout: u64) -> u64 {
         // Check FD type and status
         match fd {
             0 => {
-                // stdin: check if keyboard data is ACTUALLY available
+                // stdin: check if keyboard OR serial data is available
                 if events & POLLIN != 0 {
-                    if crate::process::kbd_has_pending() {
+                    let serial_ready: bool = unsafe {
+                        let lsr: u8;
+                        core::arch::asm!("in al, dx", out("al") lsr, in("dx") 0x3FDu16, options(nomem, nostack));
+                        lsr & 1 != 0
+                    };
+                    if crate::process::kbd_has_pending() || serial_ready {
                         revents |= POLLIN;
                     }
                 }
@@ -1444,8 +1449,13 @@ fn sys_poll(fds_addr: u64, nfds: u64, timeout: u64) -> u64 {
             unsafe { core::arch::asm!("sti; pause; cli", options(nomem, nostack)); }
             sys_yield();
 
-            // Re-check stdin for POLLIN
-            if crate::process::kbd_has_pending() {
+            // Re-check stdin for POLLIN (keyboard OR serial)
+            let serial_ready: bool = unsafe {
+                let lsr: u8;
+                core::arch::asm!("in al, dx", out("al") lsr, in("dx") 0x3FDu16, options(nomem, nostack));
+                lsr & 1 != 0
+            };
+            if crate::process::kbd_has_pending() || serial_ready {
                 // Re-scan all fds and write revents
                 for i in 0..nfds {
                     let pfd_addr = fds_addr + i * 8;
@@ -2886,30 +2896,54 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
                 return n as u64;
             }
 
-            // No data available — enable interrupts and poll with backoff
+            // No data available — block with IRQ-enabled polling.
+            // Check BOTH PS/2 keyboard buffer AND serial COM1 port (0x3F8)
+            // because QEMU -serial mon:stdio sends input through COM1.
             let mut attempts: u32 = 0;
             loop {
-                // Enable interrupts so IRQ1 can deliver keystrokes
+                // Enable interrupts so IRQ1 (keyboard) can fire
                 unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
-                // PAUSE gives the CPU a hint to save power + lets pending IRQs fire
                 unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
-                // Small busy-wait to give IRQ time to complete
-                for _ in 0..50u32 {
+                for _ in 0..20u32 {
                     unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
                 }
-                // Disable interrupts before accessing shared kernel state
                 unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
 
+                // Check PS/2 keyboard buffer first
                 let n = crate::process::kbd_read(&mut temp_buf, max_read);
                 if n > 0 {
                     unsafe { copy_to_user(buf_addr, &temp_buf[..n]); }
                     return n as u64;
                 }
+
+                // Check serial COM1 (port 0x3F8) for QEMU piped input
+                let lsr: u8;
+                unsafe { core::arch::asm!("in al, dx", out("al") lsr, in("dx") 0x3FDu16, options(nomem, nostack)); }
+                if lsr & 1 != 0 {
+                    // Data ready on serial — read it
+                    let mut serial_n = 0usize;
+                    while serial_n < max_read {
+                        let lsr2: u8;
+                        unsafe { core::arch::asm!("in al, dx", out("al") lsr2, in("dx") 0x3FDu16, options(nomem, nostack)); }
+                        if lsr2 & 1 == 0 { break; } // no more data
+                        let byte: u8;
+                        unsafe { core::arch::asm!("in al, dx", out("al") byte, in("dx") 0x3F8u16, options(nomem, nostack)); }
+                        if byte == b'\r' {
+                            temp_buf[serial_n] = b'\n'; // Convert CR to LF
+                        } else {
+                            temp_buf[serial_n] = byte;
+                        }
+                        serial_n += 1;
+                    }
+                    if serial_n > 0 {
+                        unsafe { copy_to_user(buf_addr, &temp_buf[..serial_n]); }
+                        return serial_n as u64;
+                    }
+                }
+
                 attempts += 1;
-                if attempts >= 100000 {
-                    // After ~2-3 seconds of waiting — return 0 (no data = EOF)
-                    // For interactive shell, this should be long enough for
-                    // piped input to arrive through QEMU serial
+                if attempts >= 200000 {
+                    // After extended wait — return 0 (EOF)
                     return 0;
                 }
             }
