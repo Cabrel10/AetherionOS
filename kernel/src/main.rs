@@ -78,9 +78,9 @@ const ENABLE_SECURITY_AGENTS: bool = true;
 /// Minimal hello.elf - statically linked x86-64 ELF for Ring 3 test
 static HELLO_ELF: &[u8] = include_bytes!("../../userspace/hello.elf");
 /// Interactive shell.elf - Ring 3 shell with POSIX syscalls
-static SHELL_ELF: &[u8] = include_bytes!("../../userspace/shell.elf");
+static SHELL_ELF: &[u8] = include_bytes!("../../userspace/c_apps/sh.elf");
 /// Math Agent - Ring 3 agent with mmap, linear regression, matrix ops, bus publish
-static AGENT_MATH_ELF: &[u8] = include_bytes!("../../userspace/agent_math.elf");
+static AGENT_MATH_ELF: &[u8] = include_bytes!("../../userspace/c_apps/agent_math.elf");
 /// Native C application - compiled with GCC, libc_stub, bare-metal
 static HELLO_C_ELF: &[u8] = include_bytes!("../../userspace/c_apps/hello_c.elf");
 /// wget - Ring 3 HTTP client (TCP/DNS validation - Couche 18)
@@ -118,37 +118,37 @@ static AGENT_SAGA_ELF: &[u8] = include_bytes!("../../userspace/c_apps/agent_saga
 static AGENT_SSE_ELF: &[u8] = include_bytes!("../../userspace/c_apps/agent_sse.elf");
 
 /// agent_ai_native - Jalon 34 Native Rust Tensor Engine (SSE2 matmul in Ring 3)
-static AGENT_AI_NATIVE_ELF: &[u8] = include_bytes!("../../userspace/agent_ai_native/target/x86_64-aetherion-user/release/agent_ai_native");
+static AGENT_AI_NATIVE_ELF: &[u8] = include_bytes!("../../bin_cache/agent_ai_native");
 
 /// agent_gguf - Jalon 36 GGUF Model Loaded from FAT32 Disk (Ring 3)
-static AGENT_GGUF_ELF: &[u8] = include_bytes!("../../userspace/agent_gguf/target/x86_64-aetherion-user/release/agent_gguf");
+static AGENT_GGUF_ELF: &[u8] = include_bytes!("../../bin_cache/agent_gguf");
 
 /// agent_net - Jalon 37 Network Agent (Ring 3)
-static AGENT_NET_ELF: &[u8] = include_bytes!("../../userspace/agent_net/target/x86_64-aetherion-user/release/agent_net");
+static AGENT_NET_ELF: &[u8] = include_bytes!("../../bin_cache/agent_net");
 
 /// agent_input - Jalon 38 HID Input Agent (Ring 3)
-static AGENT_INPUT_ELF: &[u8] = include_bytes!("../../userspace/agent_input/target/x86_64-aetherion-user/release/agent_input");
+static AGENT_INPUT_ELF: &[u8] = include_bytes!("../../bin_cache/agent_input");
 
 /// agent_gui_test - Jalon 39 Framebuffer GUI Test (Ring 3)
-static AGENT_GUI_TEST_ELF: &[u8] = include_bytes!("../../userspace/agent_gui_test/target/x86_64-aetherion-user/release/agent_gui_test");
+static AGENT_GUI_TEST_ELF: &[u8] = include_bytes!("../../bin_cache/agent_gui_test");
 
 /// agent_sysinfo - Jalon 40 System Information Agent (Ring 3)
-static AGENT_SYSINFO_ELF: &[u8] = include_bytes!("../../userspace/agent_sysinfo/target/x86_64-aetherion-user/release/agent_sysinfo");
+static AGENT_SYSINFO_ELF: &[u8] = include_bytes!("../../bin_cache/agent_sysinfo");
 
 /// agent_wm - Jalon 41 Cognitive Desktop Window Manager (Ring 3)
-static AGENT_WM_ELF: &[u8] = include_bytes!("../../userspace/agent_wm/target/x86_64-aetherion-user/release/agent_wm");
+static AGENT_WM_ELF: &[u8] = include_bytes!("../../bin_cache/agent_wm");
 
 /// agent_terminal - Jalon 42 Interactive Terminal Window (Ring 3)
-static AGENT_TERMINAL_ELF: &[u8] = include_bytes!("../../userspace/agent_terminal/target/x86_64-aetherion-user/release/agent_terminal");
+static AGENT_TERMINAL_ELF: &[u8] = include_bytes!("../../bin_cache/agent_terminal");
 
 /// agent_multipart - Jalon 43 Multi-Part GGUF File Merger (Ring 3)
-static AGENT_MULTIPART_ELF: &[u8] = include_bytes!("../../userspace/agent_multipart/target/x86_64-aetherion-user/release/agent_multipart");
+static AGENT_MULTIPART_ELF: &[u8] = include_bytes!("../../bin_cache/agent_multipart");
 
 /// agent_bench - Jalon 45 VirtIO Block I/O Benchmark (Ring 3)
-static AGENT_BENCH_ELF: &[u8] = include_bytes!("../../userspace/agent_bench/target/x86_64-aetherion-user/release/agent_bench");
+static AGENT_BENCH_ELF: &[u8] = include_bytes!("../../bin_cache/agent_bench");
 
 /// agent_tokenizer - Jalon 46 Static BPE Tokenizer (Ring 3)
-static AGENT_TOKENIZER_ELF: &[u8] = include_bytes!("../../userspace/agent_tokenizer/target/x86_64-aetherion-user/release/agent_tokenizer");
+static AGENT_TOKENIZER_ELF: &[u8] = include_bytes!("../../bin_cache/agent_tokenizer");
 
 /// agent_inference - Jalon 47 GGUF Tensor Metadata Inspector (Ring 3)
 static AGENT_INFERENCE_ELF: &[u8] = include_bytes!("../../bin_cache/agent_inference");
@@ -209,7 +209,7 @@ static AGENT_AUTONOMOUS_ELF: &[u8] = include_bytes!("../../bin_cache/agent_auton
 
 /// Busybox 1.35.0 - statically linked x86_64 musl Linux binary
 /// Jalon 94-95: Native Linux binary execution via Linuxulator
-static BUSYBOX_ELF: &[u8] = include_bytes!("../../userspace/busybox.elf");
+static BUSYBOX_ELF: &[u8] = include_bytes!("../../bin_cache/busybox");
 
 // VGA text buffer
 const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;

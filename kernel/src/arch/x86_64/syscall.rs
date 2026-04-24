@@ -299,16 +299,134 @@ fn validate_user_ptr(addr: u64, len: u64) -> bool {
     false
 }
 
+/// Read a byte from user-space memory safely under KPTI.
+///
+/// When the kernel CR3 is active (after SYSCALL), user pages are NOT mapped.
+/// This function looks up the physical frame for the user virtual address
+/// using the process's PML4 page table, then accesses it via the HHDM
+/// (Higher Half Direct Map: phys_to_virt = phys + 0xFFFF800000000000).
+///
+/// Returns the byte at the given user virtual address, or 0 if unmapped.
+#[inline]
+unsafe fn read_user_byte_kpti(user_vaddr: u64) -> u8 {
+    let pid = crate::scheduler::current_pid();
+    let user_pml4 = crate::process::get_pml4_phys(pid).unwrap_or(0);
+    if user_pml4 == 0 {
+        // No user PML4 — try direct read (works if kernel maps user pages)
+        return core::ptr::read_unaligned(user_vaddr as *const u8);
+    }
+    let page_offset = user_vaddr & 0xFFF;
+    let phys_frame = crate::elf::lookup_page_frame_pub(user_pml4, user_vaddr);
+    match phys_frame {
+        Some(frame_phys) => {
+            let hhdm_addr = crate::elf::phys_to_virt(frame_phys + page_offset);
+            core::ptr::read_unaligned(hhdm_addr as *const u8)
+        }
+        None => 0, // Page not mapped — return 0
+    }
+}
+
+/// Copy bytes from user-space to a kernel buffer using KPTI-safe reads.
+/// Returns the number of bytes actually copied.
+unsafe fn copy_from_user(dst: &mut [u8], user_src: u64, len: usize) -> usize {
+    let pid = crate::scheduler::current_pid();
+    let user_pml4 = crate::process::get_pml4_phys(pid).unwrap_or(0);
+    let mut copied = 0usize;
+    let mut remaining = len;
+    let mut src_addr = user_src;
+    let mut dst_offset = 0usize;
+
+    while remaining > 0 && dst_offset < dst.len() {
+        // How many bytes until the next page boundary?
+        let page_offset = (src_addr & 0xFFF) as usize;
+        let bytes_in_page = core::cmp::min(4096 - page_offset, remaining);
+        let bytes_to_copy = core::cmp::min(bytes_in_page, dst.len() - dst_offset);
+
+        if user_pml4 != 0 {
+            // KPTI path: look up physical frame via user PML4
+            if let Some(frame_phys) = crate::elf::lookup_page_frame_pub(user_pml4, src_addr) {
+                let hhdm_ptr = crate::elf::phys_to_virt(frame_phys + page_offset as u64) as *const u8;
+                for i in 0..bytes_to_copy {
+                    dst[dst_offset + i] = core::ptr::read_unaligned(hhdm_ptr.add(i));
+                }
+                copied += bytes_to_copy;
+            } else {
+                break; // Page not mapped
+            }
+        } else {
+            // No KPTI: direct access
+            let src_ptr = src_addr as *const u8;
+            for i in 0..bytes_to_copy {
+                dst[dst_offset + i] = core::ptr::read_unaligned(src_ptr.add(i));
+            }
+            copied += bytes_to_copy;
+        }
+
+        src_addr += bytes_to_copy as u64;
+        dst_offset += bytes_to_copy;
+        remaining -= bytes_to_copy;
+    }
+    copied
+}
+
+/// Copy bytes from kernel buffer to user-space using KPTI-safe writes via HHDM.
+/// Returns the number of bytes actually written.
+unsafe fn copy_to_user(user_dst: u64, src: &[u8]) -> usize {
+    let pid = crate::scheduler::current_pid();
+    let user_pml4 = crate::process::get_pml4_phys(pid).unwrap_or(0);
+    let mut written = 0usize;
+    let mut dst_addr = user_dst;
+    let mut src_offset = 0usize;
+    let total = src.len();
+
+    while src_offset < total {
+        let page_offset = (dst_addr & 0xFFF) as usize;
+        let bytes_in_page = core::cmp::min(4096 - page_offset, total - src_offset);
+
+        if user_pml4 != 0 {
+            if let Some(frame_phys) = crate::elf::lookup_page_frame_pub(user_pml4, dst_addr) {
+                let hhdm_ptr = crate::elf::phys_to_virt(frame_phys + page_offset as u64) as *mut u8;
+                for i in 0..bytes_in_page {
+                    core::ptr::write_unaligned(hhdm_ptr.add(i), src[src_offset + i]);
+                }
+                written += bytes_in_page;
+            } else {
+                break; // Page not mapped
+            }
+        } else {
+            let dst_ptr = dst_addr as *mut u8;
+            for i in 0..bytes_in_page {
+                core::ptr::write_unaligned(dst_ptr.add(i), src[src_offset + i]);
+            }
+            written += bytes_in_page;
+        }
+
+        dst_addr += bytes_in_page as u64;
+        src_offset += bytes_in_page;
+    }
+    written
+}
+
+/// Public wrapper for copy_to_user (for use from linux_abi module)
+pub unsafe fn copy_to_user_pub(user_dst: u64, src: &[u8]) -> usize {
+    copy_to_user(user_dst, src)
+}
+
+/// Public wrapper for copy_from_user (for use from linux_abi module)
+pub unsafe fn copy_from_user_pub(dst: &mut [u8], user_src: u64, len: usize) -> usize {
+    copy_from_user(dst, user_src, len)
+}
+
 /// Read a null-terminated string from user space (max 256 bytes)
 unsafe fn read_user_string(addr: u64) -> Option<alloc::string::String> {
     if !validate_user_ptr(addr, 1) { return None; }
-    let mut buf = alloc::vec::Vec::with_capacity(256);
-    let ptr = addr as *const u8;
-    for i in 0..256usize {
-        if !validate_user_ptr(addr + i as u64, 1) { return None; }
-        let byte = core::ptr::read_unaligned(ptr.add(i));
-        if byte == 0 { break; }
-        buf.push(byte);
+    // KPTI-safe: copy up to 256 bytes from user space via HHDM page-table walk
+    let mut raw = [0u8; 256];
+    let copied = unsafe { copy_from_user(&mut raw, addr, 256) };
+    let mut buf = alloc::vec::Vec::with_capacity(copied);
+    for i in 0..copied {
+        if raw[i] == 0 { break; }
+        buf.push(raw[i]);
     }
     alloc::string::String::from_utf8(buf).ok()
 }
@@ -333,83 +451,94 @@ extern "C" fn syscall_entry() {
         // 1. Switch to kernel GS
         "swapgs",
 
-        // 2. Save user RSP, RIP, and R10 (4th syscall arg), load kernel RSP
-        "mov gs:[8], rsp",
-        "mov gs:[16], rcx",   // save user RIP (RCX holds return addr from SYSCALL)
-        "mov gs:[32], r10",   // save R10 = 4th syscall argument (pread64 offset, etc.)
-        "mov gs:[56], r9",    // save R9 = 6th syscall argument (mmap offset, etc.)
-        "mov rsp, gs:[0]",
+        // 2. Save user RSP, RIP, R10, R9 into per-CPU area; load kernel RSP
+        "mov gs:[8], rsp",    // save user RSP
+        "mov gs:[16], rcx",   // save user RIP (RCX set by SYSCALL hw)
+        "mov gs:[32], r10",   // save R10 (4th syscall arg / scratch)
+        "mov gs:[56], r9",    // save R9 (6th syscall arg)
+        "mov rsp, gs:[0]",    // load kernel RSP
 
-        // 2b. KPTI: Switch to kernel page tables.
-        // gs:[40] = kernel_cr3 (physical address of kernel PML4).
-        // After this, all kernel code is accessible at both identity-mapped
-        // and phys-offset addresses. User pages at 0x400000+ are now the
-        // kernel's original pages (not BusyBox).
-        // We use a scratch register (r10 already saved above) for the mov.
+        // 2b. KPTI: Switch to kernel page tables
         "mov r10, gs:[40]",   // r10 = kernel_cr3
-        "test r10, r10",      // skip if kernel_cr3 == 0 (not set yet)
+        "test r10, r10",
         "jz 2f",
         "mov cr3, r10",
         "2:",
 
-        // 3. Build a stack frame with all user state
-        "push rcx",     // user RIP (saved by SYSCALL)
-        "push r11",     // user RFLAGS (saved by SYSCALL)
+        // 3. Save ALL user registers on the kernel stack.
+        //    Linux syscall ABI: kernel preserves everything except RAX, RCX, R11.
+        //    We must save RDI, RSI, RDX, R8, R9, R10 too (they are caller-saved
+        //    in System V but NOT clobbered by the Linux syscall ABI).
+        "push rcx",           // user RIP  (from SYSCALL hw)
+        "push r11",           // user RFLAGS (from SYSCALL hw)
         "push rbp",
         "push rbx",
         "push r12",
         "push r13",
         "push r14",
         "push r15",
+        "push rdi",           // user a1
+        "push rsi",           // user a2
+        "push rdx",           // user a3
+        "push r8",            // user a5
+        "mov r10, gs:[32]",   // reload user R10 (clobbered by CR3 switch)
+        "push r10",           // user a4 (R10)
+        "mov r10, gs:[56]",   // reload user R9 (saved above)
+        "push r10",           // user a6 (R9)
 
-        // 3b. Save the kernel RSP (pointing to saved regs) into per-CPU data.
-        // This is overwritten on every syscall; sys_wait copies it to the
-        // process struct before launching a child thread.
-        // Uses GS-relative access (gs:[24]) to avoid R_X86_64_32S relocations.
+        // 3b. Save kernel RSP into per-CPU data
         "mov gs:[24], rsp",
 
-        // 4. Prepare arguments for Rust handler (6-arg ABI)
-        //    syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64)
-        //    System V calling convention: rdi, rsi, rdx, rcx, r8, r9
-        //    From SYSCALL: rax=nr, rdi=a1, rsi=a2, rdx=a3, r10=a4, r8=a5
-        //    Note: r8 still holds user's 5th arg, r10 was saved to gs:[32]
-        "mov r10, gs:[32]",   // reload user r10 (we clobbered it for CR3 switch)
-        "mov r9, r8",      // 6th SysV arg = a5 (user R8) — MUST be before r8 is overwritten
-        "mov r8, r10",     // 5th SysV arg = a4 (user R10)
-        "mov rcx, rdx",    // 4th SysV arg = a3 (user RDX)
-        "mov rdx, rsi",    // 3rd SysV arg = a2 (user RSI)
-        "mov rsi, rdi",    // 2nd SysV arg = a1 (user RDI)
-        "mov rdi, rax",    // 1st SysV arg = nr (user RAX)
+        // 4. Prepare arguments for Rust handler (System V x86-64 ABI)
+        //    syscall_handler_rust(nr: rdi, a1: rsi, a2: rdx, a3: rcx, a4: r8, a5: r9)
+        //    From user: RAX=nr, RDI=a1, RSI=a2, RDX=a3, R10=a4, R8=a5
+        //    The registers still hold user values (we pushed copies above).
+        //    Shuffle order: read before overwrite.
+        "mov r9, r8",         // SysV r9  = user R8  (a5)
+        "mov r8, gs:[32]",    // SysV r8  = user R10 (a4) — from per-CPU save
+        "mov rcx, rdx",       // SysV rcx = user RDX (a3)
+        "mov rdx, rsi",       // SysV rdx = user RSI (a2)
+        "mov rsi, rdi",       // SysV rsi = user RDI (a1)
+        "mov rdi, rax",       // SysV rdi = user RAX (nr)
 
-        // Align RSP to 16 bytes before calling Rust (ABI requirement)
-        "mov r15, rsp",          // save current RSP in r15 (already pushed)
-        "and rsp, -16",          // align to 16-byte boundary
-        // Call the Rust dispatcher
+        // Align RSP to 16 bytes (ABI requirement), use R15 as frame save
+        "mov r15, rsp",
+        "and rsp, -16",
         "call {handler}",
-        "mov rsp, r15",          // restore RSP (r15 will be popped next)
+        "mov rsp, r15",       // restore stack pointer to saved-regs frame
 
-        // RAX = return value (set by Rust handler)
+        // RAX = return value from Rust handler
 
-        // 5. Restore callee-saved registers
+        // 5. Restore ALL user registers (reverse order of push)
+        "pop r9",             // restore user R9
+        "pop r10",            // restore user R10
+        "pop r8",             // restore user R8
+        "pop rdx",            // restore user RDX
+        "pop rsi",            // restore user RSI
+        "pop rdi",            // restore user RDI
         "pop r15",
         "pop r14",
         "pop r13",
         "pop r12",
         "pop rbx",
         "pop rbp",
-        "pop r11",     // user RFLAGS
-        "pop rcx",     // user RIP
+        "pop r11",            // user RFLAGS (loaded by SYSRETQ)
+        "pop rcx",            // user RIP   (loaded by SYSRETQ)
 
-        // 6. Restore user RSP
-        "mov rsp, gs:[8]",
-
-        // 6b. KPTI: Switch back to user page tables before returning to Ring 3.
-        // gs:[48] = user_cr3 (the process's PML4).
-        "mov r10, gs:[48]",
-        "test r10, r10",      // skip if user_cr3 == 0 (not set yet)
+        // 6. KPTI: Switch back to user page tables BEFORE restoring user RSP.
+        //    We must do this while still on the kernel stack, because the
+        //    user stack is only mapped in the user page tables.
+        //    Use gs:[32] to save/restore R10 (scratch slot, not needed anymore).
+        "mov gs:[32], r10",   // save user R10 in per-CPU scratch
+        "mov r10, gs:[48]",   // r10 = user_cr3
+        "test r10, r10",
         "jz 3f",
-        "mov cr3, r10",
+        "mov cr3, r10",       // switch to user page tables
         "3:",
+        "mov r10, gs:[32]",   // restore user R10
+
+        // 6b. Restore user RSP (now safe — user pages are mapped)
+        "mov rsp, gs:[8]",
 
         // 7. Swap back to user GS
         "swapgs",
@@ -477,8 +606,20 @@ extern "C" fn syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, 
 /// Jalon 105: Linux ABI compatibility layer — processes tagged with Abi::Linux
 /// get Linux-specific behavior for certain syscalls (uname, arch_prctl, etc.)
 /// Syscall numbers match Linux x86_64 ABI for POSIX compatibility.
+/// Last syscall number (for GP fault diagnostics)
+pub static LAST_SYSCALL_NR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
+    LAST_SYSCALL_NR.store(nr, core::sync::atomic::Ordering::Relaxed);
     let current_pid = crate::scheduler::current_pid();
+    // Trace first 60 syscalls of PID 1 for debugging
+    static TRACE_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    if current_pid == 1 {
+        let c = TRACE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if c < 60 {
+            crate::serial_println!("[SC#{}] nr={} a1=0x{:X} a2=0x{:X} a3=0x{:X}", c, nr, a1, a2, a3);
+        }
+    }
     // Jalon 105: Check if this process uses Linux ABI and route to Linux-specific handlers
     if current_pid != 0 {
         let is_linux = crate::process::with_process(current_pid, |p| {
@@ -933,17 +1074,22 @@ fn sys_stub_rt_sigaction(signum: u64, act: u64, oldact: u64) -> u64 {
     let current_pid = crate::scheduler::current_pid();
     if signum == 0 || signum >= 32 { return EINVAL; }
 
-    // Save old handler if oldact is non-null
-    if oldact != 0 && validate_user_ptr(oldact, 8) {
+    // Save old handler if oldact is non-null (struct sigaction = 32 bytes on x86_64)
+    if oldact != 0 && validate_user_ptr(oldact, 32) {
         let old_handler = crate::process::with_process(current_pid, |p| {
             p.signal_handlers[signum as usize]
         }).unwrap_or(0);
-        unsafe { core::ptr::write_unaligned(oldact as *mut u64, old_handler); }
+        let mut old_buf = [0u8; 32];
+        old_buf[0..8].copy_from_slice(&old_handler.to_le_bytes()); // sa_handler
+        // sa_flags=0, sa_restorer=0, sa_mask=0 (all zeroed)
+        unsafe { copy_to_user(oldact, &old_buf); }
     }
 
-    // Set new handler if act is non-null
+    // Set new handler if act is non-null (read full sigaction struct)
     if act != 0 && validate_user_ptr(act, 8) {
-        let handler = unsafe { core::ptr::read_unaligned(act as *const u64) };
+        let mut act_buf = [0u8; 8];
+        unsafe { copy_from_user(&mut act_buf, act, 8); }
+        let handler = u64::from_le_bytes(act_buf);
         crate::process::with_process_mut(current_pid, |p| {
             p.signal_handlers[signum as usize] = handler;
         });
@@ -964,12 +1110,14 @@ fn sys_stub_rt_sigprocmask(how: u64, set: u64, oldset: u64) -> u64 {
     // Save old mask if oldset is non-null
     if oldset != 0 && validate_user_ptr(oldset, 8) {
         let old_mask = crate::process::with_process(current_pid, |p| p.signal_mask).unwrap_or(0);
-        unsafe { core::ptr::write_unaligned(oldset as *mut u64, old_mask); }
+        unsafe { copy_to_user(oldset, &old_mask.to_le_bytes()); }
     }
 
     // Update mask if set is non-null
     if set != 0 && validate_user_ptr(set, 8) {
-        let new_bits = unsafe { core::ptr::read_unaligned(set as *const u64) };
+        let mut set_buf = [0u8; 8];
+        unsafe { copy_from_user(&mut set_buf, set, 8); }
+        let new_bits = u64::from_le_bytes(set_buf);
         crate::process::with_process_mut(current_pid, |p| {
             match how {
                 0 => p.signal_mask |= new_bits,           // SIG_BLOCK
@@ -992,10 +1140,15 @@ fn sys_stub_writev(fd: u32, iov_addr: u64, iovcnt: u64) -> u64 {
     if !validate_user_ptr(iov_addr, iovcnt * 16) { return EFAULT; }
     let mut total: u64 = 0;
     for i in 0..core::cmp::min(iovcnt, 16) as usize {
-        let base_ptr = (iov_addr + (i * 16) as u64) as *const u64;
-        let len_ptr = (iov_addr + (i * 16 + 8) as u64) as *const u64;
-        let base = unsafe { core::ptr::read_unaligned(base_ptr) };
-        let len = unsafe { core::ptr::read_unaligned(len_ptr) };
+        // KPTI-safe: read iovec struct (base, len) via copy_from_user
+        let iov_off = iov_addr + (i * 16) as u64;
+        let mut iov_buf = [0u8; 16];
+        let copied = unsafe { copy_from_user(&mut iov_buf, iov_off, 16) };
+        if copied < 16 { break; }
+        let base = u64::from_le_bytes([iov_buf[0], iov_buf[1], iov_buf[2], iov_buf[3],
+                                        iov_buf[4], iov_buf[5], iov_buf[6], iov_buf[7]]);
+        let len = u64::from_le_bytes([iov_buf[8], iov_buf[9], iov_buf[10], iov_buf[11],
+                                       iov_buf[12], iov_buf[13], iov_buf[14], iov_buf[15]]);
         if len > 0 && validate_user_ptr(base, len) {
             let n = sys_write(fd as u64, base, len);
             if (n as i64) < 0 { return n; }
@@ -1063,9 +1216,11 @@ fn sys_futex(uaddr: u64, op: u64, val: u64) -> u64 {
                 return EFAULT;
             }
 
-            // Read the current value at uaddr
-            let current_val = unsafe {
-                core::ptr::read_unaligned(uaddr as *const u32)
+            // Read the current value at uaddr via HHDM
+            let current_val = {
+                let mut fbuf = [0u8; 4];
+                unsafe { copy_from_user(&mut fbuf, uaddr, 4); }
+                u32::from_le_bytes(fbuf)
             };
 
             if current_val != val as u32 {
@@ -1150,36 +1305,23 @@ fn sys_futex(uaddr: u64, op: u64, val: u64) -> u64 {
 /// stat(path, buf) -> 0 (fills minimal stat struct)
 fn sys_stub_stat(_path_addr: u64, buf_addr: u64) -> u64 {
     if !validate_user_ptr(buf_addr, 144) { return EFAULT; }
-    // Zero the struct (144 bytes = sizeof(struct stat) on x86_64)
-    unsafe {
-        let dst = buf_addr as *mut u8;
-        for i in 0..144 { core::ptr::write_unaligned(dst.add(i), 0); }
-        // st_mode at offset 24: S_IFREG | 0644 = 0o100644 = 33188
-        let mode_ptr = (buf_addr + 24) as *mut u32;
-        core::ptr::write_unaligned(mode_ptr, 0o100644);
-        // st_blksize at offset 56: 4096
-        let blk_ptr = (buf_addr + 56) as *mut u64;
-        core::ptr::write_unaligned(blk_ptr, 4096);
-    }
+    let mut buf = [0u8; 144];
+    // st_mode at offset 24: S_IFREG | 0644 = 0o100644 = 33188
+    buf[24..28].copy_from_slice(&0o100644u32.to_le_bytes());
+    // st_blksize at offset 56: 4096
+    buf[56..64].copy_from_slice(&4096u64.to_le_bytes());
+    unsafe { copy_to_user(buf_addr, &buf); }
     0
 }
 
 /// fstat(fd, buf) -> 0
 fn sys_stub_fstat(fd: u32, buf_addr: u64) -> u64 {
     if !validate_user_ptr(buf_addr, 144) { return EFAULT; }
-    unsafe {
-        let dst = buf_addr as *mut u8;
-        for i in 0..144 { core::ptr::write_unaligned(dst.add(i), 0); }
-        let mode_ptr = (buf_addr + 24) as *mut u32;
-        if fd <= 2 {
-            // TTY: S_IFCHR | 0620 = 0o20620 = 8592
-            core::ptr::write_unaligned(mode_ptr, 0o20620);
-        } else {
-            core::ptr::write_unaligned(mode_ptr, 0o100644);
-        }
-        let blk_ptr = (buf_addr + 56) as *mut u64;
-        core::ptr::write_unaligned(blk_ptr, 4096);
-    }
+    let mut buf = [0u8; 144];
+    let mode: u32 = if fd <= 2 { 0o20620 } else { 0o100644 };
+    buf[24..28].copy_from_slice(&mode.to_le_bytes());
+    buf[56..64].copy_from_slice(&4096u64.to_le_bytes());
+    unsafe { copy_to_user(buf_addr, &buf); }
     0
 }
 
@@ -1201,39 +1343,49 @@ fn sys_poll(fds_addr: u64, nfds: u64, timeout: u64) -> u64 {
         return EFAULT;
     }
 
+    // POLLIN (0x0001): data available for reading
+    // POLLOUT (0x0004): writing won't block
+    // POLLHUP (0x0010): hung up
+    // POLLERR (0x0008): error
+    const POLLIN: i16 = 0x0001;
+    const POLLOUT: i16 = 0x0004;
+    const POLLHUP: i16 = 0x0010;
+
     let mut ready_count: u64 = 0;
 
     // Read and process each pollfd
     for i in 0..nfds {
         let pfd_addr = fds_addr + i * 8;
-        let fd_raw = unsafe { core::ptr::read_unaligned(pfd_addr as *const i32) };
-        let events = unsafe { core::ptr::read_unaligned((pfd_addr + 4) as *const i16) };
+        // Read pollfd from user memory via HHDM
+        let mut pfd_buf = [0u8; 8];
+        unsafe { copy_from_user(&mut pfd_buf, pfd_addr, 8); }
+        let fd_raw = i32::from_le_bytes([pfd_buf[0], pfd_buf[1], pfd_buf[2], pfd_buf[3]]);
+        let events = i16::from_le_bytes([pfd_buf[4], pfd_buf[5]]);
 
         // Clear revents
-        unsafe { core::ptr::write_unaligned((pfd_addr + 6) as *mut i16, 0); }
+        let zero_revents: [u8; 2] = [0, 0];
+        unsafe { copy_to_user(pfd_addr + 6, &zero_revents); }
 
         if fd_raw < 0 { continue; } // Negative FD = skip
 
         let fd = fd_raw as u32;
         let current_pid = crate::scheduler::current_pid();
 
-        // POLLIN (0x0001): data available for reading
-        // POLLOUT (0x0004): writing won't block
-        // POLLHUP (0x0010): hung up
-        // POLLERR (0x0008): error
-        const POLLIN: i16 = 0x0001;
-        const POLLOUT: i16 = 0x0004;
-        const POLLHUP: i16 = 0x0010;
-
         let mut revents: i16 = 0;
 
         // Check FD type and status
         match fd {
             0 => {
-                // stdin: check if keyboard data is available
+                // stdin: check if keyboard OR serial data is available
                 if events & POLLIN != 0 {
-                    // PS/2 keyboard always has potential data
-                    revents |= POLLIN;
+                    let serial_ready: bool = unsafe {
+                        let lsr: u8;
+                        core::arch::asm!("in al, dx", out("al") lsr, in("dx") 0x3FDu16, options(nomem, nostack));
+                        lsr & 1 != 0
+                    };
+                    if crate::process::kbd_has_pending() || serial_ready {
+                        revents |= POLLIN;
+                    }
                 }
             }
             1 | 2 => {
@@ -1278,18 +1430,54 @@ fn sys_poll(fds_addr: u64, nfds: u64, timeout: u64) -> u64 {
 
         // Write revents back
         if revents != 0 {
-            unsafe { core::ptr::write_unaligned((pfd_addr + 6) as *mut i16, revents); }
+            let rev_bytes = revents.to_le_bytes();
+            unsafe { copy_to_user(pfd_addr + 6, &rev_bytes); }
             ready_count += 1;
         }
     }
 
-    // If no FDs ready and timeout > 0, yield and retry
-    if ready_count == 0 && timeout > 0 && timeout < 60000 {
-        let max_yields = (timeout / 10).min(100);
-        for _ in 0..max_yields {
-            sys_yield();
+    // If no FDs ready, block based on timeout:
+    // timeout == 0xFFFFFFFFFFFFFFFF (-1 signed) = infinite wait
+    // timeout > 0 = wait up to timeout_ms
+    // timeout == 0 = non-blocking (already handled above)
+    let timeout_i = timeout as i64;
+    if ready_count == 0 && timeout != 0 {
+        // Enable interrupts so keyboard IRQ can fire while we yield
+        // For infinite timeout (-1): loop for ~10 seconds
+        // For finite timeout: loop proportionally
+        let max_iterations = if timeout_i < 0 { 5_000_000u64 } else { (timeout * 500).min(5_000_000) };
+        for _iter in 0..max_iterations {
+            // Enable IRQs briefly to let keyboard data arrive, then pause
+            unsafe {
+                core::arch::asm!("sti", options(nomem, nostack));
+                core::arch::asm!("pause; pause; pause; pause", options(nomem, nostack));
+                core::arch::asm!("cli", options(nomem, nostack));
+            }
+
+            // Re-check stdin for POLLIN (keyboard OR serial)
+            let serial_ready: bool = unsafe {
+                let lsr: u8;
+                core::arch::asm!("in al, dx", out("al") lsr, in("dx") 0x3FDu16, options(nomem, nostack));
+                lsr & 1 != 0
+            };
+            if crate::process::kbd_has_pending() || serial_ready {
+                // Re-scan all fds and write revents
+                for i in 0..nfds {
+                    let pfd_addr = fds_addr + i * 8;
+                    let mut pfd_buf = [0u8; 8];
+                    unsafe { copy_from_user(&mut pfd_buf, pfd_addr, 8); }
+                    let fd_raw = i32::from_le_bytes([pfd_buf[0], pfd_buf[1], pfd_buf[2], pfd_buf[3]]);
+                    if fd_raw == 0 {
+                        let rev: i16 = POLLIN;
+                        let rev_bytes = rev.to_le_bytes();
+                        unsafe { copy_to_user(pfd_addr + 6, &rev_bytes); }
+                        ready_count = 1;
+                        break;
+                    }
+                }
+                if ready_count > 0 { break; }
+            }
         }
-        // After yielding, report 0 ready (timeout expired)
     }
 
     ready_count
@@ -1370,6 +1558,12 @@ fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
 /// Jalon 131: Enhanced ioctl with TTY support for musl/glibc compatibility.
 /// Supports TIOCGWINSZ, TCGETS/TCSETS (termios), FIONREAD, and isatty detection.
 fn sys_ioctl(fd: u32, cmd: u64, arg: u64) -> u64 {
+    // Diagnostic: log ioctl calls for BusyBox debugging
+    static IOCTL_LOG_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let count = IOCTL_LOG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if count < 20 {
+        crate::serial_println!("[IOCTL] fd={} cmd=0x{:X} arg=0x{:X}", fd, cmd, arg);
+    }
     const TIOCGWINSZ: u64  = 0x5413;
     const TIOCSWINSZ: u64  = 0x5414;
     const TCGETS: u64      = 0x5401;
@@ -1385,35 +1579,34 @@ fn sys_ioctl(fd: u32, cmd: u64, arg: u64) -> u64 {
 
     match cmd {
         TIOCGWINSZ => {
-            // Return terminal size (80x25)
+            // Return terminal size (80x25) — KPTI safe
             if arg != 0 && validate_user_ptr(arg, 8) {
-                unsafe {
-                    let ws = arg as *mut u16;
-                    core::ptr::write_unaligned(ws, 25);       // ws_row
-                    core::ptr::write_unaligned(ws.add(1), 80); // ws_col
-                    core::ptr::write_unaligned(ws.add(2), 640);  // ws_xpixel
-                    core::ptr::write_unaligned(ws.add(3), 400);  // ws_ypixel
-                }
+                let winsize: [u8; 8] = {
+                    let mut buf = [0u8; 8];
+                    buf[0..2].copy_from_slice(&25u16.to_le_bytes());   // ws_row
+                    buf[2..4].copy_from_slice(&80u16.to_le_bytes());   // ws_col
+                    buf[4..6].copy_from_slice(&640u16.to_le_bytes());  // ws_xpixel
+                    buf[6..8].copy_from_slice(&400u16.to_le_bytes());  // ws_ypixel
+                    buf
+                };
+                unsafe { copy_to_user(arg, &winsize); }
                 return 0;
             }
             EINVAL
         }
         TCGETS => {
-            // Return a minimal termios struct for stdin/stdout/stderr
+            // Return a minimal termios struct for stdin/stdout/stderr — KPTI safe
             if fd <= 2 && arg != 0 && validate_user_ptr(arg, 60) {
-                unsafe {
-                    let dst = arg as *mut u8;
-                    // Zero the struct first (struct termios is ~60 bytes)
-                    for i in 0..60 { core::ptr::write_unaligned(dst.add(i), 0); }
-                    // c_iflag = ICRNL | IMAXBEL (offset 0)
-                    core::ptr::write_unaligned(arg as *mut u32, 0x2102);
-                    // c_oflag = OPOST | ONLCR (offset 4)
-                    core::ptr::write_unaligned((arg + 4) as *mut u32, 0x05);
-                    // c_cflag = CS8 | CREAD | B9600 (offset 8)
-                    core::ptr::write_unaligned((arg + 8) as *mut u32, 0x00BF);
-                    // c_lflag = ECHO | ECHOE | ECHOK | ECHOCTL | ECHOKE | ICANON | ISIG (offset 12)
-                    core::ptr::write_unaligned((arg + 12) as *mut u32, 0x8A3B);
-                }
+                let mut termios_buf = [0u8; 60];
+                // c_iflag = ICRNL | IMAXBEL (offset 0)
+                termios_buf[0..4].copy_from_slice(&0x2102u32.to_le_bytes());
+                // c_oflag = OPOST | ONLCR (offset 4)
+                termios_buf[4..8].copy_from_slice(&0x05u32.to_le_bytes());
+                // c_cflag = CS8 | CREAD | B9600 (offset 8)
+                termios_buf[8..12].copy_from_slice(&0x00BFu32.to_le_bytes());
+                // c_lflag = ECHO | ECHOE | ECHOK | ECHOCTL | ECHOKE | ICANON | ISIG (offset 12)
+                termios_buf[12..16].copy_from_slice(&0x8A3Bu32.to_le_bytes());
+                unsafe { copy_to_user(arg, &termios_buf); }
                 return 0;
             }
             ENOTTY
@@ -1427,7 +1620,8 @@ fn sys_ioctl(fd: u32, cmd: u64, arg: u64) -> u64 {
             // Return process group ID
             if arg != 0 && validate_user_ptr(arg, 4) {
                 let pid = crate::scheduler::current_pid();
-                unsafe { core::ptr::write_unaligned(arg as *mut u32, pid as u32); }
+                let pid_bytes = (pid as u32).to_le_bytes();
+                unsafe { copy_to_user(arg, &pid_bytes); }
                 return 0;
             }
             EINVAL
@@ -1436,7 +1630,8 @@ fn sys_ioctl(fd: u32, cmd: u64, arg: u64) -> u64 {
         FIONREAD => {
             // Bytes available to read
             if arg != 0 && validate_user_ptr(arg, 4) {
-                unsafe { core::ptr::write_unaligned(arg as *mut u32, 0); }
+                let zero_bytes = 0u32.to_le_bytes();
+                unsafe { copy_to_user(arg, &zero_bytes); }
                 return 0;
             }
             EINVAL
@@ -1456,10 +1651,11 @@ fn sys_stub_readv(fd: u32, iov_addr: u64, iovcnt: u64) -> u64 {
     if !validate_user_ptr(iov_addr, iovcnt * 16) { return EFAULT; }
     let mut total: u64 = 0;
     for i in 0..core::cmp::min(iovcnt, 16) as usize {
-        let base_ptr = (iov_addr + (i * 16) as u64) as *const u64;
-        let len_ptr = (iov_addr + (i * 16 + 8) as u64) as *const u64;
-        let base = unsafe { core::ptr::read_unaligned(base_ptr) };
-        let len = unsafe { core::ptr::read_unaligned(len_ptr) };
+        let iov_entry_addr = iov_addr + (i * 16) as u64;
+        let mut iov_buf = [0u8; 16];
+        unsafe { copy_from_user(&mut iov_buf, iov_entry_addr, 16); }
+        let base = u64::from_le_bytes([iov_buf[0], iov_buf[1], iov_buf[2], iov_buf[3], iov_buf[4], iov_buf[5], iov_buf[6], iov_buf[7]]);
+        let len = u64::from_le_bytes([iov_buf[8], iov_buf[9], iov_buf[10], iov_buf[11], iov_buf[12], iov_buf[13], iov_buf[14], iov_buf[15]]);
         if len > 0 && validate_user_ptr(base, len) {
             let n = sys_read(fd, base, len);
             if (n as i64) < 0 { return n; }
@@ -1478,9 +1674,11 @@ fn sys_nanosleep(req: u64, _rem: u64) -> u64 {
         sys_yield();
         return 0;
     }
-    let (secs, nsecs) = unsafe {
-        let s = core::ptr::read_unaligned(req as *const u64);
-        let ns = core::ptr::read_unaligned((req + 8) as *const u64);
+    let (secs, nsecs) = {
+        let mut buf = [0u8; 16];
+        unsafe { copy_from_user(&mut buf, req, 16); }
+        let s = u64::from_le_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]);
+        let ns = u64::from_le_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]);
         (s, ns)
     };
 
@@ -1562,8 +1760,10 @@ fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u64 {
         EPOLL_CTL_ADD => {
             // Read epoll_event from user space: { u32 events, u64 data } (12 bytes packed)
             if event_ptr == 0 || !validate_user_ptr(event_ptr, 12) { return EFAULT; }
-            let events = unsafe { core::ptr::read_unaligned(event_ptr as *const u32) };
-            let data = unsafe { core::ptr::read_unaligned((event_ptr + 4) as *const u64) };
+            let mut ev_buf = [0u8; 12];
+            unsafe { copy_from_user(&mut ev_buf, event_ptr, 12); }
+            let events = u32::from_le_bytes([ev_buf[0], ev_buf[1], ev_buf[2], ev_buf[3]]);
+            let data = u64::from_le_bytes([ev_buf[4], ev_buf[5], ev_buf[6], ev_buf[7], ev_buf[8], ev_buf[9], ev_buf[10], ev_buf[11]]);
 
             // Verify target fd exists
             let fd_exists = crate::process::with_fd_table(pid, |fdt| {
@@ -1595,8 +1795,10 @@ fn sys_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u64 {
         }
         EPOLL_CTL_MOD => {
             if event_ptr == 0 || !validate_user_ptr(event_ptr, 12) { return EFAULT; }
-            let events = unsafe { core::ptr::read_unaligned(event_ptr as *const u32) };
-            let data = unsafe { core::ptr::read_unaligned((event_ptr + 4) as *const u64) };
+            let mut ev_buf = [0u8; 12];
+            unsafe { copy_from_user(&mut ev_buf, event_ptr, 12); }
+            let events = u32::from_le_bytes([ev_buf[0], ev_buf[1], ev_buf[2], ev_buf[3]]);
+            let data = u64::from_le_bytes([ev_buf[4], ev_buf[5], ev_buf[6], ev_buf[7], ev_buf[8], ev_buf[9], ev_buf[10], ev_buf[11]]);
 
             crate::process::with_process_mut(pid, |p| {
                 if let Some(ei) = p.epoll_interests.iter_mut()
@@ -1731,12 +1933,12 @@ fn sys_epoll_wait_real(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64)
             }
 
             if revents != 0 {
-                // Write epoll_event to user space: { u32 events, u64 data }
+                // Write epoll_event to user space: { u32 events, u64 data } via HHDM
                 let ev_offset = events_ptr + ready_count * 12;
-                unsafe {
-                    core::ptr::write_unaligned(ev_offset as *mut u32, revents);
-                    core::ptr::write_unaligned((ev_offset + 4) as *mut u64, data);
-                }
+                let mut ev_buf = [0u8; 12];
+                ev_buf[0..4].copy_from_slice(&revents.to_le_bytes());
+                ev_buf[4..12].copy_from_slice(&data.to_le_bytes());
+                unsafe { copy_to_user(ev_offset, &ev_buf); }
                 ready_count += 1;
             }
         }
@@ -1828,24 +2030,23 @@ fn sys_timerfd_settime(fd: u64, _flags: u64, new_value_ptr: u64, old_value_ptr: 
 
     // Read new timer value from user space
     let (interval_ns, value_ns) = if new_value_ptr != 0 && validate_user_ptr(new_value_ptr, 32) {
-        unsafe {
-            // it_interval: { tv_sec (8 bytes), tv_nsec (8 bytes) }
-            let interval_sec = core::ptr::read_unaligned(new_value_ptr as *const i64);
-            let interval_nsec = core::ptr::read_unaligned((new_value_ptr + 8) as *const i64);
-            // it_value: { tv_sec (8 bytes), tv_nsec (8 bytes) }
-            let value_sec = core::ptr::read_unaligned((new_value_ptr + 16) as *const i64);
-            let value_nsec = core::ptr::read_unaligned((new_value_ptr + 24) as *const i64);
-            let i_ns = (interval_sec as u64).wrapping_mul(1_000_000_000).wrapping_add(interval_nsec as u64);
-            let v_ns = (value_sec as u64).wrapping_mul(1_000_000_000).wrapping_add(value_nsec as u64);
-            (i_ns, v_ns)
-        }
+        let mut tbuf = [0u8; 32];
+        unsafe { copy_from_user(&mut tbuf, new_value_ptr, 32); }
+        let interval_sec = i64::from_le_bytes([tbuf[0],tbuf[1],tbuf[2],tbuf[3],tbuf[4],tbuf[5],tbuf[6],tbuf[7]]);
+        let interval_nsec = i64::from_le_bytes([tbuf[8],tbuf[9],tbuf[10],tbuf[11],tbuf[12],tbuf[13],tbuf[14],tbuf[15]]);
+        let value_sec = i64::from_le_bytes([tbuf[16],tbuf[17],tbuf[18],tbuf[19],tbuf[20],tbuf[21],tbuf[22],tbuf[23]]);
+        let value_nsec = i64::from_le_bytes([tbuf[24],tbuf[25],tbuf[26],tbuf[27],tbuf[28],tbuf[29],tbuf[30],tbuf[31]]);
+        let i_ns = (interval_sec as u64).wrapping_mul(1_000_000_000).wrapping_add(interval_nsec as u64);
+        let v_ns = (value_sec as u64).wrapping_mul(1_000_000_000).wrapping_add(value_nsec as u64);
+        (i_ns, v_ns)
     } else {
         (0u64, 0u64)
     };
 
     // Write old value if requested (zero it out for simplicity)
     if old_value_ptr != 0 && validate_user_ptr(old_value_ptr, 32) {
-        unsafe { core::ptr::write_bytes(old_value_ptr as *mut u8, 0, 32); }
+        let zero_buf = [0u8; 32];
+        unsafe { copy_to_user(old_value_ptr, &zero_buf); }
     }
 
     // Update timer state
@@ -1901,17 +2102,17 @@ fn sys_timerfd_gettime(fd: u64, cur_value_ptr: u64) -> u64 {
         }
     }).unwrap_or((0, 0));
 
-    unsafe {
-        // it_interval
+    {
         let interval_sec = interval_ns / 1_000_000_000;
         let interval_nsec = interval_ns % 1_000_000_000;
-        core::ptr::write_unaligned(cur_value_ptr as *mut i64, interval_sec as i64);
-        core::ptr::write_unaligned((cur_value_ptr + 8) as *mut i64, interval_nsec as i64);
-        // it_value  
         let value_sec = remaining_ns / 1_000_000_000;
         let value_nsec = remaining_ns % 1_000_000_000;
-        core::ptr::write_unaligned((cur_value_ptr + 16) as *mut i64, value_sec as i64);
-        core::ptr::write_unaligned((cur_value_ptr + 24) as *mut i64, value_nsec as i64);
+        let mut buf = [0u8; 32];
+        buf[0..8].copy_from_slice(&(interval_sec as i64).to_le_bytes());
+        buf[8..16].copy_from_slice(&(interval_nsec as i64).to_le_bytes());
+        buf[16..24].copy_from_slice(&(value_sec as i64).to_le_bytes());
+        buf[24..32].copy_from_slice(&(value_nsec as i64).to_le_bytes());
+        unsafe { copy_to_user(cur_value_ptr, &buf); }
     }
 
     0
@@ -2008,9 +2209,11 @@ fn sys_socketpair(_domain: u64, _type_: u64, _protocol: u64, sv_ptr: u64) -> u64
 
     if fd0 == 0 || fd1 == 0 { return EMFILE; }
 
-    unsafe {
-        core::ptr::write_unaligned(sv_ptr as *mut i32, fd0 as i32);
-        core::ptr::write_unaligned((sv_ptr + 4) as *mut i32, fd1 as i32);
+    {
+        let mut buf = [0u8; 8];
+        buf[0..4].copy_from_slice(&(fd0 as i32).to_le_bytes());
+        buf[4..8].copy_from_slice(&(fd1 as i32).to_le_bytes());
+        unsafe { copy_to_user(sv_ptr, &buf); }
     }
     crate::serial_println!("[SOCKETPAIR] fd0={}, fd1={} (PID {})", fd0, fd1, pid);
     0
@@ -2021,11 +2224,15 @@ fn sc_socketpair(a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> u64 { sys_sock
 /// getsockname(fd, addr, addrlen) -> 0 (stub: returns zeroed sockaddr)
 fn sys_getsockname(_fd: u64, addr: u64, addrlen: u64) -> u64 {
     if addr != 0 && addrlen != 0 && validate_user_ptr(addrlen, 4) {
-        let len = unsafe { core::ptr::read_unaligned(addrlen as *const u32) };
+        let mut len_buf = [0u8; 4];
+        unsafe { copy_from_user(&mut len_buf, addrlen, 4); }
+        let len = u32::from_le_bytes(len_buf);
         if len > 0 && validate_user_ptr(addr, core::cmp::min(len as u64, 128)) {
-            unsafe { core::ptr::write_bytes(addr as *mut u8, 0, core::cmp::min(len as usize, 128)); }
-            // Write AF_INET (2) as the first 2 bytes
-            unsafe { core::ptr::write_unaligned(addr as *mut u16, 2); }
+            let size = core::cmp::min(len as usize, 128);
+            let mut buf = [0u8; 128];
+            // AF_INET (2) as the first 2 bytes
+            buf[0..2].copy_from_slice(&2u16.to_le_bytes());
+            unsafe { copy_to_user(addr, &buf[..size]); }
         }
     }
     0
@@ -2037,9 +2244,12 @@ fn sc_getpeername(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_ge
 /// getsockopt(fd, level, optname, optval, optlen) -> 0 (stub)
 fn sys_getsockopt(_fd: u64, _level: u64, _optname: u64, optval: u64, optlen: u64) -> u64 {
     if optval != 0 && optlen != 0 && validate_user_ptr(optlen, 4) {
-        let len = unsafe { core::ptr::read_unaligned(optlen as *const u32) };
+        let mut len_buf = [0u8; 4];
+        unsafe { copy_from_user(&mut len_buf, optlen, 4); }
+        let len = u32::from_le_bytes(len_buf);
         if len >= 4 && validate_user_ptr(optval, 4) {
-            unsafe { core::ptr::write_unaligned(optval as *mut u32, 0); }
+            let zero_val = 0u32.to_le_bytes();
+            unsafe { copy_to_user(optval, &zero_val); }
         }
     }
     0
@@ -2050,28 +2260,23 @@ fn sc_getsockopt(a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 { sys_getso
 
 /// uname(buf) -> fills with AetherionOS info
 fn sys_stub_uname(buf_addr: u64) -> u64 {
-    // struct utsname: 5 fields of 65 bytes each = 325 bytes
-    if !validate_user_ptr(buf_addr, 325) { return EFAULT; }
-    unsafe {
-        let dst = buf_addr as *mut u8;
-        // Zero first
-        for i in 0..325 { core::ptr::write_unaligned(dst.add(i), 0); }
-        // sysname
-        let sysname = b"AetherionOS";
-        for (i, &b) in sysname.iter().enumerate() { core::ptr::write_unaligned(dst.add(i), b); }
-        // nodename (offset 65)
-        let node = b"aetherion";
-        for (i, &b) in node.iter().enumerate() { core::ptr::write_unaligned(dst.add(65 + i), b); }
-        // release (offset 130)
-        let rel = b"2.3.0-j79";
-        for (i, &b) in rel.iter().enumerate() { core::ptr::write_unaligned(dst.add(130 + i), b); }
-        // version (offset 195)
-        let ver = b"#1 SMP";
-        for (i, &b) in ver.iter().enumerate() { core::ptr::write_unaligned(dst.add(195 + i), b); }
-        // machine (offset 260)
-        let mach = b"x86_64";
-        for (i, &b) in mach.iter().enumerate() { core::ptr::write_unaligned(dst.add(260 + i), b); }
-    }
+    // struct utsname: 5 fields of 65 bytes each = 325 bytes (6 on Linux = 390)
+    // Use 390 bytes (6 fields) for full Linux compat (domainname at offset 325)
+    if !validate_user_ptr(buf_addr, 390) { return EFAULT; }
+    let mut buf = [0u8; 390];
+    // sysname (offset 0)
+    buf[..11].copy_from_slice(b"AetherionOS");
+    // nodename (offset 65)
+    buf[65..74].copy_from_slice(b"aetherion");
+    // release (offset 130)
+    buf[130..139].copy_from_slice(b"4.3.0-os2");
+    // version (offset 195)
+    buf[195..201].copy_from_slice(b"#1 SMP");
+    // machine (offset 260)
+    buf[260..266].copy_from_slice(b"x86_64");
+    // domainname (offset 325)
+    buf[325..331].copy_from_slice(b"(none)");
+    unsafe { copy_to_user(buf_addr, &buf); }
     0
 }
 
@@ -2134,11 +2339,8 @@ fn sys_stub_fcntl(_fd: u32, cmd: u64, _arg: u64) -> u64 {
 /// getcwd(buf, size) -> writes "/" and returns buf
 fn sys_stub_getcwd(buf_addr: u64, size: u64) -> u64 {
     if size < 2 || !validate_user_ptr(buf_addr, size) { return EFAULT; }
-    unsafe {
-        let dst = buf_addr as *mut u8;
-        core::ptr::write_unaligned(dst, b'/');
-        core::ptr::write_unaligned(dst.add(1), 0);
-    }
+    let data: [u8; 2] = [b'/', 0];
+    unsafe { copy_to_user(buf_addr, &data); }
     buf_addr
 }
 
@@ -2147,23 +2349,23 @@ fn sys_stub_getcwd(buf_addr: u64, size: u64) -> u64 {
 /// getrlimit(resource, rlim) -> 0 with generous limits
 fn sys_stub_getrlimit(_resource: u64, rlim_addr: u64) -> u64 {
     if !validate_user_ptr(rlim_addr, 16) { return EFAULT; }
-    unsafe {
-        // rlim_cur = rlim_max = 8 MiB (stack) or RLIM_INFINITY
-        let infinity: u64 = 0xFFFF_FFFF_FFFF_FFFF;
-        core::ptr::write_unaligned(rlim_addr as *mut u64, infinity);
-        core::ptr::write_unaligned((rlim_addr + 8) as *mut u64, infinity);
-    }
+    // rlim_cur = rlim_max = RLIM_INFINITY
+    let infinity: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+    let mut buf = [0u8; 16];
+    buf[0..8].copy_from_slice(&infinity.to_le_bytes());
+    buf[8..16].copy_from_slice(&infinity.to_le_bytes());
+    unsafe { copy_to_user(rlim_addr, &buf); }
     0
 }
 
-/// getuid -> 1000
-fn sys_stub_getuid() -> u64 { 1000 }
-/// getgid -> 1000
-fn sys_stub_getgid() -> u64 { 1000 }
-/// geteuid -> 1000
-fn sys_stub_geteuid() -> u64 { 1000 }
-/// getegid -> 1000
-fn sys_stub_getegid() -> u64 { 1000 }
+/// getuid -> 0 (root — BusyBox needs root for some applets)
+fn sys_stub_getuid() -> u64 { 0 }
+/// getgid -> 0
+fn sys_stub_getgid() -> u64 { 0 }
+/// geteuid -> 0
+fn sys_stub_geteuid() -> u64 { 0 }
+/// getegid -> 0
+fn sys_stub_getegid() -> u64 { 0 }
 /// getpgrp -> getpid
 fn sys_stub_getppid_compat() -> u64 { crate::scheduler::current_pid() }
 
@@ -2228,7 +2430,7 @@ fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
             if validate_user_ptr(addr, 8) {
                 let pid = crate::scheduler::current_pid();
                 let fs = crate::process::with_process(pid, |p| p.fs_base).unwrap_or(0);
-                unsafe { core::ptr::write_unaligned(addr as *mut u64, fs); }
+                unsafe { copy_to_user(addr, &fs.to_le_bytes()); }
             }
             0
         }
@@ -2236,7 +2438,7 @@ fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
             if validate_user_ptr(addr, 8) {
                 let pid = crate::scheduler::current_pid();
                 let gs = crate::process::with_process(pid, |p| p.gs_base).unwrap_or(0);
-                unsafe { core::ptr::write_unaligned(addr as *mut u64, gs); }
+                unsafe { copy_to_user(addr, &gs.to_le_bytes()); }
             }
             0
         }
@@ -2253,7 +2455,9 @@ fn sys_stub_time(tloc: u64) -> u64 {
     unsafe { asm!("rdtsc", "shl rdx, 32", "or rax, rdx", out("rax") tsc, out("rdx") _); }
     let approx_secs = tsc / 2_000_000_000;
     if tloc != 0 && validate_user_ptr(tloc, 8) {
-        unsafe { core::ptr::write_unaligned(tloc as *mut u64, approx_secs); }
+        // KPTI-safe: use copy_to_user instead of direct write
+        let bytes = approx_secs.to_le_bytes();
+        unsafe { copy_to_user(tloc, &bytes); }
     }
     approx_secs
 }
@@ -2288,9 +2492,12 @@ fn sys_clock_gettime(clk_id: u64, tp_addr: u64) -> u64 {
         _ => 0,              // MONOTONIC, CPUTIME, etc.: boot-relative
     };
 
+    // KPTI-safe: use copy_to_user
+    let sec_bytes = (secs + epoch_offset).to_le_bytes();
+    let nsec_bytes = nsecs.to_le_bytes();
     unsafe {
-        core::ptr::write_unaligned(tp_addr as *mut u64, secs + epoch_offset);
-        core::ptr::write_unaligned((tp_addr + 8) as *mut u64, nsecs);
+        copy_to_user(tp_addr, &sec_bytes);
+        copy_to_user(tp_addr + 8, &nsec_bytes);
     }
     0
 }
@@ -2307,9 +2514,12 @@ fn sys_gettimeofday(tv_addr: u64, _tz_addr: u64) -> u64 {
     let total_us = tsc / (freq / 1_000_000).max(1);
     let secs = total_us / 1_000_000 + 1_735_689_600;
     let usecs = total_us % 1_000_000;
+    // KPTI-safe: use copy_to_user
+    let sec_bytes = secs.to_le_bytes();
+    let usec_bytes = usecs.to_le_bytes();
     unsafe {
-        core::ptr::write_unaligned(tv_addr as *mut u64, secs);
-        core::ptr::write_unaligned((tv_addr + 8) as *mut u64, usecs);
+        copy_to_user(tv_addr, &sec_bytes);
+        copy_to_user(tv_addr + 8, &usec_bytes);
     }
     0
 }
@@ -2366,12 +2576,7 @@ fn sys_readlink(path_addr: u64, buf_addr: u64, bufsiz: u64) -> u64 {
     let target_bytes = target.as_bytes();
     let copy_len = core::cmp::min(target_bytes.len(), bufsiz as usize);
 
-    unsafe {
-        let dst = buf_addr as *mut u8;
-        for i in 0..copy_len {
-            core::ptr::write_volatile(dst.add(i), target_bytes[i]);
-        }
-    }
+    unsafe { copy_to_user(buf_addr, &target_bytes[..copy_len]); }
 
     copy_len as u64
 }
@@ -2412,30 +2617,25 @@ fn sys_getrandom(buf_addr: u64, buflen: u64, _flags: u64) -> u64 {
     if s0 == 0 { s0 = 0xDEAD_BEEF_CAFE_BABE; }
     if s1 == 0 { s1 = 0x0123_4567_89AB_CDEF; }
 
-    unsafe {
-        let dst = buf_addr as *mut u8;
-        let mut i = 0usize;
-        while i < buflen as usize {
-            // Xorshift128+ iteration
-            let mut t = s0;
-            let s = s1;
-            s0 = s;
-            t ^= t << 23;
-            t ^= t >> 18;
-            t ^= s ^ (s >> 5);
-            s1 = t;
-            let val = t.wrapping_add(s);
-
-            // Write up to 8 bytes per iteration
-            let remaining = buflen as usize - i;
-            let bytes = val.to_le_bytes();
-            let to_write = core::cmp::min(remaining, 8);
-            for j in 0..to_write {
-                core::ptr::write_unaligned(dst.add(i + j), bytes[j]);
-            }
-            i += to_write;
-        }
+    // Generate random bytes into a kernel buffer, then copy to user
+    let total = buflen as usize;
+    let mut rand_buf = alloc::vec![0u8; total];
+    let mut i = 0usize;
+    while i < total {
+        let mut t = s0;
+        let s = s1;
+        s0 = s;
+        t ^= t << 23;
+        t ^= t >> 18;
+        t ^= s ^ (s >> 5);
+        s1 = t;
+        let val = t.wrapping_add(s);
+        let bytes = val.to_le_bytes();
+        let to_write = core::cmp::min(total - i, 8);
+        rand_buf[i..i + to_write].copy_from_slice(&bytes[..to_write]);
+        i += to_write;
     }
+    unsafe { copy_to_user(buf_addr, &rand_buf); }
     buflen
 }
 
@@ -2504,16 +2704,17 @@ fn sys_write(fd: u64, buf_addr: u64, len: u64) -> u64 {
                 }
             }
 
-            // stdout/stderr -> serial output (atomic: no preemption during write)
+            // stdout/stderr -> serial output (KPTI-safe: use copy_from_user)
             let n = len as usize;
             if n > 0 && n <= 8192 && validate_user_ptr(buf_addr, len) {
+                // Copy user buffer to kernel stack via HHDM page-table walk
+                let safe_n = core::cmp::min(n, 8192);
+                let mut kbuf = [0u8; 8192];
+                let copied = unsafe { copy_from_user(&mut kbuf[..safe_n], buf_addr, safe_n) };
                 unsafe {
                     asm!("cli", options(nomem, nostack));
-                    let buf = buf_addr as *const u8;
-                    for i in 0..n {
-                        let byte = core::ptr::read_unaligned(buf.add(i));
-                        // Skip null bytes: MCP ELF .rodata pages read as 0x00
-                        // from kernel CR3 (page table isolation)
+                    for i in 0..copied {
+                        let byte = kbuf[i];
                         if byte == 0 { continue; }
                         loop {
                             let lsr: u8;
@@ -2526,6 +2727,20 @@ fn sys_write(fd: u64, buf_addr: u64, len: u64) -> u64 {
                     }
                     asm!("sti", options(nomem, nostack));
                 }
+                // Detect ESC[6n (cursor position query) and inject response
+                // ESC[6n = bytes [0x1B, 0x5B, 0x36, 0x6E]
+                if copied >= 4 {
+                    for w in kbuf[..copied].windows(4) {
+                        if w == [0x1B, 0x5B, 0x36, 0x6E] {
+                            // Inject ESC[1;1R into keyboard buffer as response
+                            let response = [0x1B, b'[', b'1', b';', b'1', b'R'];
+                            for &byte in &response {
+                                crate::process::kbd_push_byte(byte);
+                            }
+                            break;
+                        }
+                    }
+                }
                 // Jalon 118: Pipe Cognitif — capture child process stdout/stderr
                 // If this process is a child (PID > 10), publish output to Cognitive Bus
                 if current_pid > 10 && (fd == 1 || fd == 2) {
@@ -2535,12 +2750,12 @@ fn sys_write(fd: u64, buf_addr: u64, len: u64) -> u64 {
                 }
             } else if n > 0 && validate_user_ptr(buf_addr, 1) {
                 let safe_len = core::cmp::min(n, 4096);
-                let ptr = buf_addr as *const u8;
+                let mut kbuf = [0u8; 4096];
+                let copied = unsafe { copy_from_user(&mut kbuf[..safe_len], buf_addr, safe_len) };
                 unsafe {
                     asm!("cli", options(nomem, nostack));
-                    for i in 0..safe_len {
-                        if !validate_user_ptr(buf_addr + i as u64, 1) { break; }
-                        let byte = core::ptr::read_unaligned(ptr.add(i));
+                    for i in 0..copied {
+                        let byte = kbuf[i];
                         if byte == 0 { break; }
                         loop {
                             let lsr: u8;
@@ -2578,13 +2793,10 @@ fn sys_write(fd: u64, buf_addr: u64, len: u64) -> u64 {
                 return EBADF;
             }
 
-            // Copy user data to kernel buffer
+            // Copy user data to kernel buffer (KPTI-safe)
             let user_data = unsafe {
-                let buf = buf_addr as *const u8;
-                let mut data = alloc::vec::Vec::with_capacity(len as usize);
-                for i in 0..len as usize {
-                    data.push(core::ptr::read_unaligned(buf.add(i)));
-                }
+                let mut data = alloc::vec![0u8; len as usize];
+                copy_from_user(&mut data, buf_addr, len as usize);
                 data
             };
 
@@ -2695,42 +2907,59 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
             // Each iteration takes ~1-2 us with PAUSE, total timeout ~1ms.
             let n = crate::process::kbd_read(&mut temp_buf, max_read);
             if n > 0 {
-                unsafe {
-                    let dst = buf_addr as *mut u8;
-                    for i in 0..n {
-                        core::ptr::write_unaligned(dst.add(i), temp_buf[i]);
-                    }
-                }
+                unsafe { copy_to_user(buf_addr, &temp_buf[..n]); }
                 return n as u64;
             }
 
-            // No data available — enable interrupts and poll with backoff
+            // No data available — block with IRQ-enabled polling.
+            // Check BOTH PS/2 keyboard buffer AND serial COM1 port (0x3F8)
+            // because QEMU -serial mon:stdio sends input through COM1.
             let mut attempts: u32 = 0;
             loop {
-                // Enable interrupts so IRQ1 can deliver keystrokes
+                // Enable interrupts so IRQ1 (keyboard) can fire
                 unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
-                // PAUSE gives the CPU a hint to save power + lets pending IRQs fire
                 unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
-                // Small busy-wait to give IRQ time to complete
-                for _ in 0..50u32 {
+                for _ in 0..20u32 {
                     unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
                 }
-                // Disable interrupts before accessing shared kernel state
                 unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
 
+                // Check PS/2 keyboard buffer first
                 let n = crate::process::kbd_read(&mut temp_buf, max_read);
                 if n > 0 {
-                    unsafe {
-                        let dst = buf_addr as *mut u8;
-                        for i in 0..n {
-                            core::ptr::write_unaligned(dst.add(i), temp_buf[i]);
-                        }
-                    }
+                    unsafe { copy_to_user(buf_addr, &temp_buf[..n]); }
                     return n as u64;
                 }
+
+                // Check serial COM1 (port 0x3F8) for QEMU piped input
+                let lsr: u8;
+                unsafe { core::arch::asm!("in al, dx", out("al") lsr, in("dx") 0x3FDu16, options(nomem, nostack)); }
+                if lsr & 1 != 0 {
+                    // Data ready on serial — read it
+                    let mut serial_n = 0usize;
+                    while serial_n < max_read {
+                        let lsr2: u8;
+                        unsafe { core::arch::asm!("in al, dx", out("al") lsr2, in("dx") 0x3FDu16, options(nomem, nostack)); }
+                        if lsr2 & 1 == 0 { break; } // no more data
+                        let byte: u8;
+                        unsafe { core::arch::asm!("in al, dx", out("al") byte, in("dx") 0x3F8u16, options(nomem, nostack)); }
+                        if byte == b'\r' {
+                            temp_buf[serial_n] = b'\n'; // Convert CR to LF
+                        } else {
+                            temp_buf[serial_n] = byte;
+                        }
+                        serial_n += 1;
+                    }
+                    if serial_n > 0 {
+                        unsafe { copy_to_user(buf_addr, &temp_buf[..serial_n]); }
+                        return serial_n as u64;
+                    }
+                }
+
                 attempts += 1;
-                if attempts >= 500 {
-                    return 0; // No data after ~1ms — return 0 (non-blocking)
+                if attempts >= 5_000_000 {
+                    // After ~10 seconds of waiting — return 0 (EOF)
+                    return 0;
                 }
             }
         }
@@ -2750,12 +2979,7 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
                 if start >= bytes.len() { return 0; }
                 let avail = bytes.len() - start;
                 let to_copy = core::cmp::min(avail, len as usize);
-                unsafe {
-                    let dst = buf_addr as *mut u8;
-                    for i in 0..to_copy {
-                        core::ptr::write_unaligned(dst.add(i), bytes[start + i]);
-                    }
-                }
+                unsafe { copy_to_user(buf_addr, &bytes[start..start + to_copy]); }
                 crate::process::with_fd_table_mut(current_pid, |fd_table| {
                     if let Some(entry) = fd_table.get_mut(fd as usize) { entry.offset += to_copy as u64; }
                 });
@@ -2768,12 +2992,7 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
                 if start >= bytes.len() { return 0; }
                 let avail = bytes.len() - start;
                 let to_copy = core::cmp::min(avail, len as usize);
-                unsafe {
-                    let dst = buf_addr as *mut u8;
-                    for i in 0..to_copy {
-                        core::ptr::write_unaligned(dst.add(i), bytes[start + i]);
-                    }
-                }
+                unsafe { copy_to_user(buf_addr, &bytes[start..start + to_copy]); }
                 crate::process::with_fd_table_mut(current_pid, |fd_table| {
                     if let Some(entry) = fd_table.get_mut(fd as usize) { entry.offset += to_copy as u64; }
                 });
@@ -2786,12 +3005,7 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
                 if start >= bytes.len() { return 0; }
                 let avail = bytes.len() - start;
                 let to_copy = core::cmp::min(avail, len as usize);
-                unsafe {
-                    let dst = buf_addr as *mut u8;
-                    for i in 0..to_copy {
-                        core::ptr::write_unaligned(dst.add(i), bytes[start + i]);
-                    }
-                }
+                unsafe { copy_to_user(buf_addr, &bytes[start..start + to_copy]); }
                 crate::process::with_fd_table_mut(current_pid, |fd_table| {
                     if let Some(entry) = fd_table.get_mut(fd as usize) { entry.offset += to_copy as u64; }
                 });
@@ -2804,12 +3018,7 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
                 if start >= bytes.len() { return 0; }
                 let avail = bytes.len() - start;
                 let to_copy = core::cmp::min(avail, len as usize);
-                unsafe {
-                    let dst = buf_addr as *mut u8;
-                    for i in 0..to_copy {
-                        core::ptr::write_unaligned(dst.add(i), bytes[start + i]);
-                    }
-                }
+                unsafe { copy_to_user(buf_addr, &bytes[start..start + to_copy]); }
                 crate::process::with_fd_table_mut(current_pid, |fd_table| {
                     if let Some(entry) = fd_table.get_mut(fd as usize) { entry.offset += to_copy as u64; }
                 });
@@ -2821,29 +3030,26 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
                 return 0; // EOF — /dev/null reads return 0 bytes
             }
             if path == "/dev/zero" {
-                // Fill buffer with zeros
+                // Fill buffer with zeros — KPTI safe
                 let to_fill = core::cmp::min(len as usize, 4096);
-                unsafe {
-                    let dst = buf_addr as *mut u8;
-                    for i in 0..to_fill {
-                        core::ptr::write_unaligned(dst.add(i), 0u8);
-                    }
-                }
+                let zeros = alloc::vec![0u8; to_fill];
+                unsafe { copy_to_user(buf_addr, &zeros); }
                 return to_fill as u64;
             }
             if path == "/dev/urandom" || path == "/dev/random" {
-                // Generate pseudo-random bytes using RDTSC + LCG
+                // Generate pseudo-random bytes using RDTSC + LCG — KPTI safe
                 let to_fill = core::cmp::min(len as usize, 4096);
+                let mut buf = alloc::vec![0u8; to_fill];
                 unsafe {
                     let tsc: u64;
                     core::arch::asm!("rdtsc", "shl rdx, 32", "or rax, rdx",
                                      out("rax") tsc, out("rdx") _, options(nomem, nostack));
-                    let dst = buf_addr as *mut u8;
                     let mut seed = tsc ^ (current_pid as u64 * 0x9E3779B97F4A7C15);
                     for i in 0..to_fill {
                         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-                        core::ptr::write_unaligned(dst.add(i), (seed >> 33) as u8);
+                        buf[i] = (seed >> 33) as u8;
                     }
+                    copy_to_user(buf_addr, &buf);
                 }
                 return to_fill as u64;
             }
@@ -2856,12 +3062,7 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
                     Some(chunk) => {
                         let to_copy = chunk.len();
                         if to_copy == 0 { return 0; } // EOF
-                        unsafe {
-                            let dst = buf_addr as *mut u8;
-                            for i in 0..to_copy {
-                                core::ptr::write_unaligned(dst.add(i), chunk[i]);
-                            }
-                        }
+                        unsafe { copy_to_user(buf_addr, &chunk[..to_copy]); }
                         crate::process::with_fd_table_mut(current_pid, |fd_table| {
                             if let Some(entry) = fd_table.get_mut(fd as usize) {
                                 entry.offset += to_copy as u64;
@@ -2885,12 +3086,7 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
             if start >= data.len() { return 0; } // EOF
             let avail = data.len() - start;
             let to_copy = core::cmp::min(avail, len as usize);
-            unsafe {
-                let dst = buf_addr as *mut u8;
-                for i in 0..to_copy {
-                    core::ptr::write_unaligned(dst.add(i), data[start + i]);
-                }
-            }
+            unsafe { copy_to_user(buf_addr, &data[start..start + to_copy]); }
             crate::process::with_fd_table_mut(current_pid, |fd_table| {
                 if let Some(entry) = fd_table.get_mut(fd as usize) {
                     entry.offset += to_copy as u64;
@@ -3250,12 +3446,15 @@ fn sys_yield() -> u64 {
     let current = crate::scheduler::current_pid();
     if current == 0 { return 0; }
 
-    // Debug: log entry with real PID
-    let ysc_entry = YIELD_COUNT.load(AtomicOrdering::Relaxed);
-    if ysc_entry < 3 {
-        crate::serial_write("[YIELD-ENTRY] cur=");
-        print_u64_raw(current);
-        crate::serial_write("\n");
+    // Debug: log entry with real PID (throttled — first 3 only)
+    {
+        static YIELD_LOG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let n = YIELD_LOG.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n < 3 {
+            crate::serial_write("[YIELD-ENTRY] cur=");
+            print_u64_raw(current);
+            crate::serial_write("\n");
+        }
     }
 
     // Save current process's user-mode state
@@ -3286,8 +3485,8 @@ fn sys_yield() -> u64 {
     // If scheduler picked the same process (or none), just return normally
     // (sysretq in syscall_entry will restore our registers)
     if next == 0 || next == current {
-        // Debug: log yield-to-self
-        let ysc = YIELD_COUNT.load(AtomicOrdering::Relaxed);
+        // Debug: log yield-to-self (throttled)
+        let ysc = YIELD_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
         if ysc < 5 {
             crate::serial_write("[YIELD-SELF] pid=");
             print_u64_raw(current);
@@ -4438,7 +4637,30 @@ fn sys_exit(code: u64) -> u64 {
     // Try to launch the next queued userspace process
     launch_next_userspace_process(current);
 
-    // If we reach here, no more processes to run
+    // No more user processes to run — resume the kernel shell.
+    // Switch back to kernel CR3 and PID 0, then start a fresh shell loop
+    // on the current (syscall) stack. The original kmain shell is dead
+    // (its stack was abandoned by exec_switch_cr3_and_ring3).
+    crate::scheduler::set_current_pid(0);
+
+    // Restore kernel CR3 (from PER_CPU)
+    unsafe {
+        let kernel_cr3 = PER_CPU.kernel_cr3;
+        if kernel_cr3 != 0 {
+            core::arch::asm!("mov cr3, {}", in(reg) kernel_cr3, options(nostack));
+        }
+        // Re-enable interrupts (disabled by SYSCALL SFMASK)
+        asm!("sti", options(nomem, nostack));
+    }
+
+    crate::serial_println!("[SYSCALL] Resuming kernel shell (PID 0)");
+
+    // Resume the shell — this never returns
+    #[cfg(feature = "limine")]
+    crate::boot::limine_entry::resume_kernel_shell();
+
+    // Fallback: hlt loop if not limine
+    #[allow(unreachable_code)]
     loop { unsafe { asm!("hlt", options(nomem, nostack)); } }
 }
 
@@ -4920,12 +5142,11 @@ fn sys_pipe(pipefd_ptr: u64) -> u64 {
     
     match (read_fd, write_fd) {
         (Some(rfd), Some(wfd)) => {
-            // Write [read_fd, write_fd] to user memory as two i32 values
-            let user_ptr = pipefd_ptr as *mut i32;
-            unsafe {
-                core::ptr::write_unaligned(user_ptr, rfd as i32);
-                core::ptr::write_unaligned(user_ptr.add(1), wfd as i32);
-            }
+            // Write [read_fd, write_fd] to user memory via HHDM copy_to_user
+            let mut buf = [0u8; 8];
+            buf[0..4].copy_from_slice(&(rfd as i32).to_le_bytes());
+            buf[4..8].copy_from_slice(&(wfd as i32).to_le_bytes());
+            unsafe { copy_to_user(pipefd_ptr, &buf); }
             crate::serial_println!("[SYSCALL] pipe: created pipe_id={}, read_fd={}, write_fd={}", pipe_id, rfd, wfd);
             0
         }
@@ -4966,139 +5187,135 @@ fn sys_dup2(oldfd: u32, newfd: u32) -> u64 {
 /// Writes entries as newline-separated filenames into buf.
 /// Returns total bytes written on success.
 fn sys_getdents(fd: u32, buf_ptr: u64, buf_size: u64) -> u64 {
-    // Silenced: getdents is called frequently by ls/shell (reduce serial spam)
-    
+    // Linux getdents64: fills buf with linux_dirent64 structs
+    // struct linux_dirent64 {
+    //   u64 d_ino;        // inode number
+    //   u64 d_off;        // offset to next entry
+    //   u16 d_reclen;     // total size of this entry
+    //   u8  d_type;       // file type (DT_REG=8, DT_DIR=4, DT_LNK=10)
+    //   char d_name[];    // null-terminated filename
+    // }
+
     if buf_ptr == 0 || buf_ptr >= USER_ADDR_LIMIT || buf_size == 0 {
         return EINVAL;
     }
-    
-    // Get the path associated with this FD
+    if !validate_user_ptr(buf_ptr, buf_size) { return EFAULT; }
+
     let pid = crate::scheduler::current_pid();
     let path = crate::process::get_fd_path(pid, fd as usize);
-    
+
     let dir_path = match path {
         Some(p) => p,
         None => return EBADF,
     };
-    
-    // Silenced: directory listing path (reduce serial spam)
-    
-    // Handle /disk/ paths via FAT32 real directory listing
+
+    // Check if we've already returned all entries (offset-based EOF)
+    let offset = crate::process::with_fd_table(pid, |fd_table| {
+        fd_table.get(fd as usize).map(|e| e.offset)
+    }).flatten().unwrap_or(0);
+    // If offset != 0, we already returned entries — return 0 (EOF)
+    if offset != 0 { return 0; }
+
+    const DT_REG: u8 = 8;
+    const DT_DIR: u8 = 4;
+    const DT_LNK: u8 = 10;
+
+    // Collect directory entries as (name, type)
+    let mut entries: alloc::vec::Vec<(alloc::string::String, u8)> = alloc::vec::Vec::new();
+
+    // Always add . and ..
+    entries.push((alloc::string::String::from("."), DT_DIR));
+    entries.push((alloc::string::String::from(".."), DT_DIR));
+
+    // Handle /disk/ paths via FAT32
     let is_disk = dir_path.starts_with("/disk/") || dir_path == "/disk";
     if is_disk {
-        let fat_path = if dir_path == "/disk" || dir_path == "/disk/" {
-            ""
-        } else {
-            &dir_path[6..]
-        };
-        
-        let entries = crate::fs::fat32::list_directory_path(fat_path);
-        let mut output = alloc::string::String::new();
-        for (i, entry) in entries.iter().enumerate() {
-            if i > 0 { output.push('\n'); }
-            // Format: "d" or "-" flag, size, name
-            if entry.is_directory {
-                output.push('d');
-            } else {
-                output.push('-');
-            }
-            output.push(' ');
-            // Write size as decimal
-            let sz = entry.file_size;
-            let mut digits = [0u8; 12];
-            let mut n = sz;
-            let mut pos = 11;
-            if n == 0 {
-                digits[pos] = b'0';
-            } else {
-                while n > 0 && pos > 0 {
-                    digits[pos] = b'0' + (n % 10) as u8;
-                    n /= 10;
-                    pos -= 1;
-                }
-                pos += 1;
-            }
-            for b in &digits[pos..12] {
-                output.push(*b as char);
-            }
-            output.push(' ');
-            output.push_str(&entry.name);
+        let fat_path = if dir_path == "/disk" || dir_path == "/disk/" { "" } else { &dir_path[6..] };
+        let fat_entries = crate::fs::fat32::list_directory_path(fat_path);
+        for entry in fat_entries.iter() {
+            let dtype = if entry.is_directory { DT_DIR } else { DT_REG };
+            entries.push((entry.name.clone(), dtype));
         }
-        
-        let bytes = output.as_bytes();
-        let to_copy = core::cmp::min(bytes.len(), buf_size as usize);
-        if to_copy > 0 {
-            unsafe {
-                core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_ptr as *mut u8, to_copy);
-            }
-        }
-        // Silenced: FAT32 getdents result (reduce serial spam)
-        return to_copy as u64;
-    }
-    
-    // VFS paths — generic directory traversal for any VFS-mounted path
-    let entries = {
+    } else {
+        // VFS paths
         let root = crate::fs::vfs::lock_root();
-        let mut result = alloc::vec::Vec::new();
-        
         let components: alloc::vec::Vec<&str> = dir_path.split('/').filter(|s| !s.is_empty()).collect();
-        
+
         if components.is_empty() {
-            // Root directory "/"
-            for key in root.keys() {
-                result.push(alloc::format!("d 0 {}", key));
+            for (key, node) in root.iter() {
+                let dtype = match node {
+                    crate::fs::vfs::VfsNode::Directory(_) => DT_DIR,
+                    crate::fs::vfs::VfsNode::File(_) => DT_REG,
+                    crate::fs::vfs::VfsNode::Symlink(_) => DT_LNK,
+                    crate::fs::vfs::VfsNode::Device { .. } => DT_REG,
+                };
+                entries.push((key.clone(), dtype));
             }
         } else {
-            // Navigate to the target directory
             let mut current: &alloc::collections::BTreeMap<alloc::string::String, crate::fs::vfs::VfsNode> = &root;
             let mut found = true;
             for comp in &components {
                 match current.get(*comp) {
-                    Some(crate::fs::vfs::VfsNode::Directory(ref children)) => {
-                        current = children;
-                    }
+                    Some(crate::fs::vfs::VfsNode::Directory(ref children)) => { current = children; }
                     _ => { found = false; break; }
                 }
             }
             if found {
                 for (name, node) in current.iter() {
-                    match node {
-                        crate::fs::vfs::VfsNode::Directory(_) => {
-                            result.push(alloc::format!("d 0 {}", name));
-                        }
-                        crate::fs::vfs::VfsNode::File(ref data) => {
-                            result.push(alloc::format!("- {} {}", data.len(), name));
-                        }
-                        crate::fs::vfs::VfsNode::Device { ref manifest, .. } => {
-                            result.push(alloc::format!("- {} {}", manifest.capacity, name));
-                        }
-                        crate::fs::vfs::VfsNode::Symlink(ref target) => {
-                            result.push(alloc::format!("l {} {}", target.len(), name));
-                        }
-                    }
+                    let dtype = match node {
+                        crate::fs::vfs::VfsNode::Directory(_) => DT_DIR,
+                        crate::fs::vfs::VfsNode::File(_) => DT_REG,
+                        crate::fs::vfs::VfsNode::Symlink(_) => DT_LNK,
+                        crate::fs::vfs::VfsNode::Device { .. } => DT_REG,
+                    };
+                    entries.push((name.clone(), dtype));
                 }
             }
         }
-        result
-    };
-    
-    let mut output = alloc::string::String::new();
-    for (i, entry) in entries.iter().enumerate() {
-        if i > 0 { output.push('\n'); }
-        output.push_str(entry);
     }
-    
-    let bytes = output.as_bytes();
-    let to_copy = core::cmp::min(bytes.len(), buf_size as usize);
-    
-    if to_copy > 0 {
-        unsafe {
-            core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_ptr as *mut u8, to_copy);
-        }
+
+    // Serialize into linux_dirent64 format in a kernel buffer
+    let mut kbuf = alloc::vec![0u8; buf_size as usize];
+    let mut pos = 0usize;
+    let mut inode = 1000u64;
+    let bsize = buf_size as usize;
+
+    for (name, dtype) in &entries {
+        let name_bytes = name.as_bytes();
+        // reclen = 19 (fixed header) + name_len + 1 (null) + padding to 8-byte align
+        let reclen_raw = 19 + name_bytes.len() + 1;
+        let reclen = (reclen_raw + 7) & !7; // 8-byte align
+        if pos + reclen > bsize { break; }
+
+        // d_ino (8 bytes)
+        kbuf[pos..pos+8].copy_from_slice(&inode.to_le_bytes());
+        inode += 1;
+        // d_off (8 bytes) - offset to next entry
+        let d_off = (pos + reclen) as u64;
+        kbuf[pos+8..pos+16].copy_from_slice(&d_off.to_le_bytes());
+        // d_reclen (2 bytes)
+        kbuf[pos+16..pos+18].copy_from_slice(&(reclen as u16).to_le_bytes());
+        // d_type (1 byte)
+        kbuf[pos+18] = *dtype;
+        // d_name (null-terminated)
+        kbuf[pos+19..pos+19+name_bytes.len()].copy_from_slice(name_bytes);
+        kbuf[pos+19+name_bytes.len()] = 0;
+
+        pos += reclen;
     }
-    
-    // Silenced: VFS getdents result (reduce serial spam)
-    to_copy as u64
+
+    if pos > 0 {
+        // KPTI-safe write
+        unsafe { copy_to_user(buf_ptr, &kbuf[..pos]); }
+        // Mark offset so next call returns EOF
+        crate::process::with_fd_table_mut(pid, |fd_table| {
+            if let Some(entry) = fd_table.get_mut(fd as usize) {
+                entry.offset = 1; // non-zero = already returned
+            }
+        });
+    }
+
+    pos as u64
 }
 
 fn sys_kill(pid: u64, _signal: u32) -> u64 {
@@ -5549,10 +5766,12 @@ fn sys_mmap_full(addr_hint: u64, len: u64, prot: u64, flags: u64, fd: u64) -> u6
 
     let num_pages = ((len + 4095) / 4096) as usize;
 
-    // Get current process PML4 from CR3
-    let cr3: u64;
-    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)); }
-    let pml4_phys = cr3 & !0xFFF;
+    // Get user process PML4 (NOT from CR3 — KPTI means CR3 = kernel PML4)
+    let pml4_phys = crate::process::get_pml4_phys(current_pid).unwrap_or(0);
+    if pml4_phys == 0 {
+        crate::serial_println!("[MMAP] PID {} has no PML4!", current_pid);
+        return ENOMEM;
+    }
 
     // Determine the base virtual address
     let base_vaddr = if is_fixed && addr_hint != 0 && addr_hint >= 0x1000 {
@@ -5645,15 +5864,26 @@ fn sys_mmap_full(addr_hint: u64, len: u64, prot: u64, flags: u64, fd: u64) -> u6
         }
     }
 
-    // Flush TLB
-    unsafe {
-        core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack));
+    // TLB is flushed when CR3 switches back to user PML4 on sysretq.
+    // No explicit flush needed here since we mapped in the user's PML4.
+
+    if log_count < 20 {
+        crate::serial_println!(
+            "[SYSCALL] mmap: mapped {} pages ({} KB) at 0x{:X} in PML4=0x{:X}",
+            num_pages, num_pages * 4, base_vaddr, pml4_phys
+        );
     }
 
-    crate::serial_println!(
-        "[SYSCALL] mmap: mapped {} pages ({} KB) at 0x{:X}",
-        num_pages, num_pages * 4, base_vaddr
-    );
+    // Record VMA for the process
+    crate::process::add_vma(current_pid, crate::process::VirtualMemoryArea {
+        vaddr_start: base_vaddr,
+        vaddr_end: base_vaddr + (num_pages as u64) * 4096,
+        file_path: if is_anonymous { alloc::string::String::from("[anon]") } else { file_path.unwrap_or_default() },
+        file_offset: file_offset,
+        size: len,
+        writable: (prot & 0x02) != 0,
+    });
+
     base_vaddr
 }
 
@@ -6096,20 +6326,21 @@ fn sys_bus_consume_intent(buf_addr: u64, target_intent: u32) -> u64 {
 
     match crate::ipc::bus::consume_intent(target_intent) {
         Ok(msg) => {
-            unsafe {
-                let ptr = buf_addr as *mut u32;
-                core::ptr::write_unaligned(ptr.add(0), msg.source as u32);
-                core::ptr::write_unaligned(ptr.add(1), msg.destination as u32);
-                core::ptr::write_unaligned(ptr.add(2), msg.intent_id);
-                core::ptr::write_unaligned(ptr.add(3), msg.priority as u32);
-
-                let ptr64 = buf_addr as *mut u64;
-                core::ptr::write_unaligned(ptr64.add(2), msg.payload);
-                core::ptr::write_unaligned(ptr64.add(3), msg.timestamp);
-                // Jalon 109: write session and correlation IDs
-                core::ptr::write_unaligned(ptr64.add(4), msg.session_id);
-                core::ptr::write_unaligned(ptr64.add(5), msg.correlation_id);
-            }
+            // Build a 48-byte kernel buffer then copy_to_user (KPTI-safe)
+            let mut kbuf = [0u8; 48];
+            let src = msg.source as u32;
+            let dst_id = msg.destination as u32;
+            let intent = msg.intent_id;
+            let prio = msg.priority as u32;
+            kbuf[0..4].copy_from_slice(&src.to_ne_bytes());
+            kbuf[4..8].copy_from_slice(&dst_id.to_ne_bytes());
+            kbuf[8..12].copy_from_slice(&intent.to_ne_bytes());
+            kbuf[12..16].copy_from_slice(&prio.to_ne_bytes());
+            kbuf[16..24].copy_from_slice(&msg.payload.to_ne_bytes());
+            kbuf[24..32].copy_from_slice(&msg.timestamp.to_ne_bytes());
+            kbuf[32..40].copy_from_slice(&msg.session_id.to_ne_bytes());
+            kbuf[40..48].copy_from_slice(&msg.correlation_id.to_ne_bytes());
+            unsafe { copy_to_user(buf_addr, &kbuf) };
 
             let cc = BUS_CON_COUNT.fetch_add(1, AtomicOrdering::Relaxed) + 1;
             let consume_pid = crate::scheduler::current_pid();
@@ -6666,9 +6897,9 @@ fn sys_brk(new_break: u64) -> u64 {
 
         if new_page > old_page {
             let pages_needed = ((new_page - old_page) / 4096) as usize;
-            let cr3: u64;
-            unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)); }
-            let pml4_phys = cr3 & !0xFFF;
+            // KPTI fix: use user PML4, not kernel CR3
+            let pml4_phys = crate::process::get_pml4_phys(current).unwrap_or(0);
+            if pml4_phys == 0 { return old_break; }
 
             for i in 0..pages_needed {
                 let vaddr = old_page + (i as u64) * 4096;
@@ -6705,8 +6936,12 @@ fn sys_brk(new_break: u64) -> u64 {
                 }
             }
 
-            // Flush TLB
-            unsafe { core::arch::asm!("mov cr3, {}", in(reg) cr3, options(nostack)); }
+            // TLB flush: reload kernel CR3 (user PML4 is loaded on sysretq)
+            unsafe {
+                let kcr3: u64;
+                core::arch::asm!("mov {}, cr3", out(reg) kcr3, options(nomem, nostack));
+                core::arch::asm!("mov cr3, {}", in(reg) kcr3, options(nostack));
+            }
 
             crate::serial_println!(
                 "[SYSCALL] sys_brk: PID {} grew heap by {} pages ({} KB), break 0x{:X} -> 0x{:X}",
@@ -6867,13 +7102,16 @@ fn sys_fb_get_info(info_buf: u64) -> u64 {
     };
 
     if info_buf != 0 && validate_user_ptr(info_buf, 32) {
-        unsafe {
-            let buf = info_buf as *mut u64;
-            core::ptr::write_unaligned(buf, info.width as u64);
-            core::ptr::write_unaligned(buf.add(1), info.height as u64);
-            core::ptr::write_unaligned(buf.add(2), info.stride as u64);
-            core::ptr::write_unaligned(buf.add(3), info.bpp as u64);
-        }
+        let data: [u64; 4] = [
+            info.width as u64,
+            info.height as u64,
+            info.stride as u64,
+            info.bpp as u64,
+        ];
+        let bytes = unsafe { core::slice::from_raw_parts(
+            data.as_ptr() as *const u8, 32,
+        ) };
+        unsafe { copy_to_user(info_buf, bytes) };
     }
     1
 }

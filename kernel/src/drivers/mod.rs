@@ -6,6 +6,7 @@
 // USB 3.0 xHCI controller (Jalon 77)
 
 pub mod virtio_blk;
+pub mod virtio_gpu;
 pub mod mouse;
 pub mod ps2;
 pub mod usb;

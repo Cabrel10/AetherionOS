@@ -3,48 +3,41 @@
 **Bare-Metal AI-Native Operating System in Rust `no_std` -- ACHA Architecture**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-nightly--2023--08--01-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-nightly--2026-orange.svg)](https://www.rust-lang.org)
 [![Arch](https://img.shields.io/badge/arch-x86__64-green.svg)](https://en.wikipedia.org/wiki/X86-64)
-[![Version](https://img.shields.io/badge/version-v4.0--smp--stable-blue.svg)](#)
-[![Jalons](https://img.shields.io/badge/jalons-109c%2F115-brightgreen.svg)](#development-milestones)
+[![Version](https://img.shields.io/badge/version-v4.1.0--phase6-blue.svg)](#)
+[![CI](https://img.shields.io/badge/CI-green-brightgreen.svg)](#)
 
 ---
 
-## Current System State (v4.0-smp-stable — Jalon 109c)
+## Current System State (v4.1.0-phase6 -- 2026-04-23)
 
 **Reference Branch:** `genspark_ai_developer`
 
 | Component | Status |
 |-----------|--------|
-| **SMP Dual-Core** | ✅ Core 0 (BSP) + Core 1 (AP) via INIT-SIPI-SIPI |
-| **Visual Terminal (PID 18)** | ✅ AetherionOS v4.0 Production Terminal — "Terminal ready" |
-| **LLM Chat Agent (PID 11)** | ✅ Running on Core 1, GGUF model loading |
-| **Llama Core Agent (PID 13)** | ✅ Running on Core 1, tensor processing |
-| **Orchestrator Agent** | ✅ Functional — bus intent routing |
-| **Validator Agent (PID 15)** | ✅ Strict mode, INTENT_VALIDATOR_READY published |
-| **MCP Agent** | ✅ Level 8 security firewall, subscribing to intents |
-| **BusyBox (PID 16)** | ✅ Linux-compatible, 33 commands |
-| **Agent Clock** | ✅ J112a — QUEUED on Core 0 |
-| **Cognitive Bus** | ✅ 5+ bus_publish events, intent routing active |
-| **Keyboard Input** | ✅ PS/2 AZERTY, scancode translation |
-| **Framebuffer** | ✅ 1024x768x32bpp |
+| **Boot** | Limine v8.7.0, base revision 3, HHDM 0xFFFF800000000000 |
+| **CI** | All 4 jobs green (Kernel Check, C Apps, Rust Agents, ISO Build) |
+| **ISO** | ~100 MiB (kernel 616 KiB + Alpine rootfs + Python 3 + BusyBox) |
+| **Memory** | Bitmap frame allocator + OffsetPageTable + 64 MiB heap |
+| **Scheduler** | PriorityScheduler (5 queues, anti-starvation aging, SMP-aware) |
+| **VFS** | BTreeMap hierarchy, capability checks, path traversal protection |
+| **IPC** | Cognitive Bus (priority BinaryHeap, 1024 capacity) |
+| **Framebuffer** | Limine GOP 1280x800 @ 32bpp |
+| **Interrupts** | ENABLED -- timer + keyboard (Phase 6 #GP fix) |
+| **Network** | VirtIO-Net init, PCI scan, IP 10.0.2.15 (QEMU user-mode) |
+| **Shell** | help/uname/free/ps/uptime/heap/bus/net/exec/ping/wget/clear/halt |
+| **Syscalls** | 13 core Linux syscalls + 100+ stubs for BusyBox compatibility |
+| **Userspace** | 18 C ELF apps + 33 Rust agents built |
 
-### Regression Test Results (300s, SMP 2-core, 1 GiB RAM)
-- ✅ **0 SIGSEGV** — Zero process crashes
-- ✅ **0 Double Fault** — No SMP kernel panics
-- ✅ **0 PANIC** — Kernel completely stable
-- ✅ **0 PF-FATAL / addr=0x0 / rip=0x0** — No null pointer faults
-- ✅ **0 System halted** — Full 300s uptime
-- ✅ **Terminal ready** achieved
-- ✅ **5+ bus_publish** intents published
-- ✅ **agent_clock.elf** queued (J112a)
-- ✅ **166/185 regression tests pass**
-
-### Critical Fix: Jalon 109c — IRETQ Register Clobbering
-The LLVM optimizer was coalescing `in(reg)` operands in inline assembly IRETQ blocks,
-causing the PML4 physical address to overwrite the user RIP/RSP values. Fixed by
-forcing explicit GPR allocation (`r8`, `r9`, `r10`, `r11`, `r12`) across **all 8 IRETQ
-sites** in `main.rs`, `syscall.rs`, `idt.rs`, and `elf/mod.rs`.
+### QEMU Boot Verification
+- Boots to `$` prompt with all 12 init steps passing
+- 2045 MiB usable RAM, 14 memory map entries
+- CPU: QEMU Virtual CPU v2.5+ (SSE, no AVX)
+- GDT+TSS (segments reloaded SS=0x10), IDT (20 handlers), PIC (remapped 32-47), PS/2 keyboard
+- Timer interrupts active (uptime >0 ticks)
+- Security: TPM stub, KPTI-Lite, stack protector
+- Network: PCI scan for VirtIO-Net on boot
 
 ---
 
@@ -56,11 +49,11 @@ AetherionOS is an experimental bare-metal operating system written entirely in R
 where AI agents communicate through a mediated Intent Bus rather than direct hardware
 access.
 
-As of **v4.0** the system has crossed the **SMP + AGI Wall**: true dual-core execution
-(INIT-SIPI-SIPI), bare-metal GGUF LLM inference on a dedicated core, cognitive bus
-intent routing, Linux ABI compatibility (BusyBox runs natively), a Model Context
-Protocol (MCP) security firewall, and a visual terminal with 10+ concurrent agents --
-all running bare-metal on QEMU with 1 GiB RAM and 2 CPU cores.
+As of **v4.1.0-phase6** the system boots via Limine v8.7.0 with a fully functional kernel:
+memory management (bitmap frame allocator, OffsetPageTable, 64 MiB heap), a priority
+scheduler with anti-starvation aging, VFS with security checks, a priority-aware
+Cognitive Bus for inter-agent IPC, and an interactive serial shell. The kernel runs
+bare-metal on QEMU with 2 GiB RAM and boots in ~3 seconds.
 
 ### Capabilities (v4.0-smp-stable)
 

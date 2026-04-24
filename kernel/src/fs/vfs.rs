@@ -476,8 +476,10 @@ pub fn file_read(path: &str) -> Result<Vec<u8>, VfsError> {
                 return Err(VfsError::PermissionDenied);
             }
             VfsNode::Symlink(ref target) => {
-                // Follow symlink: read the target path's data
-                data = target.as_bytes().to_vec();
+                // Follow symlink: recursively read the target path
+                let target_path = target.clone();
+                drop(root); // release lock before recursive call
+                return file_read(&target_path);
             }
         }
     }

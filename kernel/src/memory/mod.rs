@@ -201,3 +201,72 @@ pub fn init(boot_info: &BootInfo) -> MemoryResult<MemoryManager> {
     
     Ok(manager)
 }
+
+/// Initialise la mémoire à partir de la carte mémoire Limine.
+///
+/// Prend les régions usable directement (déjà extraites dans limine_entry.rs)
+/// et le HHDM offset. Crée le frame allocator, page table manager, et heap.
+///
+/// # Safety
+/// - `usable_regions` doit contenir des plages physiques valides
+/// - `hhdm_offset` doit correspondre au HHDM configuré par Limine
+/// - Doit être appelé une seule fois pendant le boot
+pub fn init_from_limine(
+    usable_regions: &[(u64, u64)],
+    hhdm_offset: u64,
+) -> MemoryResult<MemoryManager> {
+    crate::serial_write("\n========================================\n");
+    crate::serial_write("[MEMORY] Limine path - Initializing...\n");
+    crate::serial_write("========================================\n");
+
+    let phys_offset = VirtAddr::new(hhdm_offset);
+
+    {
+        use core::fmt::Write;
+        let mut s = arrayvec::ArrayString::<128>::new();
+        let _ = writeln!(s, "[MEMORY] HHDM offset: {:#x}", hhdm_offset);
+        crate::serial_write(&s);
+    }
+
+    // Log usable regions
+    let mut total_usable = 0u64;
+    for &(start, end) in usable_regions {
+        total_usable += end - start;
+    }
+    {
+        use core::fmt::Write;
+        let mut s = arrayvec::ArrayString::<128>::new();
+        let _ = writeln!(s, "[MEMORY] {} usable regions, total: {} MB",
+            usable_regions.len(), total_usable / (1024 * 1024));
+        crate::serial_write(&s);
+    }
+
+    // Frame allocator from Limine usable regions
+    let frame_allocator = unsafe {
+        frame::FrameAllocator::new(usable_regions)
+    };
+
+    {
+        use core::fmt::Write;
+        let mut s = arrayvec::ArrayString::<128>::new();
+        let _ = writeln!(s, "[MEMORY] Frame allocator: {} frames ({} MB)",
+            frame_allocator.total_frames(),
+            (frame_allocator.total_frames() * 4) / 1024);
+        crate::serial_write(&s);
+    }
+
+    // Page table manager using Limine's HHDM
+    let page_table = unsafe {
+        paging::OffsetPageTableManager::new(phys_offset)
+    };
+    crate::serial_write("[MEMORY] Page table manager initialized (Limine CR3)\n");
+
+    crate::serial_write("[MEMORY] Limine path core initialized\n");
+    crate::serial_write("========================================\n\n");
+
+    Ok(MemoryManager {
+        frame_allocator,
+        page_table,
+        heap_initialized: false,
+    })
+}

@@ -71,7 +71,7 @@ echo "[OK] Linker script: $LINKER_SCRIPT"
 # =========================================
 # Phase 3: Build each C application
 # =========================================
-APPS="hello_c j19_test ls cat wget threads ui agent_ai agent_rag sh test_malloc test_preempt"
+APPS="hello_c j19_test ls cat wget threads ui agent_ai agent_rag sh test_malloc test_preempt agent_sse agent_rust agent_saga wget_real agent_math tls_bridge"
 
 for APP in $APPS; do
     SRC="$C_APPS_DIR/${APP}.c"
@@ -85,7 +85,7 @@ for APP in $APPS; do
 
     echo ""
     echo "[BUILD] Compiling ${APP}.c..."
-    gcc -c $GCC_FLAGS -I"$SDK_DIR" \
+    gcc -c $GCC_FLAGS -I"$SDK_DIR" -I"$C_APPS_DIR" \
         -o "$OBJ" \
         "$SRC"
     echo "[OK] ${APP}.o"

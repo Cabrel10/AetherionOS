@@ -1,0 +1,8 @@
+NAME="AetherionOS"
+VERSION="3.1.0"
+ID=aetherion
+ID_LIKE=alpine
+VERSION_ID=3.1.0
+PRETTY_NAME="AetherionOS 3.1.0 (Cognitive Desktop)"
+HOME_URL="https://github.com/Cabrel10/AetherionOS"
+BUG_REPORT_URL="https://github.com/Cabrel10/AetherionOS/issues"
