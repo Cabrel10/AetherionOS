@@ -601,6 +601,14 @@ pub static LAST_SYSCALL_NR: core::sync::atomic::AtomicU64 = core::sync::atomic::
 fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
     LAST_SYSCALL_NR.store(nr, core::sync::atomic::Ordering::Relaxed);
     let current_pid = crate::scheduler::current_pid();
+    // Trace first 60 syscalls of PID 1 for debugging
+    static TRACE_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    if current_pid == 1 {
+        let c = TRACE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if c < 60 {
+            crate::serial_println!("[SC#{}] nr={} a1=0x{:X} a2=0x{:X} a3=0x{:X}", c, nr, a1, a2, a3);
+        }
+    }
     // Jalon 105: Check if this process uses Linux ABI and route to Linux-specific handlers
     if current_pid != 0 {
         let is_linux = crate::process::with_process(current_pid, |p| {
