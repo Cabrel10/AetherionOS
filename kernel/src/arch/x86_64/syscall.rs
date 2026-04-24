@@ -525,18 +525,20 @@ extern "C" fn syscall_entry() {
         "pop r11",            // user RFLAGS (loaded by SYSRETQ)
         "pop rcx",            // user RIP   (loaded by SYSRETQ)
 
-        // 6. Restore user RSP
-        "mov rsp, gs:[8]",
-
-        // 6b. KPTI: Switch back to user page tables.
-        //     Use the user stack to save/restore R10 (which we just restored).
-        "push r10",
+        // 6. KPTI: Switch back to user page tables BEFORE restoring user RSP.
+        //    We must do this while still on the kernel stack, because the
+        //    user stack is only mapped in the user page tables.
+        //    Use gs:[32] to save/restore R10 (scratch slot, not needed anymore).
+        "mov gs:[32], r10",   // save user R10 in per-CPU scratch
         "mov r10, gs:[48]",   // r10 = user_cr3
         "test r10, r10",
         "jz 3f",
-        "mov cr3, r10",
+        "mov cr3, r10",       // switch to user page tables
         "3:",
-        "pop r10",            // restore user R10
+        "mov r10, gs:[32]",   // restore user R10
+
+        // 6b. Restore user RSP (now safe — user pages are mapped)
+        "mov rsp, gs:[8]",
 
         // 7. Swap back to user GS
         "swapgs",
