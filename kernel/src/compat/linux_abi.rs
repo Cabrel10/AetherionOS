@@ -674,18 +674,17 @@ pub fn linux_munmap(_addr: u64, _len: u64) -> u64 { 0 }
 pub fn linux_readlink(path: u64, buf: u64, bufsiz: u64) -> u64 {
     if !crate::arch::x86_64::syscall::validate_user_ptr_pub(path, 1) { return (-14i64) as u64; }
     if !crate::arch::x86_64::syscall::validate_user_ptr_pub(buf, bufsiz) { return (-14i64) as u64; }
-    // Read path from user space
+    // Read path from user space via HHDM
     let mut path_buf = [0u8; 128];
+    unsafe { crate::arch::x86_64::syscall::copy_from_user_pub(&mut path_buf, path, 128); }
     let mut _plen = 0;
     for i in 0..128 {
-        let b = unsafe { core::ptr::read_volatile((path + i) as *const u8) };
-        if b == 0 { break; }
-        path_buf[i as usize] = b;
-        _plen = i as usize + 1;
+        if path_buf[i] == 0 { break; }
+        _plen = i + 1;
     }
     let reply = b"/bin/busybox.elf";
     let copy_len = reply.len().min(bufsiz as usize);
-    unsafe { core::ptr::copy_nonoverlapping(reply.as_ptr(), buf as *mut u8, copy_len); }
+    unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(buf, &reply[..copy_len]); }
     copy_len as u64
 }
 
@@ -896,11 +895,11 @@ pub fn linux_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u64 {
         1 => { // EPOLL_CTL_ADD
             // Read epoll_event from user space: { u32 events, u64 data }
             let (events, data) = if event_ptr != 0 && crate::arch::x86_64::syscall::validate_user_ptr_pub(event_ptr, 12) {
-                unsafe {
-                    let ev = core::ptr::read_unaligned(event_ptr as *const u32);
-                    let d = core::ptr::read_unaligned((event_ptr + 4) as *const u64);
-                    (ev, d)
-                }
+                let mut ev_buf = [0u8; 12];
+                unsafe { crate::arch::x86_64::syscall::copy_from_user_pub(&mut ev_buf, event_ptr, 12); }
+                let ev = u32::from_le_bytes([ev_buf[0], ev_buf[1], ev_buf[2], ev_buf[3]]);
+                let d = u64::from_le_bytes([ev_buf[4], ev_buf[5], ev_buf[6], ev_buf[7], ev_buf[8], ev_buf[9], ev_buf[10], ev_buf[11]]);
+                (ev, d)
             } else {
                 (crate::process::EPOLLIN | crate::process::EPOLLOUT, fd) // default
             };
@@ -925,11 +924,11 @@ pub fn linux_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u64 {
         }
         3 => { // EPOLL_CTL_MOD
             let (events, data) = if event_ptr != 0 && crate::arch::x86_64::syscall::validate_user_ptr_pub(event_ptr, 12) {
-                unsafe {
-                    let ev = core::ptr::read_unaligned(event_ptr as *const u32);
-                    let d = core::ptr::read_unaligned((event_ptr + 4) as *const u64);
-                    (ev, d)
-                }
+                let mut ev_buf = [0u8; 12];
+                unsafe { crate::arch::x86_64::syscall::copy_from_user_pub(&mut ev_buf, event_ptr, 12); }
+                let ev = u32::from_le_bytes([ev_buf[0], ev_buf[1], ev_buf[2], ev_buf[3]]);
+                let d = u64::from_le_bytes([ev_buf[4], ev_buf[5], ev_buf[6], ev_buf[7], ev_buf[8], ev_buf[9], ev_buf[10], ev_buf[11]]);
+                (ev, d)
             } else {
                 return (-22i64) as u64; // EINVAL
             };
@@ -1083,12 +1082,10 @@ pub fn linux_ioctl_extended(fd: u64, cmd: u64, arg: u64) -> u64 {
         }
         // EVIOCGNAME(len) — approximate match for common sizes
         0x80FF4506 | 0x80404506 => {
-            let name = b"AetherionOS Virtual Input\0";
+            let name = b"AetherionOS Virtual Input\\0";
             let copy_len = core::cmp::min(name.len(), 255);
             if arg != 0 && crate::arch::x86_64::syscall::validate_user_ptr_pub(arg, copy_len as u64) {
-                unsafe {
-                    core::ptr::copy_nonoverlapping(name.as_ptr(), arg as *mut u8, copy_len);
-                }
+                unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(arg, &name[..copy_len]); }
             }
             copy_len as u64
         }
@@ -1123,32 +1120,28 @@ pub fn linux_fb_get_vscreeninfo(buf: u64) -> u64 {
         Some(i) => i,
         None => return (-19i64) as u64, // ENODEV
     };
-    unsafe {
-        let dst = buf as *mut u8;
-        core::ptr::write_bytes(dst, 0, 160);
-        // xres, yres (visible resolution)
-        core::ptr::write_volatile(buf as *mut u32, info.width);
-        core::ptr::write_volatile((buf + 4) as *mut u32, info.height);
-        // xres_virtual, yres_virtual (virtual resolution, same as visible)
-        core::ptr::write_volatile((buf + 8) as *mut u32, info.width);
-        core::ptr::write_volatile((buf + 12) as *mut u32, info.height);
-        // xoffset, yoffset = 0 (already zeroed)
-        // bits_per_pixel
-        core::ptr::write_volatile((buf + 24) as *mut u32, info.bpp);
-        // grayscale = 0 (already zeroed)
-        // red: offset=16, length=8, msb_right=0 (BGRA format from Bochs/Limine)
-        core::ptr::write_volatile((buf + 32) as *mut u32, 16); // red offset
-        core::ptr::write_volatile((buf + 36) as *mut u32, 8);  // red length
-        // green: offset=8, length=8
-        core::ptr::write_volatile((buf + 40) as *mut u32, 8);  // green offset
-        core::ptr::write_volatile((buf + 44) as *mut u32, 8);  // green length
-        // blue: offset=0, length=8
-        core::ptr::write_volatile((buf + 48) as *mut u32, 0);  // blue offset
-        core::ptr::write_volatile((buf + 52) as *mut u32, 8);  // blue length
-        // transp: offset=24, length=8
-        core::ptr::write_volatile((buf + 56) as *mut u32, 24); // alpha offset
-        core::ptr::write_volatile((buf + 60) as *mut u32, 8);  // alpha length
-    }
+    let mut kbuf = [0u8; 160];
+    // xres, yres (visible resolution)
+    kbuf[0..4].copy_from_slice(&info.width.to_le_bytes());
+    kbuf[4..8].copy_from_slice(&info.height.to_le_bytes());
+    // xres_virtual, yres_virtual
+    kbuf[8..12].copy_from_slice(&info.width.to_le_bytes());
+    kbuf[12..16].copy_from_slice(&info.height.to_le_bytes());
+    // bits_per_pixel (offset 24)
+    kbuf[24..28].copy_from_slice(&info.bpp.to_le_bytes());
+    // red: offset=16, length=8 (offset 32)
+    kbuf[32..36].copy_from_slice(&16u32.to_le_bytes());
+    kbuf[36..40].copy_from_slice(&8u32.to_le_bytes());
+    // green: offset=8, length=8 (offset 40)
+    kbuf[40..44].copy_from_slice(&8u32.to_le_bytes());
+    kbuf[44..48].copy_from_slice(&8u32.to_le_bytes());
+    // blue: offset=0, length=8 (offset 48)
+    kbuf[48..52].copy_from_slice(&0u32.to_le_bytes());
+    kbuf[52..56].copy_from_slice(&8u32.to_le_bytes());
+    // transp: offset=24, length=8 (offset 56)
+    kbuf[56..60].copy_from_slice(&24u32.to_le_bytes());
+    kbuf[60..64].copy_from_slice(&8u32.to_le_bytes());
+    unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(buf, &kbuf); }
     crate::serial_println!("[FB-IOCTL] VSCREENINFO: {}x{}x{}", info.width, info.height, info.bpp);
     0
 }
@@ -1162,23 +1155,19 @@ pub fn linux_fb_get_fscreeninfo(buf: u64) -> u64 {
         Some(i) => i,
         None => return (-19i64) as u64, // ENODEV
     };
-    unsafe {
-        let dst = buf as *mut u8;
-        core::ptr::write_bytes(dst, 0, 68);
-        // id[16] — device name
-        let name = b"AetherionFB\0";
-        core::ptr::copy_nonoverlapping(name.as_ptr(), dst, name.len());
-        // smem_start — physical address of framebuffer (offset 16, u64 on x86_64)
-        core::ptr::write_volatile((buf + 16) as *mut u64, info.phys_addr);
-        // smem_len — size of framebuffer in bytes (offset 24)
-        core::ptr::write_volatile((buf + 24) as *mut u32, info.size as u32);
-        // type = FB_TYPE_PACKED_PIXELS (0) — already zeroed
-        // visual = FB_VISUAL_TRUECOLOR (2) (offset 32)
-        core::ptr::write_volatile((buf + 32) as *mut u32, 2);
-        // line_length = stride (offset 48)
-        core::ptr::write_volatile((buf + 48) as *mut u32, info.stride);
-        // mmio_start, mmio_len = 0 (already zeroed)
-    }
+    let mut kbuf = [0u8; 68];
+    // id[16] — device name
+    let name = b"AetherionFB\0";
+    kbuf[..name.len()].copy_from_slice(name);
+    // smem_start — physical address of framebuffer (offset 16, u64)
+    kbuf[16..24].copy_from_slice(&info.phys_addr.to_le_bytes());
+    // smem_len — size of framebuffer in bytes (offset 24)
+    kbuf[24..28].copy_from_slice(&(info.size as u32).to_le_bytes());
+    // visual = FB_VISUAL_TRUECOLOR (2) (offset 32)
+    kbuf[32..36].copy_from_slice(&2u32.to_le_bytes());
+    // line_length = stride (offset 48)
+    kbuf[48..52].copy_from_slice(&info.stride.to_le_bytes());
+    unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(buf, &kbuf); }
     crate::serial_println!(
         "[FB-IOCTL] FSCREENINFO: phys=0x{:X}, size={}, stride={}",
         info.phys_addr, info.size, info.stride
@@ -1259,8 +1248,14 @@ pub fn read_input_events(out_buf: u64, max_bytes: u64) -> u64 {
 
     while written < max_events && buf.1 != buf.2 {
         let ev = buf.0[buf.1];
-        let dst = (out_buf + (written as u64) * event_size) as *mut InputEvent;
-        unsafe { core::ptr::write_volatile(dst, ev); }
+        let ev_bytes = unsafe {
+            core::slice::from_raw_parts(
+                &ev as *const InputEvent as *const u8,
+                core::mem::size_of::<InputEvent>()
+            )
+        };
+        let dst_addr = out_buf + (written as u64) * event_size;
+        unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(dst_addr, ev_bytes); }
         buf.1 = (buf.1 + 1) % INPUT_EVENT_BUF_SIZE;
         written += 1;
     }
@@ -1281,23 +1276,17 @@ pub fn linux_rt_sigaction_v2(sig: u64, act: u64, oldact: u64, sigsetsize: u64) -
 
     // Return old action if requested
     if oldact != 0 && crate::arch::x86_64::syscall::validate_user_ptr_pub(oldact, 32) {
-        unsafe {
-            // sa_handler
-            core::ptr::write_volatile(oldact as *mut u64, handlers[idx]);
-            // sa_flags
-            core::ptr::write_volatile((oldact + 8) as *mut u64, 0);
-            // sa_restorer
-            core::ptr::write_volatile((oldact + 16) as *mut u64, 0);
-            // sa_mask
-            core::ptr::write_volatile((oldact + 24) as *mut u64, 0);
-        }
+        let mut buf = [0u8; 32];
+        buf[0..8].copy_from_slice(&handlers[idx].to_le_bytes()); // sa_handler
+        // sa_flags=0, sa_restorer=0, sa_mask=0 (already zeroed)
+        unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(oldact, &buf); }
     }
 
     // Set new action if provided
     if act != 0 && crate::arch::x86_64::syscall::validate_user_ptr_pub(act, 32) {
-        unsafe {
-            handlers[idx] = core::ptr::read_volatile(act as *const u64);
-        }
+        let mut act_buf = [0u8; 8];
+        unsafe { crate::arch::x86_64::syscall::copy_from_user_pub(&mut act_buf, act, 8); }
+        handlers[idx] = u64::from_le_bytes(act_buf);
     }
 
     0
@@ -1313,12 +1302,15 @@ pub fn linux_rt_sigprocmask_v2(how: u64, set: u64, oldset: u64, sigsetsize: u64)
 
     // Return old mask
     if oldset != 0 && crate::arch::x86_64::syscall::validate_user_ptr_pub(oldset, 8) {
-        unsafe { core::ptr::write_volatile(oldset as *mut u64, *mask); }
+        let buf = (*mask).to_le_bytes();
+        unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(oldset, &buf); }
     }
 
     // Apply new mask
     if set != 0 && crate::arch::x86_64::syscall::validate_user_ptr_pub(set, 8) {
-        let new_bits = unsafe { core::ptr::read_volatile(set as *const u64) };
+        let mut set_buf = [0u8; 8];
+        unsafe { crate::arch::x86_64::syscall::copy_from_user_pub(&mut set_buf, set, 8); }
+        let new_bits = u64::from_le_bytes(set_buf);
         match how {
             0 => { *mask |= new_bits; }   // SIG_BLOCK
             1 => { *mask &= !new_bits; }  // SIG_UNBLOCK
@@ -1496,25 +1488,12 @@ pub fn linux_sigaltstack(uss: u64, uoss: u64) -> u64 {
     // On x86_64: sp=8 bytes, flags=4 bytes (padded to 8), size=8 bytes = 24 bytes total
     
     // If uoss is non-null, write the current alternate stack info (we have none)
-    if uoss != 0 && uoss < 0x0000_8000_0000_0000 {
-        let cr3: u64;
-        unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)); }
-        let pml4_phys = cr3 & !0xFFF;
-        // Write ss_sp = 0, ss_flags = SS_DISABLE (2), ss_size = 0
-        for offset in [0u64, 8, 16] {
-            let vaddr = uoss + offset;
-            if let Some(phys) = unsafe { crate::elf::lookup_page_frame_pub(pml4_phys, vaddr) } {
-                let ptr = (phys_offset + phys + (vaddr & 0xFFF)) as *mut u64;
-                unsafe {
-                    if offset == 8 {
-                        // ss_flags = SS_DISABLE (2)
-                        core::ptr::write_volatile(ptr as *mut u32, 2);
-                    } else {
-                        core::ptr::write_volatile(ptr, 0);
-                    }
-                }
-            }
-        }
+    if uoss != 0 && uoss < 0x0000_8000_0000_0000 && crate::arch::x86_64::syscall::validate_user_ptr_pub(uoss, 24) {
+        // struct sigaltstack { void *ss_sp; int ss_flags; size_t ss_size; }
+        // ss_sp = 0, ss_flags = SS_DISABLE (2), ss_size = 0
+        let mut buf = [0u8; 24];
+        buf[8..12].copy_from_slice(&2u32.to_le_bytes()); // ss_flags = SS_DISABLE at offset 8
+        unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(uoss, &buf); }
     }
     
     // Accept uss but don't actually configure it (we have no signal delivery mechanism yet)
@@ -1539,7 +1518,11 @@ pub fn linux_futex(uaddr: u64, op: u64, val: u64) -> u64 {
             if uaddr == 0 || !crate::arch::x86_64::syscall::validate_user_ptr_pub(uaddr, 4) {
                 return (-14i64) as u64; // EFAULT
             }
-            let current = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
+            let current = {
+                let mut buf = [0u8; 4];
+                unsafe { crate::arch::x86_64::syscall::copy_from_user_pub(&mut buf, uaddr, 4); }
+                u32::from_le_bytes(buf)
+            };
             if current != val as u32 {
                 return (-11i64) as u64; // EAGAIN: value changed
             }
@@ -1571,7 +1554,11 @@ pub fn linux_futex(uaddr: u64, op: u64, val: u64) -> u64 {
                 };
                 if !still_waiting { return 0; } // Woken up
                 // Also check if value changed (spurious wake is allowed)
-                let new_val = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
+                let new_val = {
+                    let mut buf = [0u8; 4];
+                    unsafe { crate::arch::x86_64::syscall::copy_from_user_pub(&mut buf, uaddr, 4); }
+                    u32::from_le_bytes(buf)
+                };
                 if new_val != val as u32 {
                     // Remove ourselves from waiters
                     let mut waiters = FUTEX_WAITERS.lock();

@@ -1498,6 +1498,12 @@ fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
 /// Jalon 131: Enhanced ioctl with TTY support for musl/glibc compatibility.
 /// Supports TIOCGWINSZ, TCGETS/TCSETS (termios), FIONREAD, and isatty detection.
 fn sys_ioctl(fd: u32, cmd: u64, arg: u64) -> u64 {
+    // Diagnostic: log ioctl calls for BusyBox debugging
+    static IOCTL_LOG_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let count = IOCTL_LOG_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if count < 20 {
+        crate::serial_println!("[IOCTL] fd={} cmd=0x{:X} arg=0x{:X}", fd, cmd, arg);
+    }
     const TIOCGWINSZ: u64  = 0x5413;
     const TIOCSWINSZ: u64  = 0x5414;
     const TCGETS: u64      = 0x5401;
