@@ -451,83 +451,92 @@ extern "C" fn syscall_entry() {
         // 1. Switch to kernel GS
         "swapgs",
 
-        // 2. Save user RSP, RIP, and R10 (4th syscall arg), load kernel RSP
-        "mov gs:[8], rsp",
-        "mov gs:[16], rcx",   // save user RIP (RCX holds return addr from SYSCALL)
-        "mov gs:[32], r10",   // save R10 = 4th syscall argument (pread64 offset, etc.)
-        "mov gs:[56], r9",    // save R9 = 6th syscall argument (mmap offset, etc.)
-        "mov rsp, gs:[0]",
+        // 2. Save user RSP, RIP, R10, R9 into per-CPU area; load kernel RSP
+        "mov gs:[8], rsp",    // save user RSP
+        "mov gs:[16], rcx",   // save user RIP (RCX set by SYSCALL hw)
+        "mov gs:[32], r10",   // save R10 (4th syscall arg / scratch)
+        "mov gs:[56], r9",    // save R9 (6th syscall arg)
+        "mov rsp, gs:[0]",    // load kernel RSP
 
-        // 2b. KPTI: Switch to kernel page tables.
-        // gs:[40] = kernel_cr3 (physical address of kernel PML4).
-        // After this, all kernel code is accessible at both identity-mapped
-        // and phys-offset addresses. User pages at 0x400000+ are now the
-        // kernel's original pages (not BusyBox).
-        // We use a scratch register (r10 already saved above) for the mov.
+        // 2b. KPTI: Switch to kernel page tables
         "mov r10, gs:[40]",   // r10 = kernel_cr3
-        "test r10, r10",      // skip if kernel_cr3 == 0 (not set yet)
+        "test r10, r10",
         "jz 2f",
         "mov cr3, r10",
         "2:",
 
-        // 3. Build a stack frame with all user state
-        "push rcx",     // user RIP (saved by SYSCALL)
-        "push r11",     // user RFLAGS (saved by SYSCALL)
+        // 3. Save ALL user registers on the kernel stack.
+        //    Linux syscall ABI: kernel preserves everything except RAX, RCX, R11.
+        //    We must save RDI, RSI, RDX, R8, R9, R10 too (they are caller-saved
+        //    in System V but NOT clobbered by the Linux syscall ABI).
+        "push rcx",           // user RIP  (from SYSCALL hw)
+        "push r11",           // user RFLAGS (from SYSCALL hw)
         "push rbp",
         "push rbx",
         "push r12",
         "push r13",
         "push r14",
         "push r15",
+        "push rdi",           // user a1
+        "push rsi",           // user a2
+        "push rdx",           // user a3
+        "push r8",            // user a5
+        "mov r10, gs:[32]",   // reload user R10 (clobbered by CR3 switch)
+        "push r10",           // user a4 (R10)
+        "mov r10, gs:[56]",   // reload user R9 (saved above)
+        "push r10",           // user a6 (R9)
 
-        // 3b. Save the kernel RSP (pointing to saved regs) into per-CPU data.
-        // This is overwritten on every syscall; sys_wait copies it to the
-        // process struct before launching a child thread.
-        // Uses GS-relative access (gs:[24]) to avoid R_X86_64_32S relocations.
+        // 3b. Save kernel RSP into per-CPU data
         "mov gs:[24], rsp",
 
-        // 4. Prepare arguments for Rust handler (6-arg ABI)
-        //    syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64)
-        //    System V calling convention: rdi, rsi, rdx, rcx, r8, r9
-        //    From SYSCALL: rax=nr, rdi=a1, rsi=a2, rdx=a3, r10=a4, r8=a5
-        //    Note: r8 still holds user's 5th arg, r10 was saved to gs:[32]
-        "mov r10, gs:[32]",   // reload user r10 (we clobbered it for CR3 switch)
-        "mov r9, r8",      // 6th SysV arg = a5 (user R8) — MUST be before r8 is overwritten
-        "mov r8, r10",     // 5th SysV arg = a4 (user R10)
-        "mov rcx, rdx",    // 4th SysV arg = a3 (user RDX)
-        "mov rdx, rsi",    // 3rd SysV arg = a2 (user RSI)
-        "mov rsi, rdi",    // 2nd SysV arg = a1 (user RDI)
-        "mov rdi, rax",    // 1st SysV arg = nr (user RAX)
+        // 4. Prepare arguments for Rust handler (System V x86-64 ABI)
+        //    syscall_handler_rust(nr: rdi, a1: rsi, a2: rdx, a3: rcx, a4: r8, a5: r9)
+        //    From user: RAX=nr, RDI=a1, RSI=a2, RDX=a3, R10=a4, R8=a5
+        //    The registers still hold user values (we pushed copies above).
+        //    Shuffle order: read before overwrite.
+        "mov r9, r8",         // SysV r9  = user R8  (a5)
+        "mov r8, gs:[32]",    // SysV r8  = user R10 (a4) — from per-CPU save
+        "mov rcx, rdx",       // SysV rcx = user RDX (a3)
+        "mov rdx, rsi",       // SysV rdx = user RSI (a2)
+        "mov rsi, rdi",       // SysV rsi = user RDI (a1)
+        "mov rdi, rax",       // SysV rdi = user RAX (nr)
 
-        // Align RSP to 16 bytes before calling Rust (ABI requirement)
-        "mov r15, rsp",          // save current RSP in r15 (already pushed)
-        "and rsp, -16",          // align to 16-byte boundary
-        // Call the Rust dispatcher
+        // Align RSP to 16 bytes (ABI requirement), use R15 as frame save
+        "mov r15, rsp",
+        "and rsp, -16",
         "call {handler}",
-        "mov rsp, r15",          // restore RSP (r15 will be popped next)
+        "mov rsp, r15",       // restore stack pointer to saved-regs frame
 
-        // RAX = return value (set by Rust handler)
+        // RAX = return value from Rust handler
 
-        // 5. Restore callee-saved registers
+        // 5. Restore ALL user registers (reverse order of push)
+        "pop r9",             // restore user R9
+        "pop r10",            // restore user R10
+        "pop r8",             // restore user R8
+        "pop rdx",            // restore user RDX
+        "pop rsi",            // restore user RSI
+        "pop rdi",            // restore user RDI
         "pop r15",
         "pop r14",
         "pop r13",
         "pop r12",
         "pop rbx",
         "pop rbp",
-        "pop r11",     // user RFLAGS
-        "pop rcx",     // user RIP
+        "pop r11",            // user RFLAGS (loaded by SYSRETQ)
+        "pop rcx",            // user RIP   (loaded by SYSRETQ)
 
         // 6. Restore user RSP
         "mov rsp, gs:[8]",
 
-        // 6b. KPTI: Switch back to user page tables before returning to Ring 3.
-        // gs:[48] = user_cr3 (the process's PML4).
-        "mov r10, gs:[48]",
-        "test r10, r10",      // skip if user_cr3 == 0 (not set yet)
+        // 6b. KPTI: Switch back to user page tables.
+        //     Use the user stack to save/restore R10 (which we just restored).
+        "push r10",
+        "mov r10, gs:[48]",   // r10 = user_cr3
+        "test r10, r10",
         "jz 3f",
         "mov cr3, r10",
         "3:",
+        "pop r10",            // restore user R10
 
         // 7. Swap back to user GS
         "swapgs",
