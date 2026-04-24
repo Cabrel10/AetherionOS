@@ -24,6 +24,7 @@ use limine::request::{
 static HELLO_ELF: &[u8] = include_bytes!("../../../userspace/hello.elf");
 static HELLO_C_ELF: &[u8] = include_bytes!("../../../userspace/c_apps/hello_c.elf");
 static BUSYBOX_ELF: &[u8] = include_bytes!("../../../userspace/busybox.elf");
+static AGENT_AUTONOMOUS_ELF: &[u8] = include_bytes!("../../../bin_cache/agent_autonomous");
 
 // ===== Limine Request Structures =====
 // These are placed in the .requests section by the linker script.
@@ -536,6 +537,12 @@ unsafe extern "C" fn kmain() -> ! {
                 crate::fs::vfs::VfsNode::File(alloc::vec::Vec::from(BUSYBOX_ELF)),
             );
             crate::serial_println!("       [OK] /bin/busybox ({} bytes)", BUSYBOX_ELF.len());
+
+            bin_dir.insert(
+                alloc::string::String::from("agent_autonomous"),
+                crate::fs::vfs::VfsNode::File(alloc::vec::Vec::from(AGENT_AUTONOMOUS_ELF)),
+            );
+            crate::serial_println!("       [OK] /bin/agent_autonomous ({} bytes)", AGENT_AUTONOMOUS_ELF.len());
 
             // BusyBox symlinks for common applets
             let bb_applets = ["sh", "ash", "ls", "cat", "echo", "mkdir", "rm",
