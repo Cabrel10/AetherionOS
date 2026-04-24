@@ -24,7 +24,7 @@ use limine::request::{
 static HELLO_ELF: &[u8] = include_bytes!("../../../userspace/hello.elf");
 static HELLO_C_ELF: &[u8] = include_bytes!("../../../userspace/c_apps/hello_c.elf");
 static BUSYBOX_ELF: &[u8] = include_bytes!("../../../userspace/busybox.elf");
-static AGENT_AUTONOMOUS_ELF: &[u8] = include_bytes!("../../../bin_cache/agent_autonomous");
+static AGENT_AUTONOMOUS_ELF: &[u8] = include_bytes!("../../../userspace/agent_autonomous.elf");
 
 // ===== Limine Request Structures =====
 // These are placed in the .requests section by the linker script.
