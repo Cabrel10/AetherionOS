@@ -1481,7 +1481,43 @@ pub fn linux_rt_sigaction(sig: u64, act: u64, oldact: u64, sigsetsize: u64) -> u
 pub fn linux_rt_sigprocmask(how: u64, set: u64, oldset: u64, sigsetsize: u64) -> u64 {
     linux_rt_sigprocmask_v2(how, set, oldset, sigsetsize)
 }
-pub fn linux_sigaltstack(_uss: u64, _uoss: u64) -> u64 { 0 }
+/// sigaltstack(uss, uoss) - Set/get alternate signal stack.
+/// Required by Go runtime (goroutine signal handling) and glibc.
+/// Writes back the old stack info if uoss is non-null, accepts new stack from uss.
+pub fn linux_sigaltstack(uss: u64, uoss: u64) -> u64 {
+    let phys_offset = crate::elf::phys_offset();
+    // struct sigaltstack { void *ss_sp; int ss_flags; size_t ss_size; }
+    // On x86_64: sp=8 bytes, flags=4 bytes (padded to 8), size=8 bytes = 24 bytes total
+    
+    // If uoss is non-null, write the current alternate stack info (we have none)
+    if uoss != 0 && uoss < 0x0000_8000_0000_0000 {
+        let cr3: u64;
+        unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)); }
+        let pml4_phys = cr3 & !0xFFF;
+        // Write ss_sp = 0, ss_flags = SS_DISABLE (2), ss_size = 0
+        for offset in [0u64, 8, 16] {
+            let vaddr = uoss + offset;
+            if let Some(phys) = unsafe { crate::elf::lookup_page_frame_pub(pml4_phys, vaddr) } {
+                let ptr = (phys_offset + phys + (vaddr & 0xFFF)) as *mut u64;
+                unsafe {
+                    if offset == 8 {
+                        // ss_flags = SS_DISABLE (2)
+                        core::ptr::write_volatile(ptr as *mut u32, 2);
+                    } else {
+                        core::ptr::write_volatile(ptr, 0);
+                    }
+                }
+            }
+        }
+    }
+    
+    // Accept uss but don't actually configure it (we have no signal delivery mechanism yet)
+    // Return success so Go/glibc doesn't abort
+    if uss != 0 {
+        crate::serial_println!("[LINUX-ABI] sigaltstack: accepted (sp set, not yet functional)");
+    }
+    0
+}
 
 /// Linux futex(uaddr, op, val, timeout, uaddr2, val3)
 ///

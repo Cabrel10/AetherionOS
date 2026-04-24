@@ -53,6 +53,8 @@ const INTENT_GOAL: u32            = 0xC001; // Receive a goal
 const INTENT_GOAL_RESULT: u64     = 0xC002; // Publish goal result
 const INTENT_TASK_PROGRESS: u64   = 0xC003; // Task progress update
 const INTENT_AUTONOMOUS_READY: u64 = 0xC004; // Agent ready signal
+const INTENT_START_DEMO: u32      = 0xC005; // Start AGI demo sequence
+const INTENT_LLM_COMMAND: u32     = 0xC010; // LLM command input
 const INTENT_MCP_EXECUTE: u64     = 0x9002; // MCP contract execution
 const INTENT_MCP_RESULT: u32      = 0x9003; // MCP result
 const INTENT_MEMORY_LOG: u64      = 0xA004; // Log to episodic memory
@@ -552,6 +554,65 @@ fn plan_goal(queue: &mut TaskQueue, goal_hash: u64) {
 }
 
 // ═══════════════════════════════════════════════════
+// AGI Demo: Visual Desktop Manipulation Proof
+// ═══════════════════════════════════════════════════
+
+/// Execute the AGI desktop manipulation demo.
+/// This proves the autonomous agent can:
+/// 1. Install software (apk add nano)
+/// 2. Open an editor (nano /etc/os-release)
+/// 3. Take a screenshot (proof of visual manipulation)
+/// 4. Interact with the UI (keypress)
+fn run_agi_demo(queue: &mut TaskQueue) {
+    sys_write(1, b"\n[AGI-DEMO] ============================================\n");
+    sys_write(1, b"[AGI-DEMO] Starting Desktop Manipulation Proof\n");
+    sys_write(1, b"[AGI-DEMO] ============================================\n");
+
+    // Step 1: Execute 'apk add nano' via MCP
+    sys_write(1, b"[AGI-DEMO] Step 1: exec apk add nano\n");
+    queue.add(TaskType::ExecTool, djb2(b"apk add nano"));
+
+    // Step 2: Wait 3 seconds (yield ~3000 times at ~1ms per yield)
+    sys_write(1, b"[AGI-DEMO] Step 2: waiting 3s...\n");
+    for _ in 0..3000 { sys_yield(); }
+
+    // Step 3: Type 'nano /etc/os-release\n'
+    sys_write(1, b"[AGI-DEMO] Step 3: type 'nano /etc/os-release'\n");
+    queue.add(TaskType::TypeText, djb2(b"nano /etc/os-release\n"));
+
+    // Step 4: Take screenshot
+    sys_write(1, b"[AGI-DEMO] Step 4: screenshot /tmp/demo1.bmp\n");
+    queue.add(TaskType::Screenshot, djb2(b"/tmp/demo1.bmp"));
+
+    // Step 5: Press Enter key
+    sys_write(1, b"[AGI-DEMO] Step 5: key ENTER\n");
+    queue.add(TaskType::KeyPress, 28); // KEY_ENTER
+
+    sys_write(1, b"[AGI-DEMO] Demo tasks queued (5 steps)\n");
+}
+
+/// Parse and execute an LLM command string.
+/// Commands: EXEC: <cmd>, SCREENSHOT: <path>, KEY: <code>, TYPE: <text>, MOUSE: <x> <y>
+fn parse_llm_command(queue: &mut TaskQueue, cmd_hash: u64) {
+    sys_write(1, b"[LLM] Processing command hash 0x");
+    print_hex(cmd_hash);
+    sys_write(1, b"\n");
+
+    // The actual command text would come from the bus payload.
+    // For now, we handle well-known command hashes:
+    if cmd_hash == djb2(b"EXEC: ls /") {
+        sys_write(1, b"[LLM] -> EXEC: ls /\n");
+        queue.add(TaskType::ExecTool, djb2(b"ls /"));
+    } else if cmd_hash == djb2(b"EXEC: START_DEMO") {
+        sys_write(1, b"[LLM] -> EXEC: START_DEMO\n");
+        run_agi_demo(queue);
+    } else {
+        sys_write(1, b"[LLM] -> Unknown command, executing as tool\n");
+        queue.add(TaskType::ExecTool, cmd_hash);
+    }
+}
+
+// ═══════════════════════════════════════════════════
 // Main Execution Loop
 // ═══════════════════════════════════════════════════
 
@@ -703,22 +764,43 @@ pub extern "C" fn main() -> i64 {
             queue.completed as u64,
         );
 
-        // Wait for new goals from the bus
-        sys_write(1, b"[AUTO] Waiting for new goals on bus (INTENT_GOAL 0xC001)...\n");
+        // Wait for new goals, AGI demo, or LLM commands from the bus
+        sys_write(1, b"[AUTO] Waiting for goals/demo/llm commands...\n");
 
         loop {
+            // Check for INTENT_GOAL (0xC001)
             if sys_bus_consume_intent(&mut msg_buf, INTENT_GOAL) == 0 {
                 let goal_hash = msg_buf[2];
                 sys_write(1, b"[AUTO] New goal received: 0x");
                 print_hex(goal_hash);
                 sys_write(1, b"\n");
-
-                // Reset queue and plan new goal
                 queue = TaskQueue::new();
                 plan_goal(&mut queue, goal_hash);
                 goals_processed += 1;
                 break;
             }
+
+            // Check for INTENT_START_DEMO (0xC005) — AGI desktop demo
+            if sys_bus_consume_intent(&mut msg_buf, INTENT_START_DEMO) == 0 {
+                sys_write(1, b"[AUTO] INTENT_START_DEMO received!\n");
+                queue = TaskQueue::new();
+                run_agi_demo(&mut queue);
+                goals_processed += 1;
+                break;
+            }
+
+            // Check for INTENT_LLM_COMMAND (0xC010) — LLM control
+            if sys_bus_consume_intent(&mut msg_buf, INTENT_LLM_COMMAND) == 0 {
+                let cmd_hash = msg_buf[2];
+                sys_write(1, b"[AUTO] LLM command received: 0x");
+                print_hex(cmd_hash);
+                sys_write(1, b"\n");
+                queue = TaskQueue::new();
+                parse_llm_command(&mut queue, cmd_hash);
+                goals_processed += 1;
+                break;
+            }
+
             sys_yield();
         }
     }

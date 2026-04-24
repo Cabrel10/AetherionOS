@@ -1,0 +1,24 @@
+#!/bin/sh
+# AetherionOS Init Script - Network Setup
+# Configures basic networking (loopback + DHCP if available)
+
+echo "[init/network] Configuring network..."
+
+# Loopback
+ip link set lo up 2>/dev/null || ifconfig lo up 2>/dev/null
+
+# Try DHCP on eth0 if available
+if [ -e /sys/class/net/eth0 ]; then
+    echo "[init/network] Requesting DHCP on eth0..."
+    udhcpc -i eth0 -q 2>/dev/null || {
+        # Static fallback for QEMU user-mode networking
+        ip addr add 10.0.2.15/24 dev eth0 2>/dev/null
+        ip route add default via 10.0.2.2 2>/dev/null
+        echo "nameserver 10.0.2.3" > /etc/resolv.conf
+    }
+fi
+
+# DNS resolver
+[ -f /etc/resolv.conf ] || echo "nameserver 8.8.8.8" > /etc/resolv.conf
+
+echo "[init/network] Network ready"

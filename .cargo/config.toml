@@ -4,3 +4,14 @@
 bindeps = true
 build-std = ["core", "compiler_builtins", "alloc"]
 build-std-features = ["compiler-builtins-mem"]
+
+# Linker script for the kernel binary (Limine protocol, upper-half mapping)
+# This applies ONLY to x86_64-unknown-none target, not to host build scripts
+# -no-pie forces ET_EXEC (not ET_DYN/PIE) so linker script base address is exact
+# relocation-model=static is required for bare-metal with fixed address layout
+[target.x86_64-unknown-none]
+rustflags = [
+  "-C", "link-arg=-Tkernel/linker-x86_64.ld",
+  "-C", "link-arg=-no-pie",
+  "-C", "relocation-model=static"
+]

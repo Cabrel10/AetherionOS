@@ -114,7 +114,7 @@ for agent_dir in $AGENTS; do
         fi
     else
         echo "  [FAIL] Compilation error:"
-        echo "$BUILD_OUTPUT" | grep "^error" | head -5
+        echo "$BUILD_OUTPUT" | grep -E "^error|error\[" | head -10
         FAILED=$((FAILED + 1))
         FAIL_LIST="$FAIL_LIST\n    - $agent_name (compile error)"
     fi

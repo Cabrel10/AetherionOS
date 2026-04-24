@@ -329,9 +329,15 @@ extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFram
             // or enters an idle HLT loop if no other process is ready.
             kill_user_and_switch(current_pid, stack_frame.instruction_pointer.as_u64());
         }
-        // If PID was 0 somehow, enter idle loop instead of panicking
-        crate::serial_println!("[#UD] No user PID to kill, entering idle loop");
+        // If PID was 0 somehow, resume shell instead of panicking
+        crate::serial_println!("[#UD] No user PID to kill, resuming shell");
         crate::scheduler::set_current_pid(0);
+        #[cfg(feature = "limine")]
+        {
+            unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
+            crate::boot::limine_entry::resume_kernel_shell();
+        }
+        #[cfg(not(feature = "limine"))]
         loop { x86_64::instructions::hlt(); }
     }
     // Only panic for kernel-mode #UD (genuine kernel bug)
@@ -435,8 +441,33 @@ const USER_HEAP_DEMAND_LOW: u64  = 0x0000_3000_0000_0000;
 const USER_HEAP_DEMAND_HIGH: u64 = 0x0000_3002_0000_0000;
 
 /// Helper: try to demand-map a user page at `page_addr`.
-/// Returns true if the page was successfully mapped.
+/// Returns true if the page was successfully mapped (or was already present).
 fn try_demand_map_user_page(page_addr: u64, is_instruction_fetch: bool) -> bool {
+    // KPTI fix: CR3 is kernel PML4 in the page fault handler.
+    // We must use the user process's PML4, not the current CR3.
+    let current_pid = crate::scheduler::current_pid();
+    let pml4_phys = crate::process::get_pml4_phys(current_pid).unwrap_or(0);
+    if pml4_phys == 0 {
+        crate::serial_println!("[PF-DEMAND] PID {} has no PML4!", current_pid);
+        return false;
+    }
+
+    // CRITICAL FIX (Jalon 210): Check if the page is already mapped in the
+    // user PML4.  When a page fault occurs because the CR3 was still set to
+    // the kernel PML4 (KPTI switch), the page IS present in the user PML4
+    // but the CPU could not see it.  Allocating a zero frame here would
+    // overwrite the valid code/data page, causing an infinite fault loop
+    // and exhausting the entire frame pool (the BusyBox OOM bug).
+    if let Some(_existing_phys) = unsafe { crate::elf::lookup_page_frame_pub(pml4_phys, page_addr) } {
+        // Page is already mapped — just flush the TLB entry and return.
+        // The fault was caused by a stale TLB / wrong CR3, not a missing page.
+        unsafe {
+            core::arch::asm!("invlpg [{}]", in(reg) page_addr, options(nostack));
+        }
+        return true;
+    }
+
+    // Page is genuinely not present — allocate and map a zero frame.
     let frame_phys = unsafe { crate::elf::alloc_demand_frame() };
     match frame_phys {
         Some(phys) => {
@@ -444,9 +475,6 @@ fn try_demand_map_user_page(page_addr: u64, is_instruction_fetch: bool) -> bool 
             unsafe {
                 core::ptr::write_bytes((phys + phys_offset) as *mut u8, 0, 4096);
             }
-            let cr3: u64;
-            unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)); }
-            let pml4_phys = cr3 & !0xFFF;
             // Jalon 96: If this is an instruction fetch, map as executable (no NX)
             // Otherwise, map as data (WRITABLE + NX for W^X enforcement)
             let flags: u64 = if is_instruction_fetch {
@@ -463,7 +491,9 @@ fn try_demand_map_user_page(page_addr: u64, is_instruction_fetch: bool) -> bool 
             }
         }
         None => {
-            crate::serial_println!("[PF-DEMAND] FATAL: Out of frames");
+            let (used, max) = crate::elf::pool_stats();
+            let fl = crate::elf::freelist_count();
+            crate::serial_println!("[PF-DEMAND] FATAL: Out of frames (pool {}/{}, freelist={})", used, max, fl);
             false
         }
     }
@@ -751,11 +781,25 @@ fn kill_user_and_switch(current_pid: u64, addr_raw: u64) {
         }
     }
 
-    // No other Ready process — enter kernel idle loop
-    // Enable interrupts so the APIC timer can wake us and dispatch new work.
-    crate::serial_println!("[SIGSEGV] No other process ready, idle");
+    // No other Ready process — resume the kernel shell.
+    crate::serial_println!("[SIGSEGV] No other process ready, resuming shell");
     crate::scheduler::set_current_pid(0);
-    unsafe { core::arch::asm!("sti"); }
+
+    // Restore kernel CR3
+    unsafe {
+        let kernel_cr3 = crate::arch::x86_64::syscall::get_kernel_cr3();
+        if kernel_cr3 != 0 {
+            core::arch::asm!("mov cr3, {}", in(reg) kernel_cr3, options(nostack));
+        }
+        core::arch::asm!("sti", options(nomem, nostack));
+    }
+
+    // Resume the shell (never returns)
+    #[cfg(feature = "limine")]
+    crate::boot::limine_entry::resume_kernel_shell();
+
+    // Fallback: hlt loop
+    #[allow(unreachable_code)]
     loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)); } }
 }
 
@@ -768,15 +812,30 @@ extern "x86-interrupt" fn page_fault_handler(
     // KPTI: Ensure we are running with kernel CR3. If a fault occurs after
     // CR3 was switched to the user PML4 (e.g. during IRETQ), the IST handler
     // would otherwise run with user page tables and be unable to access kernel
-    // data structures. Switch back to kernel PML4 (0x1000) immediately.
+    // data structures. Switch back to kernel PML4 immediately.
+    // We save the original CR3 so we can restore it before IRET.
+    let saved_cr3: u64;
     unsafe {
-        let cr3: u64;
-        core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
+        core::arch::asm!("mov {}, cr3", out(reg) saved_cr3, options(nomem, nostack));
         let kernel_cr3 = crate::arch::x86_64::syscall::get_kernel_cr3();
-        if kernel_cr3 != 0 && cr3 != kernel_cr3 {
+        if kernel_cr3 != 0 && saved_cr3 != kernel_cr3 {
             core::arch::asm!("mov cr3, {}", in(reg) kernel_cr3, options(nostack));
         }
     }
+
+    // Helper: restore CR3 to the value it had when the page fault occurred.
+    // This is critical for KPTI: we switch to kernel CR3 above for kernel
+    // data structure access, but before IRET-ing back to user mode, we must
+    // restore the user PML4 or the user code will fault immediately.
+    let restore_cr3 = |cr3_val: u64| {
+        unsafe {
+            let current_cr3: u64;
+            core::arch::asm!("mov {}, cr3", out(reg) current_cr3, options(nomem, nostack));
+            if current_cr3 != cr3_val {
+                core::arch::asm!("mov cr3, {}", in(reg) cr3_val, options(nostack));
+            }
+        }
+    };
 
     let addr_raw = Cr2::read().map(|v| v.as_u64()).unwrap_or(0);
     let is_user_mode = error_code.contains(PageFaultErrorCode::USER_MODE);
@@ -964,7 +1023,13 @@ extern "x86-interrupt" fn page_fault_handler(
         && addr_raw >= USER_STACK_DEMAND_LOW
         && addr_raw < USER_STACK_DEMAND_HIGH
     {
+        static STACK_DEMAND_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let n = STACK_DEMAND_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n < 5 || n % 100 == 0 {
+            crate::serial_println!("[PF-STACK] #{} addr=0x{:X} fl={}", n, addr_raw, crate::elf::freelist_count());
+        }
         if try_demand_map_user_page(page_addr, false) {
+            restore_cr3(saved_cr3);
             return; // Resume faulting instruction
         }
         // Fall through to SIGSEGV
@@ -980,7 +1045,13 @@ extern "x86-interrupt" fn page_fault_handler(
             .unwrap_or(USER_HEAP_DEMAND_LOW);
         // Only map if address is below the current break (valid heap)
         if addr_raw < heap_break {
+            static HEAP_DEMAND_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+            let n = HEAP_DEMAND_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if n < 5 || n % 100 == 0 {
+                crate::serial_println!("[PF-HEAP] #{} addr=0x{:X} fl={}", n, addr_raw, crate::elf::freelist_count());
+            }
             if try_demand_map_user_page(page_addr, false) {
+                restore_cr3(saved_cr3);
                 return; // Resume
             }
         }
@@ -998,9 +1069,32 @@ extern "x86-interrupt" fn page_fault_handler(
         && addr_raw >= ELF_DEMAND_LOW
         && addr_raw < ELF_DEMAND_HIGH
     {
+        static ELF_DEMAND_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        let n = ELF_DEMAND_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if n < 5 || n % 100 == 0 {
+            crate::serial_println!("[PF-ELF] #{} addr=0x{:X} fl={}", n, addr_raw, crate::elf::freelist_count());
+        }
         let is_ifetch = error_code.contains(PageFaultErrorCode::INSTRUCTION_FETCH);
         if try_demand_map_user_page(page_addr, is_ifetch) {
+            restore_cr3(saved_cr3);
             return; // Resume — BSS/code page now mapped
+        }
+        // Fall through to SIGSEGV
+    }
+
+    // --- Demand paging for mmap region (0x400000000000+, PML4[128]) ---
+    // If a user-mode page fault occurs in the mmap region, the page may have
+    // been mapped in the user PML4 but a TLB stale entry or race condition
+    // caused the fault. Try demand mapping as a safety net.
+    const MMAP_DEMAND_LOW: u64 = 0x0000_4000_0000_0000;
+    const MMAP_DEMAND_HIGH: u64 = 0x0000_4010_0000_0000; // +1 TiB guard
+    if is_user_mode
+        && addr_raw >= MMAP_DEMAND_LOW
+        && addr_raw < MMAP_DEMAND_HIGH
+    {
+        if try_demand_map_user_page(page_addr, false) {
+            restore_cr3(saved_cr3);
+            return; // Resume — mmap page demand-mapped
         }
         // Fall through to SIGSEGV
     }
@@ -1019,9 +1113,13 @@ extern "x86-interrupt" fn page_fault_handler(
                 // This reduces page-fault overhead for sequential model weight access
                 const READAHEAD_PAGES: u64 = 8; // 32 KiB readahead window
                 
-                let cr3: u64;
-                unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)); }
-                let pml4_phys = cr3 & !0xFFF;
+                // KPTI fix: CR3 is kernel PML4 in the page fault handler.
+                // Use the user process's PML4 for demand mapping.
+                let pml4_phys = crate::process::get_pml4_phys(current_pid).unwrap_or(0);
+                if pml4_phys == 0 {
+                    crate::serial_println!("[PF-VMA] PID {} has no PML4!", current_pid);
+                    kill_user_and_switch(current_pid, addr_raw);
+                }
                 
                 let mut mapped_count: u64 = 0;
                 
@@ -1087,6 +1185,7 @@ extern "x86-interrupt" fn page_fault_handler(
                 }
                 
                 if mapped_count > 0 {
+                    restore_cr3(saved_cr3);
                     return; // Resume execution — faulting page is now mapped
                 }
                 // Fall through to SIGSEGV if nothing was mapped
@@ -1117,6 +1216,7 @@ extern "x86-interrupt" fn page_fault_handler(
     // User stack region (including guard page area)
     if !is_user_mode && addr_raw >= USER_STACK_DEMAND_LOW && addr_raw < USER_STACK_DEMAND_HIGH {
         if try_demand_map_user_page(page_addr, false) {
+            restore_cr3(saved_cr3);
             return; // Resume IRETQ — user stack page now mapped
         }
     }
@@ -1127,6 +1227,7 @@ extern "x86-interrupt" fn page_fault_handler(
     if !is_user_mode && addr_raw >= ELF_DEMAND_LOW && addr_raw < ELF_DEMAND_HIGH {
         let is_ifetch = error_code.contains(PageFaultErrorCode::INSTRUCTION_FETCH);
         if try_demand_map_user_page(page_addr, is_ifetch) {
+            restore_cr3(saved_cr3);
             return;
         }
     }
@@ -1134,6 +1235,7 @@ extern "x86-interrupt" fn page_fault_handler(
     // User heap region — kernel may fault during sys_write copying to user buffer
     if !is_user_mode && addr_raw >= USER_HEAP_DEMAND_LOW && addr_raw < USER_HEAP_DEMAND_HIGH {
         if try_demand_map_user_page(page_addr, false) {
+            restore_cr3(saved_cr3);
             return;
         }
     }

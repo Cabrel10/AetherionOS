@@ -1,0 +1,47 @@
+#!/bin/sh
+# AetherionOS Init Script - Framebuffer + Input Setup
+# This script is executed by the kernel's init system at boot.
+
+echo "[init/x11] Starting framebuffer and input subsystem..."
+
+# Mount virtual filesystems
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sysfs /sys 2>/dev/null
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+
+# Ensure device nodes exist
+[ -c /dev/fb0 ] || mknod /dev/fb0 c 29 0
+[ -c /dev/input/event0 ] || {
+    mkdir -p /dev/input
+    mknod /dev/input/event0 c 13 64
+    mknod /dev/input/event1 c 13 65
+}
+
+# Set up TTY
+[ -c /dev/ttyS0 ] || mknod /dev/ttyS0 c 4 64
+
+echo "[init/x11] Device nodes ready"
+
+# Start TinyX if available (framebuffer X server)
+if command -v Xfbdev >/dev/null 2>&1; then
+    echo "[init/x11] Starting Xfbdev on /dev/fb0..."
+    Xfbdev :0 -screen 1024x768x24 &
+    sleep 2
+    if command -v xterm >/dev/null 2>&1; then
+        DISPLAY=:0 xterm &
+    fi
+elif command -v fbterm >/dev/null 2>&1; then
+    echo "[init/x11] Starting fbterm..."
+    fbterm &
+fi
+
+# Launch the AetherionOS shell on serial console
+if [ -x /bin/busybox ]; then
+    echo "[init/x11] Starting BusyBox shell on /dev/ttyS0..."
+    /bin/busybox sh
+elif [ -x /bin/sh.elf ]; then
+    echo "[init/x11] Starting AetherionOS shell..."
+    /bin/sh.elf
+else
+    echo "[init/x11] No shell available - dropping to kernel console"
+fi

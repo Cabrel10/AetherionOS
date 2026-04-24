@@ -193,7 +193,7 @@ impl core::fmt::Display for ElfError {
 
 /// Maximum number of freed frames we can track for recycling.
 /// When a process exits, its frames are pushed here and reused by the next allocation.
-const FREELIST_MAX: usize = 8192; // 32 MiB of recyclable frames
+const FREELIST_MAX: usize = 32768; // 128 MiB of recyclable frames
 
 struct ElfFramePool {
     base_frame: u64,    // Physical base address (frame-aligned)
@@ -220,23 +220,47 @@ static mut ELF_POOL: ElfFramePool = ElfFramePool {
 static ELF_POOL_INITIALIZED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
-/// Initialize the ELF frame pool with a base physical address
+/// Initialize the ELF frame pool with a base physical address.
+/// When `freelist_mode` is true, the caller will push individual frames via
+/// `push_pool_frame`, so the bump allocator is disabled (frames_used = max_frames).
 /// SAFETY: Must be called once, after physical memory is known
 pub unsafe fn init_frame_pool(base_phys: u64, num_frames: usize) {
     ELF_POOL.base_frame = base_phys;
-    ELF_POOL.frames_used = 0;
+    // Disable bump allocator — all frames come from the freelist populated
+    // by push_pool_frame(). This prevents double-allocation where the bump
+    // allocator would return the same physical frames already in the freelist.
+    ELF_POOL.frames_used = num_frames;
     ELF_POOL.max_frames = num_frames;
+    ELF_POOL.freelist_count = 0;
     ELF_POOL_INITIALIZED.store(true, Ordering::SeqCst);
     crate::serial_println!(
-        "[ELF] Frame pool initialized: base=0x{:X}, frames={}, size={} KB",
+        "[ELF] Frame pool initialized: base=0x{:X}, frames={}, size={} KB (freelist mode)",
         base_phys, num_frames, num_frames * 4
     );
 }
+
+/// Add a pre-allocated frame to the pool's freelist.
+/// Called during boot to pre-populate the pool with non-contiguous frames.
+pub unsafe fn push_pool_frame(phys: u64) {
+    if ELF_POOL.freelist_count < FREELIST_MAX {
+        ELF_POOL.freelist[ELF_POOL.freelist_count] = phys;
+        ELF_POOL.freelist_count += 1;
+    }
+}
+
+/// Return the current freelist count (for diagnostics)
+pub fn freelist_count() -> usize {
+    unsafe { ELF_POOL.freelist_count }
+}
+
+/// Global allocation counter (diagnostic)
+static ALLOC_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Allocate a physical frame from the ELF pool.
 /// Jalon 94: Checks freelist first (recycled frames), then bumps.
 pub unsafe fn alloc_elf_frame() -> Option<u64> {
     if !ELF_POOL_INITIALIZED.load(Ordering::SeqCst) {
+        crate::serial_println!("[POOL] NOT INITIALIZED");
         return None;
     }
     // Priority 1: Reuse a freed frame from the freelist
@@ -244,10 +268,17 @@ pub unsafe fn alloc_elf_frame() -> Option<u64> {
         ELF_POOL.freelist_count -= 1;
         let phys = ELF_POOL.freelist[ELF_POOL.freelist_count];
         ELF_POOL.total_recycled += 1;
+        let n = ALLOC_COUNTER.fetch_add(1, Ordering::Relaxed);
+        // Print every 1000th allocation to track where frames go
+        if n % 5000 == 0 && n > 0 {
+            crate::serial_println!("[POOL-TRACE] alloc #{}: freelist={} phys=0x{:X}", n, ELF_POOL.freelist_count, phys);
+        }
         return Some(phys);
     }
     // Priority 2: Bump allocate a new frame
     if ELF_POOL.frames_used >= ELF_POOL.max_frames {
+        let n = ALLOC_COUNTER.load(Ordering::Relaxed);
+        crate::serial_println!("[POOL] EXHAUSTED: used={} max={} freelist=0 total_allocs={}", ELF_POOL.frames_used, ELF_POOL.max_frames, n);
         return None;
     }
     let phys = ELF_POOL.base_frame + (ELF_POOL.frames_used as u64) * PAGE_SIZE;
@@ -262,13 +293,9 @@ pub unsafe fn free_elf_frame(phys: u64) {
     if !ELF_POOL_INITIALIZED.load(Ordering::SeqCst) {
         return;
     }
-    // Validate frame belongs to our pool
-    let pool_end = ELF_POOL.base_frame + (ELF_POOL.max_frames as u64) * PAGE_SIZE;
-    if phys < ELF_POOL.base_frame || phys >= pool_end {
-        return; // Not from our pool — don't free
-    }
-    if phys & 0xFFF != 0 {
-        return; // Not page-aligned
+    // Validate frame is page-aligned and non-zero
+    if phys == 0 || phys & 0xFFF != 0 {
+        return;
     }
     // Push onto freelist if space available
     if ELF_POOL.freelist_count < FREELIST_MAX {
@@ -307,11 +334,21 @@ pub unsafe fn free_user_page_table(pml4_phys: u64) {
     }
 
     let pool_base = ELF_POOL.base_frame;
+    // The kernel frame allocator is a bump allocator that returns contiguous
+    // frames. All pool frames come from base_frame + i*4096, so the pool
+    // spans [pool_base, pool_base + max_frames * 4096).
+    // Additionally, pool frames pushed from non-contiguous sources must
+    // also be accepted, so we use a conservative upper bound: any address
+    // above pool_base and below the end of physical RAM (0x80000000 for 2G).
+    // To be safe, we only accept addresses within the freelist's known range.
     let pool_end = pool_base + (ELF_POOL.max_frames as u64) * PAGE_SIZE;
-
-    // Helper: check if a physical address belongs to ELF_POOL
+    
+    // Helper: check if a physical address was allocated from the ELF pool.
+    // Only free frames that are within our pool's physical address range.
+    // This prevents the GC from accidentally freeing kernel page tables,
+    // heap frames, or other kernel structures.
     let in_pool = |phys: u64| -> bool {
-        phys >= pool_base && phys < pool_end && phys & 0xFFF == 0
+        phys != 0 && phys & 0xFFF == 0 && phys >= pool_base && phys < pool_end
     };
 
     let mut freed_count: usize = 0;
@@ -502,6 +539,22 @@ fn elf_flags_to_page_flags(p_flags: u32) -> u64 {
 /// Physical memory offset (set during kernel boot)
 static PHYS_MEM_OFFSET: AtomicU64 = AtomicU64::new(0);
 
+/// Program name to use as argv[0] for the next ELF load.
+/// Set by load_elf() before calling load_elf_binary().
+static mut ELF_ARGV0: [u8; 128] = [0u8; 128];
+static mut ELF_ARGV0_LEN: usize = 0;
+
+/// Set the program name for the next ELF load
+pub fn set_argv0(name: &str) {
+    unsafe {
+        let bytes = name.as_bytes();
+        let len = core::cmp::min(bytes.len(), 126); // leave room for null
+        ELF_ARGV0[..len].copy_from_slice(&bytes[..len]);
+        ELF_ARGV0[len] = 0;
+        ELF_ARGV0_LEN = len;
+    }
+}
+
 /// Set the physical memory offset (call during boot)
 pub fn set_phys_mem_offset(offset: u64) {
     PHYS_MEM_OFFSET.store(offset, Ordering::SeqCst);
@@ -684,30 +737,56 @@ unsafe fn map_user_page(
         let table_virt = phys_to_virt(table_phys) as *mut u64;
         let entry = core::ptr::read_volatile(table_virt.add(indices[level]));
 
-        // J135 CRITICAL FIX: Reject 1 GiB huge pages (PDPT PS=1) and 2 MiB huge pages (PD PS=1).
-        // These are kernel mappings (e.g., kernel .text at PD[2]=0x4000A3 with PS=1, covering
-        // phys 0x400000-0x5FFFFF). If we naively treat them as page tables and deep-copy them,
-        // we will corrupt kernel memory: the "copy" only duplicates the first 4 KiB of what the
-        // CPU actually maps as a 2 MiB frame, and the new PTE still has PS=1, so the MMU
-        // interprets the new frame as a 2 MiB page containing garbage that happens to include
-        // the syscall_entry region. This was the root cause of the CR2=0xC / 0x0 crash in
-        // syscall_entry: user ELF loading was writing user data into kernel .text.
-        //
-        // Fix: explicitly refuse to insert a user mapping on top of a kernel huge page.
-        // User ELFs live at 0x8000000000 (PML4[1]) and never need low identity-mapped kernel
-        // pages. If we ever need this path, we would have to SPLIT the 2 MiB page into 512
-        // individual 4 KiB PT entries — not attempted here.
+        // J135+J200: Handle huge pages. For 1 GiB PDPT huge pages (level 1),
+        // we still refuse (too complex and unnecessary). For 2 MiB PD huge pages
+        // (level 2), we SPLIT them into 512 individual 4 KiB PT entries.
+        // This is needed for BusyBox (loads at 0x400000) which overlaps the
+        // kernel identity mapping's 2 MiB huge page at PD[2].
         if (entry & 0x01) != 0 && (entry & 0x80) != 0 {
-            // Huge-page encountered on the way to a user page — refuse.
-            // level == 1 -> 1 GiB PDPT entry, level == 2 -> 2 MiB PD entry.
-            crate::serial_println!(
-                "[ELF][J135] REFUSING huge-page split: vaddr=0x{:X} level={} entry=0x{:X} (kernel mapping)",
-                vaddr, level, entry
-            );
-            return Err(ElfError::AddressOutOfRange);
-        }
+            if level == 2 {
+                // Split 2 MiB huge page into 512 × 4 KiB pages
+                let huge_phys_base = entry & 0x000F_FFFF_FFE0_0000; // 2 MiB aligned phys addr
+                let huge_flags = entry & 0xFFF; // lower 12 flag bits (minus PS)
+                let huge_nx = entry & (1u64 << 63); // NX bit
 
-        if entry & 0x01 == 0 {
+                // Allocate a new PT
+                let new_pt = alloc_elf_frame().ok_or(ElfError::OutOfMemory)?;
+                let new_pt_virt = phys_to_virt(new_pt) as *mut u64;
+
+                // Fill 512 entries: each maps a 4 KiB page within the 2 MiB region
+                for j in 0..512usize {
+                    let page_phys = huge_phys_base + (j as u64) * 4096;
+                    // Copy flags from huge page, clear PS bit (0x80), keep NX
+                    let pt_flags = (huge_flags & !0x80) | huge_nx;
+                    core::ptr::write_volatile(new_pt_virt.add(j), page_phys | pt_flags);
+                }
+
+                // Replace the huge page PD entry with a pointer to the new PT
+                // Use P|W|U flags so user pages can be mapped here
+                let new_pd_entry = new_pt | 0x07; // P|W|U
+                core::ptr::write_volatile(table_virt.add(indices[level]), new_pd_entry);
+
+                // Track as owned
+                if OWNED_COUNT < (*core::ptr::addr_of!(OWNED_TABLES)).len() {
+                    OWNED_TABLES[OWNED_COUNT] = new_pt;
+                    OWNED_COUNT += 1;
+                }
+
+                crate::serial_println!(
+                    "[ELF] Split 2MiB huge page: vaddr=0x{:X} phys_base=0x{:X} -> PT at 0x{:X}",
+                    vaddr, huge_phys_base, new_pt
+                );
+
+                table_phys = new_pt;
+            } else {
+                // 1 GiB PDPT huge page — too complex, refuse
+                crate::serial_println!(
+                    "[ELF][J135] REFUSING 1GiB huge-page split: vaddr=0x{:X} level={} entry=0x{:X}",
+                    vaddr, level, entry
+                );
+                return Err(ElfError::AddressOutOfRange);
+            }
+        } else if entry & 0x01 == 0 {
             // Entry not present - allocate a new page table
             let new_table = alloc_elf_frame().ok_or(ElfError::OutOfMemory)?;
             core::ptr::write_bytes(phys_to_virt(new_table) as *mut u8, 0, PAGE_SIZE as usize);
@@ -821,7 +900,8 @@ pub struct InterpLoadResult {
 /// 6. Map 8 MiB user stack at USER_STACK_TOP
 /// 7. Return load result
 pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
-    let frames_before = unsafe { ELF_POOL.frames_used };
+    let fl_before = unsafe { ELF_POOL.freelist_count };
+    crate::serial_println!("[ELF] load_elf_binary: freelist={} frames available", fl_before);
 
     // Step 1: Parse header
     let hdr = parse_header(elf_data)?;
@@ -1071,7 +1151,8 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
         }
     }
 
-    let frames_after = unsafe { ELF_POOL.frames_used };
+    let fl_after = unsafe { ELF_POOL.freelist_count };
+    let frames_consumed = if fl_before > fl_after { fl_before - fl_after } else { 0 };
 
     // ═══════════════════════════════════════════════════════════════
     // Step 7: Linux ABI Stack Layout — Inject AuxV, argv, envp
@@ -1098,7 +1179,7 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
                 stack_pointer: USER_STACK_INITIAL_RSP,
                 pml4_phys,
                 segments_loaded,
-                frames_used: frames_after - frames_before,
+                frames_used: frames_consumed,
                 is_linux_abi,
                 phdr_vaddr: computed_phdr_vaddr,
                 phdr_count: phnum,
@@ -1128,14 +1209,23 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
             }
         }
 
-        // --- Write program name "aetherion" at offset 0xF10 ---
+        // --- Write program name (argv[0]) at offset 0xF10 ---
         let progname_offset: usize = 0xF10;
         let progname_vaddr: u64 = top_stack_page + progname_offset as u64;
         {
-            let name = b"aetherion\0";
+            let name_len = ELF_ARGV0_LEN;
             let dst = page_base.add(progname_offset);
-            for (i, &b) in name.iter().enumerate() {
-                core::ptr::write_volatile(dst.add(i), b);
+            if name_len > 0 && name_len < 127 {
+                for i in 0..name_len {
+                    core::ptr::write_volatile(dst.add(i), ELF_ARGV0[i]);
+                }
+                core::ptr::write_volatile(dst.add(name_len), 0u8);
+            } else {
+                // Fallback to "aetherion" if no name set
+                let fallback = b"aetherion\0";
+                for (i, &b) in fallback.iter().enumerate() {
+                    core::ptr::write_volatile(dst.add(i), b);
+                }
             }
         }
 
@@ -1230,12 +1320,13 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
     let final_entry = entry + pie_base;
 
     crate::serial_println!(
-        "[ELF] Load complete: entry=0x{:X}, stack_rsp=0x{:X}, segments={}, frames={}, pie_base=0x{:X}",
+        "[ELF] Load complete: entry=0x{:X}, stack_rsp=0x{:X}, segments={}, frames={}, pie_base=0x{:X}, freelist_remaining={}",
         final_entry,
         linux_rsp,
         segments_loaded,
-        frames_after - frames_before,
-        pie_base
+        frames_consumed,
+        pie_base,
+        unsafe { ELF_POOL.freelist_count }
     );
 
     let final_phdr_vaddr = if found_first_load { first_load_vaddr + e_phoff - first_load_offset } else { 0 };
@@ -1300,7 +1391,7 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
         stack_pointer: linux_rsp,
         pml4_phys,
         segments_loaded,
-        frames_used: frames_after - frames_before,
+        frames_used: frames_consumed,
         is_linux_abi,
         phdr_vaddr: final_phdr_vaddr,
         phdr_count: phnum,
@@ -1653,6 +1744,9 @@ pub unsafe fn build_sysv_stack(
 pub fn load_elf(path: &str) -> Result<u64, ElfError> {
     crate::serial_println!("[ELF] load_elf(\"{}\")", path);
 
+    // Set argv[0] to the path so BusyBox can determine its applet
+    set_argv0(path);
+
     // Step 1: Read file from VFS
     let elf_data = crate::fs::vfs::file_read(path).map_err(|e| {
         crate::serial_println!("[ELF] VFS error reading '{}': {}", path, e);
@@ -1663,6 +1757,7 @@ pub fn load_elf(path: &str) -> Result<u64, ElfError> {
 
     // Step 2: Load ELF binary
     let result = load_elf_binary(&elf_data)?;
+    crate::serial_println!("[ELF] After load_elf_binary: freelist={}", freelist_count());
 
     // Step 3: Create a process with Ring 3 context
     // GDT selectors for Ring 3:
@@ -1672,9 +1767,18 @@ pub fn load_elf(path: &str) -> Result<u64, ElfError> {
     //   RIP = entry point
     //   RSP = stack top
 
-    let pid = crate::process::spawn_kernel_thread(path)
-        .map_err(|_| ElfError::ProcessError)?;
-    crate::process::set_pml4_phys(pid, result.pml4_phys).map_err(|_| ElfError::ProcessError)?;
+    // Phase 6 FIX: Use spawn_userspace() instead of spawn_kernel_thread().
+    // spawn_kernel_thread() creates a process with entry_point=0 and stack_pointer=0,
+    // which causes the scheduler to skip it (get_entry_state returns entry=0).
+    // spawn_userspace() correctly sets entry_point, stack_pointer, and pml4_phys,
+    // so tick_preemptive() can pick it up for context switching.
+    let pid = crate::process::spawn_userspace(
+        path,
+        0, // ppid: no parent (launched from kernel shell)
+        result.entry_point,
+        result.stack_pointer,
+        result.pml4_phys,
+    ).map_err(|_| ElfError::ProcessError)?;
 
     crate::serial_println!(
         "[ELF] Process created: PID={}, entry=0x{:X}, stack=0x{:X}",
@@ -1860,8 +1964,8 @@ pub unsafe fn exec_switch_cr3_and_ring3(
 ) -> ! {
     // Pre-IRETQ UART diagnostics
     crate::serial_println!(
-        "[ELF-DEBUG] exec_switch_cr3_and_ring3: CR3=0x{:X} RIP=0x{:X} RSP=0x{:X} (naked)",
-        new_pml4_phys, user_entry, user_rsp
+        "[ELF-DEBUG] exec_switch_cr3_and_ring3: CR3=0x{:X} RIP=0x{:X} RSP=0x{:X} freelist={}",
+        new_pml4_phys, user_entry, user_rsp, freelist_count()
     );
 
     // Verify user entry point is mapped in the target PML4
@@ -1876,6 +1980,14 @@ pub unsafe fn exec_switch_cr3_and_ring3(
     crate::serial_println!(
         "[ELF-DEBUG] Entry 0x{:X} -> phys frame 0x{:X} (OK)",
         user_entry, entry_phys.unwrap()
+    );
+    
+    // Diagnostic: check if page 0x4D3000 is mapped (the crash address)
+    let crash_page = 0x4D3000u64;
+    let crash_phys = lookup_page_frame_pub(new_pml4_phys, crash_page);
+    crate::serial_println!(
+        "[ELF-DEBUG] Crash page 0x{:X} mapped={} phys={:X}",
+        crash_page, crash_phys.is_some(), crash_phys.unwrap_or(0)
     );
 
     // Verify PML4[256] is present
