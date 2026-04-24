@@ -1074,6 +1074,45 @@ extern "x86-interrupt" fn page_fault_handler(
         if n < 5 || n % 100 == 0 {
             crate::serial_println!("[PF-ELF] #{} addr=0x{:X} fl={}", n, addr_raw, crate::elf::freelist_count());
         }
+        // Jalon 211: On the first few ELF faults, dump the full PTE chain
+        // to diagnose why the CPU faults even though the page appears mapped.
+        if n < 3 {
+            let pid = crate::scheduler::current_pid();
+            let pml4 = crate::process::get_pml4_phys(pid).unwrap_or(0);
+            if pml4 != 0 {
+                let po = crate::elf::phys_offset();
+                let pml4_i = ((addr_raw >> 39) & 0x1FF) as usize;
+                let pdpt_i = ((addr_raw >> 30) & 0x1FF) as usize;
+                let pd_i   = ((addr_raw >> 21) & 0x1FF) as usize;
+                let pt_i   = ((addr_raw >> 12) & 0x1FF) as usize;
+                unsafe {
+                    let pml4_e = core::ptr::read_volatile(((pml4 + po) as *const u64).add(pml4_i));
+                    crate::serial_println!("[PTE-WALK] PML4[{}]=0x{:X} (P={} U={} W={} NX={})",
+                        pml4_i, pml4_e, pml4_e & 1, (pml4_e >> 2) & 1, (pml4_e >> 1) & 1, (pml4_e >> 63) & 1);
+                    if pml4_e & 1 != 0 {
+                        let pdpt_base = pml4_e & 0x000F_FFFF_FFFF_F000;
+                        let pdpt_e = core::ptr::read_volatile(((pdpt_base + po) as *const u64).add(pdpt_i));
+                        crate::serial_println!("[PTE-WALK] PDPT[{}]=0x{:X} (P={} U={} W={} NX={})",
+                            pdpt_i, pdpt_e, pdpt_e & 1, (pdpt_e >> 2) & 1, (pdpt_e >> 1) & 1, (pdpt_e >> 63) & 1);
+                        if pdpt_e & 1 != 0 {
+                            let pd_base = pdpt_e & 0x000F_FFFF_FFFF_F000;
+                            let pd_e = core::ptr::read_volatile(((pd_base + po) as *const u64).add(pd_i));
+                            crate::serial_println!("[PTE-WALK] PD[{}]=0x{:X} (P={} U={} W={} PS={} NX={})",
+                                pd_i, pd_e, pd_e & 1, (pd_e >> 2) & 1, (pd_e >> 1) & 1, (pd_e >> 7) & 1, (pd_e >> 63) & 1);
+                            if pd_e & 1 != 0 && pd_e & 0x80 == 0 {
+                                let pt_base = pd_e & 0x000F_FFFF_FFFF_F000;
+                                let pt_e = core::ptr::read_volatile(((pt_base + po) as *const u64).add(pt_i));
+                                crate::serial_println!("[PTE-WALK] PT[{}]=0x{:X} (P={} U={} W={} NX={})",
+                                    pt_i, pt_e, pt_e & 1, (pt_e >> 2) & 1, (pt_e >> 1) & 1, (pt_e >> 63) & 1);
+                            }
+                        }
+                    }
+                }
+                let err = error_code.bits();
+                crate::serial_println!("[PF-ELF-ERR] err=0x{:X} P={} W={} U={} RSVD={} I/D={}",
+                    err, err & 1, (err >> 1) & 1, (err >> 2) & 1, (err >> 3) & 1, (err >> 4) & 1);
+            }
+        }
         let is_ifetch = error_code.contains(PageFaultErrorCode::INSTRUCTION_FETCH);
         if try_demand_map_user_page(page_addr, is_ifetch) {
             restore_cr3(saved_cr3);
