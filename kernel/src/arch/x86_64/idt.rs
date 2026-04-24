@@ -1077,6 +1077,8 @@ extern "x86-interrupt" fn page_fault_handler(
         // Jalon 211: On the first few ELF faults, dump the full PTE chain
         // to diagnose why the CPU faults even though the page appears mapped.
         if n < 3 {
+            crate::serial_println!("[PF-ELF-CR3] saved_cr3=0x{:X} kernel_cr3=0x{:X}",
+                saved_cr3, unsafe { crate::arch::x86_64::syscall::get_kernel_cr3() });
             let pid = crate::scheduler::current_pid();
             let pml4 = crate::process::get_pml4_phys(pid).unwrap_or(0);
             if pml4 != 0 {
