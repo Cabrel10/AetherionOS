@@ -403,9 +403,14 @@ extern "x86-interrupt" fn general_protection_fault_handler(stack_frame: Interrup
     let cs = stack_frame.code_segment;
     let is_ring3 = (cs.0 & 0x3) == 3;
 
+    let last_nr = crate::arch::x86_64::syscall::LAST_SYSCALL_NR.load(core::sync::atomic::Ordering::Relaxed);
     crate::serial_println!(
-        "[EXCEPTION] #GP code=0x{:X} rip={:?} ring3={}",
-        error_code, stack_frame.instruction_pointer, is_ring3
+        "[EXCEPTION] #GP code=0x{:X} rip={:?} ring3={} last_syscall={}",
+        error_code, stack_frame.instruction_pointer, is_ring3, last_nr
+    );
+    crate::serial_println!(
+        "[EXCEPTION] #GP RSP={:?} RFLAGS={:?} SS={:?}",
+        stack_frame.stack_pointer, stack_frame.cpu_flags, stack_frame.stack_segment
     );
 
     if is_ring3 {

@@ -595,7 +595,11 @@ extern "C" fn syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, 
 /// Jalon 105: Linux ABI compatibility layer — processes tagged with Abi::Linux
 /// get Linux-specific behavior for certain syscalls (uname, arch_prctl, etc.)
 /// Syscall numbers match Linux x86_64 ABI for POSIX compatibility.
+/// Last syscall number (for GP fault diagnostics)
+pub static LAST_SYSCALL_NR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
+    LAST_SYSCALL_NR.store(nr, core::sync::atomic::Ordering::Relaxed);
     let current_pid = crate::scheduler::current_pid();
     // Jalon 105: Check if this process uses Linux ABI and route to Linux-specific handlers
     if current_pid != 0 {
@@ -1051,15 +1055,18 @@ fn sys_stub_rt_sigaction(signum: u64, act: u64, oldact: u64) -> u64 {
     let current_pid = crate::scheduler::current_pid();
     if signum == 0 || signum >= 32 { return EINVAL; }
 
-    // Save old handler if oldact is non-null
-    if oldact != 0 && validate_user_ptr(oldact, 8) {
+    // Save old handler if oldact is non-null (struct sigaction = 32 bytes on x86_64)
+    if oldact != 0 && validate_user_ptr(oldact, 32) {
         let old_handler = crate::process::with_process(current_pid, |p| {
             p.signal_handlers[signum as usize]
         }).unwrap_or(0);
-        unsafe { copy_to_user(oldact, &old_handler.to_le_bytes()); }
+        let mut old_buf = [0u8; 32];
+        old_buf[0..8].copy_from_slice(&old_handler.to_le_bytes()); // sa_handler
+        // sa_flags=0, sa_restorer=0, sa_mask=0 (all zeroed)
+        unsafe { copy_to_user(oldact, &old_buf); }
     }
 
-    // Set new handler if act is non-null
+    // Set new handler if act is non-null (read full sigaction struct)
     if act != 0 && validate_user_ptr(act, 8) {
         let mut act_buf = [0u8; 8];
         unsafe { copy_from_user(&mut act_buf, act, 8); }
