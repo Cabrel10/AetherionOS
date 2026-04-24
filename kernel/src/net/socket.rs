@@ -124,13 +124,16 @@ pub fn sys_sendto(fd: u32, buf_addr: u64, len: u64, _flags: u64, dest_ip: Ipv4Ad
         None => return (-9i64) as u64, // EBADF
     };
 
-    // Read data from user buffer
-    let data = unsafe {
-        let buf = buf_addr as *const u8;
-        let mut v = Vec::with_capacity(len as usize);
-        for i in 0..len as usize {
-            v.push(core::ptr::read_volatile(buf.add(i)));
+    // Read data from user buffer (KPTI-safe)
+    let data = {
+        let mut v = alloc::vec![0u8; len as usize];
+        let copied = unsafe { crate::arch::x86_64::syscall::copy_from_user_pub(
+            &mut v, buf_addr, len as usize,
+        ) };
+        if copied == 0 && len > 0 {
+            return (-14i64) as u64; // EFAULT
         }
+        v.truncate(copied);
         v
     };
 
@@ -179,12 +182,9 @@ pub fn sys_recvfrom(fd: u32, buf_addr: u64, len: u64) -> u64 {
                 let reply_data = alloc::format!("PONG from {} seq={}", ip, seq);
                 let bytes = reply_data.as_bytes();
                 let copy_len = core::cmp::min(bytes.len(), len as usize);
-                unsafe {
-                    let dst = buf_addr as *mut u8;
-                    for i in 0..copy_len {
-                        core::ptr::write_volatile(dst.add(i), bytes[i]);
-                    }
-                }
+                unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(
+                    buf_addr, &bytes[..copy_len],
+                ) };
                 return copy_len as u64;
             }
         }
@@ -194,12 +194,9 @@ pub fn sys_recvfrom(fd: u32, buf_addr: u64, len: u64) -> u64 {
     // Pop from receive queue
     let datagram = socket.recv_queue.remove(0);
     let copy_len = core::cmp::min(datagram.data.len(), len as usize);
-    unsafe {
-        let dst = buf_addr as *mut u8;
-        for i in 0..copy_len {
-            core::ptr::write_volatile(dst.add(i), datagram.data[i]);
-        }
-    }
+    unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(
+        buf_addr, &datagram.data[..copy_len],
+    ) };
 
     copy_len as u64
 }
@@ -265,13 +262,16 @@ pub fn sys_tcp_send(fd: u32, buf_addr: u64, len: u64) -> u64 {
         return (-107i64) as u64; // ENOTCONN
     }
 
-    // Read data from user buffer
-    let data = unsafe {
-        let buf = buf_addr as *const u8;
-        let mut v = Vec::with_capacity(len as usize);
-        for i in 0..len as usize {
-            v.push(core::ptr::read_volatile(buf.add(i)));
+    // Read data from user buffer (KPTI-safe)
+    let data = {
+        let mut v = alloc::vec![0u8; len as usize];
+        let copied = unsafe { crate::arch::x86_64::syscall::copy_from_user_pub(
+            &mut v, buf_addr, len as usize,
+        ) };
+        if copied == 0 && len > 0 {
+            return (-14i64) as u64; // EFAULT
         }
+        v.truncate(copied);
         v
     };
 
@@ -301,14 +301,11 @@ pub fn sys_tcp_recv(fd: u32, buf_addr: u64, len: u64) -> u64 {
 
     match super::tcp::tcp_recv(local_port, remote_ip, remote_port, &mut temp_buf) {
         Ok(bytes_read) => {
-            // Copy to user buffer
+            // Copy to user buffer (KPTI-safe)
             if bytes_read > 0 {
-                unsafe {
-                    let dst = buf_addr as *mut u8;
-                    for i in 0..bytes_read {
-                        core::ptr::write_volatile(dst.add(i), temp_buf[i]);
-                    }
-                }
+                unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(
+                    buf_addr, &temp_buf[..bytes_read],
+                ) };
             }
             bytes_read as u64
         }
@@ -348,16 +345,18 @@ pub fn sys_tcp_shutdown(fd: u32) -> u64 {
 
 /// DNS resolution: gethostbyname
 pub fn sys_gethostbyname(name_addr: u64) -> u64 {
-    // Read domain name from user space
-    let domain = unsafe {
-        let mut buf = Vec::with_capacity(256);
-        let ptr = name_addr as *const u8;
-        for i in 0..256usize {
-            let byte = core::ptr::read_volatile(ptr.add(i));
-            if byte == 0 { break; }
-            buf.push(byte);
+    // Read domain name from user space using copy_from_user (KPTI-safe)
+    let domain = {
+        let mut raw = [0u8; 256];
+        let copied = unsafe { crate::arch::x86_64::syscall::copy_from_user_pub(
+            &mut raw, name_addr, 256,
+        ) };
+        if copied == 0 {
+            return (-14i64) as u64; // EFAULT
         }
-        match alloc::string::String::from_utf8(buf) {
+        // Find null terminator
+        let len = raw.iter().position(|&b| b == 0).unwrap_or(copied);
+        match alloc::string::String::from_utf8(raw[..len].to_vec()) {
             Ok(s) => s,
             Err(_) => return (-22i64) as u64, // EINVAL
         }
@@ -426,12 +425,9 @@ pub fn sys_tcp_recv_blocking(fd: u32, buf_addr: u64, len: u64) -> u64 {
         let mut temp_buf = alloc::vec![0u8; len as usize];
         match super::tcp::tcp_recv(local_port, remote_ip, remote_port, &mut temp_buf) {
             Ok(bytes_read) if bytes_read > 0 => {
-                unsafe {
-                    let dst = buf_addr as *mut u8;
-                    for i in 0..bytes_read {
-                        core::ptr::write_volatile(dst.add(i), temp_buf[i]);
-                    }
-                }
+                unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(
+                    buf_addr, &temp_buf[..bytes_read],
+                ) };
                 return bytes_read as u64;
             }
             Ok(0) => {
