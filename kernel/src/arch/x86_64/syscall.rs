@@ -1343,6 +1343,14 @@ fn sys_poll(fds_addr: u64, nfds: u64, timeout: u64) -> u64 {
         return EFAULT;
     }
 
+    // POLLIN (0x0001): data available for reading
+    // POLLOUT (0x0004): writing won't block
+    // POLLHUP (0x0010): hung up
+    // POLLERR (0x0008): error
+    const POLLIN: i16 = 0x0001;
+    const POLLOUT: i16 = 0x0004;
+    const POLLHUP: i16 = 0x0010;
+
     let mut ready_count: u64 = 0;
 
     // Read and process each pollfd
@@ -1363,23 +1371,16 @@ fn sys_poll(fds_addr: u64, nfds: u64, timeout: u64) -> u64 {
         let fd = fd_raw as u32;
         let current_pid = crate::scheduler::current_pid();
 
-        // POLLIN (0x0001): data available for reading
-        // POLLOUT (0x0004): writing won't block
-        // POLLHUP (0x0010): hung up
-        // POLLERR (0x0008): error
-        const POLLIN: i16 = 0x0001;
-        const POLLOUT: i16 = 0x0004;
-        const POLLHUP: i16 = 0x0010;
-
         let mut revents: i16 = 0;
 
         // Check FD type and status
         match fd {
             0 => {
-                // stdin: check if keyboard data is available
+                // stdin: check if keyboard data is ACTUALLY available
                 if events & POLLIN != 0 {
-                    // PS/2 keyboard always has potential data
-                    revents |= POLLIN;
+                    if crate::process::kbd_has_pending() {
+                        revents |= POLLIN;
+                    }
                 }
             }
             1 | 2 => {
@@ -1430,13 +1431,42 @@ fn sys_poll(fds_addr: u64, nfds: u64, timeout: u64) -> u64 {
         }
     }
 
-    // If no FDs ready and timeout > 0, yield and retry
-    if ready_count == 0 && timeout > 0 && timeout < 60000 {
-        let max_yields = (timeout / 10).min(100);
-        for _ in 0..max_yields {
+    // If no FDs ready, block based on timeout:
+    // timeout == 0xFFFFFFFFFFFFFFFF (-1 signed) = infinite wait
+    // timeout > 0 = wait up to timeout_ms
+    // timeout == 0 = non-blocking (already handled above)
+    let timeout_i = timeout as i64;
+    if ready_count == 0 && timeout != 0 {
+        // Enable interrupts so keyboard IRQ can fire while we yield
+        let max_iterations = if timeout_i < 0 { 50000u64 } else { (timeout / 10).min(5000) };
+        for iter in 0..max_iterations {
+            // Enable IRQs briefly to let keyboard data arrive
+            unsafe { core::arch::asm!("sti; pause; cli", options(nomem, nostack)); }
             sys_yield();
+
+            // Re-check stdin for POLLIN
+            if crate::process::kbd_has_pending() {
+                // Re-scan all fds and write revents
+                for i in 0..nfds {
+                    let pfd_addr = fds_addr + i * 8;
+                    let mut pfd_buf = [0u8; 8];
+                    unsafe { copy_from_user(&mut pfd_buf, pfd_addr, 8); }
+                    let fd_raw = i32::from_le_bytes([pfd_buf[0], pfd_buf[1], pfd_buf[2], pfd_buf[3]]);
+                    if fd_raw == 0 {
+                        let rev: i16 = POLLIN;
+                        let rev_bytes = rev.to_le_bytes();
+                        unsafe { copy_to_user(pfd_addr + 6, &rev_bytes); }
+                        ready_count = 1;
+                        break;
+                    }
+                }
+                if ready_count > 0 { break; }
+            }
+            // Avoid burning CPU: extra pauses
+            if iter % 100 == 0 {
+                for _ in 0..10 { unsafe { core::arch::asm!("pause", options(nomem, nostack)); } }
+            }
         }
-        // After yielding, report 0 ready (timeout expired)
     }
 
     ready_count
@@ -2876,8 +2906,11 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
                     return n as u64;
                 }
                 attempts += 1;
-                if attempts >= 500 {
-                    return 0; // No data after ~1ms — return 0 (non-blocking)
+                if attempts >= 100000 {
+                    // After ~2-3 seconds of waiting — return 0 (no data = EOF)
+                    // For interactive shell, this should be long enough for
+                    // piped input to arrive through QEMU serial
+                    return 0;
                 }
             }
         }
