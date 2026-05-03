@@ -66,3 +66,4 @@ disk.img
 models/
 /tmp/
 .agent_target/
+third_party/

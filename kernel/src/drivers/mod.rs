@@ -10,3 +10,4 @@ pub mod virtio_gpu;
 pub mod mouse;
 pub mod ps2;
 pub mod usb;
+pub mod pty;

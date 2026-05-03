@@ -16,6 +16,8 @@
 //   - Segment overlap detection
 //   - Stack guard page (unmapped page below stack)
 
+pub mod dynlink;
+
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -271,14 +273,15 @@ pub unsafe fn alloc_elf_frame() -> Option<u64> {
         let n = ALLOC_COUNTER.fetch_add(1, Ordering::Relaxed);
         // Print every 1000th allocation to track where frames go
         if n % 5000 == 0 && n > 0 {
-            crate::serial_println!("[POOL-TRACE] alloc #{}: freelist={} phys=0x{:X}", n, ELF_POOL.freelist_count, phys);
+            crate::serial_println!("[POOL-TRACE] alloc #{}: freelist={} phys=0x{:X}", n, core::ptr::addr_of!(ELF_POOL).read_volatile().freelist_count, phys);
         }
         return Some(phys);
     }
     // Priority 2: Bump allocate a new frame
     if ELF_POOL.frames_used >= ELF_POOL.max_frames {
         let n = ALLOC_COUNTER.load(Ordering::Relaxed);
-        crate::serial_println!("[POOL] EXHAUSTED: used={} max={} freelist=0 total_allocs={}", ELF_POOL.frames_used, ELF_POOL.max_frames, n);
+        let pool_snap = core::ptr::addr_of!(ELF_POOL).read_volatile();
+        crate::serial_println!("[POOL] EXHAUSTED: used={} max={} freelist=0 total_allocs={}", pool_snap.frames_used, pool_snap.max_frames, n);
         return None;
     }
     let phys = ELF_POOL.base_frame + (ELF_POOL.frames_used as u64) * PAGE_SIZE;
@@ -544,6 +547,12 @@ static PHYS_MEM_OFFSET: AtomicU64 = AtomicU64::new(0);
 static mut ELF_ARGV0: [u8; 128] = [0u8; 128];
 static mut ELF_ARGV0_LEN: usize = 0;
 
+/// Extra arguments (argv[1..]) for the next ELF load.
+/// Each arg is null-terminated, stored sequentially. ELF_EXTRA_ARGC tracks count.
+static mut ELF_EXTRA_ARGS: [u8; 512] = [0u8; 512];
+static mut ELF_EXTRA_ARGS_LEN: usize = 0; // total bytes used in ELF_EXTRA_ARGS
+static mut ELF_EXTRA_ARGC: usize = 0;     // number of extra args
+
 /// Set the program name for the next ELF load
 pub fn set_argv0(name: &str) {
     unsafe {
@@ -552,6 +561,62 @@ pub fn set_argv0(name: &str) {
         ELF_ARGV0[..len].copy_from_slice(&bytes[..len]);
         ELF_ARGV0[len] = 0;
         ELF_ARGV0_LEN = len;
+    }
+}
+
+/// Set extra arguments for the next ELF load.
+///
+/// Supports two formats:
+/// 1. NUL-delimited: "ash\0-c\0echo hello" → ["ash", "-c", "echo hello"]
+///    (used when the string contains embedded NUL bytes)
+/// 2. Space-separated: "ash -l" → ["ash", "-l"]
+///    (legacy fallback when no NUL bytes are present)
+///
+/// For commands with arguments that contain spaces (like shell -c "..."),
+/// use NUL-delimited format.
+pub fn set_extra_args(args: &str) {
+    unsafe {
+        ELF_EXTRA_ARGS_LEN = 0;
+        ELF_EXTRA_ARGC = 0;
+        if args.is_empty() {
+            return;
+        }
+        let bytes = args.as_bytes();
+        // Detect NUL-delimited format: if any NUL byte exists in the string
+        let has_nul = bytes.iter().any(|&b| b == 0);
+        let mut pos = 0;
+        if has_nul {
+            // NUL-delimited: split on \0 boundaries
+            let mut start = 0;
+            while start < bytes.len() {
+                // Find the end of this argument (next NUL or end of string)
+                let end = bytes[start..].iter().position(|&b| b == 0)
+                    .map(|p| start + p)
+                    .unwrap_or(bytes.len());
+                let arg_bytes = &bytes[start..end];
+                if !arg_bytes.is_empty() {
+                    let len = arg_bytes.len();
+                    if pos + len + 1 > 510 { break; }
+                    ELF_EXTRA_ARGS[pos..pos+len].copy_from_slice(arg_bytes);
+                    ELF_EXTRA_ARGS[pos+len] = 0; // null terminate
+                    pos += len + 1;
+                    ELF_EXTRA_ARGC += 1;
+                }
+                start = end + 1;
+            }
+        } else {
+            // Legacy: space-separated
+            for arg in args.split_whitespace() {
+                let arg_bytes = arg.as_bytes();
+                let len = arg_bytes.len();
+                if pos + len + 1 > 510 { break; }
+                ELF_EXTRA_ARGS[pos..pos+len].copy_from_slice(arg_bytes);
+                ELF_EXTRA_ARGS[pos+len] = 0; // null terminate
+                pos += len + 1;
+                ELF_EXTRA_ARGC += 1;
+            }
+        }
+        ELF_EXTRA_ARGS_LEN = pos;
     }
 }
 
@@ -696,7 +761,7 @@ unsafe fn lookup_page_frame(pml4_phys: u64, vaddr: u64) -> Option<u64> {
 /// from the kernel PML4 copy), we deep-copy the table so modifications don't
 /// corrupt the kernel's shared page tables. This fixes the multi-ELF loader
 /// state leak where user page mappings would overwrite kernel .rodata pages.
-unsafe fn map_user_page(
+pub unsafe fn map_user_page(
     pml4_phys: u64,
     vaddr: u64,
     paddr: u64,
@@ -1229,6 +1294,32 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
             }
         }
 
+        // --- Write extra args (argv[1..]) at offset 0xF80 ---
+        let extra_args_offset: usize = 0xF80;
+        let extra_argc = ELF_EXTRA_ARGC;
+        let extra_args_len = ELF_EXTRA_ARGS_LEN;
+        let mut extra_arg_vaddrs: [u64; 8] = [0u64; 8]; // up to 8 extra args
+        {
+            if extra_argc > 0 && extra_args_len > 0 {
+                let dst = page_base.add(extra_args_offset);
+                for i in 0..extra_args_len {
+                    core::ptr::write_volatile(dst.add(i), ELF_EXTRA_ARGS[i]);
+                }
+                // Build vaddr array for each arg
+                let mut scan = 0usize;
+                let mut idx = 0usize;
+                while scan < extra_args_len && idx < 8 {
+                    extra_arg_vaddrs[idx] = top_stack_page + (extra_args_offset + scan) as u64;
+                    // Skip to next null terminator
+                    while scan < extra_args_len && ELF_EXTRA_ARGS[scan] != 0 {
+                        scan += 1;
+                    }
+                    scan += 1; // skip the null
+                    idx += 1;
+                }
+            }
+        }
+
         // --- Build the stack frame growing DOWN from offset 0xEF0 ---
         // We use offset 0xE00 as the base for our stack data (plenty of room)
         // Each entry is 8 bytes (u64). We build bottom-up then set RSP.
@@ -1275,8 +1366,9 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
         // ...
         // [AT_NULL]        [0]
 
-        // Total u64 entries: 1 (argc) + 1 (argv ptr) + 1 (null) + 1 (null) + 14*2 (auxv) + 2 (AT_NULL) = 34
-        let total_entries: usize = 1 + 1 + 1 + 1 + auxv.len() * 2 + 2;
+        // Total u64 entries: 1 (argc) + (1+extra_argc) (argv ptrs) + 1 (null) + 1 (null) + 14*2 (auxv) + 2 (AT_NULL)
+        let actual_argc = 1 + extra_argc;
+        let total_entries: usize = 1 + actual_argc + 1 + 1 + auxv.len() * 2 + 2;
         let stack_data_size = total_entries * 8;
 
         // Place RSP at a 16-byte aligned address well within the page
@@ -1291,10 +1383,14 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
             core::ptr::write_volatile(ptr, val);
         };
 
-        // argc = 1
-        write_u64(pos, 1); pos += 8;
+        // argc
+        write_u64(pos, actual_argc as u64); pos += 8;
         // argv[0] = pointer to program name
         write_u64(pos, progname_vaddr); pos += 8;
+        // argv[1..N] = extra args
+        for i in 0..extra_argc {
+            write_u64(pos, extra_arg_vaddrs[i]); pos += 8;
+        }
         // argv terminator (NULL)
         write_u64(pos, 0); pos += 8;
         // envp terminator (NULL)
@@ -1309,8 +1405,8 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
         write_u64(pos, 0);
 
         crate::serial_println!(
-            "[ELF] Linux ABI: AuxV injected, RSP=0x{:X}, argc=1, AT_PHDR=0x{:X}, AT_RANDOM=0x{:X}",
-            rsp_vaddr, computed_phdr_vaddr, random_vaddr
+            "[ELF] Linux ABI: AuxV injected, RSP=0x{:X}, argc={}, AT_PHDR=0x{:X}, AT_RANDOM=0x{:X}",
+            rsp_vaddr, actual_argc, computed_phdr_vaddr, random_vaddr
         );
 
         rsp_vaddr
@@ -1747,53 +1843,232 @@ pub fn load_elf(path: &str) -> Result<u64, ElfError> {
     // Set argv[0] to the path so BusyBox can determine its applet
     set_argv0(path);
 
-    // Step 1: Read file from VFS
-    let elf_data = crate::fs::vfs::file_read(path).map_err(|e| {
-        crate::serial_println!("[ELF] VFS error reading '{}': {}", path, e);
-        ElfError::VfsError
-    })?;
+    // Step 1: Read file — prefer ext2 (dynamic binary) over VFS (may be static)
+    // ext2 has the real Alpine rootfs with dynamic busybox + ld-musl-x86_64.so.1,
+    // while VFS may contain a static busybox from include_bytes!().
+    let elf_data = if crate::fs::ext2::is_mounted() {
+        if let Some(data) = crate::fs::ext2::read_file_path(path) {
+            crate::serial_println!("[ELF] Read {} bytes from ext2 (preferred)", data.len());
+            data
+        } else {
+            // Fallback to VFS
+            let data = crate::fs::vfs::file_read(path).map_err(|e| {
+                crate::serial_println!("[ELF] VFS error reading '{}': {}", path, e);
+                ElfError::VfsError
+            })?;
+            crate::serial_println!("[ELF] Read {} bytes from VFS (fallback)", data.len());
+            data
+        }
+    } else {
+        let data = crate::fs::vfs::file_read(path).map_err(|e| {
+            crate::serial_println!("[ELF] VFS error reading '{}': {}", path, e);
+            ElfError::VfsError
+        })?;
+        crate::serial_println!("[ELF] Read {} bytes from VFS", data.len());
+        data
+    };
 
-    crate::serial_println!("[ELF] Read {} bytes from VFS", elf_data.len());
-
-    // Step 2: Load ELF binary
+    // Step 2: Load ELF binary (main executable)
     let result = load_elf_binary(&elf_data)?;
     crate::serial_println!("[ELF] After load_elf_binary: freelist={}", freelist_count());
 
-    // Step 3: Create a process with Ring 3 context
-    // GDT selectors for Ring 3:
-    //   CS = 0x23 (User Code, RPL=3)
-    //   SS = 0x1B (User Data, RPL=3)
-    //   RFLAGS = 0x202 (IF=1, reserved bit 1)
-    //   RIP = entry point
-    //   RSP = stack top
+    // ═══════════════════════════════════════════════════════════════
+    // Step 3: Dynamic Linking — PT_INTERP Interpreter Loading
+    //
+    // If the ELF has PT_INTERP (e.g., "/lib/ld-musl-x86_64.so.1"),
+    // we must:
+    //   a) Read the interpreter binary from VFS
+    //   b) Load it into the same PML4 at a high base (0x7FC0_0000_0000)
+    //   c) Rebuild the auxiliary vector with correct AT_BASE, AT_ENTRY
+    //   d) Set the process entry point to the interpreter's entry
+    //
+    // The interpreter (ld.so) will read AT_PHDR/AT_ENTRY from auxv,
+    // relocate the main binary, resolve symbols, and jump to main.
+    // ═══════════════════════════════════════════════════════════════
 
-    // Phase 6 FIX: Use spawn_userspace() instead of spawn_kernel_thread().
-    // spawn_kernel_thread() creates a process with entry_point=0 and stack_pointer=0,
-    // which causes the scheduler to skip it (get_entry_state returns entry=0).
-    // spawn_userspace() correctly sets entry_point, stack_pointer, and pml4_phys,
-    // so tick_preemptive() can pick it up for context switching.
+    let (final_entry, final_rsp) = if let Some(ref interp_path) = result.interp_path {
+        crate::serial_println!(
+            "[ELF] Dynamic binary detected: interp='{}'", interp_path
+        );
+
+        // Step 3a: Read interpreter from VFS (try multiple paths)
+        let interp_data = crate::fs::vfs::file_read(interp_path)
+            .or_else(|_| {
+                // Try /disk/ prefix for FAT32-mounted rootfs
+                let disk_path = alloc::format!("/disk{}", interp_path);
+                crate::serial_println!("[ELF] Trying fallback path: '{}'", disk_path);
+                crate::fs::vfs::file_read(&disk_path)
+            })
+            .or_else(|_| {
+                // Try /lib/ld-musl-x86_64.so.1 directly
+                crate::serial_println!("[ELF] Trying /lib/ld-musl-x86_64.so.1");
+                crate::fs::vfs::file_read("/lib/ld-musl-x86_64.so.1")
+            })
+            .or_else(|_| {
+                // Try ext2 filesystem (persistent storage)
+                if crate::fs::ext2::is_mounted() {
+                    crate::serial_println!("[ELF] Trying ext2: '{}'", interp_path);
+                    crate::fs::ext2::read_file_path(interp_path)
+                        .ok_or(crate::fs::vfs::VfsError::NotFound)
+                } else {
+                    Err(crate::fs::vfs::VfsError::NotFound)
+                }
+            });
+
+        match interp_data {
+            Ok(data) => {
+                crate::serial_println!(
+                    "[ELF] Interpreter loaded: {} bytes from '{}'", data.len(), interp_path
+                );
+
+                // Step 3b: Load interpreter into the same PML4
+                const INTERP_BASE: u64 = 0x7FC0_0000_0000;
+                let interp_result = load_interp_into_pml4(
+                    &data,
+                    result.pml4_phys,
+                    INTERP_BASE,
+                )?;
+
+                crate::serial_println!(
+                    "[ELF] Interpreter mapped: entry=0x{:X}, base=0x{:X}, segments={}",
+                    interp_result.entry_point,
+                    interp_result.base_vaddr,
+                    interp_result.segments_loaded
+                );
+
+                // Step 3c: Rebuild the stack with correct AuxV
+                // AT_ENTRY = main binary's entry point (ld.so uses this to jump to main)
+                // AT_BASE  = interpreter load base (so ld.so can relocate itself)
+                // AT_PHDR  = main binary's program headers in memory
+                // AT_PHNUM = main binary's program header count
+                let mut argv = alloc::vec![alloc::string::String::from(path)];
+                // Include extra args (e.g., "sh" for busybox)
+                unsafe {
+                    if ELF_EXTRA_ARGS_LEN > 0 {
+                        let mut pos = 0;
+                        while pos < ELF_EXTRA_ARGS_LEN {
+                            let end = ELF_EXTRA_ARGS[pos..ELF_EXTRA_ARGS_LEN].iter()
+                                .position(|&b| b == 0)
+                                .map(|p| pos + p)
+                                .unwrap_or(ELF_EXTRA_ARGS_LEN);
+                            if end > pos {
+                                if let Ok(s) = core::str::from_utf8(&ELF_EXTRA_ARGS[pos..end]) {
+                                    argv.push(alloc::string::String::from(s));
+                                }
+                            }
+                            pos = end + 1;
+                        }
+                    }
+                }
+                let envp = alloc::vec![
+                    alloc::string::String::from("PATH=/usr/bin:/bin:/sbin:/usr/sbin"),
+                    alloc::string::String::from("HOME=/root"),
+                    alloc::string::String::from("TERM=linux"),
+                    alloc::string::String::from("SHELL=/bin/sh"),
+                    alloc::string::String::from("LD_LIBRARY_PATH=/lib:/usr/lib"),
+                ];
+
+                let new_rsp = unsafe {
+                    build_sysv_stack(
+                        result.pml4_phys,
+                        &argv,
+                        &envp,
+                        result.entry_point,         // AT_ENTRY = main binary entry
+                        interp_result.base_vaddr,   // AT_BASE = interp load address
+                        result.phdr_vaddr,          // AT_PHDR = main's phdr vaddr
+                        result.phdr_count,          // AT_PHNUM = main's phdr count
+                    )
+                };
+
+                let rsp = new_rsp.unwrap_or(result.stack_pointer);
+                crate::serial_println!(
+                    "[ELF] Dynamic: jumping to interp entry=0x{:X}, RSP=0x{:X}",
+                    interp_result.entry_point, rsp
+                );
+                crate::serial_println!(
+                    "[ELF] AuxV: AT_ENTRY=0x{:X} AT_BASE=0x{:X} AT_PHDR=0x{:X} AT_PHNUM={}",
+                    result.entry_point, interp_result.base_vaddr,
+                    result.phdr_vaddr, result.phdr_count
+                );
+
+                // ═══════════════════════════════════════════
+                // Step 3d: Apply dynamic relocations (kernel-assisted)
+                //
+                // Pre-apply R_X86_64_RELATIVE relocations for the interpreter
+                // so musl's __dls2() self-relocation works correctly.
+                // Also apply GLOB_DAT, JUMP_SLOT, and TLS relocations.
+                // ═══════════════════════════════════════════
+                match dynlink::link_interpreter_and_main(
+                    &data,
+                    interp_result.base_vaddr,
+                    &elf_data,
+                    if result.is_pie { 0x0040_0000u64 } else { 0 },
+                    result.pml4_phys,
+                ) {
+                    Ok(total_relocs) => {
+                        crate::serial_println!(
+                            "[ELF] Dynamic linking complete: {} relocations applied",
+                            total_relocs
+                        );
+                    }
+                    Err(e) => {
+                        crate::serial_println!(
+                            "[ELF] Dynamic linking partial/failed: {} (continuing anyway)",
+                            e
+                        );
+                    }
+                }
+
+                // Dump diagnostic info for proof logging
+                dynlink::dump_dynlink_info(&data, "ld-musl-x86_64.so.1");
+                dynlink::dump_dynlink_info(&elf_data, path);
+
+                // Entry goes to interpreter; ld.so will later jump to AT_ENTRY
+                (interp_result.entry_point, rsp)
+            }
+            Err(_) => {
+                crate::serial_println!(
+                    "[ELF] WARNING: Interpreter '{}' not found in VFS — running as static",
+                    interp_path
+                );
+                // Fall through: run the binary directly (will likely crash if truly dynamic)
+                (result.entry_point, result.stack_pointer)
+            }
+        }
+    } else {
+        // Static binary — use entry point directly
+        (result.entry_point, result.stack_pointer)
+    };
+
+    // Step 4: Create process with Ring 3 context
     let pid = crate::process::spawn_userspace(
         path,
         0, // ppid: no parent (launched from kernel shell)
-        result.entry_point,
-        result.stack_pointer,
+        final_entry,
+        final_rsp,
         result.pml4_phys,
     ).map_err(|_| ElfError::ProcessError)?;
 
+    // Jalon 155: Set Linux ABI if the ELF was detected as a Linux binary.
+    if result.is_linux_abi {
+        crate::process::set_abi(pid, crate::compat::linux_abi::Abi::Linux);
+        crate::serial_println!("[ELF] PID {} tagged as Linux ABI (musl/uclibc)", pid);
+    }
+
     crate::serial_println!(
         "[ELF] Process created: PID={}, entry=0x{:X}, stack=0x{:X}",
-        pid, result.entry_point, result.stack_pointer
+        pid, final_entry, final_rsp
     );
 
     // Register with scheduler
     crate::scheduler::enqueue_process(pid);
 
-    // Log the IRETQ frame that would be used for Ring 3 transition
+    // Log the IRETQ frame
     crate::serial_println!("[ELF] Ring 3 IRETQ frame:");
-    crate::serial_println!("  RIP    = 0x{:X}", result.entry_point);
+    crate::serial_println!("  RIP    = 0x{:X}", final_entry);
     crate::serial_println!("  CS     = 0x23 (User Code, RPL=3)");
     crate::serial_println!("  RFLAGS = 0x202 (IF=1)");
-    crate::serial_println!("  RSP    = 0x{:X}", result.stack_pointer);
+    crate::serial_println!("  RSP    = 0x{:X}", final_rsp);
     crate::serial_println!("  SS     = 0x1B (User Data, RPL=3)");
     crate::serial_println!(
         "[ELF] PML4 = 0x{:X}, ready for CR3 switch + IRETQ",

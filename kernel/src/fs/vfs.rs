@@ -448,48 +448,61 @@ pub fn file_read(path: &str) -> Result<Vec<u8>, VfsError> {
         return Err(VfsError::InvalidPath);
     }
 
-    let data;
+    // First try in-memory VFS tree
     {
         let root = VFS_ROOT.lock();
 
-        let node = find_node(&root, &components)
-            .ok_or(VfsError::NotFound)?;
-
-        match node {
-            VfsNode::Device {
-                ref manifest,
-                data: ref device_data,
-            } => {
-                if !manifest.can(Capability::Read) {
-                    VFS_METRICS.security_violations.fetch_add(1, Ordering::Relaxed);
+        if let Some(node) = find_node(&root, &components) {
+            match node {
+                VfsNode::Device {
+                    ref manifest,
+                    data: ref device_data,
+                } => {
+                    if !manifest.can(Capability::Read) {
+                        VFS_METRICS.security_violations.fetch_add(1, Ordering::Relaxed);
+                        VFS_METRICS.errors_count.fetch_add(1, Ordering::Relaxed);
+                        return Err(VfsError::PermissionDenied);
+                    }
+                    let data = device_data.clone();
+                    VFS_METRICS
+                        .total_bytes_read
+                        .fetch_add(data.len() as u64, Ordering::Relaxed);
+                    bus_publish_event(VFS_READ, data.len() as u64);
+                    return Ok(data);
+                }
+                VfsNode::File(ref file_data) => {
+                    let data = file_data.clone();
+                    VFS_METRICS
+                        .total_bytes_read
+                        .fetch_add(data.len() as u64, Ordering::Relaxed);
+                    bus_publish_event(VFS_READ, data.len() as u64);
+                    return Ok(data);
+                }
+                VfsNode::Directory(_) => {
                     VFS_METRICS.errors_count.fetch_add(1, Ordering::Relaxed);
                     return Err(VfsError::PermissionDenied);
                 }
-
-                data = device_data.clone();
-            }
-            VfsNode::File(ref file_data) => {
-                data = file_data.clone();
-            }
-            VfsNode::Directory(_) => {
-                VFS_METRICS.errors_count.fetch_add(1, Ordering::Relaxed);
-                return Err(VfsError::PermissionDenied);
-            }
-            VfsNode::Symlink(ref target) => {
-                // Follow symlink: recursively read the target path
-                let target_path = target.clone();
-                drop(root); // release lock before recursive call
-                return file_read(&target_path);
+                VfsNode::Symlink(ref target) => {
+                    // Follow symlink: recursively read the target path
+                    let target_path = target.clone();
+                    drop(root); // release lock before recursive call
+                    return file_read(&target_path);
+                }
             }
         }
     }
 
-    VFS_METRICS
-        .total_bytes_read
-        .fetch_add(data.len() as u64, Ordering::Relaxed);
-    bus_publish_event(VFS_READ, data.len() as u64);
-
-    Ok(data)
+    // Fall through to multi-backend VFS (ext2, procfs, devfs, sysfs)
+    match crate::fs::vfs_backend::backend_read(path) {
+        Ok(data) => {
+            VFS_METRICS
+                .total_bytes_read
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
+            bus_publish_event(VFS_READ, data.len() as u64);
+            Ok(data)
+        }
+        Err(_) => Err(VfsError::NotFound),
+    }
 }
 
 /// Read a range of bytes from a VFS file at a given offset.
@@ -585,6 +598,30 @@ pub fn mkdir(path: &str) -> Result<(), VfsError> {
     );
 
     crate::serial_println!("[VFS] mkdir: created {}", path);
+    Ok(())
+}
+
+/// Recursively create directories (mkdir -p)
+pub fn mkdir_p(path: &str) -> Result<(), VfsError> {
+    let path = path.trim_start_matches('/');
+    if path.is_empty() {
+        return Ok(());
+    }
+
+    let mut current = String::from("/");
+    for component in path.split('/') {
+        if component.is_empty() {
+            continue;
+        }
+        let full_path = if current == "/" {
+            alloc::format!("/{}", component)
+        } else {
+            alloc::format!("{}/{}", current, component)
+        };
+        // Ignore error if already exists
+        let _ = mkdir(&full_path);
+        current = full_path;
+    }
     Ok(())
 }
 
@@ -979,7 +1016,40 @@ pub fn init() -> Result<(), VfsError> {
         etc_dir.insert(String::from("shadow"),
             VfsNode::File(b"root::19000:0:99999:7:::\nnobody:!:19000:0:99999:7:::\n".to_vec()));
 
+        // /etc/apk/world — list of explicitly installed packages (APK needs this)
+        // Ensure the apk subdir has a 'world' file
+        if let Some(VfsNode::Directory(ref mut apk_dir)) = etc_dir.get_mut("apk") {
+            apk_dir.entry(String::from("world")).or_insert_with(|| VfsNode::File(b"busybox\n".to_vec()));
+            // /etc/apk/protected_paths.d/
+            apk_dir.entry(String::from("protected_paths.d")).or_insert_with(|| VfsNode::Directory(BTreeMap::new()));
+        }
+
         root.insert(String::from("etc"), VfsNode::Directory(etc_dir));
+
+        // ── Session 11: Additional directories for APK package manager ──
+        // /var/lib/apk/db/ — APK database directory
+        if let Some(VfsNode::Directory(ref mut var_dir)) = root.get_mut("var") {
+            let lib_dir = var_dir.entry(String::from("lib")).or_insert_with(|| VfsNode::Directory(BTreeMap::new()));
+            if let VfsNode::Directory(ref mut lib_map) = lib_dir {
+                let apk_db_dir = lib_map.entry(String::from("apk")).or_insert_with(|| VfsNode::Directory(BTreeMap::new()));
+                if let VfsNode::Directory(ref mut apk_map) = apk_db_dir {
+                    let db_dir = apk_map.entry(String::from("db")).or_insert_with(|| VfsNode::Directory(BTreeMap::new()));
+                    if let VfsNode::Directory(ref mut db_map) = db_dir {
+                        db_map.entry(String::from("installed")).or_insert_with(|| VfsNode::File(Vec::new()));
+                        db_map.entry(String::from("lock")).or_insert_with(|| VfsNode::File(Vec::new()));
+                    }
+                }
+            }
+        }
+
+        // /lib/apk/db/ — secondary APK database location
+        if let Some(VfsNode::Directory(ref mut lib_dir)) = root.get_mut("lib") {
+            let apk_dir = lib_dir.entry(String::from("apk")).or_insert_with(|| VfsNode::Directory(BTreeMap::new()));
+            if let VfsNode::Directory(ref mut apk_map) = apk_dir {
+                apk_map.entry(String::from("db")).or_insert_with(|| VfsNode::Directory(BTreeMap::new()));
+                apk_map.entry(String::from("exec")).or_insert_with(|| VfsNode::Directory(BTreeMap::new()));
+            }
+        }
     }
 
     VFS_METRICS.total_nodes.fetch_add(30, Ordering::Relaxed);

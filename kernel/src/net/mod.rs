@@ -24,6 +24,7 @@ pub mod udp;
 pub mod tcp;
 pub mod dns;
 pub mod socket;
+pub mod tls;
 
 use alloc::collections::BTreeMap;
 use spin::Mutex;
@@ -109,15 +110,25 @@ pub fn init() {
                         NET_DEVICE = Some(net_dev);
                     }
 
-                    // Pre-populate ARP cache with gateway
-                    // QEMU user-mode networking responds to ARP for the gateway
-                    // We'll learn the actual MAC via ARP, but for now use broadcast
-                    // as QEMU's SLIRP stack will forward packets addressed to any MAC
-
                     NET_INITIALIZED.store(true, core::sync::atomic::Ordering::SeqCst);
                     virtio_found = true;
 
                     crate::serial_println!("[NET] IP: 10.0.2.15/24, Gateway: 10.0.2.2, DNS: 10.0.2.3");
+
+                    // Pre-populate ARP cache: send ARP for gateway and poll for reply
+                    send_arp_request(Ipv4Addr::new(10, 0, 2, 2));
+                    for _ in 0..50_000u32 {
+                        poll();
+                        unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
+                    }
+                    {
+                        let cache = ARP_CACHE.lock();
+                        if let Some(gw_mac) = cache.get(&Ipv4Addr::new(10, 0, 2, 2).as_u32()) {
+                            crate::serial_println!("[NET] Gateway ARP resolved: 10.0.2.2 -> {}", gw_mac);
+                        } else {
+                            crate::serial_write("[NET] WARNING: Gateway ARP not resolved yet\n");
+                        }
+                    }
                     break;
                 }
                 None => {
@@ -210,32 +221,29 @@ pub fn send_ping(target_ip: Ipv4Addr, sequence: u16) -> bool {
     }
 }
 
-/// Resolve IP to MAC address
+/// Resolve IP to MAC address.
+/// For off-subnet destinations, returns the gateway's MAC (standard L3 routing).
 fn resolve_mac(ip: Ipv4Addr) -> MacAddress {
-    // Check ARP cache
-    {
-        let cache = ARP_CACHE.lock();
-        if let Some(mac) = cache.get(&ip.as_u32()) {
-            return *mac;
-        }
-    }
-
-    // For QEMU user-mode networking, the gateway MAC is known
-    // or we use broadcast. In practice, send ARP and wait.
-    // For now, use broadcast (QEMU SLIRP handles this)
     unsafe {
         if let Some(ref config) = NET_CONFIG {
-            if !ip.same_subnet(&config.our_ip, &config.netmask) {
-                // Route through gateway - use gateway MAC or broadcast
+            // Determine the next-hop: gateway for off-subnet, direct for on-subnet
+            let next_hop = if ip.same_subnet(&config.our_ip, &config.netmask) {
+                ip
+            } else {
+                config.gateway // route through gateway
+            };
+
+            // Check ARP cache for the next-hop
+            {
                 let cache = ARP_CACHE.lock();
-                if let Some(mac) = cache.get(&config.gateway.as_u32()) {
+                if let Some(mac) = cache.get(&next_hop.as_u32()) {
                     return *mac;
                 }
             }
         }
     }
-    // Default to broadcast for QEMU SLIRP compatibility
-    MacAddress([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]) // QEMU default MAC
+    // Fallback: broadcast MAC — QEMU SLIRP will still forward the frame
+    MacAddress([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])
 }
 
 /// Process incoming packets
@@ -630,4 +638,5 @@ pub fn run_tests() {
     crate::serial_println!("========================================\n");
     tcp::run_tests();
     dns::run_tests();
+    tls::run_tests();
 }

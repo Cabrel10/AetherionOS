@@ -10,15 +10,15 @@
  *   9   sys_mmap(addr, len, prot, flags, fd, offset)
  *  20   sys_getpid()
  *  41   sys_socket(domain, type, protocol)
- *  42   sys_connect(fd, ip_packed, port)
- *  44   sys_sendto(fd, buf_encoded, dest_encoded)
- *  47   sys_shutdown(fd)
+ *  42   sys_connect(fd, sockaddr_ptr, addrlen=16)
+ *  44   sys_sendto(fd, buf, len, flags, dest_addr, addrlen)
+ *  45   sys_recvfrom(fd, buf, len, flags, src_addr, addrlen_ptr)
+ *  48   sys_shutdown(fd, how)
  *  60   sys_exit(code)
  * 201   sys_bus_publish(intent, priority, data)
  * 202   sys_vga_write(row, col, color_char)
  * 210   sys_net_ping(ip, seq)
  * 211   sys_gethostbyname(name)
- * 212   sys_tcp_read(fd, buf, len)
  */
 
 #ifndef _LIBC_STUB_H
@@ -86,11 +86,14 @@ long tcp_connect(int fd, int a, int b, int c, int d, int port);
 /* TCP send data */
 long tcp_send(int fd, const void *buf, size_t len);
 
-/* TCP read data */
+/* TCP read data (via recvfrom syscall 45) */
 long tcp_read(int fd, void *buf, size_t len);
 
-/* TCP shutdown */
+/* TCP shutdown (via shutdown syscall 48, SHUT_RDWR) */
 long tcp_shutdown(int fd);
+
+/* Create a socket: domain(AF_INET=2), type(SOCK_STREAM=1), protocol(0) */
+long net_socket(int domain, int type, int protocol);
 
 /* DNS resolve */
 long gethostbyname(const char *name);
