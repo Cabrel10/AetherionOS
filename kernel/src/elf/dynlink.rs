@@ -725,7 +725,7 @@ fn setup_tls(
 }
 
 /// Store TLS information for a process
-fn set_process_tls(pid: u64, fs_base: u64, tls_base: u64, tls_size: u64) {
+fn set_process_tls(pid: u64, fs_base: u64, tls_base: u64, _tls_size: u64) {
     // Use the existing arch_prctl mechanism to set FS base
     // This will be applied when the process context is restored
     crate::compat::linux_abi::linux_arch_prctl(0x1002, fs_base); // ARCH_SET_FS
@@ -952,7 +952,7 @@ fn build_export_table(elf_data: &[u8], load_base: u64) -> Vec<(String, u64, u64)
     // Find PT_DYNAMIC to get SYMTAB, STRTAB, HASH/GNU_HASH
     let mut symtab_vaddr: u64 = 0;
     let mut strtab_vaddr: u64 = 0;
-    let mut strsz: u64 = 0;
+    let mut _strsz: u64 = 0;
     let mut hash_vaddr: u64 = 0;
     let mut gnu_hash_vaddr: u64 = 0;
 
@@ -974,7 +974,7 @@ fn build_export_table(elf_data: &[u8], load_base: u64) -> Vec<(String, u64, u64)
             match d_tag as u64 {
                 6  => symtab_vaddr = d_val, // DT_SYMTAB
                 5  => strtab_vaddr = d_val, // DT_STRTAB
-                10 => strsz = d_val,        // DT_STRSZ
+                10 => _strsz = d_val,        // DT_STRSZ
                 4  => hash_vaddr = d_val,   // DT_HASH
                 0x6ffffef5 => gnu_hash_vaddr = d_val, // DT_GNU_HASH
                 _ => {}
@@ -1071,7 +1071,7 @@ pub fn link_interpreter_and_main(
     main_base: u64,
     pml4_phys: u64,
 ) -> Result<u64, &'static str> {
-    let phys_offset = crate::elf::phys_offset();
+    let _phys_offset = crate::elf::phys_offset();
 
     // ── Pass 1: Self-relocate the interpreter ──
     let interp_result = dynamic_link(interp_data, interp_base, pml4_phys, true)?;
