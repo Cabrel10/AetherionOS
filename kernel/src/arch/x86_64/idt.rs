@@ -544,13 +544,11 @@ fn kill_user_and_switch(current_pid: u64, addr_raw: u64) {
             // Get parent's saved context (set by sys_wait before launching child)
             let parent_ctx = crate::process::with_process(parent_pid, |p| {
                 (p.saved_user_rip, p.saved_user_rsp, p.saved_kernel_rsp,
-                 p.saved_syscall_regs, p.pml4_phys)
+                 p.saved_ctx, p.pml4_phys)
             });
-            if let Some((_saved_rip, saved_rsp, _krsp, saved_regs, pml4)) = parent_ctx {
-                // saved_regs[7] = rcx = the RIP to return to (after the syscall instruction)
-                // saved_regs[6] = r11 = RFLAGS
-                if saved_regs[7] != 0 && pml4 != 0 {
-                    // ── PRIMARY PATH: sysretq (matches sys_exit exactly) ──
+            if let Some((_saved_rip, saved_rsp, _krsp, saved_ctx, pml4)) = parent_ctx {
+                if saved_ctx.is_valid() && pml4 != 0 {
+                    // ── PRIMARY PATH: IRETQ to parent (matches sys_exit) ──
                     let _ = crate::process::set_state(
                         parent_pid,
                         crate::process::ProcessState::Running,
@@ -560,18 +558,9 @@ fn kill_user_and_switch(current_pid: u64, addr_raw: u64) {
                     // Build wait result: (child_pid << 16) | (exit_code = SIGSEGV = 11)
                     let wait_result = ((current_pid & 0xFFFF) << 16) | (11u64 & 0xFFFF);
 
-                    let r15 = saved_regs[0];
-                    let r14 = saved_regs[1];
-                    let r13 = saved_regs[2];
-                    let r12 = saved_regs[3];
-                    let rbx = saved_regs[4];
-                    let rbp = saved_regs[5];
-                    let _r11 = saved_regs[6]; // RFLAGS for sysretq
-                    let rcx = saved_regs[7]; // RIP for sysretq
-
                     crate::serial_println!(
-                        "[SIGSEGV-J132] Resuming parent PID {} via sysretq: RAX=0x{:X} RCX(RIP)=0x{:X} RSP=0x{:X} PML4=0x{:X}",
-                        parent_pid, wait_result, rcx, saved_rsp, pml4
+                        "[SIGSEGV-J132] Resuming parent PID {} via IRETQ: RAX=0x{:X} RIP=0x{:X} RSP=0x{:X} PML4=0x{:X}",
+                        parent_pid, wait_result, saved_ctx.rip, saved_rsp, pml4
                     );
 
                     // Set up GS: we need GS=PER_CPU now (for kernel use), and after
@@ -585,75 +574,60 @@ fn kill_user_and_switch(current_pid: u64, addr_raw: u64) {
                         crate::arch::x86_64::syscall::set_per_cpu_user_rsp(saved_rsp);
                     }
 
-                    // Switch to parent's address space and sysretq.
-                    // CRITICAL: We use the IRETQ approach (like sys_exit fallback) instead
-                    // of sysretq to avoid register-clobbering issues in the inline asm.
-                    // IRETQ pops RIP, CS, RFLAGS, RSP, SS from the stack, so we push them.
-                    //
-                    // We also need to restore callee-saved regs. We do this before the IRETQ
-                    // using a staged approach: first push IRETQ frame, then restore regs, then IRETQ.
-                    //
+                    // Switch to parent's address space via IRETQ.
                     // Use read_volatile to prevent optimizer from reusing registers.
                     let f_pml4 = unsafe { core::ptr::read_volatile(&pml4) };
                     let f_rsp  = unsafe { core::ptr::read_volatile(&saved_rsp) };
-                    let f_rip  = unsafe { core::ptr::read_volatile(&rcx) }; // rcx = saved user RIP
+                    let f_rip  = unsafe { core::ptr::read_volatile(&saved_ctx.rip) };
                     let f_rax  = unsafe { core::ptr::read_volatile(&wait_result) };
 
                     // Jalon 141: Use phys_off mini-stack for IRETQ frame.
-                    // Build the IRETQ frame on phys_off+0x7000 (accessible in both
-                    // kernel and user PML4 via PML4[256]). Then switch CR3, restore
-                    // callee-saved regs, set RAX, and IRETQ.
-                    //
-                    // GS state: reset_gs_bases set GS=0, KERNEL_GS=PER_CPU.
-                    // We do NOT swapgs — user mode inherits GS=0 (correct for user),
-                    // KERNEL_GS=PER_CPU (ready for next syscall entry swapgs).
                     let phys_off = crate::elf::phys_offset();
                     let mini_stack = phys_off + 0x7000;
 
                     unsafe {
                         core::arch::asm!(
                             "cli",
-                            // Set up mini-stack in phys_off region
                             "mov rsp, {stack}",
-                            // Build IRETQ frame BEFORE CR3 switch
                             "push 0x1B",          // SS (Ring 3 data)
                             "push {rsp_val}",     // RSP (parent user stack)
                             "push 0x202",         // RFLAGS (IF=1)
                             "push 0x23",          // CS (Ring 3 code)
                             "push {rip_val}",     // RIP (parent return addr)
-                            // NOW switch CR3 to parent's page tables
                             "mov cr3, {pml4}",
-                            // Restore callee-saved registers
+                            // Restore ALL registers from saved context
                             "mov r15, {v_r15}",
                             "mov r14, {v_r14}",
                             "mov r13, {v_r13}",
                             "mov r12, {v_r12}",
                             "mov rbx, {v_rbx}",
                             "mov rbp, {v_rbp}",
-                            // Set RAX = wait result
+                            "mov rsi, {v_rsi}",
+                            "mov rdi, {v_rdi}",
+                            "mov r9,  {v_r9}",
+                            "mov r10, {v_r10}",
                             "mov rax, {rax_val}",
-                            // Zero other regs to prevent leaks
+                            // Zero remaining regs to prevent leaks
                             "xor rcx, rcx",
                             "xor rdx, rdx",
-                            "xor rsi, rsi",
-                            "xor rdi, rdi",
                             "xor r8, r8",
-                            "xor r9, r9",
-                            "xor r10, r10",
                             "xor r11, r11",
-                            // IRETQ from phys_off stack (accessible in user PML4)
                             "iretq",
                             stack = in(reg) mini_stack,
                             pml4 = in(reg) f_pml4,
                             rsp_val = in(reg) f_rsp,
                             rip_val = in(reg) f_rip,
                             rax_val = in(reg) f_rax,
-                            v_r15 = in(reg) r15,
-                            v_r14 = in(reg) r14,
-                            v_r13 = in(reg) r13,
-                            v_r12 = in(reg) r12,
-                            v_rbx = in(reg) rbx,
-                            v_rbp = in(reg) rbp,
+                            v_r15 = in(reg) saved_ctx.r15,
+                            v_r14 = in(reg) saved_ctx.r14,
+                            v_r13 = in(reg) saved_ctx.r13,
+                            v_r12 = in(reg) saved_ctx.r12,
+                            v_rbx = in(reg) saved_ctx.rbx,
+                            v_rbp = in(reg) saved_ctx.rbp,
+                            v_rsi = in(reg) saved_ctx.rsi,
+                            v_rdi = in(reg) saved_ctx.rdi,
+                            v_r9  = in(reg) saved_ctx.r9,
+                            v_r10 = in(reg) saved_ctx.r10,
                             options(noreturn),
                         );
                     }
@@ -661,8 +635,8 @@ fn kill_user_and_switch(current_pid: u64, addr_raw: u64) {
                     // ── FALLBACK: mark parent Ready for scheduler ──
                     let _ = crate::process::set_state(parent_pid, crate::process::ProcessState::Ready);
                     crate::serial_println!(
-                        "[SIGSEGV-J132] Woke parent PID {} (fallback, saved_regs[7]=0x{:X} pml4=0x{:X})",
-                        parent_pid, saved_regs[7], pml4
+                        "[SIGSEGV-J132] Woke parent PID {} (fallback, ctx.rip=0x{:X} pml4=0x{:X})",
+                        parent_pid, saved_ctx.rip, pml4
                     );
                 }
             } else {
@@ -717,7 +691,7 @@ fn kill_user_and_switch(current_pid: u64, addr_raw: u64) {
     if next != 0 && next != current_pid {
         // Get the next process's saved state
         let (rip, rsp, _rfl, cr3) =
-            if let Some((saved_rip, saved_rsp, saved_rfl, saved_pml4, _regs)) =
+            if let Some((saved_rip, saved_rsp, saved_rfl, saved_pml4, _ctx)) =
                 crate::process::get_preempt_state(next)
             {
                 if is_valid_user_rip(saved_rip) {
@@ -1083,7 +1057,7 @@ extern "x86-interrupt" fn page_fault_handler(
         // to diagnose why the CPU faults even though the page appears mapped.
         if n < 3 {
             crate::serial_println!("[PF-ELF-CR3] saved_cr3=0x{:X} kernel_cr3=0x{:X}",
-                saved_cr3, unsafe { crate::arch::x86_64::syscall::get_kernel_cr3() });
+                saved_cr3, crate::arch::x86_64::syscall::get_kernel_cr3());
             let pid = crate::scheduler::current_pid();
             let pml4 = crate::process::get_pml4_phys(pid).unwrap_or(0);
             if pml4 != 0 {
@@ -1141,6 +1115,39 @@ extern "x86-interrupt" fn page_fault_handler(
         if try_demand_map_user_page(page_addr, false) {
             restore_cr3(saved_cr3);
             return; // Resume — mmap page demand-mapped
+        }
+        // Fall through to SIGSEGV
+    }
+
+    // --- Demand paging for interpreter + TLS region (0x7FA0..0x7FFF_0000_0000) ---
+    // The dynamic linker (ld-musl) is loaded at 0x7FC0_0000_0000 and TLS at 0x7FB0_0000_0000.
+    // If the interpreter's BSS exceeds mapped pages or TLS accesses un-mapped pages,
+    // demand-map them here to avoid spurious SIGSEGV.
+    const INTERP_DEMAND_LOW: u64 = 0x7FA0_0000_0000;
+    const INTERP_DEMAND_HIGH: u64 = 0x7FFF_0000_0000; // up to stack region start
+    if is_user_mode
+        && addr_raw >= INTERP_DEMAND_LOW
+        && addr_raw < INTERP_DEMAND_HIGH
+    {
+        let is_ifetch = error_code.contains(PageFaultErrorCode::INSTRUCTION_FETCH);
+        if try_demand_map_user_page(page_addr, is_ifetch) {
+            restore_cr3(saved_cr3);
+            return;
+        }
+        // Fall through to SIGSEGV
+    }
+
+    // --- Demand paging for large alloc region (0x2000_0000_0000 - 0x3000_0000_0000) ---
+    // Used by GGUF model loading and large mmaps.
+    const LARGE_ALLOC_DEMAND_LOW: u64 = 0x0000_2000_0000_0000;
+    const LARGE_ALLOC_DEMAND_HIGH: u64 = 0x0000_3000_0000_0000;
+    if is_user_mode
+        && addr_raw >= LARGE_ALLOC_DEMAND_LOW
+        && addr_raw < LARGE_ALLOC_DEMAND_HIGH
+    {
+        if try_demand_map_user_page(page_addr, false) {
+            restore_cr3(saved_cr3);
+            return;
         }
         // Fall through to SIGSEGV
     }
@@ -1495,6 +1502,21 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
                 current_pid,
                 if preempt_result.is_some() { "Some" } else { "None" }
             );
+        }
+        // Track timer ticks for PID 2 to detect if it's actually running
+        if current_pid == 2 {
+            static P2_TICK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+            let p2n = P2_TICK.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if p2n < 5 || p2n % 100 == 0 {
+                let rip = stack_frame.instruction_pointer.as_u64();
+                let rsp = stack_frame.stack_pointer.as_u64();
+                let cr3: u64;
+                unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)); }
+                crate::serial_println!(
+                    "[P2-TIMER] tick#{} RIP=0x{:X} RSP=0x{:X} CR3=0x{:X}",
+                    p2n, rip, rsp, cr3
+                );
+            }
         }
     }
     if let Some((old_pid, new_pid, new_rip, new_rsp, _new_rflags, new_pml4)) = preempt_result

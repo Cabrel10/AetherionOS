@@ -29,6 +29,10 @@ pub enum FdType {
     Tty,
     /// Epoll file descriptor for async I/O (Jalon 135)
     Epoll,
+    /// PTY master side — dispatches to drivers::pty (master I/O)
+    PtyMaster,
+    /// PTY slave side — dispatches to drivers::pty (slave I/O)
+    PtySlave,
 }
 
 /// A file descriptor entry
@@ -46,6 +50,8 @@ pub struct FileDescriptor {
     pub fd_type: FdType,
     /// Socket ID (only valid when fd_type == Socket)
     pub socket_id: u32,
+    /// PTY ID (only valid when fd_type == PtyMaster or PtySlave)
+    pub pty_id: u32,
 }
 
 impl FileDescriptor {
@@ -57,6 +63,7 @@ impl FileDescriptor {
             active: true,
             fd_type: FdType::File,
             socket_id: 0,
+            pty_id: 0,
         }
     }
 
@@ -68,6 +75,7 @@ impl FileDescriptor {
             active: true,
             fd_type,
             socket_id: 0,
+            pty_id: 0,
         }
     }
 
@@ -79,6 +87,34 @@ impl FileDescriptor {
             active: true,
             fd_type: FdType::Socket,
             socket_id,
+            pty_id: 0,
+        }
+    }
+
+    /// Create a PTY master FD
+    pub fn new_pty_master(pty_id: u32) -> Self {
+        FileDescriptor {
+            path: String::from("/dev/ptmx"),
+            offset: 0,
+            flags: 2, // O_RDWR
+            active: true,
+            fd_type: FdType::PtyMaster,
+            socket_id: 0,
+            pty_id,
+        }
+    }
+
+    /// Create a PTY slave FD
+    pub fn new_pty_slave(pty_id: u32) -> Self {
+        use alloc::format;
+        FileDescriptor {
+            path: format!("/dev/pts/{}", pty_id),
+            offset: 0,
+            flags: 2, // O_RDWR
+            active: true,
+            fd_type: FdType::PtySlave,
+            socket_id: 0,
+            pty_id,
         }
     }
 
@@ -90,6 +126,7 @@ impl FileDescriptor {
             active: false,
             fd_type: FdType::File,
             socket_id: 0,
+            pty_id: 0,
         }
     }
 }
@@ -243,6 +280,92 @@ impl fmt::Display for ProcessState {
     }
 }
 
+// ===== Syscall Register Context =====
+
+/// Complete register context saved during SYSCALL entry.
+///
+/// Field order matches the push sequence in `syscall_entry` assembly
+/// (first pushed = lowest address = first field):
+///
+/// ```text
+///   [RSP+0]   r9    — 6th syscall arg
+///   [RSP+8]   r10   — 4th syscall arg (Linux ABI)
+///   [RSP+16]  r8    — 5th syscall arg
+///   [RSP+24]  rdx   — 3rd syscall arg
+///   [RSP+32]  rsi   — 2nd syscall arg
+///   [RSP+40]  rdi   — 1st syscall arg
+///   [RSP+48]  r15   — callee-saved
+///   [RSP+56]  r14   — callee-saved
+///   [RSP+64]  r13   — callee-saved
+///   [RSP+72]  r12   — callee-saved
+///   [RSP+80]  rbx   — callee-saved
+///   [RSP+88]  rbp   — callee-saved
+///   [RSP+96]  r11   — RFLAGS (set by SYSCALL instruction)
+///   [RSP+104] rcx   — RIP   (set by SYSCALL instruction)
+/// ```
+///
+/// The `sysretq` instruction reloads RIP from RCX and RFLAGS from R11.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct SyscallContext {
+    // --- caller-saved / syscall arguments ---
+    pub r9:  u64,
+    pub r10: u64,
+    pub r8:  u64,
+    pub rdx: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    // --- callee-saved ---
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub rbx: u64,
+    pub rbp: u64,
+    // --- special (set by SYSCALL HW) ---
+    pub rflags: u64,  // r11 on the stack
+    pub rip:    u64,   // rcx on the stack
+}
+
+impl SyscallContext {
+    /// All-zero context (no registers saved yet).
+    pub const ZERO: Self = Self {
+        r9: 0, r10: 0, r8: 0, rdx: 0, rsi: 0, rdi: 0,
+        r15: 0, r14: 0, r13: 0, r12: 0, rbx: 0, rbp: 0,
+        rflags: 0, rip: 0,
+    };
+
+    /// Returns true if a valid context was saved (RIP != 0).
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        self.rip != 0
+    }
+
+    /// Read a full context from the kernel stack at the given base address.
+    /// # Safety
+    /// `base` must point to the first pushed register (r9) in a valid
+    /// `syscall_entry` frame.
+    pub unsafe fn from_kernel_stack(base: u64) -> Self {
+        let p = base as *const u64;
+        Self {
+            r9:     core::ptr::read_unaligned(p),
+            r10:    core::ptr::read_unaligned(p.add(1)),
+            r8:     core::ptr::read_unaligned(p.add(2)),
+            rdx:    core::ptr::read_unaligned(p.add(3)),
+            rsi:    core::ptr::read_unaligned(p.add(4)),
+            rdi:    core::ptr::read_unaligned(p.add(5)),
+            r15:    core::ptr::read_unaligned(p.add(6)),
+            r14:    core::ptr::read_unaligned(p.add(7)),
+            r13:    core::ptr::read_unaligned(p.add(8)),
+            r12:    core::ptr::read_unaligned(p.add(9)),
+            rbx:    core::ptr::read_unaligned(p.add(10)),
+            rbp:    core::ptr::read_unaligned(p.add(11)),
+            rflags: core::ptr::read_unaligned(p.add(12)),
+            rip:    core::ptr::read_unaligned(p.add(13)),
+        }
+    }
+}
+
 // ===== Process Descriptor =====
 
 /// A process in the AetherionOS kernel
@@ -288,9 +411,9 @@ pub struct Process {
     pub saved_user_rsp: u64,
     /// Saved kernel RSP pointing to syscall_entry register frame (for sysretq resume)
     pub saved_kernel_rsp: u64,
-    /// Saved user registers from syscall_entry (r15,r14,r13,r12,rbx,rbp,r11,rcx)
+    /// Saved user-mode register context from syscall_entry.
     /// Needed because the shared kernel syscall stack gets overwritten by child threads.
-    pub saved_syscall_regs: [u64; 8],
+    pub saved_ctx: SyscallContext,
     /// FPU/SSE state (512 bytes, 16-byte aligned) for fxsave/fxrstor
     /// Preserves XMM0-XMM15, MXCSR, x87 FPU registers across context switches
     pub fpu_state: FpuState,
@@ -310,6 +433,9 @@ pub struct Process {
     /// Jalon 105: ABI compatibility mode (AetherionOS native vs Linux)
     /// Linux ABI processes get Linux-specific uname, arch_prctl, etc.
     pub abi: crate::compat::linux_abi::Abi,
+    /// Jalon 155: User-space pointer where wait4 should write the child exit status.
+    /// Set by linux_wait4/sys_wait before blocking; used by sys_exit when resuming parent.
+    pub wait_wstatus_ptr: u64,
     /// Jalon 129: PID of the process capturing this process's stdout.
     /// When set, sys_write(fd=1/2) stores output in IPC buffer and publishes
     /// INTENT_TOOL_STDOUT instead of printing to serial.
@@ -319,6 +445,8 @@ pub struct Process {
     pub signal_handlers: [u64; 32],
     /// Jalon 128: Signal mask — bitfield of blocked signals.
     pub signal_mask: u64,
+    /// Pending signals — bitfield of signals waiting to be delivered.
+    pub pending_signals: u64,
     /// Jalon 127: Saved argv strings for this process (e.g., for /proc/self/cmdline).
     pub argv: Vec<String>,
     /// Jalon 131: FS segment base address (MSR 0xC0000100) for TLS support.
@@ -350,6 +478,8 @@ pub struct VirtualMemoryArea {
     pub size: u64,
     /// Is this mapping writable? (false = read-only for model files)
     pub writable: bool,
+    /// Is this mapping executable?
+    pub executable: bool,
 }
 
 // ===== Epoll Infrastructure (Phase 1: Real Epoll) =====
@@ -421,16 +551,18 @@ impl Process {
             saved_user_rip: 0,
             saved_user_rsp: 0,
             saved_kernel_rsp: 0,
-            saved_syscall_regs: [0; 8],
+            saved_ctx: SyscallContext::ZERO,
             fpu_state: fpu,
             is_forked: false,
             heap_break: 0x0000_3000_0000_0000, // Initial heap base (PML4[96])
             vmas: Vec::new(),
             cpu_affinity: 0xFF, // Default: no affinity (run on any core)
             abi: crate::compat::linux_abi::Abi::AetherionOS, // Default: native ABI
+            wait_wstatus_ptr: 0,
             captured_by_pid: None,
             signal_handlers: [0u64; 32],
             signal_mask: 0,
+            pending_signals: 0,
             argv: Vec::new(),
             fs_base: 0,
             gs_base: 0,

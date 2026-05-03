@@ -31,6 +31,8 @@ pub mod framebuffer;
 pub mod font;
 pub mod codegen;
 pub mod compat;
+pub mod llm;
+pub mod gui;
 #[cfg(feature = "limine")]
 pub mod boot;
 

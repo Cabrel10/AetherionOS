@@ -511,12 +511,9 @@ pub fn read_sectors(start_lba: u64, count: usize, buf: &mut [u8]) -> bool {
 
 /// Allocate contiguous physical pages
 fn alloc_contiguous_pages(count: usize) -> Option<u64> {
-    // Use the ELF frame pool allocator
-    let first = unsafe { crate::elf::alloc_demand_frame()? };
-    for _ in 1..count {
-        unsafe { crate::elf::alloc_demand_frame()?; }
-    }
-    Some(first)
+    // Use the bitmap frame allocator's contiguous DMA allocation
+    // to guarantee physically contiguous pages (required for VirtIO DMA).
+    unsafe { crate::memory::frame::alloc_contiguous_dma(count) }
 }
 
 /// Align a value up to the given alignment

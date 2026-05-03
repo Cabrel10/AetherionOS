@@ -239,6 +239,110 @@ impl FrameAllocator {
     pub fn max_frame_number(&self) -> usize {
         self.max_frame
     }
+
+    /// Allocate `count` physically contiguous frames.
+    ///
+    /// Scans the bitmap for a run of `count` consecutive free bits.
+    /// Returns the physical address of the first frame, or None if no run found.
+    /// All frames in the run are marked allocated.
+    ///
+    /// This is needed for DMA buffers (e.g. VirtIO queues) that require
+    /// physically contiguous memory.
+    pub fn alloc_contiguous_frames(&mut self, count: usize) -> Option<u64> {
+        if count == 0 { return None; }
+        if count == 1 {
+            return self.alloc_frame_kernel().map(|f| f.start_address().as_u64());
+        }
+
+        // Scan the entire bitmap for a contiguous run of `count` free frames.
+        // Start from frame 1 (skip frame 0 which is always reserved).
+        let max = self.max_frame.min(MAX_FRAMES - 1);
+        let mut start_frame = 1usize;
+
+        'outer: while start_frame + count - 1 <= max {
+            // Check if all frames in [start_frame .. start_frame+count) are free
+            for offset in 0..count {
+                let f = start_frame + offset;
+                if Self::is_allocated(f) {
+                    // Skip past this allocated frame
+                    start_frame = f + 1;
+                    continue 'outer;
+                }
+            }
+            // Found a contiguous run! Mark them all allocated.
+            for offset in 0..count {
+                let f = start_frame + offset;
+                unsafe { Self::set_bit_static(f); }
+                self.allocated_count = self.allocated_count.saturating_add(1);
+            }
+            self.search_hint = start_frame + count;
+            let phys = (start_frame as u64) * (FRAME_SIZE as u64);
+            crate::serial_println!(
+                "[FRAME] Allocated {} contiguous frames at phys 0x{:X} ({} KiB)",
+                count, phys, count * 4
+            );
+            return Some(phys);
+        }
+
+        crate::serial_println!("[FRAME] Failed to find {} contiguous frames", count);
+        None
+    }
+}
+
+/// Allocate `count` physically contiguous frames for DMA.
+///
+/// This is a **static** function that can be called without a `&mut FrameAllocator`
+/// reference, making it available globally (e.g. for VirtIO drivers that need
+/// contiguous DMA buffers during boot, before a global allocator is set up).
+///
+/// Scans the static bitmap for a run of `count` consecutive free bits,
+/// preferring frames in the first 1 GiB (for 32-bit DMA compatibility).
+/// Returns the physical address of the first frame.
+///
+/// # Safety
+/// Must be called after the frame allocator bitmap has been initialized (i.e.
+/// after `FrameAllocator::new()` during boot).
+pub unsafe fn alloc_contiguous_dma(count: usize) -> Option<u64> {
+    if count == 0 { return None; }
+
+    // Search for `count` contiguous free frames in the bitmap.
+    // Prefer low addresses (< 1 GiB) for legacy DMA compatibility.
+    // 1 GiB = 262144 frames.
+    let max_frame = MAX_FRAMES - 1;
+    let preferred_max = 262144usize.min(max_frame); // 1 GiB
+
+    // Helper: check & allocate a contiguous run starting at `start_frame`.
+    let try_range = |limit: usize| -> Option<u64> {
+        let mut start_frame = 1usize; // skip frame 0
+        'outer: while start_frame + count - 1 <= limit {
+            for offset in 0..count {
+                let f = start_frame + offset;
+                if FrameAllocator::is_allocated(f) {
+                    start_frame = f + 1;
+                    continue 'outer;
+                }
+            }
+            // Found! Mark them all allocated.
+            for offset in 0..count {
+                FrameAllocator::set_bit_static(start_frame + offset);
+            }
+            let phys = (start_frame as u64) * (FRAME_SIZE as u64);
+            crate::serial_println!(
+                "[FRAME-DMA] Allocated {} contiguous frames at phys 0x{:X} ({} KiB)",
+                count, phys, count * 4
+            );
+            return Some(phys);
+        }
+        None
+    };
+
+    // Phase 1: try in the first 1 GiB
+    if let Some(phys) = try_range(preferred_max) {
+        return Some(phys);
+    }
+    // Phase 2: try the rest of RAM
+    // (Re-scan from 1 to max_frame; the overlap is acceptable for simplicity)
+    try_range(max_frame)
 }
 
 impl Default for FrameAllocator {

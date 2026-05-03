@@ -17,8 +17,8 @@ use spin::Mutex;
 use lazy_static::lazy_static;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-pub use task::{AgentRole, Process, ProcessState, FdTable, FdType, FileDescriptor, MAX_FDS, VirtualMemoryArea,
-    EpollInterest, TimerFdState, EPOLLIN, EPOLLOUT, EPOLLERR, EPOLLHUP, EPOLLET};
+pub use task::{AgentRole, Process, ProcessState, FdTable, FdType, FileDescriptor, VirtualMemoryArea,
+    EpollInterest, TimerFdState, EPOLLIN, EPOLLOUT, EPOLLHUP, SyscallContext};
 pub use crate::arch::x86_64::context::TaskContext;
 
 // ===== Keyboard Input Buffer =====
@@ -240,6 +240,7 @@ pub fn fork_process(parent_pid: u64, child_pml4: u64, child_entry: u64, child_st
     let parent_uid = parent.uid;
     let parent_gid = parent.gid;
     let parent_fd_table = parent.fd_table.clone();
+    let parent_abi = parent.abi;  // Inherit ABI (Linux or AetherionOS)
 
     let mut child = Process::new(&parent_name, AgentRole::Worker, parent_pid, parent_uid, parent_gid);
     crate::serial_println!("[FORK] child created: pid={} ppid={}", child.pid, child.ppid);
@@ -250,6 +251,7 @@ pub fn fork_process(parent_pid: u64, child_pml4: u64, child_entry: u64, child_st
     child.saved_user_rsp = child_stack;
     child.context.rflags = 0x202; // IF=1 + reserved bit 1
     child.fd_table = parent_fd_table;
+    child.abi = parent_abi;  // CRITICAL: child inherits parent ABI for linux_syscall_override
     child.state = ProcessState::Ready;
     let child_pid = child.pid;
     table.insert(child_pid, child);
@@ -304,17 +306,28 @@ pub fn clone_thread(parent_pid: u64, child_stack: u64, child_entry: u64) -> Resu
 /// Wait for any child of parent_pid to terminate.
 /// Returns (child_pid, exit_code) or error.
 pub fn wait_for_child(parent_pid: u64) -> Result<(u64, i32), ProcessError> {
-    let table = PROCESS_TABLE.lock();
+    let mut table = PROCESS_TABLE.lock();
     let parent = table.get(&parent_pid).ok_or(ProcessError::NotFound)?;
     
     // Look for any terminated child
+    let mut found_child: Option<(u64, i32)> = None;
     for &child_pid in &parent.children {
         if let Some(child) = table.get(&child_pid) {
             if child.state == ProcessState::Terminated {
-                let exit_code = child.exit_code;
-                return Ok((child_pid, exit_code));
+                found_child = Some((child_pid, child.exit_code));
+                break;
             }
         }
+    }
+    
+    if let Some((child_pid, exit_code)) = found_child {
+        // Jalon 212: Reap the child — remove from parent's children list and process table.
+        // This prevents wait4(WNOHANG) from returning the same child repeatedly.
+        if let Some(parent) = table.get_mut(&parent_pid) {
+            parent.children.retain(|&pid| pid != child_pid);
+        }
+        table.remove(&child_pid);
+        return Ok((child_pid, exit_code));
     }
     
     // No terminated child found
@@ -323,13 +336,14 @@ pub fn wait_for_child(parent_pid: u64) -> Result<(u64, i32), ProcessError> {
 
 /// Find a Ready forked child of parent_pid (not a thread).
 /// If target_pid != 0, look for that specific child.
-/// Returns (child_pid, pml4_phys, saved_user_rip, saved_user_rsp, saved_syscall_regs).
-pub fn find_ready_forked_child(parent_pid: u64, target_pid: u64) -> Option<(u64, u64, u64, u64, [u64; 8])> {
+/// Returns (child_pid, pml4_phys, saved_user_rip, saved_user_rsp, saved_ctx).
+pub fn find_ready_forked_child(parent_pid: u64, target_pid: u64) -> Option<(u64, u64, u64, u64, SyscallContext)> {
     let table = PROCESS_TABLE.lock();
     let parent = table.get(&parent_pid)?;
 
     for &child_pid in &parent.children {
-        if target_pid != 0 && child_pid != target_pid { continue; }
+        // target_pid == 0 or target_pid == u64::MAX (-1) means "any child"
+        if target_pid != 0 && target_pid != u64::MAX && child_pid != target_pid { continue; }
         if let Some(child) = table.get(&child_pid) {
             if child.is_forked && child.state == ProcessState::Ready && !child.is_thread {
                 return Some((
@@ -337,7 +351,7 @@ pub fn find_ready_forked_child(parent_pid: u64, target_pid: u64) -> Option<(u64,
                     child.pml4_phys,
                     child.saved_user_rip,
                     child.saved_user_rsp,
-                    child.saved_syscall_regs,
+                    child.saved_ctx,
                 ));
             }
         }
@@ -465,6 +479,11 @@ pub fn alloc_fd(pid: u64, path: &str, flags: u32) -> Option<usize> {
     with_fd_table_mut(pid, |fdt| fdt.alloc_fd(path, flags))?
 }
 
+/// Allocate a new file descriptor with explicit type.
+pub fn alloc_fd_typed(pid: u64, path: &str, flags: u32, fd_type: task::FdType) -> Option<usize> {
+    with_fd_table_mut(pid, |fdt| fdt.alloc_fd_typed(path, flags, fd_type))?
+}
+
 /// Get the path associated with a file descriptor.
 pub fn get_fd_path(pid: u64, fd: usize) -> Option<alloc::string::String> {
     with_fd_table(pid, |fdt| {
@@ -481,6 +500,82 @@ pub fn set_fd(pid: u64, fd: usize, path: &str, flags: u32) {
         }
         fdt.entries[fd] = task::FileDescriptor::new(path, flags);
     });
+}
+
+/// Allocate a PTY master FD in a process's FD table.
+/// Returns Some(fd_number) on success, None if table is full.
+pub fn alloc_fd_pty_master(pid: u64, pty_id: u32) -> Option<usize> {
+    with_fd_table_mut(pid, |fdt| {
+        let fd_entry = task::FileDescriptor::new_pty_master(pty_id);
+        // Reuse closed slot or append
+        for (i, entry) in fdt.entries.iter_mut().enumerate() {
+            if !entry.active {
+                *entry = fd_entry;
+                return Some(i);
+            }
+        }
+        if fdt.entries.len() < task::MAX_FDS {
+            let fd = fdt.entries.len();
+            fdt.entries.push(fd_entry);
+            Some(fd)
+        } else {
+            None
+        }
+    })?
+}
+
+/// Allocate a PTY slave FD in a process's FD table.
+pub fn alloc_fd_pty_slave(pid: u64, pty_id: u32) -> Option<usize> {
+    with_fd_table_mut(pid, |fdt| {
+        let fd_entry = task::FileDescriptor::new_pty_slave(pty_id);
+        for (i, entry) in fdt.entries.iter_mut().enumerate() {
+            if !entry.active {
+                *entry = fd_entry;
+                return Some(i);
+            }
+        }
+        if fdt.entries.len() < task::MAX_FDS {
+            let fd = fdt.entries.len();
+            fdt.entries.push(fd_entry);
+            Some(fd)
+        } else {
+            None
+        }
+    })?
+}
+
+/// Check if an FD is a PTY (master or slave) and return its pty_id if so.
+pub fn get_fd_pty_id(pid: u64, fd: u32) -> Option<u32> {
+    with_fd_table(pid, |fdt| {
+        if let Some(entry) = fdt.get(fd as usize) {
+            if entry.active && (entry.fd_type == task::FdType::PtyMaster || entry.fd_type == task::FdType::PtySlave) {
+                return Some(entry.pty_id);
+            }
+        }
+        None
+    }).flatten()
+}
+
+/// Check if an FD is a PTY master.
+pub fn is_fd_pty_master(pid: u64, fd: u32) -> bool {
+    with_fd_table(pid, |fdt| {
+        if let Some(entry) = fdt.get(fd as usize) {
+            entry.active && entry.fd_type == task::FdType::PtyMaster
+        } else {
+            false
+        }
+    }).unwrap_or(false)
+}
+
+/// Check if an FD is a PTY slave.
+pub fn is_fd_pty_slave(pid: u64, fd: u32) -> bool {
+    with_fd_table(pid, |fdt| {
+        if let Some(entry) = fdt.get(fd as usize) {
+            entry.active && entry.fd_type == task::FdType::PtySlave
+        } else {
+            false
+        }
+    }).unwrap_or(false)
 }
 
 // ===== Spawn Functions =====
@@ -707,6 +802,166 @@ pub fn set_abi(pid: u64, abi: crate::compat::linux_abi::Abi) {
     }
 }
 
+/// Set the FS base address (MSR 0xC0000100) for a process.
+/// Used by CLONE_SETTLS to set up Thread-Local Storage for new threads.
+/// The FS base is saved/restored on context switch so each thread
+/// has its own TLS pointer (e.g., musl's pthread self-pointer).
+pub fn set_fs_base(pid: u64, fs_base: u64) {
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(p) = table.get_mut(&pid) {
+        p.fs_base = fs_base;
+    }
+}
+
+/// Get the FS base address for a process
+pub fn get_fs_base(pid: u64) -> u64 {
+    let table = PROCESS_TABLE.lock();
+    table.get(&pid).map(|p| p.fs_base).unwrap_or(0)
+}
+
+// ═══════════════════════════════════════════════════════════
+// Signal Delivery Infrastructure
+// ═══════════════════════════════════════════════════════════
+
+/// POSIX signal constants
+pub const SIGHUP: u64 = 1;
+pub const SIGINT: u64 = 2;
+pub const SIGQUIT: u64 = 3;
+pub const SIGKILL: u64 = 9;
+pub const SIGTERM: u64 = 15;
+pub const SIGTSTP: u64 = 20;
+pub const SIGCHLD: u64 = 17;
+pub const SIGCONT: u64 = 18;
+pub const SIGSTOP: u64 = 19;
+
+/// Send a signal to a specific process.
+/// Returns true if the signal was queued, false if the process doesn't exist.
+pub fn send_signal(pid: u64, signum: u64) -> bool {
+    if signum == 0 || signum >= 32 { return false; }
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(p) = table.get_mut(&pid) {
+        // Check if signal is blocked
+        if p.signal_mask & (1u64 << signum) != 0 {
+            // Signal is blocked — add to pending
+            p.pending_signals |= 1u64 << signum;
+            crate::serial_println!(
+                "[SIGNAL] SIG {} → PID {} (blocked, pending=0x{:X})",
+                signum, pid, p.pending_signals
+            );
+            return true;
+        }
+
+        // Check handler
+        let handler = p.signal_handlers[signum as usize];
+        if handler == 1 {
+            // SIG_IGN — ignored
+            crate::serial_println!("[SIGNAL] SIG {} → PID {} (SIG_IGN)", signum, pid);
+            return true;
+        }
+
+        // Default action for unhandled signals
+        if handler == 0 {
+            match signum {
+                SIGKILL | SIGTERM | SIGINT | SIGQUIT => {
+                    // Terminate the process
+                    crate::serial_println!(
+                        "[SIGNAL] SIG {} → PID {} (SIG_DFL: terminate)", signum, pid
+                    );
+                    p.state = task::ProcessState::Terminated;
+                    p.exit_code = 128 + signum as i32;
+                }
+                SIGSTOP | SIGTSTP => {
+                    crate::serial_println!(
+                        "[SIGNAL] SIG {} → PID {} (SIG_DFL: stop)", signum, pid
+                    );
+                    p.state = task::ProcessState::Blocked;
+                }
+                SIGCONT => {
+                    crate::serial_println!(
+                        "[SIGNAL] SIG {} → PID {} (SIG_DFL: continue)", signum, pid
+                    );
+                    if p.state == task::ProcessState::Blocked {
+                        p.state = task::ProcessState::Ready;
+                    }
+                }
+                _ => {
+                    // Default: add to pending for userspace delivery
+                    p.pending_signals |= 1u64 << signum;
+                    crate::serial_println!(
+                        "[SIGNAL] SIG {} → PID {} (pending for delivery)",
+                        signum, pid
+                    );
+                }
+            }
+            return true;
+        }
+
+        // Userspace handler — mark as pending for delivery during syscall return
+        p.pending_signals |= 1u64 << signum;
+        crate::serial_println!(
+            "[SIGNAL] SIG {} → PID {} (handler=0x{:X}, pending=0x{:X})",
+            signum, pid, handler, p.pending_signals
+        );
+        true
+    } else {
+        false
+    }
+}
+
+/// Send a signal to all processes in a process group.
+/// Used by PTY for Ctrl+C → SIGINT, Ctrl+Z → SIGTSTP, etc.
+pub fn send_signal_to_pgrp(pgid: u64, signum: u64) {
+    let pids: alloc::vec::Vec<u64> = {
+        let table = PROCESS_TABLE.lock();
+        table.values()
+            .filter(|p| p.is_alive() && p.pid == pgid) // Simplified: pgrp ≈ pid for now
+            .map(|p| p.pid)
+            .collect()
+    };
+    for pid in pids {
+        send_signal(pid, signum);
+    }
+    // Also try sending to any child of the pgrp leader
+    let children: alloc::vec::Vec<u64> = {
+        let table = PROCESS_TABLE.lock();
+        table.values()
+            .filter(|p| p.is_alive() && p.ppid == pgid)
+            .map(|p| p.pid)
+            .collect()
+    };
+    for pid in children {
+        send_signal(pid, signum);
+    }
+}
+
+/// Check if a process has pending signals that can be delivered.
+pub fn has_pending_signals(pid: u64) -> bool {
+    let table = PROCESS_TABLE.lock();
+    table.get(&pid).map(|p| {
+        let deliverable = p.pending_signals & !p.signal_mask;
+        deliverable != 0
+    }).unwrap_or(false)
+}
+
+/// Dequeue the next deliverable signal for a process.
+/// Returns (signum, handler_address) or None if no signals pending.
+pub fn dequeue_signal(pid: u64) -> Option<(u64, u64)> {
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(p) = table.get_mut(&pid) {
+        let deliverable = p.pending_signals & !p.signal_mask;
+        if deliverable == 0 { return None; }
+        // Find lowest pending signal
+        let signum = deliverable.trailing_zeros() as u64;
+        if signum >= 32 { return None; }
+        // Clear the pending bit
+        p.pending_signals &= !(1u64 << signum);
+        let handler = p.signal_handlers[signum as usize];
+        Some((signum, handler))
+    } else {
+        None
+    }
+}
+
 /// Jalon 55/79: Save user-mode state for preemptive context switch.
 /// Called from timer interrupt handler or sys_yield when preempting a Ring 3 process.
 /// Also saves callee-saved registers (r15,r14,r13,r12,rbx,rbp,r11,rcx) from
@@ -720,24 +975,20 @@ pub fn save_preempt_state(pid: u64, rip: u64, rsp: u64, rflags: u64) {
     }
 }
 
-/// Jalon 79: Save callee-saved registers from kernel syscall stack.
-/// The kernel_rsp points to: [r15, r14, r13, r12, rbx, rbp, r11, rcx]
-/// These must be saved per-process to restore on context switch.
-pub fn save_syscall_regs(pid: u64, regs: [u64; 8]) {
+/// Save the full syscall register context for a process.
+pub fn save_syscall_ctx(pid: u64, ctx: SyscallContext) {
     let mut table = PROCESS_TABLE.lock();
     if let Some(p) = table.get_mut(&pid) {
-        p.saved_syscall_regs = regs;
+        p.saved_ctx = ctx;
     }
 }
 
-/// Jalon 55: Get user-mode state for restoring a preempted process.
-/// Retourne (rip, rsp, rflags, pml4_phys, saved_syscall_regs).
-/// Les regs contiennent les registres callee-saved (r15,r14,r13,r12,rbx,rbp,r11,rcx)
-/// tels qu'ils étaient sur le stack noyau au moment du yield.
-pub fn get_preempt_state(pid: u64) -> Option<(u64, u64, u64, u64, [u64; 8])> {
+/// Get user-mode state for restoring a preempted process.
+/// Returns (rip, rsp, rflags, pml4_phys, saved_ctx).
+pub fn get_preempt_state(pid: u64) -> Option<(u64, u64, u64, u64, SyscallContext)> {
     let table = PROCESS_TABLE.lock();
     if let Some(p) = table.get(&pid) {
-        Some((p.saved_user_rip, p.saved_user_rsp, p.context.rflags, p.pml4_phys, p.saved_syscall_regs))
+        Some((p.saved_user_rip, p.saved_user_rsp, p.context.rflags, p.pml4_phys, p.saved_ctx))
     } else {
         None
     }
@@ -800,6 +1051,21 @@ pub fn set_heap_break(pid: u64, new_break: u64) -> Option<u64> {
 pub fn add_vma(pid: u64, vma: VirtualMemoryArea) -> Option<()> {
     with_process_mut(pid, |p| {
         p.vmas.push(vma);
+    })
+}
+
+/// Get a copy of all VMAs for the process (used by /proc/self/maps)
+pub fn get_vmas(pid: u64) -> Option<alloc::vec::Vec<VirtualMemoryArea>> {
+    with_process(pid, |p| {
+        p.vmas.iter().map(|v| VirtualMemoryArea {
+            vaddr_start: v.vaddr_start,
+            vaddr_end: v.vaddr_end,
+            file_path: v.file_path.clone(),
+            file_offset: v.file_offset,
+            size: v.size,
+            writable: v.writable,
+            executable: v.executable,
+        }).collect()
     })
 }
 

@@ -63,6 +63,8 @@ mod framebuffer;
 mod font;
 mod codegen;
 mod compat;
+mod llm;
+mod gui;
 #[cfg(feature = "limine")]
 mod boot;
 

@@ -424,18 +424,22 @@ impl VirtioNetDevice {
             let effective_size = queue_size.min(QUEUE_SIZE);
             crate::serial_println!("[VIRTIO-NET] Queue {} size: {}", queue_idx, effective_size);
 
-            // Allocate memory for the queue
+            // Allocate CONTIGUOUS physical memory for the queue.
+            // VirtIO legacy requires the queue to be physically contiguous
+            // because the device uses a single PFN (page frame number).
             let mem_size = VirtQueue::mem_size(effective_size);
             let num_pages = (mem_size + 4095) / 4096;
-            let mut base_phys = 0u64;
-            for i in 0..num_pages {
-                let frame = crate::elf::alloc_demand_frame()?;
-                if i == 0 { base_phys = frame; }
-                // Zero the frame
-                core::ptr::write_bytes((frame + phys_offset) as *mut u8, 0, 4096);
-            }
 
+            let base_phys = crate::memory::frame::alloc_contiguous_dma(num_pages)?;
             let base_virt = base_phys + phys_offset;
+
+            crate::serial_println!(
+                "[VIRTIO-NET] Queue {} DMA: phys=0x{:X} virt=0x{:X} pages={}",
+                queue_idx, base_phys, base_virt, num_pages
+            );
+
+            // Zero all allocated pages
+            core::ptr::write_bytes(base_virt as *mut u8, 0, num_pages * 4096);
 
             // Initialize free list
             let desc_ptr = base_virt as *mut VringDesc;

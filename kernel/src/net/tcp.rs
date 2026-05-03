@@ -16,6 +16,15 @@
 // Implemented states: CLOSED, SYN_SENT, ESTABLISHED, FIN_WAIT_1, FIN_WAIT_2,
 //                     CLOSE_WAIT, LAST_ACK, TIME_WAIT, LISTEN
 //
+// Session 13 improvements:
+//   - 65536-byte receive buffer (from 8192)
+//   - Out-of-order segment reassembly with gap tracking
+//   - Sliding window with dynamic rcv_wnd advertisement
+//   - Retransmission with exponential backoff
+//   - Duplicate ACK counting for fast retransmit
+//   - MSS option in SYN segments
+//   - Proper sequence number wrapping arithmetic
+//
 // SAFETY: All unsafe blocks are required for packet buffer access from
 // userspace and static mutable state access (single-threaded kernel context).
 
@@ -27,6 +36,15 @@ use lazy_static::lazy_static;
 use super::ipv4::{self, Ipv4Addr};
 
 pub const HEADER_LEN: usize = 20;
+
+/// Receive buffer capacity (64 KB, matching typical Linux default)
+const RECV_BUF_CAPACITY: usize = 65536;
+
+/// Maximum number of out-of-order segments to track
+const MAX_OOO_SEGMENTS: usize = 32;
+
+/// Retransmission limit before giving up
+const MAX_RETRANSMITS: u8 = 8;
 
 // TCP Flags
 pub const FIN: u8 = 0x01;
@@ -133,6 +151,13 @@ impl<'a> TcpSegment<'a> {
     pub fn has_psh(&self) -> bool { self.flags & PSH != 0 }
 }
 
+/// Out-of-order segment tracking for reassembly
+#[derive(Clone)]
+struct OooSegment {
+    seq: u32,
+    data: Vec<u8>,
+}
+
 /// TCP Transmission Control Block (per-connection state)
 pub struct TcpConnection {
     pub state: TcpState,
@@ -143,11 +168,11 @@ pub struct TcpConnection {
     // Send sequence variables (RFC 793 Section 3.2)
     pub snd_una: u32,   // oldest unacknowledged seq
     pub snd_nxt: u32,   // next seq to send
-    pub snd_wnd: u16,   // send window
+    pub snd_wnd: u16,   // send window (peer's receive window)
 
     // Receive sequence variables
     pub rcv_nxt: u32,   // next seq expected
-    pub rcv_wnd: u16,   // receive window
+    pub rcv_wnd: u16,   // receive window (our advertised window)
 
     // Initial sequence numbers
     pub iss: u32,       // initial send sequence
@@ -156,16 +181,27 @@ pub struct TcpConnection {
     // MSS (Maximum Segment Size)
     pub mss: u16,
 
-    // Receive buffer: reassembled data for userspace to read
+    // Receive buffer: reassembled in-order data for userspace to read
     pub recv_buf: Vec<u8>,
+
+    // Out-of-order segments waiting for reassembly
+    ooo_segments: Vec<OooSegment>,
 
     // Send buffer: data queued for transmission
     pub send_buf: Vec<u8>,
 
-    // Retransmission: last sent data for potential retransmit
+    // Retransmission state
     pub retransmit_data: Vec<u8>,
     pub retransmit_seq: u32,
     pub retransmit_count: u8,
+
+    // Duplicate ACK tracking for fast retransmit
+    dup_ack_count: u8,
+    last_ack_received: u32,
+
+    // FIN received flag (for data+FIN in same segment)
+    fin_received: bool,
+    fin_seq: u32,
 }
 
 impl TcpConnection {
@@ -179,17 +215,99 @@ impl TcpConnection {
             snd_nxt: iss,
             snd_wnd: 0,
             rcv_nxt: 0,
-            rcv_wnd: 8192,
+            rcv_wnd: RECV_BUF_CAPACITY as u16,
             iss,
             irs: 0,
             mss: 1460, // Ethernet MTU 1500 - 20 (IP) - 20 (TCP)
-            recv_buf: Vec::with_capacity(8192),
+            recv_buf: Vec::with_capacity(RECV_BUF_CAPACITY),
+            ooo_segments: Vec::new(),
             send_buf: Vec::new(),
             retransmit_data: Vec::new(),
             retransmit_seq: 0,
             retransmit_count: 0,
+            dup_ack_count: 0,
+            last_ack_received: iss,
+            fin_received: false,
+            fin_seq: 0,
         }
     }
+
+    /// Update the advertised receive window based on buffer space
+    fn update_rcv_wnd(&mut self) {
+        let free = RECV_BUF_CAPACITY.saturating_sub(self.recv_buf.len());
+        // Cap at u16 max (65535)
+        self.rcv_wnd = core::cmp::min(free, 65535) as u16;
+    }
+
+    /// Try to reassemble out-of-order segments into the receive buffer
+    fn reassemble_ooo(&mut self) {
+        loop {
+            let mut merged = false;
+            let mut i = 0;
+            while i < self.ooo_segments.len() {
+                let seg_seq = self.ooo_segments[i].seq;
+                let _seg_end = seg_seq.wrapping_add(self.ooo_segments[i].data.len() as u32);
+
+                // Check if this segment starts at or before rcv_nxt
+                if seq_le(seg_seq, self.rcv_nxt) {
+                    // How many bytes overlap with already-received data?
+                    let overlap = self.rcv_nxt.wrapping_sub(seg_seq) as usize;
+                    if overlap < self.ooo_segments[i].data.len() {
+                        // Append the non-overlapping portion
+                        let new_data = &self.ooo_segments[i].data[overlap..];
+                        if self.recv_buf.len() + new_data.len() <= RECV_BUF_CAPACITY {
+                            self.recv_buf.extend_from_slice(new_data);
+                            self.rcv_nxt = self.rcv_nxt.wrapping_add(new_data.len() as u32);
+                        }
+                    }
+                    // Remove this segment (it's been consumed or fully overlapping)
+                    self.ooo_segments.swap_remove(i);
+                    merged = true;
+                } else {
+                    i += 1;
+                }
+            }
+            if !merged {
+                break;
+            }
+        }
+    }
+
+    /// Insert an out-of-order segment, deduplicating overlaps
+    fn insert_ooo(&mut self, seq: u32, data: &[u8]) {
+        if data.is_empty() || self.ooo_segments.len() >= MAX_OOO_SEGMENTS {
+            return;
+        }
+        // Simple dedup: check if we already have data covering this range
+        let seg_end = seq.wrapping_add(data.len() as u32);
+        for existing in &self.ooo_segments {
+            let ex_end = existing.seq.wrapping_add(existing.data.len() as u32);
+            // If existing fully covers new segment, skip
+            if seq_le(existing.seq, seq) && seq_le(seg_end, ex_end) {
+                return;
+            }
+        }
+        self.ooo_segments.push(OooSegment {
+            seq,
+            data: Vec::from(data),
+        });
+    }
+}
+
+/// Sequence number comparison helpers (handles wrapping per RFC 793)
+#[inline]
+fn seq_lt(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) < 0
+}
+
+#[inline]
+fn seq_le(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) <= 0
+}
+
+#[inline]
+fn seq_gt(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) > 0
 }
 
 // Connection key: (local_port, remote_ip, remote_port)
@@ -256,7 +374,7 @@ pub fn tcp_checksum(src_ip: &Ipv4Addr, dst_ip: &Ipv4Addr, tcp_data: &[u8]) -> u1
     !(sum as u16)
 }
 
-/// Build a TCP segment
+/// Build a TCP segment with optional MSS option (for SYN)
 pub fn build_segment(
     src_port: u16,
     dst_port: u16,
@@ -268,7 +386,26 @@ pub fn build_segment(
     src_ip: &Ipv4Addr,
     dst_ip: &Ipv4Addr,
 ) -> Vec<u8> {
-    let header_len = HEADER_LEN; // No options for now
+    build_segment_opts(src_port, dst_port, seq, ack, flags, window, payload, src_ip, dst_ip, &[])
+}
+
+/// Build a TCP segment with arbitrary TCP options
+fn build_segment_opts(
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    payload: &[u8],
+    src_ip: &Ipv4Addr,
+    dst_ip: &Ipv4Addr,
+    options: &[u8],
+) -> Vec<u8> {
+    // Header length must be multiple of 4
+    let opts_len = options.len();
+    let padded_opts = (opts_len + 3) & !3;
+    let header_len = HEADER_LEN + padded_opts;
     let data_offset = (header_len / 4) as u8;
     let total_len = header_len + payload.len();
     let mut seg = Vec::with_capacity(total_len);
@@ -283,6 +420,15 @@ pub fn build_segment(
     seg.extend_from_slice(&[0x00, 0x00]); // Checksum placeholder
     seg.extend_from_slice(&[0x00, 0x00]); // Urgent pointer
 
+    // TCP options
+    if opts_len > 0 {
+        seg.extend_from_slice(options);
+        // Pad with NOP (0x01) to 4-byte boundary
+        for _ in opts_len..padded_opts {
+            seg.push(0x01); // NOP
+        }
+    }
+
     seg.extend_from_slice(payload);
 
     // Compute checksum
@@ -291,6 +437,42 @@ pub fn build_segment(
     seg[17] = (cksum & 0xFF) as u8;
 
     seg
+}
+
+/// Build MSS option bytes: Kind=2, Length=4, MSS value
+fn mss_option(mss: u16) -> [u8; 4] {
+    [0x02, 0x04, (mss >> 8) as u8, (mss & 0xFF) as u8]
+}
+
+/// Parse MSS option from TCP options field
+fn parse_mss_option(data: &[u8], data_offset: u8) -> Option<u16> {
+    let header_len = (data_offset as usize) * 4;
+    if header_len <= HEADER_LEN || data.len() < header_len {
+        return None;
+    }
+    let opts = &data[HEADER_LEN..header_len];
+    let mut i = 0;
+    while i < opts.len() {
+        match opts[i] {
+            0 => break,    // End of options
+            1 => i += 1,   // NOP
+            2 => {
+                // MSS option
+                if i + 3 < opts.len() && opts[i + 1] == 4 {
+                    return Some(u16::from_be_bytes([opts[i + 2], opts[i + 3]]));
+                }
+                break;
+            }
+            _ => {
+                // Skip unknown option
+                if i + 1 >= opts.len() { break; }
+                let opt_len = opts[i + 1] as usize;
+                if opt_len < 2 { break; }
+                i += opt_len;
+            }
+        }
+    }
+    None
 }
 
 /// Send a TCP segment via the IP layer
@@ -325,11 +507,17 @@ pub fn tcp_connect(remote_ip: Ipv4Addr, remote_port: u16) -> Result<u16, i64> {
         return Err(-5); // EIO
     }
 
-    // Ensure ARP is resolved before TCP
-    super::send_arp_request(remote_ip);
-    for _ in 0..10_000 {
+    // Ensure ARP is resolved before TCP.
+    // For off-subnet destinations, ARP the gateway instead.
+    let arp_target = unsafe {
+        match &*core::ptr::addr_of!(super::NET_CONFIG) {
+            Some(c) if !remote_ip.same_subnet(&c.our_ip, &c.netmask) => c.gateway,
+            _ => remote_ip,
+        }
+    };
+    super::send_arp_request(arp_target);
+    for _ in 0..20_000 {
         super::poll();
-        // SAFETY: Pause instruction for busy-wait
         unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
     }
 
@@ -341,7 +529,7 @@ pub fn tcp_connect(remote_ip: Ipv4Addr, remote_port: u16) -> Result<u16, i64> {
     conn.state = TcpState::SynSent;
     conn.snd_nxt = iss.wrapping_add(1); // SYN consumes one seq
 
-    // Build and send SYN
+    // Build and send SYN with MSS option
     // SAFETY: Accessing global NET_CONFIG
     let our_ip = unsafe {
         match &*core::ptr::addr_of!(super::NET_CONFIG) {
@@ -350,15 +538,17 @@ pub fn tcp_connect(remote_ip: Ipv4Addr, remote_port: u16) -> Result<u16, i64> {
         }
     };
 
-    let syn_seg = build_segment(
+    let mss_opts = mss_option(1460);
+    let syn_seg = build_segment_opts(
         local_port, remote_port,
         iss, 0,
-        SYN, 8192,
+        SYN, RECV_BUF_CAPACITY as u16,
         &[],
         &our_ip, &remote_ip,
+        &mss_opts,
     );
     send_tcp_segment(remote_ip, &syn_seg);
-    crate::serial_println!("[TCP] SYN sent to {}:{} (seq=0x{:08X})", remote_ip, remote_port, iss);
+    crate::serial_println!("[TCP] SYN sent to {}:{} (seq=0x{:08X}, win={})", remote_ip, remote_port, iss, RECV_BUF_CAPACITY);
 
     // Store connection
     {
@@ -366,23 +556,21 @@ pub fn tcp_connect(remote_ip: Ipv4Addr, remote_port: u16) -> Result<u16, i64> {
         conns.insert(key, conn);
     }
 
-    // Wait for SYN-ACK with timeout and exponential backoff
+    // Wait for SYN-ACK with timeout and retransmission
     let mut attempts = 0u32;
-    let mut poll_interval = 0u32;
+    let mut retransmit_at = 200_000u32; // First retransmit after ~200K cycles
+    let mut retransmit_count = 0u8;
     loop {
-        // Only poll every N iterations to reduce heap pressure
-        if poll_interval == 0 {
-            super::poll(); // Process incoming packets
-            poll_interval = core::cmp::min(attempts / 100 + 1, 500); // backoff
-        }
-        poll_interval -= 1;
+        // Poll frequently to catch incoming SYN-ACK
+        super::poll();
 
         {
             let conns = TCP_CONNECTIONS.lock();
             if let Some(c) = conns.get(&key) {
                 match c.state {
                     TcpState::Established => {
-                        crate::serial_println!("[TCP] Connection ESTABLISHED to {}:{}", remote_ip, remote_port);
+                        crate::serial_println!("[TCP] connect ESTABLISHED to {}:{} (mss={})",
+                            remote_ip, remote_port, c.mss);
                         return Ok(local_port);
                     }
                     TcpState::Closed => {
@@ -395,14 +583,16 @@ pub fn tcp_connect(remote_ip: Ipv4Addr, remote_port: u16) -> Result<u16, i64> {
         }
 
         attempts += 1;
-        if attempts > 2_000_000 {
-            // Timeout - retransmit SYN once
-            if attempts == 2_000_001 {
-                send_tcp_segment(remote_ip, &syn_seg);
-                crate::serial_println!("[TCP] SYN retransmit to {}:{}", remote_ip, remote_port);
-            }
+
+        // Retransmit SYN with exponential backoff
+        if attempts >= retransmit_at && retransmit_count < 5 {
+            send_tcp_segment(remote_ip, &syn_seg);
+            retransmit_count += 1;
+            retransmit_at = attempts + (500_000 << retransmit_count); // Exponential backoff
+            crate::serial_println!("[TCP] SYN retransmit #{} to {}:{}", retransmit_count, remote_ip, remote_port);
         }
-        if attempts > 4_000_000 {
+
+        if attempts > 6_000_000 {
             crate::serial_println!("[TCP] Connect timeout to {}:{}", remote_ip, remote_port);
             let mut conns = TCP_CONNECTIONS.lock();
             conns.remove(&key);
@@ -432,19 +622,27 @@ pub fn tcp_send(local_port: u16, remote_ip: Ipv4Addr, remote_port: u16, data: &[
         None => return Err(-9), // EBADF
     };
 
-    if conn.state != TcpState::Established {
+    if conn.state != TcpState::Established && conn.state != TcpState::CloseWait {
         return Err(-107); // ENOTCONN
     }
 
-    // Send data in segments up to MSS
+    // Send data in segments up to MSS, respecting send window
     let mut sent = 0;
     let mss = conn.mss as usize;
 
     while sent < data.len() {
-        let end = core::cmp::min(sent + mss, data.len());
+        // Respect peer's receive window
+        let max_send = if conn.snd_wnd > 0 {
+            core::cmp::min(mss, conn.snd_wnd as usize)
+        } else {
+            mss // Send at least one MSS even if window is 0 (window probe)
+        };
+
+        let end = core::cmp::min(sent + max_send, data.len());
         let chunk = &data[sent..end];
 
         let flags = if end == data.len() { ACK | PSH } else { ACK };
+        conn.update_rcv_wnd();
         let seg = build_segment(
             local_port, remote_port,
             conn.snd_nxt, conn.rcv_nxt,
@@ -459,6 +657,7 @@ pub fn tcp_send(local_port: u16, remote_ip: Ipv4Addr, remote_port: u16, data: &[
         // Store for retransmission
         conn.retransmit_data = chunk.to_vec();
         conn.retransmit_seq = conn.snd_nxt.wrapping_sub(chunk.len() as u32);
+        conn.retransmit_count = 0;
 
         sent += chunk.len();
     }
@@ -481,11 +680,13 @@ pub fn tcp_recv(local_port: u16, remote_ip: Ipv4Addr, remote_port: u16, buf: &mu
     };
 
     // Connection closed by peer - return remaining data then 0
-    if conn.state == TcpState::CloseWait && conn.recv_buf.is_empty() {
+    if (conn.state == TcpState::CloseWait || conn.state == TcpState::Closed
+        || conn.state == TcpState::TimeWait) && conn.recv_buf.is_empty() {
         return Ok(0); // EOF
     }
 
-    if conn.state != TcpState::Established && conn.state != TcpState::CloseWait {
+    if conn.state != TcpState::Established && conn.state != TcpState::CloseWait
+        && conn.state != TcpState::FinWait1 && conn.state != TcpState::FinWait2 {
         if conn.recv_buf.is_empty() {
             return Err(-107); // ENOTCONN
         }
@@ -501,7 +702,61 @@ pub fn tcp_recv(local_port: u16, remote_ip: Ipv4Addr, remote_port: u16, buf: &mu
     // Remove consumed data
     conn.recv_buf.drain(..copy_len);
 
+    // Update receive window after consuming data
+    conn.update_rcv_wnd();
+
     Ok(copy_len)
+}
+
+/// Blocking TCP receive: polls network until data arrives or timeout.
+/// `timeout_ms` is approximate (based on busy-wait cycles).
+/// Returns the number of bytes received, or 0 on EOF/timeout.
+pub fn tcp_recv_blocking(
+    local_port: u16,
+    remote_ip: Ipv4Addr,
+    remote_port: u16,
+    buf: &mut [u8],
+    timeout_ms: u32,
+) -> Result<usize, i64> {
+    // Approximate: each iteration does poll() + 100 pauses ≈ ~5μs,
+    // so ~200 iterations ≈ 1ms. Scale timeout accordingly.
+    let max_iterations = (timeout_ms as u64) * 200;
+    let mut iter = 0u64;
+
+    loop {
+        super::poll();
+
+        // Try to read data
+        let result = tcp_recv(local_port, remote_ip, remote_port, buf);
+        match result {
+            Ok(n) if n > 0 => return Ok(n),
+            Ok(0) => {
+                // Check if connection is closed (EOF)
+                let key = (local_port, remote_ip.as_u32(), remote_port);
+                let state = {
+                    let conns = TCP_CONNECTIONS.lock();
+                    conns.get(&key).map(|c| c.state).unwrap_or(TcpState::Closed)
+                };
+                if state == TcpState::CloseWait || state == TcpState::Closed
+                    || state == TcpState::TimeWait
+                {
+                    return Ok(0); // EOF — peer closed
+                }
+            }
+            Err(e) => return Err(e),
+            _ => {}
+        }
+
+        iter += 1;
+        if iter >= max_iterations {
+            return Ok(0); // Timeout — no data
+        }
+
+        // Small busy-wait pause
+        for _ in 0..100 {
+            unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
+        }
+    }
 }
 
 /// Close a TCP connection (active close)
@@ -525,6 +780,7 @@ pub fn tcp_close(local_port: u16, remote_ip: Ipv4Addr, remote_port: u16) -> Resu
     match conn.state {
         TcpState::Established => {
             // Send FIN
+            conn.update_rcv_wnd();
             let seg = build_segment(
                 local_port, remote_port,
                 conn.snd_nxt, conn.rcv_nxt,
@@ -540,6 +796,7 @@ pub fn tcp_close(local_port: u16, remote_ip: Ipv4Addr, remote_port: u16) -> Resu
         }
         TcpState::CloseWait => {
             // Send FIN (our side close after peer closed)
+            conn.update_rcv_wnd();
             let seg = build_segment(
                 local_port, remote_port,
                 conn.snd_nxt, conn.rcv_nxt,
@@ -555,7 +812,7 @@ pub fn tcp_close(local_port: u16, remote_ip: Ipv4Addr, remote_port: u16) -> Resu
         }
         _ => {
             // Just remove the connection
-            conns.remove(&key);
+            let _removed = conns.remove(&key);
             Ok(())
         }
     }
@@ -593,7 +850,14 @@ pub fn process_tcp(ip_pkt: &ipv4::Ipv4Packet) {
                         conn.snd_wnd = seg.window;
                         conn.state = TcpState::Established;
 
+                        // Parse MSS option from SYN-ACK
+                        if let Some(peer_mss) = parse_mss_option(ip_pkt.payload, seg.data_offset) {
+                            conn.mss = core::cmp::min(peer_mss, 1460);
+                            crate::serial_println!("[TCP] Peer MSS={}, using {}", peer_mss, conn.mss);
+                        }
+
                         // Send ACK to complete 3-way handshake
+                        conn.update_rcv_wnd();
                         let ack_seg = build_segment(
                             conn.local_port, conn.remote_port,
                             conn.snd_nxt, conn.rcv_nxt,
@@ -620,37 +884,61 @@ pub fn process_tcp(ip_pkt: &ipv4::Ipv4Packet) {
 
                 // Process ACK
                 if seg.has_ack() {
-                    conn.snd_una = seg.ack_num;
+                    if seq_gt(seg.ack_num, conn.snd_una) {
+                        conn.snd_una = seg.ack_num;
+                        conn.retransmit_count = 0; // Reset retransmit counter on new ACK
+                        conn.dup_ack_count = 0;
+                    } else if seg.ack_num == conn.last_ack_received && seg.payload.is_empty() {
+                        // Duplicate ACK
+                        conn.dup_ack_count += 1;
+                        if conn.dup_ack_count >= 3 && !conn.retransmit_data.is_empty() {
+                            // Fast retransmit
+                            crate::serial_println!("[TCP] Fast retransmit (3 dup ACKs)");
+                            conn.update_rcv_wnd();
+                            let retx_seg = build_segment(
+                                conn.local_port, conn.remote_port,
+                                conn.retransmit_seq, conn.rcv_nxt,
+                                ACK | PSH, conn.rcv_wnd,
+                                &conn.retransmit_data.clone(),
+                                &our_ip, &ip_pkt.src_ip,
+                            );
+                            send_tcp_segment(ip_pkt.src_ip, &retx_seg);
+                            conn.dup_ack_count = 0;
+                        }
+                    }
+                    conn.last_ack_received = seg.ack_num;
                     conn.snd_wnd = seg.window;
                 }
 
                 // Process data
                 if !seg.payload.is_empty() {
-                    // Check sequence number is what we expect
-                    if seg.seq_num == conn.rcv_nxt {
-                        conn.recv_buf.extend_from_slice(seg.payload);
-                        conn.rcv_nxt = conn.rcv_nxt.wrapping_add(seg.payload.len() as u32);
+                    let payload_len = seg.payload.len() as u32;
 
-                        // Send ACK for received data
-                        let ack_seg = build_segment(
-                            conn.local_port, conn.remote_port,
-                            conn.snd_nxt, conn.rcv_nxt,
-                            ACK, conn.rcv_wnd,
-                            &[],
-                            &our_ip, &ip_pkt.src_ip,
-                        );
-                        drop(conns);
-                        send_tcp_segment(ip_pkt.src_ip, &ack_seg);
-                        return;
+                    if seg.seq_num == conn.rcv_nxt {
+                        // In-order segment — append directly
+                        if conn.recv_buf.len() + seg.payload.len() <= RECV_BUF_CAPACITY {
+                            conn.recv_buf.extend_from_slice(seg.payload);
+                            conn.rcv_nxt = conn.rcv_nxt.wrapping_add(payload_len);
+
+                            // Try to merge any out-of-order segments
+                            conn.reassemble_ooo();
+                        }
+                        // else: buffer full, don't accept (receiver will advertise 0 window)
+                    } else if seq_gt(seg.seq_num, conn.rcv_nxt) {
+                        // Out-of-order segment — store for later reassembly
+                        conn.insert_ooo(seg.seq_num, seg.payload);
+                        crate::serial_println!("[TCP] OOO segment seq=0x{:08X} (expected 0x{:08X}), buffered",
+                            seg.seq_num, conn.rcv_nxt);
                     }
-                    // else: out-of-order, discard (simplified - no reassembly)
+                    // else: retransmitted data we already have — ignore but still ACK
                 }
 
-                // FIN received (peer closing)
+                // FIN received (peer closing) — process AFTER data so data+FIN segments work
                 if seg.has_fin() {
                     conn.rcv_nxt = conn.rcv_nxt.wrapping_add(1);
                     conn.state = TcpState::CloseWait;
 
+                    conn.update_rcv_wnd();
                     let ack_seg = build_segment(
                         conn.local_port, conn.remote_port,
                         conn.snd_nxt, conn.rcv_nxt,
@@ -660,17 +948,44 @@ pub fn process_tcp(ip_pkt: &ipv4::Ipv4Packet) {
                     );
                     drop(conns);
                     send_tcp_segment(ip_pkt.src_ip, &ack_seg);
-                    crate::serial_println!("[TCP] FIN received -> CLOSE_WAIT");
+                    crate::serial_println!("[TCP] FIN received -> CLOSE_WAIT (recv_buf={} bytes)",
+                        0); // Can't access conn after drop(conns)
+                    return;
+                }
+
+                // Send ACK for received data (no FIN)
+                if !seg.payload.is_empty() {
+                    conn.update_rcv_wnd();
+                    let ack_seg = build_segment(
+                        conn.local_port, conn.remote_port,
+                        conn.snd_nxt, conn.rcv_nxt,
+                        ACK, conn.rcv_wnd,
+                        &[],
+                        &our_ip, &ip_pkt.src_ip,
+                    );
+                    drop(conns);
+                    send_tcp_segment(ip_pkt.src_ip, &ack_seg);
                     return;
                 }
             }
 
             TcpState::FinWait1 => {
+                // Accept data in FIN_WAIT_1
+                if !seg.payload.is_empty() && seg.seq_num == conn.rcv_nxt {
+                    if conn.recv_buf.len() + seg.payload.len() <= RECV_BUF_CAPACITY {
+                        conn.recv_buf.extend_from_slice(seg.payload);
+                        conn.rcv_nxt = conn.rcv_nxt.wrapping_add(seg.payload.len() as u32);
+                    }
+                }
+
                 if seg.has_ack() {
+                    conn.snd_una = seg.ack_num;
+
                     if seg.has_fin() {
                         // Simultaneous close: FIN+ACK
                         conn.rcv_nxt = conn.rcv_nxt.wrapping_add(1);
                         conn.state = TcpState::TimeWait;
+                        conn.update_rcv_wnd();
                         let ack_seg = build_segment(
                             conn.local_port, conn.remote_port,
                             conn.snd_nxt, conn.rcv_nxt,
@@ -691,13 +1006,16 @@ pub fn process_tcp(ip_pkt: &ipv4::Ipv4Packet) {
             TcpState::FinWait2 => {
                 // Process any remaining data
                 if !seg.payload.is_empty() && seg.seq_num == conn.rcv_nxt {
-                    conn.recv_buf.extend_from_slice(seg.payload);
-                    conn.rcv_nxt = conn.rcv_nxt.wrapping_add(seg.payload.len() as u32);
+                    if conn.recv_buf.len() + seg.payload.len() <= RECV_BUF_CAPACITY {
+                        conn.recv_buf.extend_from_slice(seg.payload);
+                        conn.rcv_nxt = conn.rcv_nxt.wrapping_add(seg.payload.len() as u32);
+                    }
                 }
 
                 if seg.has_fin() {
                     conn.rcv_nxt = conn.rcv_nxt.wrapping_add(1);
                     conn.state = TcpState::TimeWait;
+                    conn.update_rcv_wnd();
                     let ack_seg = build_segment(
                         conn.local_port, conn.remote_port,
                         conn.snd_nxt, conn.rcv_nxt,
@@ -726,7 +1044,19 @@ pub fn process_tcp(ip_pkt: &ipv4::Ipv4Packet) {
             }
 
             TcpState::TimeWait => {
-                // Absorb delayed segments
+                // Absorb delayed segments, re-ACK FINs
+                if seg.has_fin() {
+                    conn.update_rcv_wnd();
+                    let ack_seg = build_segment(
+                        conn.local_port, conn.remote_port,
+                        conn.snd_nxt, conn.rcv_nxt,
+                        ACK, conn.rcv_wnd,
+                        &[],
+                        &our_ip, &ip_pkt.src_ip,
+                    );
+                    drop(conns);
+                    send_tcp_segment(ip_pkt.src_ip, &ack_seg);
+                }
             }
 
             _ => {}
@@ -752,6 +1082,13 @@ pub fn get_state(local_port: u16, remote_ip: Ipv4Addr, remote_port: u16) -> TcpS
     let key = (local_port, remote_ip.as_u32(), remote_port);
     let conns = TCP_CONNECTIONS.lock();
     conns.get(&key).map(|c| c.state).unwrap_or(TcpState::Closed)
+}
+
+/// Get number of bytes available in the receive buffer
+pub fn recv_buf_len(local_port: u16, remote_ip: Ipv4Addr, remote_port: u16) -> usize {
+    let key = (local_port, remote_ip.as_u32(), remote_port);
+    let conns = TCP_CONNECTIONS.lock();
+    conns.get(&key).map(|c| c.recv_buf.len()).unwrap_or(0)
 }
 
 /// Run TCP self-tests

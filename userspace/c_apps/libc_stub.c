@@ -186,56 +186,47 @@ long net_ping(int a, int b, int c, int d, int seq) {
     return syscall2(210, (long)ip, (long)seq);
 }
 
-/* TCP connect: syscall 42(fd, packed_ip, port)
- * Kernel reads: a1=fd, a2=packed_ip, a3=port */
+/* TCP connect: use standard Linux connect(fd, sockaddr*, addrlen=16).
+ * Build a sockaddr_in { sa_family=AF_INET(2), sin_port=BE, sin_addr=BE } on stack
+ * and pass its address to syscall 42 = connect(fd, addr_ptr, 16). */
 long tcp_connect(int fd, int a, int b, int c, int d, int port) {
-    unsigned long ip = pack_ip(a, b, c, d);
-    return syscall3(42, (long)fd, (long)ip, (long)port);
+    unsigned char sa[16];
+    memset(sa, 0, 16);
+    sa[0] = 2; sa[1] = 0;  /* AF_INET = 2 (little-endian u16) */
+    sa[2] = (unsigned char)((port >> 8) & 0xFF);  /* sin_port high byte (big-endian) */
+    sa[3] = (unsigned char)(port & 0xFF);          /* sin_port low byte */
+    sa[4] = (unsigned char)a;  /* sin_addr byte 0 */
+    sa[5] = (unsigned char)b;  /* sin_addr byte 1 */
+    sa[6] = (unsigned char)c;  /* sin_addr byte 2 */
+    sa[7] = (unsigned char)d;  /* sin_addr byte 3 */
+    return syscall3(42, (long)fd, (long)sa, 16);
 }
 
-/* TCP send: use syscall 44 (sendto) but with TCP semantics
- * The kernel sendto for TCP sockets uses buf directly */
+/* TCP send: use sendto(fd, buf, len, 0, NULL, 0) on connected socket.
+ * syscall 44 = sendto: a1=fd, a2=buf, a3=len, a4=flags, a5=dest_addr, a6=addrlen
+ * With dest_addr=NULL and addrlen=0, kernel routes to tcp_send on connected socket. */
 long tcp_send(int fd, const void *buf, size_t len) {
-    /* For TCP: syscall 44(fd, buf, encoded_dest)
-     * We encode length in buf_addr and use the TCP socket's remote from connect
-     * Simpler: the kernel's sys_sendto for SOCK_STREAM reads data from buf
-     * Actually, we need a dedicated TCP send path.
-     * Let's use the sendto with a special encoding:
-     * a1=fd, a2=buf_addr (with length prefix), a3=0 (use connected remote) */
-    
-    /* Build a buffer with 8-byte length prefix + data */
-    /* Actually, to keep it simple, let's route through the tcp_send in socket.rs
-     * which already handles SOCK_STREAM differently */
-    
-    /* Use a simplified approach: syscall 44 with len encoded */
-    /* The kernel dispatcher reads: fd, buf_addr, encoded_dest */
-    /* For TCP sockets, we'll encode the length in the first 8 bytes */
-    
-    /* Simplest: just pass buf and encode len in a3 */
-    /* But the kernel expects the sendto format with len prefix...
-     * Let's use a separate syscall approach: pack len in a3 */
-    
-    /* Use a small stack buffer approach */
-    unsigned char tmp[1500];
-    if (len > 1492) len = 1492;
-    
-    /* 8-byte length prefix */
-    unsigned long l = (unsigned long)len;
-    memcpy(tmp, &l, 8);
-    memcpy(tmp + 8, buf, len);
-    
-    /* syscall 44: sendto(fd, tmp, 0) - a3=0 means use connected TCP */
-    return syscall3(44, (long)fd, (long)tmp, 0);
+    return syscall6(44, (long)fd, (long)buf, (long)len, 0, 0, 0);
 }
 
-/* TCP read: syscall 212(fd, buf, len) */
+/* TCP read: use standard Linux recvfrom(fd, buf, len, 0, NULL, NULL).
+ * syscall 45 = recvfrom: a1=fd, a2=buf, a3=len, a4=flags, a5=src_addr, a6=addrlen_ptr
+ * With src_addr=NULL and addrlen_ptr=NULL, this reads from a connected TCP socket. */
 long tcp_read(int fd, void *buf, size_t len) {
-    return syscall3(212, (long)fd, (long)buf, (long)len);
+    return syscall6(45, (long)fd, (long)buf, (long)len, 0, 0, 0);
 }
 
-/* TCP shutdown: syscall 47(fd) */
+/* TCP shutdown: use standard Linux shutdown(fd, how).
+ * syscall 48 = shutdown: a1=fd, a2=how (SHUT_RDWR=2). */
 long tcp_shutdown(int fd) {
-    return syscall1(47, (long)fd);
+    return syscall2(48, (long)fd, 2);  /* SHUT_RDWR */
+}
+
+/* socket(domain, type, protocol): create a socket file descriptor.
+ * syscall 41 = socket: a1=domain(AF_INET=2), a2=type(SOCK_STREAM=1), a3=protocol(0).
+ * Returns a file descriptor or negative error. */
+long net_socket(int domain, int type, int protocol) {
+    return syscall3(41, (long)domain, (long)type, (long)protocol);
 }
 
 /* DNS gethostbyname: syscall 211(name_addr) -> packed IP */

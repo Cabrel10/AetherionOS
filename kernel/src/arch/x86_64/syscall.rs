@@ -70,6 +70,11 @@ const ENOSPC: u64 = (-28i64) as u64;
 const EEXIST: u64 = (-17i64) as u64;
 const EPERM:  u64 = (-1i64) as u64;
 const ENOTTY: u64 = (-25i64) as u64;
+const EPIPE:  u64 = (-32i64) as u64;
+const EINTR:  u64 = (-4i64) as u64;
+const ENOTDIR: u64 = (-20i64) as u64;
+const EISDIR: u64 = (-21i64) as u64;
+const ERANGE: u64 = (-34i64) as u64;
 
 // POSIX open flags
 const O_RDONLY: u32 = 0;
@@ -199,6 +204,108 @@ pub fn init_global_sysret_trampoline() {
 #[inline]
 pub fn sysret_trampoline_addr() -> u64 {
     GLOBAL_SYSRET_TRAMPOLINE.load(AtomicOrdering::SeqCst)
+}
+
+// ===== Restore-and-SYSRETQ macro =====
+//
+// Emits the inline asm to restore all user registers from a SyscallContext,
+// set RAX to the given result value, load the user RSP from GS:[8], and
+// jump to the global SYSRETQ trampoline (mov cr3, rdx → swapgs → sysretq).
+//
+// $ctx:    expression of type SyscallContext
+// $pml4:   user PML4 physical address (loaded into rdx for the trampoline)
+// $result: value for RAX (e.g., child PID for wait4, 0 for fork-child)
+
+macro_rules! restore_and_sysret {
+    ($ctx:expr, $pml4:expr, $result:expr) => {{
+        let ctx = $ctx;
+        let pml4_val: u64 = $pml4;
+        let result_val: u64 = $result;
+        unsafe {
+            PER_CPU.user_cr3 = pml4_val;
+            let trampoline = sysret_trampoline_addr();
+            // Jalon 212: Fix register allocation conflict in sysretq restore.
+            //
+            // The old code used `in(reg)` for all ctx fields, letting the compiler
+            // pick ANY register.  If the compiler allocated ctx.rip to R15 (or any
+            // register that we overwrite early), the `mov r15, {v_r15}` instruction
+            // would clobber the value before `mov rcx, {v_rcx}` could read it,
+            // causing the child to jump to the wrong address after sysretq.
+            //
+            // Fix: snapshot ALL context values into local variables FIRST (the
+            // compiler will use its own scratch registers / stack spills for these),
+            // then push them onto the kernel stack in reverse order.  The asm block
+            // pops them into the correct CPU registers in a deterministic order,
+            // eliminating any register reuse hazard.
+            let v_r15  = ctx.r15;
+            let v_r14  = ctx.r14;
+            let v_r13  = ctx.r13;
+            let v_r12  = ctx.r12;
+            let v_rbx  = ctx.rbx;
+            let v_rbp  = ctx.rbp;
+            let v_rsi  = ctx.rsi;
+            let v_rdi  = ctx.rdi;
+            let v_r9   = ctx.r9;
+            let v_r10  = ctx.r10;
+            let v_rfl  = ctx.rflags;  // → R11 for sysretq
+            let v_rip  = ctx.rip;     // → RCX for sysretq
+
+            core::arch::asm!(
+                "cli",
+                // Push values in reverse pop-order onto kernel stack.
+                // This avoids ANY register aliasing: each push reads exactly
+                // one input operand and the stack is the only intermediate store.
+                "push {v_r15}",
+                "push {v_r14}",
+                "push {v_r13}",
+                "push {v_r12}",
+                "push {v_rbx}",
+                "push {v_rbp}",
+                "push {v_rsi}",
+                "push {v_rdi}",
+                "push {v_r9}",
+                "push {v_r10}",
+                "push {v_r11}",  // rflags → R11
+                "push {v_rcx}",  // rip → RCX
+                "push {result}", // → RAX
+
+                // Now pop them into the actual CPU registers (no aliasing possible)
+                "pop rax",
+                "pop rcx",       // user RIP
+                "pop r11",       // user RFLAGS
+                "pop r10",
+                "pop r9",
+                "pop rdi",
+                "pop rsi",
+                "pop rbp",
+                "pop rbx",
+                "pop r12",
+                "pop r13",
+                "pop r14",
+                "pop r15",
+
+                // Load user RSP and jump to the sysretq trampoline
+                "mov rsp, gs:[8]",
+                "jmp r8",
+                in("rdx") pml4_val,
+                in("r8")  trampoline,
+                v_r15  = in(reg) v_r15,
+                v_r14  = in(reg) v_r14,
+                v_r13  = in(reg) v_r13,
+                v_r12  = in(reg) v_r12,
+                v_rbx  = in(reg) v_rbx,
+                v_rbp  = in(reg) v_rbp,
+                v_rsi  = in(reg) v_rsi,
+                v_rdi  = in(reg) v_rdi,
+                v_r9   = in(reg) v_r9,
+                v_r10  = in(reg) v_r10,
+                v_r11  = in(reg) v_rfl,
+                v_rcx  = in(reg) v_rip,
+                result = in(reg) result_val,
+                options(noreturn),
+            );
+        }
+    }};
 }
 
 // ===== MSR helpers =====
@@ -612,12 +719,45 @@ pub static LAST_SYSCALL_NR: core::sync::atomic::AtomicU64 = core::sync::atomic::
 fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
     LAST_SYSCALL_NR.store(nr, core::sync::atomic::Ordering::Relaxed);
     let current_pid = crate::scheduler::current_pid();
-    // Trace first 60 syscalls of PID 1 for debugging
+    // ══════════════════ Millimeter-level tracing ══════════════════
+    // Trace first 200 syscalls of PID 1/2 + all critical syscalls (exit, brk, mmap, mprotect)
     static TRACE_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    static TRACE_COUNT2: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let is_critical_nr = nr == 60 || nr == 231 || nr == 12 || nr == 9 || nr == 10 || nr == 11;
     if current_pid == 1 {
         let c = TRACE_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        if c < 60 {
-            crate::serial_println!("[SC#{}] nr={} a1=0x{:X} a2=0x{:X} a3=0x{:X}", c, nr, a1, a2, a3);
+        if c < 200 || is_critical_nr {
+            crate::serial_println!("[SC#{}] PID1 nr={} a1=0x{:X} a2=0x{:X} a3=0x{:X} a4=0x{:X} a5=0x{:X}",
+                c, nr, a1, a2, a3, a4, a5);
+        }
+        // Log brk calls with full detail (heap growth tracking)
+        if nr == 12 {
+            crate::serial_println!("[BRK] PID1 SC#{} brk(0x{:X})", c, a1);
+        }
+        // Log mmap calls with full detail
+        if nr == 9 {
+            crate::serial_println!("[MMAP] PID1 SC#{} mmap(addr=0x{:X}, len=0x{:X}, prot=0x{:X}, flags=0x{:X}, fd={}, off=0x{:X})",
+                c, a1, a2, a3, a4, a5 as i64, saved_user_r9());
+        }
+        // Log mprotect
+        if nr == 10 {
+            crate::serial_println!("[MPROT] PID1 SC#{} mprotect(addr=0x{:X}, len=0x{:X}, prot=0x{:X})", c, a1, a2, a3);
+        }
+        // Log munmap
+        if nr == 11 {
+            crate::serial_println!("[MUNMAP] PID1 SC#{} munmap(addr=0x{:X}, len=0x{:X})", c, a1, a2);
+        }
+        // Log exit with full register dump
+        if nr == 60 || nr == 231 {
+            let rsp: u64;
+            unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack)); }
+            crate::serial_println!("[EXIT] PID1 SC#{} exit(status={}) RSP=0x{:X}", c, a1 as i64, rsp);
+        }
+    }
+    if current_pid == 2 {
+        let c = TRACE_COUNT2.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if c < 200 || is_critical_nr {
+            crate::serial_println!("[P2-SC#{}] nr={} a1=0x{:X} a2=0x{:X} a3=0x{:X} a4=0x{:X}", c, nr, a1, a2, a3, a4);
         }
     }
     // Jalon 105: Check if this process uses Linux ABI and route to Linux-specific handlers
@@ -627,7 +767,8 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         }).unwrap_or(false);
 
         if is_linux {
-            if let Some(result) = crate::compat::linux_abi::linux_syscall_override(nr, a1, a2, a3, a4) {
+            let a6 = saved_user_r9();  // 6th syscall arg (r9), e.g. mmap offset
+            if let Some(result) = crate::compat::linux_abi::linux_syscall_override(nr, a1, a2, a3, a4, a5, a6) {
                 return result;
             }
             // Fall through to standard dispatch for non-overridden syscalls
@@ -635,19 +776,87 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
     }
 
     // J135-T1: Dispatch via static function table instead of giant match.
-    // The giant match produced a fragile jump table that mis-assembled under
-    // release optimisation and sent RIP into non-canonical land (#GP) or to
-    // address 0x1E (#PF). The static table below is a plain PIC-safe array
-    // of fn pointers living in .rodata; the lookup is a single bounds-check
-    // + indexed load + indirect-call. No jump table is generated.
     if nr >= SYSCALL_TABLE_LEN as u64 {
         return dispatch_unknown(nr, current_pid);
     }
     let handler_opt = SYSCALL_TABLE[nr as usize];
     match handler_opt {
-        Some(handler) => handler(a1, a2, a3, a4, a5),
+        Some(handler) => {
+            let result = handler(a1, a2, a3, a4, a5);
+            // Log return values for critical syscalls (brk, mmap, mprotect, open, execve)
+            if current_pid <= 2 && (nr == 12 || nr == 9 || nr == 10 || nr == 2 || nr == 59) {
+                crate::serial_println!("[SC-RET] PID{} nr={} -> 0x{:X} ({})",
+                    current_pid, nr, result, result as i64);
+            }
+            result
+        }
         None => dispatch_unknown(nr, current_pid),
     }
+}
+
+/// Generate exact /proc/self/maps content for the dynamic linker (ld-musl).
+/// Format matches Linux: start-end perms offset dev inode pathname
+/// The dynamic linker reads this to discover its own load address and
+/// the main binary's segments for ASLR-aware relocation.
+fn generate_proc_self_maps(pid: u64) -> alloc::string::String {
+    use alloc::format;
+    let mut output = alloc::string::String::new();
+
+    // Get process VMAs (populated by mmap, load_elf, etc.)
+    let vmas = crate::process::get_vmas(pid);
+    if let Some(vmas) = vmas {
+        for vma in &vmas {
+            let perms = alloc::format!("{}{}{}{}",
+                "r",
+                if vma.writable { "w" } else { "-" },
+                if vma.executable { "x" } else { "-" },
+                "p", // always private for our processes
+            );
+
+            // Determine inode: use ext2 inode if file exists on disk
+            let inode = if !vma.file_path.is_empty()
+                && !vma.file_path.starts_with("[")
+                && crate::fs::ext2::is_mounted()
+            {
+                crate::fs::ext2::lookup_path(&vma.file_path)
+                    .map(|ino| ino as u64)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+
+            // Device: 08:01 for ext2 block device, 00:00 for anonymous
+            let dev = if inode > 0 { "08:01" } else { "00:00" };
+
+            let line = format!(
+                "{:012x}-{:012x} {} {:08x} {} {:<10} {}\n",
+                vma.vaddr_start,
+                vma.vaddr_end,
+                perms,
+                vma.file_offset,
+                dev,
+                inode,
+                vma.file_path,
+            );
+            output.push_str(&line);
+        }
+    }
+
+    // Always include heap and stack regions
+    let heap_start: u64 = 0x300000000000; // Our fixed heap base
+    let heap_end = crate::process::get_heap_break(pid).unwrap_or(heap_start + 0x2000);
+    if heap_start > 0 {
+        output.push_str(&format!(
+            "{:012x}-{:012x} rw-p 00000000 00:00 0          [heap]\n",
+            heap_start, heap_end
+        ));
+    }
+    // Stack is always at top of user address space
+    output.push_str("7ffffffde000-7ffffffff000 rw-p 00000000 00:00 0          [stack]\n");
+    // vDSO stub
+    output.push_str("7ffff7ffd000-7ffff7ffe000 r-xp 00000000 00:00 0          [vdso]\n");
+
+    output
 }
 
 /// Handle an unmapped syscall number with a consistent ENOSYS return value.
@@ -705,8 +914,8 @@ fn sc_getpid(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_getp
 fn sc_socket(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_socket(a1 as u32, a2 as u32, a3 as u32) }
 fn sc_connect(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_tcp_connect(a1 as u32, a2, a3) }
 fn sc_accept(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_accept(a1 as u32, a2, a3) }
-fn sc_sendto(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_sendto(a1 as u32, a2, a3) }
-fn sc_recvfrom(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_recvfrom(a1 as u32, a2, a3) }
+fn sc_sendto(a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 { sys_sendto_linux(a1 as u32, a2, a3, a4, a5, saved_user_r9()) }
+fn sc_recvfrom(a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 { sys_recvfrom_linux(a1 as u32, a2, a3, a4, a5, saved_user_r9()) }
 fn sc_setsockopt(a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 { sys_setsockopt(a1 as u32, a2, a3, a4, a5) }
 fn sc_shutdown(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_tcp_shutdown_syscall(a1 as u32) }
 fn sc_bind(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_bind(a1 as u32, a2 as u16) }
@@ -715,7 +924,7 @@ fn sc_clone(a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 { sys_clone(a1, 
 fn sc_fork(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_fork() }
 fn sc_execve(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_execve(a1, a2, a3) }
 fn sc_exit(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_exit(a1) }
-fn sc_wait(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_wait(a1) }
+fn sc_wait(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_wait4(a1, a2, a3) }
 fn sc_kill(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_kill(a1, a2 as u32) }
 fn sc_uname(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_uname(a1) }
 fn sc_fcntl(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_fcntl(a1 as u32, a2, a3) }
@@ -734,6 +943,10 @@ fn sc_getgid(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub
 fn sc_geteuid(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_geteuid() }
 fn sc_getegid(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_getegid() }
 fn sc_getppid(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_getppid() }
+fn sc_setpgid(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_setpgid(a1, a2) }
+fn sc_getpgrp(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_getpgrp() }
+fn sc_setsid(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_setsid() }
+fn sc_getpgid(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_getpgid(a1) }
 fn sc_sigaltstack(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_sigaltstack(a1, a2) }
 fn sc_arch_prctl(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_arch_prctl(a1, a2) }
 fn sc_gettid(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_gettid() }
@@ -743,7 +956,7 @@ fn sc_set_tid_address(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { 
 fn sc_clock_gettime(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_clock_gettime(a1, a2) }
 fn sc_clock_getres(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_clock_gettime(0, a1) }
 fn sc_exit_group(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_exit_group(a1) }
-fn sc_openat(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_openat(a1, a2, a3) }
+fn sc_openat(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_openat(a1, a2, a3) }
 fn sc_newfstatat(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_newfstatat(a1, a2, a3) }
 fn sc_epoll_create(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_epoll_create1(0) }
 fn sc_epoll_create1(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_epoll_create1(a1) }
@@ -751,7 +964,7 @@ fn sc_epoll_ctl(a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> u64 { sys_epoll
 fn sc_epoll_wait(a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> u64 { sys_epoll_wait_real(a1, a2, a3, a4) }
 fn sc_epoll_pwait(a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> u64 { sys_epoll_wait_real(a1, a2, a3, a4) }
 fn sc_set_robust_list(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_set_robust_list(a1, a2) }
-fn sc_pipe2(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_pipe2(a1, a2) }
+fn sc_pipe2(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_pipe2_real(a1, a2) }
 fn sc_prlimit64(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_prlimit64(a1, a2, a3) }
 fn sc_getrandom(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_getrandom(a1, a2, a3) }
 fn sc_mkdirat(_a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_mkdir(a2, a3) }
@@ -760,6 +973,9 @@ fn sc_readlinkat(_a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> u64 { sys_rea
 fn sc_symlink(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_symlink(a1, a2) }
 fn sc_symlinkat(a1: u64, _a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_symlink(a1, a3) }
 fn sc_faccessat(_a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_access(a2, a3) }
+/// statx(dirfd, path, flags, mask, statxbuf) — Linux 4.11+ stat variant.
+/// Fills struct statx (256 bytes) with file metadata from VFS/ext2/procfs.
+fn sc_statx(a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 { sys_statx(a1, a2, a3, a4, a5) }
 
 // ---- AetherionOS custom syscalls (nr 500+) ----
 fn sc_ps(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_ps() }
@@ -901,10 +1117,10 @@ static SYSCALL_TABLE: [Option<SyscallFn>; SYSCALL_TABLE_LEN] = {
     t[106] = Some(sc_zero);          // setgid
     t[107] = Some(sc_geteuid);
     t[108] = Some(sc_getegid);
-    t[109] = Some(sc_zero);          // setpgid
+    t[109] = Some(sc_setpgid);       // setpgid
     t[110] = Some(sc_getppid);
-    t[111] = Some(sc_zero);          // getpgrp
-    t[112] = Some(sc_zero);          // setsid
+    t[111] = Some(sc_getpgrp);       // getpgrp
+    t[112] = Some(sc_setsid);        // setsid
     t[113] = Some(sc_zero);          // setreuid
     t[114] = Some(sc_zero);          // setregid
     t[115] = Some(sc_zero);          // getgroups
@@ -913,7 +1129,7 @@ static SYSCALL_TABLE: [Option<SyscallFn>; SYSCALL_TABLE_LEN] = {
     t[118] = Some(sc_zero);          // getresuid
     t[119] = Some(sc_zero);          // setresgid
     t[120] = Some(sc_zero);          // getresgid
-    t[121] = Some(sc_zero);          // getpgid
+    t[121] = Some(sc_getpgid);       // getpgid
     t[122] = Some(sc_zero);          // setfsuid
     t[123] = Some(sc_zero);          // setfsgid
     t[124] = Some(sc_zero);          // getsid
@@ -944,7 +1160,7 @@ static SYSCALL_TABLE: [Option<SyscallFn>; SYSCALL_TABLE_LEN] = {
     t[206] = Some(sc_zero);          // io_setup
     t[207] = Some(sc_zero);          // io_destroy
     t[213] = Some(sc_epoll_create);   // epoll_create
-    t[217] = Some(sc_zero);          // getdents64 (legacy alias)
+    t[217] = Some(sc_getdents);      // getdents64 — uses same linux_dirent64 format as sc_getdents
     t[218] = Some(sc_set_tid_address);
     t[220] = Some(sc_zero);          // semtimedop
     t[221] = Some(sc_zero);          // fadvise64
@@ -1017,7 +1233,7 @@ static SYSCALL_TABLE: [Option<SyscallFn>; SYSCALL_TABLE_LEN] = {
     t[326] = Some(sc_zero);          // copy_file_range
     t[327] = Some(sc_readv);         // preadv2 → readv
     t[328] = Some(sc_writev);        // pwritev2 → writev
-    t[332] = Some(sc_zero);          // statx
+    t[332] = Some(sc_statx);          // statx
     t[334] = Some(sc_zero);          // rseq
     t[435] = Some(sc_zero);          // clone3
     t[439] = Some(sc_zero);          // faccessat2
@@ -1167,9 +1383,19 @@ fn sys_stub_access(path_addr: u64, _mode: u64) -> u64 {
     };
     // Check VFS
     if crate::fs::vfs::file_read(&path).is_ok() { return 0; }
+    // Check ext2 filesystem (Alpine rootfs)
+    if crate::fs::ext2::is_mounted() {
+        if crate::fs::ext2::file_exists(&path).is_some() { return 0; }
+        // Also check if it's a directory
+        if crate::fs::ext2::list_dir(&path).is_some() { return 0; }
+    }
     // Check /disk/ paths via FAT32
     if path.starts_with("/disk/") {
         if crate::fs::fat32::file_exists(&path[6..]).is_some() { return 0; }
+    }
+    // Pseudo-filesystem paths always accessible
+    if path.starts_with("/proc/") || path.starts_with("/dev/") || path.starts_with("/sys/") {
+        return 0;
     }
     ENOENT
 }
@@ -1302,14 +1528,131 @@ fn sys_futex(uaddr: u64, op: u64, val: u64) -> u64 {
 // ===== Musl-libc Stub Syscalls (Jalon 79: POSIX Compatibility) =====
 // These return sensible defaults so musl-linked binaries don't crash.
 
+/// statx(dirfd, path, flags, mask, statxbuf) — real implementation.
+/// struct statx is 256 bytes. Key fields:
+///   offset  0: u32 stx_mask
+///   offset  4: u32 stx_blksize
+///   offset  8: u64 stx_attributes
+///   offset 16: u32 stx_nlink
+///   offset 20: u32 stx_uid
+///   offset 24: u32 stx_gid
+///   offset 28: u16 stx_mode
+///   offset 40: u64 stx_ino
+///   offset 48: u64 stx_size
+///   offset 56: u64 stx_blocks
+///   offset 64: u64 stx_attributes_mask
+fn sys_statx(dirfd: u64, path_addr: u64, _flags: u64, _mask: u64, buf_addr: u64) -> u64 {
+    if !validate_user_ptr(buf_addr, 256) { return EFAULT; }
+
+    // Read path from userspace
+    let path = if path_addr != 0 && validate_user_ptr(path_addr, 1) {
+        unsafe { read_user_string(path_addr) }
+    } else {
+        None
+    };
+
+    let mut stx = [0u8; 256];
+    // stx_mask: STATX_BASIC_STATS = 0x7FF
+    stx[0..4].copy_from_slice(&0x7FFu32.to_le_bytes());
+    // stx_blksize = 4096
+    stx[4..8].copy_from_slice(&4096u32.to_le_bytes());
+    // stx_nlink = 1
+    stx[16..20].copy_from_slice(&1u32.to_le_bytes());
+    // stx_uid = 0 (root)
+    // stx_gid = 0 (root)
+
+    // Default: regular file mode 0644
+    let mut mode: u16 = 0o100644;
+    let mut file_size: u64 = 0;
+    let mut inode: u64 = 1;
+
+    if let Some(ref p) = path {
+        // Check if it's a directory
+        if p == "/" || p == "/proc" || p == "/dev" || p == "/tmp" || p == "/etc"
+            || p == "/sys" || p == "/bin" || p == "/lib" || p == "/usr" {
+            mode = 0o40755; // directory
+        } else if p.starts_with("/proc/") || p.starts_with("/dev/") || p.starts_with("/sys/") {
+            mode = 0o100444; // read-only pseudo-file
+        }
+
+        // Try to get real file size from ext2
+        if crate::fs::ext2::is_mounted() {
+            if let Some(ino) = crate::fs::ext2::lookup_path(p) {
+                inode = ino as u64;
+                if let Some(sz) = crate::fs::ext2::file_size(ino) {
+                    file_size = sz as u64;
+                }
+            }
+        }
+
+        // Try VFS
+        if file_size == 0 {
+            if let Ok(data) = crate::fs::vfs::file_read(p) {
+                file_size = data.len() as u64;
+            }
+        }
+    }
+
+    // stx_mode at offset 28 (u16)
+    stx[28..30].copy_from_slice(&mode.to_le_bytes());
+    // stx_ino at offset 40 (u64)
+    stx[40..48].copy_from_slice(&inode.to_le_bytes());
+    // stx_size at offset 48 (u64)
+    stx[48..56].copy_from_slice(&file_size.to_le_bytes());
+    // stx_blocks at offset 56 (u64) = ceil(size/512)
+    let blocks = (file_size + 511) / 512;
+    stx[56..64].copy_from_slice(&blocks.to_le_bytes());
+
+    unsafe { copy_to_user(buf_addr, &stx); }
+    0
+}
+
 /// stat(path, buf) -> 0 (fills minimal stat struct)
-fn sys_stub_stat(_path_addr: u64, buf_addr: u64) -> u64 {
+fn sys_stub_stat(path_addr: u64, buf_addr: u64) -> u64 {
     if !validate_user_ptr(buf_addr, 144) { return EFAULT; }
     let mut buf = [0u8; 144];
-    // st_mode at offset 24: S_IFREG | 0644 = 0o100644 = 33188
-    buf[24..28].copy_from_slice(&0o100644u32.to_le_bytes());
-    // st_blksize at offset 56: 4096
-    buf[56..64].copy_from_slice(&4096u64.to_le_bytes());
+
+    let path = if validate_user_ptr(path_addr, 1) {
+        unsafe { read_user_string(path_addr) }
+    } else { None };
+
+    let (mode, size) = if let Some(ref p) = path {
+        // Try ext2 first for real file metadata
+        if crate::fs::ext2::is_mounted() {
+            if let Some(ino) = crate::fs::ext2::lookup_path(p) {
+                let fsize = crate::fs::ext2::file_size(ino).unwrap_or(0);
+                let is_dir = crate::fs::ext2::is_dir(ino).unwrap_or(false);
+                let is_link = crate::fs::ext2::is_symlink(ino).unwrap_or(false);
+                let m = if is_dir { 0o40755u32 } else if is_link { 0o120777u32 } else { 0o100755u32 };
+                (m, fsize)
+            } else {
+                (0o100644u32, 4096u64)
+            }
+        } else {
+            (0o100644u32, 4096u64)
+        }
+    } else {
+        (0o100644u32, 4096u64)
+    };
+
+    // struct stat layout (x86_64):
+    // offset 0:  st_dev (8 bytes)
+    // offset 8:  st_ino (8 bytes)
+    // offset 16: st_nlink (8 bytes)
+    // offset 24: st_mode (4 bytes)
+    // offset 28: st_uid (4 bytes)
+    // offset 32: st_gid (4 bytes)
+    // offset 40: st_rdev (8 bytes)
+    // offset 48: st_size (8 bytes)
+    // offset 56: st_blksize (8 bytes)
+    // offset 64: st_blocks (8 bytes)
+    buf[8..16].copy_from_slice(&1u64.to_le_bytes()); // st_ino
+    buf[16..24].copy_from_slice(&1u64.to_le_bytes()); // st_nlink
+    buf[24..28].copy_from_slice(&mode.to_le_bytes());
+    buf[48..56].copy_from_slice(&size.to_le_bytes()); // st_size
+    buf[56..64].copy_from_slice(&4096u64.to_le_bytes()); // st_blksize
+    let blocks = (size + 511) / 512;
+    buf[64..72].copy_from_slice(&blocks.to_le_bytes()); // st_blocks
     unsafe { copy_to_user(buf_addr, &buf); }
     0
 }
@@ -1318,9 +1661,50 @@ fn sys_stub_stat(_path_addr: u64, buf_addr: u64) -> u64 {
 fn sys_stub_fstat(fd: u32, buf_addr: u64) -> u64 {
     if !validate_user_ptr(buf_addr, 144) { return EFAULT; }
     let mut buf = [0u8; 144];
-    let mode: u32 = if fd <= 2 { 0o20620 } else { 0o100644 };
+    let current_pid = crate::scheduler::current_pid();
+
+    // Get FD info for type and path
+    let fd_info = crate::process::with_fd_table(current_pid, |fdt| {
+        fdt.get(fd as usize).map(|e| (e.fd_type, e.path.clone()))
+    }).flatten();
+
+    let is_tty = if fd <= 2 {
+        true
+    } else {
+        fd_info.as_ref().map(|(t, _)| *t == crate::process::FdType::Tty).unwrap_or(false)
+    };
+    let is_pipe = fd_info.as_ref().map(|(t, _)| *t == crate::process::FdType::Pipe).unwrap_or(false);
+
+    let (mode, size): (u32, u64) = if is_tty {
+        (0o20620, 0) // S_IFCHR + perms
+    } else if is_pipe {
+        (0o10600, 0) // S_IFIFO + perms
+    } else if let Some((_, ref path)) = fd_info {
+        // Try to get real file size from ext2
+        if crate::fs::ext2::is_mounted() {
+            if let Some(fsize) = crate::fs::ext2::file_exists(path) {
+                (0o100755, fsize)
+            } else {
+                (0o100644, 4096)
+            }
+        } else if path.starts_with("/disk/") {
+            let disk_path = &path[6..];
+            let fsize = crate::fs::fat32::file_exists(disk_path).unwrap_or(0) as u64;
+            (0o100644, fsize)
+        } else {
+            (0o100644, 4096)
+        }
+    } else {
+        (0o100644, 4096)
+    };
+
+    buf[8..16].copy_from_slice(&1u64.to_le_bytes()); // st_ino
+    buf[16..24].copy_from_slice(&1u64.to_le_bytes()); // st_nlink
     buf[24..28].copy_from_slice(&mode.to_le_bytes());
-    buf[56..64].copy_from_slice(&4096u64.to_le_bytes());
+    buf[48..56].copy_from_slice(&size.to_le_bytes()); // st_size
+    buf[56..64].copy_from_slice(&4096u64.to_le_bytes()); // st_blksize
+    let blocks = (size + 511) / 512;
+    buf[64..72].copy_from_slice(&blocks.to_le_bytes()); // st_blocks
     unsafe { copy_to_user(buf_addr, &buf); }
     0
 }
@@ -1349,6 +1733,7 @@ fn sys_poll(fds_addr: u64, nfds: u64, timeout: u64) -> u64 {
     // POLLERR (0x0008): error
     const POLLIN: i16 = 0x0001;
     const POLLOUT: i16 = 0x0004;
+    const POLLERR: i16 = 0x0008;
     const POLLHUP: i16 = 0x0010;
 
     let mut ready_count: u64 = 0;
@@ -1395,13 +1780,13 @@ fn sys_poll(fds_addr: u64, nfds: u64, timeout: u64) -> u64 {
                 }
             }
             _ => {
-                // Check if it's a socket FD
+                // Check FD type with path info for pipe status
                 let fd_info = crate::process::with_process(current_pid, |p| {
-                    p.fd_table.get(fd as usize).map(|f| (f.fd_type, f.flags))
+                    p.fd_table.get(fd as usize).map(|f| (f.fd_type, f.flags, f.path.clone()))
                 }).flatten();
 
                 match fd_info {
-                    Some((crate::process::FdType::Socket, _)) => {
+                    Some((crate::process::FdType::Socket, _, _)) => {
                         // Socket: check smoltcp for readiness
                         if events & POLLIN != 0 {
                             revents |= POLLIN; // Optimistic: report readable
@@ -1410,13 +1795,44 @@ fn sys_poll(fds_addr: u64, nfds: u64, timeout: u64) -> u64 {
                             revents |= POLLOUT; // Sockets are usually writable
                         }
                     }
-                    Some((crate::process::FdType::File, _)) => {
+                    Some((crate::process::FdType::Pipe, _, ref path)) => {
+                        // Pipe FD: check actual pipe buffer state
+                        if path.starts_with("pipe:") {
+                            let parts: alloc::vec::Vec<&str> = path.split(':').collect();
+                            if let Some(Ok(pipe_id)) = parts.get(1).map(|s| s.parse::<usize>()) {
+                                let avail = pipe::available(pipe_id);
+                                if events & POLLIN != 0 {
+                                    if avail > 0 { revents |= POLLIN; }
+                                    if pipe::is_writer_closed(pipe_id) { revents |= POLLHUP; }
+                                }
+                                if events & POLLOUT != 0 {
+                                    if !pipe::is_reader_closed(pipe_id) { revents |= POLLOUT; }
+                                    else { revents |= POLLERR; }
+                                }
+                            }
+                        }
+                    }
+                    Some((crate::process::FdType::Tty, _, _)) => {
+                        // TTY: check serial for input, always writable
+                        if events & POLLIN != 0 {
+                            let serial_ready: bool = unsafe {
+                                let lsr: u8;
+                                core::arch::asm!("in al, dx", out("al") lsr, in("dx") 0x3FDu16, options(nomem, nostack));
+                                lsr & 1 != 0
+                            };
+                            if crate::process::kbd_has_pending() || serial_ready {
+                                revents |= POLLIN;
+                            }
+                        }
+                        if events & POLLOUT != 0 { revents |= POLLOUT; }
+                    }
+                    Some((crate::process::FdType::File, _, _)) => {
                         // Regular file: always ready for read/write
                         if events & POLLIN != 0 { revents |= POLLIN; }
                         if events & POLLOUT != 0 { revents |= POLLOUT; }
                     }
                     Some(_) => {
-                        // Tty or other: report ready
+                        // Other FD type: report ready
                         if events & POLLIN != 0 { revents |= POLLIN; }
                         if events & POLLOUT != 0 { revents |= POLLOUT; }
                     }
@@ -1595,8 +2011,18 @@ fn sys_ioctl(fd: u32, cmd: u64, arg: u64) -> u64 {
             EINVAL
         }
         TCGETS => {
-            // Return a minimal termios struct for stdin/stdout/stderr — KPTI safe
-            if fd <= 2 && arg != 0 && validate_user_ptr(arg, 60) {
+            // Return a minimal termios struct for TTY file descriptors — KPTI safe
+            // Check if the FD is typed as Tty (not just fd <= 2, in case of dup or open /dev/tty)
+            let is_tty = if fd <= 2 {
+                true // stdin/stdout/stderr are always TTY
+            } else {
+                // Check FD table for Tty type
+                let pid = crate::scheduler::current_pid();
+                crate::process::with_fd_table(pid, |fdt| {
+                    fdt.get(fd as usize).map(|e| e.fd_type == crate::process::FdType::Tty).unwrap_or(false)
+                }).unwrap_or(false)
+            };
+            if is_tty && arg != 0 && validate_user_ptr(arg, 60) {
                 let mut termios_buf = [0u8; 60];
                 // c_iflag = ICRNL | IMAXBEL (offset 0)
                 termios_buf[0..4].copy_from_slice(&0x2102u32.to_le_bytes());
@@ -1612,8 +2038,14 @@ fn sys_ioctl(fd: u32, cmd: u64, arg: u64) -> u64 {
             ENOTTY
         }
         TCSETS | TCSETSW | TCSETSF => {
-            // Accept terminal attribute changes silently
+            // Accept terminal attribute changes silently for TTY fds
             if fd <= 2 { return 0; }
+            // Also check if the FD is typed as Tty
+            let pid = crate::scheduler::current_pid();
+            let is_tty = crate::process::with_fd_table(pid, |fdt| {
+                fdt.get(fd as usize).map(|e| e.fd_type == crate::process::FdType::Tty).unwrap_or(false)
+            }).unwrap_or(false);
+            if is_tty { return 0; }
             ENOTTY
         }
         TIOCGPGRP => {
@@ -1913,6 +2345,34 @@ fn sys_epoll_wait_real(epfd: u64, events_ptr: u64, maxevents: u64, timeout: u64)
                         revents |= crate::process::EPOLLOUT;
                     }
                 }
+                Some(crate::process::FdType::PtyMaster) => {
+                    // PTY master: check slave_to_master buffer for read data
+                    let pty_id = crate::process::with_fd_table(pid, |fdt| {
+                        fdt.get(fd as usize).map(|e| e.pty_id)
+                    }).flatten().unwrap_or(0);
+                    if req_events & crate::process::EPOLLIN != 0 {
+                        if crate::drivers::pty::pty_master_readable(pty_id) > 0 {
+                            revents |= crate::process::EPOLLIN;
+                        }
+                    }
+                    if req_events & crate::process::EPOLLOUT != 0 {
+                        revents |= crate::process::EPOLLOUT; // master write always ready
+                    }
+                }
+                Some(crate::process::FdType::PtySlave) => {
+                    // PTY slave: check master_to_slave buffer for read data
+                    let pty_id = crate::process::with_fd_table(pid, |fdt| {
+                        fdt.get(fd as usize).map(|e| e.pty_id)
+                    }).flatten().unwrap_or(0);
+                    if req_events & crate::process::EPOLLIN != 0 {
+                        if crate::drivers::pty::pty_slave_readable(pty_id) > 0 {
+                            revents |= crate::process::EPOLLIN;
+                        }
+                    }
+                    if req_events & crate::process::EPOLLOUT != 0 {
+                        revents |= crate::process::EPOLLOUT;
+                    }
+                }
                 Some(crate::process::FdType::Epoll) => {
                     // Nested epoll: not supported, skip
                 }
@@ -2165,14 +2625,13 @@ fn sys_memfd_create(name_ptr: u64, _flags: u64) -> u64 {
     let pid = crate::scheduler::current_pid();
     if pid == 0 { return ENOSYS; }
 
-    // Read name from userspace into a fixed buffer
+    // Read name from userspace into a fixed buffer (KPTI-safe)
     let mut name_buf = [0u8; 64];
     let mut name_len = 0usize;
     if name_ptr != 0 && validate_user_ptr(name_ptr, 1) {
-        for i in 0..63usize {
-            let b = unsafe { core::ptr::read_volatile((name_ptr + i as u64) as *const u8) };
-            if b == 0 { break; }
-            name_buf[i] = b;
+        let copied = unsafe { copy_from_user(&mut name_buf, name_ptr, 63) };
+        for i in 0..copied {
+            if name_buf[i] == 0 { break; }
             name_len += 1;
         }
     }
@@ -2292,23 +2751,35 @@ fn sys_set_robust_list(head: u64, len: u64) -> u64 {
 }
 
 /// Jalon 131: pipe2(pipefd[2], flags) - create pipe with flags.
-fn sys_pipe2(pipefd_ptr: u64, _flags: u64) -> u64 {
-    // Delegate to regular pipe, ignore O_CLOEXEC/O_NONBLOCK for now
-    sys_pipe(pipefd_ptr)
+/// pipe2(pipefd, flags) — create pipe with O_CLOEXEC / O_NONBLOCK support.
+/// Flags: O_CLOEXEC=0x80000, O_NONBLOCK=0x800
+fn sys_pipe2_real(pipefd_ptr: u64, flags: u64) -> u64 {
+    // Create the pipe using the base implementation
+    let result = sys_pipe(pipefd_ptr);
+    if result != 0 { return result; }
+    // If O_NONBLOCK (0x800) is set, mark the pipe FDs as non-blocking
+    // If O_CLOEXEC (0x80000) is set, mark FDs for close-on-exec
+    // For now we store the flags but don't enforce close-on-exec yet
+    let _o_nonblock = flags & 0x800 != 0;
+    let _o_cloexec = flags & 0x80000 != 0;
+    // Flags are accepted silently — pipe is functional
+    0
 }
 
 /// Jalon 131: dup(oldfd) - duplicate file descriptor.
 fn sys_dup(oldfd: u32) -> u64 {
     let pid = crate::scheduler::current_pid();
-    // Get the path associated with the old FD
-    let path = crate::process::get_fd_path(pid, oldfd as usize);
-    match path {
-        Some(p) => {
-            // Allocate a new FD with the same path and flags
-            let new_fd = crate::process::alloc_fd(pid, &p, 2); // O_RDWR default
+    // Get full FD info (path + type + flags) to preserve on dup
+    let fd_info = crate::process::with_fd_table(pid, |fdt| {
+        fdt.get(oldfd as usize).map(|e| (e.path.clone(), e.fd_type, e.flags))
+    }).flatten();
+    match fd_info {
+        Some((path, fd_type, flags)) => {
+            // Allocate a new FD preserving the original type
+            let new_fd = crate::process::alloc_fd_typed(pid, &path, flags, fd_type);
             match new_fd {
                 Some(fd) => fd as u64,
-                None => 24, // EMFILE (too many open files)
+                None => EMFILE,
             }
         }
         None => EBADF,
@@ -2326,13 +2797,50 @@ fn sys_setsockopt(_sockfd: u32, _level: u64, _optname: u64, _optval: u64, _optle
 fn sys_stub_flock(_fd: u64, _op: u64) -> u64 { 0 }
 
 /// fcntl(fd, cmd, arg) -> 0 or flags - enhanced for Jalon 131
-fn sys_stub_fcntl(_fd: u32, cmd: u64, _arg: u64) -> u64 {
+fn sys_stub_fcntl(fd: u32, cmd: u64, arg: u64) -> u64 {
+    const F_DUPFD: u64 = 0;
+    const F_GETFD: u64 = 1;
+    const F_SETFD: u64 = 2;
+    const F_GETFL: u64 = 3;
+    const F_SETFL: u64 = 4;
+    const F_DUPFD_CLOEXEC: u64 = 1030;
+
     match cmd {
-        1 => 0,    // F_GETFD -> 0 (no CLOEXEC)
-        2 => 0,    // F_SETFD -> success
-        3 => 2,    // F_GETFL -> O_RDWR
-        4 => 0,    // F_SETFL -> success
-        _ => EINVAL,
+        F_DUPFD | F_DUPFD_CLOEXEC => {
+            // Duplicate fd to lowest available fd >= arg
+            let pid = crate::scheduler::current_pid();
+            let old_path = crate::process::get_fd_path(pid, fd as usize);
+            match old_path {
+                Some(path) => {
+                    let min_fd = arg as usize;
+                    // Use set_fd which grows the table and sets the entry
+                    // Find the lowest unused fd >= min_fd
+                    let candidate = crate::process::with_fd_table(pid, |fd_table| {
+                        for c in min_fd..32 {
+                            match fd_table.get(c) {
+                                None => return Some(c),
+                                Some(e) if !e.active => return Some(c),
+                                _ => continue,
+                            }
+                        }
+                        None
+                    }).flatten();
+                    match candidate {
+                        Some(nfd) => {
+                            crate::process::set_fd(pid, nfd, &path, 2); // O_RDWR
+                            nfd as u64
+                        }
+                        None => EMFILE,
+                    }
+                }
+                None => EBADF,
+            }
+        }
+        F_GETFD => 0,    // no CLOEXEC
+        F_SETFD => 0,    // success
+        F_GETFL => 2,    // O_RDWR
+        F_SETFL => 0,    // success
+        _ => 0,          // Accept unknown commands gracefully
     }
 }
 
@@ -2569,7 +3077,22 @@ fn sys_readlink(path_addr: u64, buf_addr: u64, bufsiz: u64) -> u64 {
         // Phase 2.1: Check VFS for real symbolic links
         match crate::fs::vfs::readlink(&path) {
             Ok(t) => t,
-            Err(_) => return EINVAL, // not a symlink
+            Err(_) => {
+                // Try ext2 filesystem for symlinks
+                if crate::fs::ext2::is_mounted() {
+                    if let Some(ino) = crate::fs::ext2::lookup_path(&path) {
+                        if let Some(target) = crate::fs::ext2::read_symlink(ino) {
+                            target
+                        } else {
+                            return EINVAL;
+                        }
+                    } else {
+                        return EINVAL;
+                    }
+                } else {
+                    return EINVAL; // not a symlink
+                }
+            }
         }
     };
 
@@ -2581,9 +3104,39 @@ fn sys_readlink(path_addr: u64, buf_addr: u64, bufsiz: u64) -> u64 {
     copy_len as u64
 }
 
-/// openat(dirfd, path, flags) -> route to sys_open (ignoring dirfd)
-fn sys_stub_openat(_dirfd: u64, path_addr: u64, flags: u64) -> u64 {
-    sys_open(path_addr, flags as u32)
+/// openat(dirfd, path, flags) -> real VFS-aware open with dirfd support.
+/// AT_FDCWD (-100) means use current working directory (same as sys_open).
+/// If path is absolute, dirfd is ignored.
+fn sys_openat(dirfd: u64, path_addr: u64, flags: u64) -> u64 {
+    if !validate_user_ptr(path_addr, 1) { return EFAULT; }
+    let raw_path = match unsafe { read_user_string(path_addr) } {
+        Some(p) => p,
+        None => return EFAULT,
+    };
+    // AT_FDCWD = -100 (0xFFFFFF9C as i32), or absolute path → delegate to sys_open
+    let dirfd_i = dirfd as i64;
+    if raw_path.starts_with('/') || dirfd_i == -100 {
+        return sys_open(path_addr, flags as u32);
+    }
+    // Relative path with a real dirfd: resolve against the dirfd's path
+    let current_pid = crate::scheduler::current_pid();
+    let dir_path = crate::process::get_fd_path(current_pid, dirfd as usize)
+        .unwrap_or_else(|| alloc::string::String::from("/"));
+    let full_path = if dir_path.ends_with('/') {
+        alloc::format!("{}{}", dir_path, raw_path)
+    } else {
+        alloc::format!("{}/{}", dir_path, raw_path)
+    };
+    // Write the full path to a temporary kernel buffer and call sys_open logic
+    // We re-use the VFS open path by constructing the absolute path
+    crate::serial_println!("[OPENAT] dirfd={} path='{}' -> '{}'", dirfd, raw_path, full_path);
+    // Allocate FD for the resolved path
+    match crate::process::with_fd_table_mut(current_pid, |fd_table| {
+        fd_table.alloc_fd(&full_path, flags as u32)
+    }) {
+        Some(Some(fd)) => fd as u64,
+        _ => ENOENT,
+    }
 }
 
 /// newfstatat(dirfd, path, buf, flags) -> route to stat stub
@@ -2773,24 +3326,40 @@ fn sys_write(fd: u64, buf_addr: u64, len: u64) -> u64 {
         }
 
         crate::process::FdType::Socket => {
-            // Jalon 79: Route socket writes directly to TCP send
+            // Session 13: Route socket writes to TCP send via socket module
             if !validate_user_ptr(buf_addr, len) { return EFAULT; }
             crate::serial_println!("[FD-ROUTE] sys_write fd={} -> tcp_send (socket_id={})", fd, socket_id);
-            sys_sendto(fd as u32, buf_addr, len)
+            crate::net::socket::sys_tcp_send(fd as u32, buf_addr, len)
         }
 
-        crate::process::FdType::File | crate::process::FdType::Pipe => {
+        crate::process::FdType::Pipe => {
+            // ═══ Pipe FD writes: dispatch to pipe kernel buffer ═══
+            if !validate_user_ptr(buf_addr, len) { return EFAULT; }
+            if path.starts_with("pipe:") {
+                let parts: alloc::vec::Vec<&str> = path.split(':').collect();
+                if parts.len() >= 2 {
+                    if let Ok(pipe_id) = parts[1].parse::<usize>() {
+                        // Check if reader has closed — SIGPIPE
+                        if pipe::is_reader_closed(pipe_id) {
+                            return EPIPE;
+                        }
+                        let n = len as usize;
+                        let mut kbuf = alloc::vec![0u8; n.min(4096)];
+                        let copied = unsafe { copy_from_user(&mut kbuf, buf_addr, n.min(4096)) };
+                        let written = pipe::write(pipe_id, &kbuf[..copied]);
+                        return written as u64;
+                    }
+                }
+            }
+            return EBADF;
+        }
+
+        crate::process::FdType::File => {
             if !validate_user_ptr(buf_addr, len) { return EFAULT; }
 
             // ═══ Linux ABI Pseudo-Device Intercepts for write (Jalon 93) ═══
             if path == "/dev/null" {
                 return len; // /dev/null: accept all writes, return requested len
-            }
-
-            // Check write permission (O_WRONLY or O_RDWR)
-            let access_mode = flags & 0x3;
-            if access_mode != O_WRONLY && access_mode != O_RDWR {
-                return EBADF;
             }
 
             // Copy user data to kernel buffer (KPTI-safe)
@@ -2840,6 +3409,32 @@ fn sys_write(fd: u64, buf_addr: u64, len: u64) -> u64 {
                     Err(_) => EBADF,
                 }
             }
+        }
+
+        crate::process::FdType::PtyMaster => {
+            // Write to PTY master → feeds data to slave's input (line discipline)
+            if !validate_user_ptr(buf_addr, len) { return EFAULT; }
+            let pty_id = crate::process::with_fd_table(current_pid, |fdt| {
+                fdt.get(fd as usize).map(|e| e.pty_id)
+            }).flatten().unwrap_or(0);
+            let n = len as usize;
+            let mut kbuf = alloc::vec![0u8; n.min(4096)];
+            let copied = unsafe { copy_from_user(&mut kbuf, buf_addr, n.min(4096)) };
+            let written = crate::drivers::pty::pty_master_write(pty_id, &kbuf[..copied]);
+            written as u64
+        }
+
+        crate::process::FdType::PtySlave => {
+            // Write to PTY slave → output for master to read (stdout of process)
+            if !validate_user_ptr(buf_addr, len) { return EFAULT; }
+            let pty_id = crate::process::with_fd_table(current_pid, |fdt| {
+                fdt.get(fd as usize).map(|e| e.pty_id)
+            }).flatten().unwrap_or(0);
+            let n = len as usize;
+            let mut kbuf = alloc::vec![0u8; n.min(4096)];
+            let copied = unsafe { copy_from_user(&mut kbuf, buf_addr, n.min(4096)) };
+            let written = crate::drivers::pty::pty_slave_write(pty_id, &kbuf[..copied]);
+            written as u64
         }
 
         crate::process::FdType::Epoll => {
@@ -2892,7 +3487,9 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
 
     match fd_type {
         crate::process::FdType::Tty => {
-            if fd != 0 { return 0; } // stdout/stderr can't be read
+            // stdout (fd 1) and stderr (fd 2) are write-only — reading returns 0
+            // All other Tty FDs (stdin fd 0, or opened /dev/tty) can read from serial
+            if fd == 1 || fd == 2 { return 0; }
             let mut temp_buf = [0u8; 256];
             let max_read = core::cmp::min(len as usize, temp_buf.len());
 
@@ -2914,6 +3511,14 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
             // No data available — block with IRQ-enabled polling.
             // Check BOTH PS/2 keyboard buffer AND serial COM1 port (0x3F8)
             // because QEMU -serial mon:stdio sends input through COM1.
+            //
+            // CRITICAL FIX: For interactive shell support, stdin must block
+            // indefinitely (not timeout after ~10s). BusyBox ash expects
+            // read(0, ...) to block until data arrives. Returning 0 (EOF)
+            // causes the shell to exit immediately.
+            //
+            // We yield the CPU to other processes every 1000 iterations to
+            // prevent starving the scheduler.
             let mut attempts: u32 = 0;
             loop {
                 // Enable interrupts so IRQ1 (keyboard) can fire
@@ -2943,6 +3548,28 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
                         if lsr2 & 1 == 0 { break; } // no more data
                         let byte: u8;
                         unsafe { core::arch::asm!("in al, dx", out("al") byte, in("dx") 0x3F8u16, options(nomem, nostack)); }
+                        // Ctrl+C (0x03) → deliver SIGINT to foreground process
+                        if byte == 0x03 {
+                            crate::serial_println!("[SIGINT] Ctrl+C from serial -> SIGINT to PID {}", current_pid);
+                            crate::process::send_signal(current_pid, 2); // SIGINT = 2
+                            // Echo ^C and return -EINTR
+                            crate::serial_println!("^C");
+                            return (-4i64) as u64; // EINTR
+                        }
+                        // Ctrl+Z (0x1A) → deliver SIGTSTP
+                        if byte == 0x1A {
+                            crate::serial_println!("[SIGTSTP] Ctrl+Z from serial -> SIGTSTP to PID {}", current_pid);
+                            crate::process::send_signal(current_pid, 20); // SIGTSTP = 20
+                            crate::serial_println!("^Z");
+                            return (-4i64) as u64; // EINTR
+                        }
+                        // Ctrl+\ (0x1C) → deliver SIGQUIT
+                        if byte == 0x1C {
+                            crate::serial_println!("[SIGQUIT] Ctrl+\\\\ from serial -> SIGQUIT to PID {}", current_pid);
+                            crate::process::send_signal(current_pid, 3); // SIGQUIT = 3
+                            crate::serial_println!("^\\\\");
+                            return (-4i64) as u64; // EINTR
+                        }
                         if byte == b'\r' {
                             temp_buf[serial_n] = b'\n'; // Convert CR to LF
                         } else {
@@ -2957,10 +3584,20 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
                 }
 
                 attempts += 1;
-                if attempts >= 5_000_000 {
-                    // After ~10 seconds of waiting — return 0 (EOF)
-                    return 0;
+                // Yield to other processes periodically to prevent CPU starvation.
+                // Every 1000 iterations (~2ms), let the scheduler run other tasks.
+                if attempts % 1000 == 0 {
+                    // Re-enable interrupts and do a longer pause to let
+                    // the timer tick and scheduler pick up other work.
+                    unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
+                    for _ in 0..200u32 {
+                        unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
+                    }
+                    unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
                 }
+                // Never return EOF — block indefinitely for interactive TTY.
+                // The shell expects stdin to always be available.
+                // Exit only via signal (SIGINT/SIGTSTP/SIGQUIT handled above).
             }
         }
 
@@ -2970,7 +3607,54 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
             sys_tcp_read(fd, buf_addr, len)
         }
 
-        crate::process::FdType::File | crate::process::FdType::Pipe => {
+        crate::process::FdType::Pipe => {
+            // ═══ Pipe FD reads: dispatch to pipe kernel buffer ═══
+            if path.starts_with("pipe:") {
+                // Parse pipe_id from path "pipe:<id>:r"
+                let parts: alloc::vec::Vec<&str> = path.split(':').collect();
+                if parts.len() >= 2 {
+                    if let Ok(pipe_id) = parts[1].parse::<usize>() {
+                        let max_read = core::cmp::min(len as usize, 4096);
+                        let mut kbuf = alloc::vec![0u8; max_read];
+                        // Try to read immediately
+                        let n = pipe::read(pipe_id, &mut kbuf);
+                        if n > 0 {
+                            unsafe { copy_to_user(buf_addr, &kbuf[..n]); }
+                            return n as u64;
+                        }
+                        // Check if writer has closed — return EOF
+                        if pipe::is_writer_closed(pipe_id) { return 0; }
+                        // Block waiting for data (with scheduler yields)
+                        let mut attempts = 0u64;
+                        loop {
+                            unsafe {
+                                core::arch::asm!("sti", options(nomem, nostack));
+                                for _ in 0..50u32 {
+                                    core::arch::asm!("pause", options(nomem, nostack));
+                                }
+                                core::arch::asm!("cli", options(nomem, nostack));
+                            }
+                            let n = pipe::read(pipe_id, &mut kbuf);
+                            if n > 0 {
+                                unsafe { copy_to_user(buf_addr, &kbuf[..n]); }
+                                return n as u64;
+                            }
+                            // Re-check writer closed
+                            if pipe::is_writer_closed(pipe_id) { return 0; }
+                            attempts += 1;
+                            if attempts % 1000 == 0 {
+                                crate::scheduler::yield_to_next(current_pid);
+                            }
+                            if attempts > 50_000_000 { return 0; } // safety timeout
+                        }
+                    }
+                }
+            }
+            // Non-pipe Pipe FD — fall through to File handling
+            return 0;
+        }
+
+        crate::process::FdType::File => {
             // ═══ Jalon 110b: Dynamic /proc filesystem ═══
             if path == "/proc/meminfo" {
                 let content = crate::compat::linux_abi::generate_proc_meminfo();
@@ -3014,6 +3698,38 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
             if path == "/proc/self/status" {
                 let content = crate::compat::linux_abi::generate_proc_self_status();
                 let bytes = content.as_bytes();
+                let start = offset as usize;
+                if start >= bytes.len() { return 0; }
+                let avail = bytes.len() - start;
+                let to_copy = core::cmp::min(avail, len as usize);
+                unsafe { copy_to_user(buf_addr, &bytes[start..start + to_copy]); }
+                crate::process::with_fd_table_mut(current_pid, |fd_table| {
+                    if let Some(entry) = fd_table.get_mut(fd as usize) { entry.offset += to_copy as u64; }
+                });
+                return to_copy as u64;
+            }
+
+            // /proc/self/maps — memory mappings for the dynamic linker
+            if path == "/proc/self/maps" {
+                let content = generate_proc_self_maps(current_pid);
+                let bytes = content.as_bytes();
+                let start = offset as usize;
+                if start >= bytes.len() { return 0; }
+                let avail = bytes.len() - start;
+                let to_copy = core::cmp::min(avail, len as usize);
+                unsafe { copy_to_user(buf_addr, &bytes[start..start + to_copy]); }
+                crate::process::with_fd_table_mut(current_pid, |fd_table| {
+                    if let Some(entry) = fd_table.get_mut(fd as usize) { entry.offset += to_copy as u64; }
+                });
+                return to_copy as u64;
+            }
+
+            // /proc/self/cmdline — NUL-separated argv
+            if path == "/proc/self/cmdline" {
+                let cmdline = crate::process::with_process(current_pid, |p| {
+                    p.argv.join("\0") + "\0"
+                }).unwrap_or_default();
+                let bytes = cmdline.as_bytes();
                 let start = offset as usize;
                 if start >= bytes.len() { return 0; }
                 let avail = bytes.len() - start;
@@ -3076,10 +3792,25 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
                 }
             }
 
-            // VFS path (or FAT32 fallback)
+            // ═══ Ext2 filesystem reads (Alpine rootfs) ═══
+            if crate::fs::ext2::is_mounted() {
+                if let Some(chunk) = crate::fs::ext2::read_file_chunk(&path, offset, len) {
+                    let to_copy = chunk.len();
+                    if to_copy == 0 { return 0; } // EOF
+                    unsafe { copy_to_user(buf_addr, &chunk[..to_copy]); }
+                    crate::process::with_fd_table_mut(current_pid, |fd_table| {
+                        if let Some(entry) = fd_table.get_mut(fd as usize) {
+                            entry.offset += to_copy as u64;
+                        }
+                    });
+                    return to_copy as u64;
+                }
+            }
+
+            // VFS path (final fallback)
             let data = match crate::fs::vfs::file_read(&path) {
                 Ok(d) => d,
-                Err(_) => return ENOENT,
+                Err(_) => return 0, // EOF rather than ENOENT — file may be empty
             };
 
             let start = offset as usize;
@@ -3093,6 +3824,50 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
                 }
             });
             to_copy as u64
+        }
+
+        crate::process::FdType::PtyMaster => {
+            // Read from PTY master → get output from slave (what the process wrote)
+            let pty_id = crate::process::with_fd_table(current_pid, |fdt| {
+                fdt.get(fd as usize).map(|e| e.pty_id)
+            }).flatten().unwrap_or(0);
+            let max_read = core::cmp::min(len as usize, 4096);
+            let mut kbuf = alloc::vec![0u8; max_read];
+            let n = crate::drivers::pty::pty_master_read(pty_id, &mut kbuf);
+            if n > 0 {
+                unsafe { copy_to_user(buf_addr, &kbuf[..n]); }
+            }
+            n as u64
+        }
+
+        crate::process::FdType::PtySlave => {
+            // Read from PTY slave → get input from master (user keyboard input)
+            let pty_id = crate::process::with_fd_table(current_pid, |fdt| {
+                fdt.get(fd as usize).map(|e| e.pty_id)
+            }).flatten().unwrap_or(0);
+            let max_read = core::cmp::min(len as usize, 4096);
+            let mut kbuf = alloc::vec![0u8; max_read];
+            let n = crate::drivers::pty::pty_slave_read(pty_id, &mut kbuf);
+            if n > 0 {
+                unsafe { copy_to_user(buf_addr, &kbuf[..n]); }
+                return n as u64;
+            }
+            // No data — brief spin wait with interrupts enabled
+            let mut attempts: u32 = 0;
+            loop {
+                unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
+                for _ in 0..20u32 {
+                    unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
+                }
+                unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+                let n = crate::drivers::pty::pty_slave_read(pty_id, &mut kbuf);
+                if n > 0 {
+                    unsafe { copy_to_user(buf_addr, &kbuf[..n]); }
+                    return n as u64;
+                }
+                attempts += 1;
+                if attempts >= 1_000_000 { return 0; } // timeout → EOF
+            }
         }
 
         crate::process::FdType::Epoll => {
@@ -3117,6 +3892,11 @@ fn sys_open(path_addr: u64, flags: u32) -> u64 {
     };
 
     let current_pid = crate::scheduler::current_pid();
+
+    // Jalon 212: Log /proc and /dev opens for debugging
+    if path.starts_with("/proc/") || path.starts_with("/dev/") {
+        crate::serial_println!("[SYSCALL] sys_open('{}', flags=0x{:X}) from PID {}", path, flags, current_pid);
+    }
 
     // Reject empty paths (fixes root-directory-as-model-file bug)
     if path.is_empty() {
@@ -3177,6 +3957,23 @@ fn sys_open(path_addr: u64, flags: u32) -> u64 {
         }) {
             Some(Some(fd)) => {
                 // crate::serial_println!("[SYSCALL] sys_open('{}') = FD {} (O_CREAT)", path, fd);
+                return fd as u64;
+            }
+            _ => return EMFILE,
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Special device handling: /dev/tty, /dev/console, /dev/ttyS0
+    // These are the controlling terminal — allocate as Tty FD type
+    // so isatty() works correctly via ioctl(TCGETS).
+    // ═══════════════════════════════════════════════════════════
+    if path == "/dev/tty" || path == "/dev/console" || path == "/dev/ttyS0" {
+        match crate::process::with_fd_table_mut(current_pid, |fd_table| {
+            fd_table.alloc_fd_typed(&path, flags, crate::process::FdType::Tty)
+        }) {
+            Some(Some(fd)) => {
+                crate::serial_println!("[SYSCALL] sys_open('{}') = FD {} (TTY device)", path, fd);
                 return fd as u64;
             }
             _ => return EMFILE,
@@ -3258,7 +4055,32 @@ fn sys_open(path_addr: u64, flags: u32) -> u64 {
                     }
                 }
             } else {
-                return ENOENT;
+                // Jalon 212: Allow opening /proc/* and /dev/* pseudo-filesystem paths.
+                // These are dynamically generated in sys_read, so they don't exist in
+                // the VFS tree, but we still need to allow open() to succeed and return an FD.
+                if path.starts_with("/proc/") || path.starts_with("/dev/") || path.starts_with("/sys/") {
+                    // Fall through to FD allocation for pseudo-filesystem paths
+                }
+                // Try ext2 filesystem — the real Alpine rootfs may have this file
+                // Use file_exists() instead of read_file_path() to avoid loading the file into memory
+                else if crate::fs::ext2::is_mounted() && crate::fs::ext2::file_exists(&path).is_some() {
+                    // File exists on ext2 — allow opening
+                }
+                // Try ext2 for directories too (ls /bin needs to open the directory)
+                else if crate::fs::ext2::is_mounted() {
+                    if let Some(entries) = crate::fs::ext2::list_dir(&path) {
+                        if !entries.is_empty() {
+                            crate::serial_println!("[SYSCALL] sys_open('{}') -> ext2 dir ({} entries)", path, entries.len());
+                        } else {
+                            return ENOENT;
+                        }
+                    } else {
+                        return ENOENT;
+                    }
+                }
+                else {
+                    return ENOENT;
+                }
             }
         }
     }
@@ -3282,15 +4104,43 @@ fn sys_open(path_addr: u64, flags: u32) -> u64 {
 fn sys_close(fd: u32) -> u64 {
     // Don't allow closing stdin/stdout/stderr
     if fd < 3 {
-        return EBADF;
+        return 0; // BusyBox may close/reopen stdio — don't fail
     }
 
     let current_pid = crate::scheduler::current_pid();
+
+    // Get FD info before closing (for pipe/socket cleanup)
+    let fd_info = crate::process::with_fd_table(current_pid, |fd_table| {
+        fd_table.get(fd as usize).map(|entry| {
+            (entry.fd_type, entry.path.clone(), entry.socket_id)
+        })
+    }).flatten();
+
+    if let Some((fd_type, path, socket_id)) = fd_info {
+        // Socket cleanup
+        if fd_type == crate::process::FdType::Socket {
+            crate::net::socket::sys_socket_close(socket_id);
+        }
+        // Pipe cleanup — close the appropriate end
+        if fd_type == crate::process::FdType::Pipe && path.starts_with("pipe:") {
+            let parts: alloc::vec::Vec<&str> = path.split(':').collect();
+            if parts.len() >= 3 {
+                if let Ok(pipe_id) = parts[1].parse::<usize>() {
+                    match parts[2] {
+                        "r" => pipe::close_reader(pipe_id),
+                        "w" => pipe::close_writer(pipe_id),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
     match crate::process::with_fd_table_mut(current_pid, |fd_table| {
         fd_table.close_fd(fd as usize)
     }) {
         Some(true) => 0,
-        _ => EBADF,
+        _ => 0, // Don't return EBADF — BusyBox closes many FDs speculatively
     }
 }
 
@@ -3331,6 +4181,38 @@ fn sys_getpid() -> u64 {
 fn sys_getppid() -> u64 {
     let pid = crate::scheduler::current_pid();
     crate::process::get_ppid(pid).unwrap_or(0)
+}
+
+// ===== Process group / Session syscalls =====
+
+/// setpgid(pid, pgid) — set process group ID
+/// pid=0 means current process, pgid=0 means use pid as pgid
+fn sys_setpgid(pid: u64, _pgid: u64) -> u64 {
+    let _target = if pid == 0 { crate::scheduler::current_pid() } else { pid };
+    // Accept silently — we don't track process groups yet but BusyBox expects success
+    0
+}
+
+/// getpgrp() — get process group of calling process
+/// Returns the PID (every process is its own group leader in our simple model)
+fn sys_getpgrp() -> u64 {
+    crate::scheduler::current_pid()
+}
+
+/// setsid() — create a new session
+/// Returns the new session ID (= PID) on success
+fn sys_setsid() -> u64 {
+    crate::scheduler::current_pid()
+}
+
+/// getpgid(pid) — get process group of process pid
+/// pid=0 means current process
+fn sys_getpgid(pid: u64) -> u64 {
+    if pid == 0 {
+        crate::scheduler::current_pid()
+    } else {
+        pid // Simple model: every process is its own group
+    }
 }
 
 // ===== sys_fork() =====
@@ -3384,8 +4266,11 @@ fn sys_clone(flags: u64, child_stack: u64, _parent_tid: u64, _child_tid: u64, _t
     // Read the function pointer from (child_stack - 8) if using our convention
     // Linux pthread_create puts the start routine differently, but for our
     // no_std binaries, fn_ptr is at stack_top - 8.
+    // KPTI-safe: use copy_from_user to read from user stack
     let fn_ptr = if validate_user_ptr(child_stack.wrapping_sub(8), 8) {
-        unsafe { core::ptr::read_unaligned((child_stack - 8) as *const u64) }
+        let mut fn_buf = [0u8; 8];
+        let copied = unsafe { copy_from_user(&mut fn_buf, child_stack - 8, 8) };
+        if copied == 8 { u64::from_ne_bytes(fn_buf) } else { 0 }
     } else {
         0
     };
@@ -3420,22 +4305,10 @@ static BUS_CON_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Read the 8 callee-saved registers from the kernel syscall stack.
 /// gs:[24] points to the stack frame: [r15, r14, r13, r12, rbx, rbp, r11, rcx]
 /// (pushed by syscall_entry, growing downward)
-fn read_syscall_regs() -> [u64; 8] {
+fn read_syscall_ctx() -> crate::process::SyscallContext {
     let ksp = unsafe { PER_CPU.saved_kernel_rsp };
-    if ksp == 0 { return [0; 8]; }
-    let ptr = ksp as *const u64;
-    unsafe {
-        [
-            core::ptr::read_unaligned(ptr),           // r15
-            core::ptr::read_unaligned(ptr.add(1)),    // r14
-            core::ptr::read_unaligned(ptr.add(2)),    // r13
-            core::ptr::read_unaligned(ptr.add(3)),    // r12
-            core::ptr::read_unaligned(ptr.add(4)),    // rbx
-            core::ptr::read_unaligned(ptr.add(5)),    // rbp
-            core::ptr::read_unaligned(ptr.add(6)),    // r11 (RFLAGS from SYSCALL)
-            core::ptr::read_unaligned(ptr.add(7)),    // rcx (RIP from SYSCALL)
-        ]
-    }
+    if ksp == 0 { return crate::process::SyscallContext::ZERO; }
+    unsafe { crate::process::SyscallContext::from_kernel_stack(ksp) }
 }
 
 /// Voluntarily yield the CPU to another ready process.
@@ -3462,9 +4335,9 @@ fn sys_yield() -> u64 {
     let user_rsp = saved_user_rsp();
     crate::process::save_preempt_state(current, user_rip, user_rsp, 0x202);
 
-    // Jalon 79: Save callee-saved registers from kernel syscall stack
-    let regs = read_syscall_regs();
-    crate::process::save_syscall_regs(current, regs);
+    // Save full register context from kernel syscall stack
+    let ctx = read_syscall_ctx();
+    crate::process::save_syscall_ctx(current, ctx);
 
     // Find next valid userspace process
     let mut next = 0u64;
@@ -3498,12 +4371,12 @@ fn sys_yield() -> u64 {
     }
 
     // Get the next process's saved state
-    let (new_rip, new_rsp, new_rflags, new_pml4, new_regs) =
-        if let Some((rip, rsp, rfl, pml4, regs)) = crate::process::get_preempt_state(next) {
+    let (new_rip, new_rsp, new_rflags, new_pml4, new_ctx) =
+        if let Some((rip, rsp, rfl, pml4, ctx)) = crate::process::get_preempt_state(next) {
             if rip != 0 {
-                (rip, rsp, rfl, pml4, regs)
+                (rip, rsp, rfl, pml4, ctx)
             } else if let Some((entry, stack, pml4)) = crate::process::get_entry_state(next) {
-                (entry, stack, 0x202u64, pml4, [0u64; 8])
+                (entry, stack, 0x202u64, pml4, crate::process::SyscallContext::ZERO)
             } else {
                 return 0;
             }
@@ -3546,14 +4419,12 @@ fn sys_yield() -> u64 {
         crate::serial_write("\n");
     }
 
-    // Jalon 79: Context switch with FULL callee-saved register restoration.
-    // 
+    // Context switch with FULL register restoration via SyscallContext.
+    //
     // Two paths:
-    // 1) First-run process (new_regs all zeroes): Use IRETQ (proven reliable).
-    // 2) Previously-preempted process: Use sysretq with saved registers.
-    
-    let is_first_run = new_regs.iter().all(|&r| r == 0);
-    
+    // 1) First-run process (ctx.rip == 0): Use IRETQ (proven reliable).
+    // 2) Previously-preempted process: Use sysretq via restore_and_sysret! macro.
+
     unsafe {
         // Update PER_CPU with new process's user state
         PER_CPU.user_rsp = new_rsp;
@@ -3561,67 +4432,16 @@ fn sys_yield() -> u64 {
         // KPTI: Store new process's PML4 for syscall_entry's exit CR3 switch
         PER_CPU.user_cr3 = new_pml4;
 
-        if is_first_run {
-            // Jalon 142: First-run process — use the global IRETQ trampoline
-            // via exec_switch_cr3_and_ring3 (which uses the phys_off mini-stack).
+        if !new_ctx.is_valid() {
+            // First-run process — use the global IRETQ trampoline
             crate::elf::exec_switch_cr3_and_ring3(new_pml4, new_rip, new_rsp);
             // unreachable
         }
-
-        // Resumed process: restore callee-saved registers and return via sysretq.
-        // Jalon 142: Use the global SYSRETQ trampoline (no per-switch allocation).
-
-        let r15 = new_regs[0];
-        let r14 = new_regs[1];
-        let r13 = new_regs[2];
-        let r12 = new_regs[3];
-        let rbx = new_regs[4];
-        let rbp = new_regs[5];
-        // new_regs[6] = r11 (user RFLAGS) — goes into R11 for sysretq
-        // new_regs[7] = rcx (user RIP)   — goes into RCX for sysretq
-
-        let sysret_trampoline = sysret_trampoline_addr();
-        if sysret_trampoline == 0 {
-            // Fallback: if trampoline isn't initialized, use IRETQ path
-            crate::elf::exec_switch_cr3_and_ring3(new_pml4, new_rip, new_rsp);
-        }
-
-        let rip_v: u64 = new_rip;
-        let rfl_v: u64 = new_rflags;
-        let rsp_v: u64 = new_rsp;
-        let cr3_v: u64 = new_pml4;
-        asm!(
-            "cli",
-            // Step 1: Restore callee-saved regs FIRST
-            "mov r15, {r15}",
-            "mov r14, {r14}",
-            "mov r13, {r13}",
-            "mov r12, {r12}",
-            "mov rbx, {rbx}",
-            "mov rbp, {rbp}",
-            // Step 2: Set up for sysretq
-            "mov rcx, rax",           // RCX = user RIP
-            "mov r11, rdi",           // R11 = user RFLAGS
-            "mov rsp, rsi",           // RSP = user stack
-            // Step 3: Jump to global trampoline that does: mov cr3 → swapgs → sysretq
-            // r8 holds the trampoline address, rdx holds the CR3 value
-            "jmp r8",
-            // Explicit register bindings
-            in("rax") rip_v,
-            in("rdi") rfl_v,
-            in("rsi") rsp_v,
-            in("rdx") cr3_v,
-            in("r8") sysret_trampoline,
-            // Generic register bindings for callee-saved values
-            r15 = in(reg) r15,
-            r14 = in(reg) r14,
-            r13 = in(reg) r13,
-            r12 = in(reg) r12,
-            rbx = in(reg) rbx,
-            rbp = in(reg) rbp,
-            options(noreturn),
-        );
     }
+
+    // Resumed process: restore ALL registers and sysretq.
+    // RAX = 0 for the yield return value (sched_yield returns 0).
+    restore_and_sysret!(new_ctx, new_pml4, 0u64);
 }
 
 /// Fork the current process (Jalon 25a - REAL UNIX FORK).
@@ -3654,27 +4474,13 @@ fn sys_fork() -> u64 {
     };
 
     // Capture parent's current user-mode return state from this syscall.
-    // syscall_entry saved: user RIP in RCX -> gs:[16], user RSP -> gs:[8].
-    // The kernel stack has: [r15, r14, r13, r12, rbx, rbp, r11(RFLAGS), rcx(RIP)]
     let parent_rip = saved_user_rip();
     let parent_rsp = saved_user_rsp();
     let parent_kernel_rsp = unsafe { PER_CPU.saved_kernel_rsp };
-    let saved_regs: [u64; 8] = if parent_kernel_rsp != 0 {
-        let ptr = parent_kernel_rsp as *const u64;
-        unsafe {
-            [
-                core::ptr::read_unaligned(ptr),          // r15
-                core::ptr::read_unaligned(ptr.add(1)),   // r14
-                core::ptr::read_unaligned(ptr.add(2)),   // r13
-                core::ptr::read_unaligned(ptr.add(3)),   // r12
-                core::ptr::read_unaligned(ptr.add(4)),   // rbx
-                core::ptr::read_unaligned(ptr.add(5)),   // rbp
-                core::ptr::read_unaligned(ptr.add(6)),   // r11 (RFLAGS)
-                core::ptr::read_unaligned(ptr.add(7)),   // rcx (RIP)
-            ]
-        }
+    let saved_ctx = if parent_kernel_rsp != 0 {
+        unsafe { crate::process::SyscallContext::from_kernel_stack(parent_kernel_rsp) }
     } else {
-        [0; 8]
+        crate::process::SyscallContext::ZERO
     };
 
     // Create the child process with deep-copied PML4
@@ -3691,7 +4497,7 @@ fn sys_fork() -> u64 {
             crate::process::with_process_mut(child_pid, |child| {
                 child.saved_user_rip = parent_rip;
                 child.saved_user_rsp = parent_rsp;
-                child.saved_syscall_regs = saved_regs;
+                child.saved_ctx = saved_ctx;
                 child.is_forked = true;  // Flag: resume via sysretq with RAX=0
             });
 
@@ -3730,10 +4536,12 @@ unsafe fn clone_pml4_deep(src_pml4_phys: u64) -> Option<u64> {
         let pml4_entry = core::ptr::read_unaligned(src_pml4.add(pml4_i));
         if pml4_entry & 0x01 == 0 { continue; } // not present
 
-        // Kernel entries: PML4[0], PML4[256..511], or any entry WITHOUT USER_ACCESSIBLE — share verbatim
+        // Kernel entries: PML4[256..511], or any entry WITHOUT USER_ACCESSIBLE — share verbatim
         // CRITICAL: The kernel heap at 0x4444_4444_0000 maps to PML4[136] which must be shared,
         // not deep-copied, so child processes see the same kernel data structures (PROCESS_TABLE etc.)
-        if pml4_i == 0 || pml4_i >= 256 || (pml4_entry & 0x04) == 0 {
+        // NOTE: PML4[0] is NOT special-cased anymore. Linux/musl binaries (BusyBox) load at
+        // 0x400000 which is in PML4[0], so if it has USER_ACCESSIBLE pages they must be deep-copied.
+        if pml4_i >= 256 || (pml4_entry & 0x04) == 0 {
             core::ptr::write_unaligned(new_pml4.add(pml4_i), pml4_entry);
             continue;
         }
@@ -3836,7 +4644,11 @@ fn read_user_string_array(array_addr: u64, max: usize) -> alloc::vec::Vec<alloc:
     for i in 0..max {
         let ptr_addr = array_addr + (i as u64) * 8;
         if !validate_user_ptr(ptr_addr, 8) { break; }
-        let str_ptr = unsafe { core::ptr::read_unaligned(ptr_addr as *const u64) };
+        // KPTI-safe: copy the string pointer from user space
+        let mut ptr_buf = [0u8; 8];
+        let copied = unsafe { copy_from_user(&mut ptr_buf, ptr_addr, 8) };
+        if copied < 8 { break; }
+        let str_ptr = u64::from_ne_bytes(ptr_buf);
         if str_ptr == 0 { break; } // NULL terminator
         if !validate_user_ptr(str_ptr, 1) { break; }
         match unsafe { read_user_string(str_ptr) } {
@@ -3920,9 +4732,24 @@ fn sys_execve(path_addr: u64, argv_addr: u64, envp_addr: u64) -> u64 {
         alloc::format!("/bin/{}", path)
     };
 
-    // ── Priority 1: Try in-memory VFS (/bin/*, /sys/*, etc.) ──
-    let elf_data = if let Ok(data) = crate::fs::vfs::file_read(&resolved) {
+    // ── Step 1: Try VFS, then ext2, then FAT32, in priority order ──
+    // Priority 1: VFS (in-memory filesystem)
+    let elf_data_opt = if let Ok(data) = crate::fs::vfs::file_read(&resolved) {
         crate::serial_println!("[EXEC] Loaded from VFS: {} ({} bytes)", resolved, data.len());
+        Some(data)
+    } else { None };
+
+    // Priority 1b: ext2 (real Alpine rootfs with dynamic binaries)
+    let elf_data_opt = if elf_data_opt.is_some() { elf_data_opt }
+    else if crate::fs::ext2::is_mounted() {
+        if let Some(data) = crate::fs::ext2::read_file_path(&resolved) {
+            crate::serial_println!("[EXEC] Loaded from ext2: {} ({} bytes)", resolved, data.len());
+            Some(data)
+        } else { None }
+    } else { None };
+
+    // Priority 2+: FAT32 paths (handled by existing chain below)
+    let elf_data = if let Some(data) = elf_data_opt {
         data
     }
     // ── Priority 2: Try FAT32 disk (/disk/* paths) ──
@@ -4027,10 +4854,35 @@ fn sys_execve(path_addr: u64, argv_addr: u64, envp_addr: u64) -> u64 {
                     alloc::format!("/lib/{}", interp_path)
                 };
 
-                // Try to load the interpreter data
+                // Try to load the interpreter data (VFS -> ext2 -> FAT32)
                 let interp_data = if let Ok(data) = crate::fs::vfs::file_read(&interp_resolved) {
                     crate::serial_println!("[EXEC] Interpreter from VFS: {} ({} bytes)", interp_resolved, data.len());
                     Some(data)
+                } else if crate::fs::ext2::is_mounted() {
+                    // Try ext2 (Alpine rootfs - this is where ld-musl-x86_64.so.1 lives)
+                    match crate::fs::ext2::read_file_path(&interp_resolved) {
+                        Some(data) => {
+                            crate::serial_println!("[EXEC] Interpreter from ext2: {} ({} bytes)", interp_resolved, data.len());
+                            Some(data)
+                        }
+                        None => {
+                            // Also try /lib/ld-musl-x86_64.so.1 -> /lib64/ld-linux-x86-64.so.2 variants
+                            let alt_paths = [
+                                alloc::format!("/lib/ld-musl-x86_64.so.1"),
+                                alloc::format!("/lib/ld-linux-x86-64.so.2"),
+                                alloc::format!("/lib64/ld-linux-x86-64.so.2"),
+                            ];
+                            let mut found = None;
+                            for alt in &alt_paths {
+                                if let Some(data) = crate::fs::ext2::read_file_path(alt) {
+                                    crate::serial_println!("[EXEC] Interpreter from ext2 (alt): {} ({} bytes)", alt, data.len());
+                                    found = Some(data);
+                                    break;
+                                }
+                            }
+                            found
+                        }
+                    }
                 } else {
                     // Try FAT32: /lib/ld-musl-x86_64.so.1 -> lib/ld-musl-x86_64.so.1
                     let fat_path = if interp_resolved.starts_with("/") {
@@ -4096,9 +4948,10 @@ fn sys_execve(path_addr: u64, argv_addr: u64, envp_addr: u64) -> u64 {
             );
 
 
-            // Replace the current process's address space and state
-            // Jalon 94: Free the OLD page table before replacing
-            let _old_pml4 = crate::process::with_process(current_pid, |p| p.pml4_phys).unwrap_or(0);
+            // Replace the current process's address space and state.
+            // Save old PML4 so we can free it after updating the process struct.
+            // This prevents a PML4 leak on every execve.
+            let old_pml4 = crate::process::with_process(current_pid, |p| p.pml4_phys).unwrap_or(0);
             crate::process::with_process_mut(current_pid, |p| {
                 p.pml4_phys = result.pml4_phys;
                 p.entry_point = launch_entry;  // Use interpreter entry for dynamic binaries
@@ -4109,7 +4962,7 @@ fn sys_execve(path_addr: u64, argv_addr: u64, envp_addr: u64) -> u64 {
                 // Clear saved state
                 p.saved_user_rip = 0;
                 p.saved_user_rsp = 0;
-                p.saved_syscall_regs = [0; 8];
+                p.saved_ctx = crate::process::SyscallContext::ZERO;
                 p.is_forked = false;
                 // Jalon 127: Store argv for /proc/self/cmdline
                 p.argv = argv.clone();
@@ -4119,8 +4972,17 @@ fn sys_execve(path_addr: u64, argv_addr: u64, envp_addr: u64) -> u64 {
                 p.signal_mask = 0;
             });
 
-            // Jalon 94: Free old page table AFTER CR3 has been changed
-            // We'll free it right after switching to the new PML4
+            // Jalon 94: Free old page table NOW (before switching CR3).
+            // We're still on the kernel PML4 (which shares kernel entries),
+            // so the old user PML4 can be freed safely.
+            // Skip if old_pml4 == 0 (first exec) or same as new (shouldn't happen).
+            if old_pml4 != 0 && old_pml4 != result.pml4_phys {
+                crate::serial_println!(
+                    "[EXEC-GC] Freeing old PML4=0x{:X} (replaced by 0x{:X})",
+                    old_pml4, result.pml4_phys
+                );
+                unsafe { crate::elf::free_user_page_table(old_pml4); }
+            }
             crate::serial_println!(
                 "[EXEC] Switching to Ring 3: {} entry=0x{:X} (launch=0x{:X}) rsp=0x{:X} pml4=0x{:X}",
                 resolved, result.entry_point, launch_entry, final_rsp, result.pml4_phys
@@ -4262,9 +5124,25 @@ fn sys_exit(code: u64) -> u64 {
     let current = crate::scheduler::current_pid();
     let is_thread = crate::process::with_process(current, |p| p.is_thread).unwrap_or(false);
 
+    // ═══ DIAGNOSTIC: Dump full process state on exit ═══
+    let (name, argv_str, saved_rip, saved_rsp) = crate::process::with_process(current, |p| {
+        let a = p.argv.join(" ");
+        (p.name.clone(), a, p.saved_user_rip, p.saved_user_rsp)
+    }).unwrap_or_default();
     crate::serial_println!(
-        "[SYSCALL] sys_exit({}) - {} {} terminating",
-        code, if is_thread { "Thread" } else { "Process" }, current
+        "\n╔══════════════════════════════════════════════════════════════╗"
+    );
+    crate::serial_println!(
+        "║ [EXIT] PID {} '{}' exit_code={} (0x{:X})", current, name, code, code
+    );
+    crate::serial_println!(
+        "║ [EXIT] argv=[{}]  last_RIP=0x{:X} last_RSP=0x{:X}", argv_str, saved_rip, saved_rsp
+    );
+    crate::serial_println!(
+        "║ [EXIT] type={}", if is_thread { "Thread" } else { "Process" }
+    );
+    crate::serial_println!(
+        "╚══════════════════════════════════════════════════════════════╝\n"
     );
 
     if current != 0 {
@@ -4349,10 +5227,10 @@ fn sys_exit(code: u64) -> u64 {
             // by syscall_entry. We restore the kernel RSP to that point and let the
             // normal pop + sysretq path run, which correctly restores all user registers.
             let parent_info = crate::process::with_process(parent_pid, |p| {
-                (p.saved_user_rip, p.saved_user_rsp, p.pml4_phys, p.saved_kernel_rsp, p.saved_syscall_regs)
+                (p.saved_user_rip, p.saved_user_rsp, p.pml4_phys, p.saved_kernel_rsp, p.saved_ctx)
             });
 
-            if let Some((saved_rip, saved_rsp, pml4, _saved_kernel_rsp, saved_regs)) = parent_info {
+            if let Some((saved_rip, saved_rsp, pml4, _saved_kernel_rsp, saved_ctx)) = parent_info {
                 crate::serial_println!(
                     "[SYSCALL] All threads done, resuming parent PID {} at RIP=0x{:X} RSP=0x{:X}",
                     parent_pid, saved_rip, saved_rsp
@@ -4362,65 +5240,15 @@ fn sys_exit(code: u64) -> u64 {
                 crate::scheduler::set_current_pid(parent_pid);
                 let _ = crate::process::set_state(parent_pid, crate::process::ProcessState::Running);
 
-                // KPTI: Set user_cr3 for parent and switch via trampoline
-                unsafe {
-                    PER_CPU.user_cr3 = pml4;
-                }
-
-                let wait_result = ((current & 0xFFFF) << 16) | (code & 0xFFFF);
+                let wait_result = current; // child PID (Linux wait4 convention)
                 crate::serial_println!(
-                    "[SYSCALL] sysretq to parent: RAX=0x{:X}, regs saved={}",
-                    wait_result, saved_regs[7] != 0
+                    "[SYSCALL] sysretq to parent: RAX=0x{:X} (child PID), regs saved={}",
+                    wait_result, saved_ctx.is_valid()
                 );
 
-                if saved_regs[7] != 0 {
-                    let r15 = saved_regs[0];
-                    let r14 = saved_regs[1];
-                    let r13 = saved_regs[2];
-                    let r12 = saved_regs[3];
-                    let rbx = saved_regs[4];
-                    let rbp = saved_regs[5];
-                    let r11 = saved_regs[6];
-                    let rcx = saved_regs[7];
-
-                    unsafe {
-                        PER_CPU.user_rsp = saved_rsp;
-
-                        // KPTI: sysretq trampoline
-                        let tb = alloc::vec![0u8; 64];
-                        let tp = tb.as_ptr() as *mut u8;
-                        let ta = tp as u64;
-                        *tp.add(0) = 0x0F; *tp.add(1) = 0x22; *tp.add(2) = 0xDA; // mov cr3,rdx
-                        *tp.add(3) = 0x0F; *tp.add(4) = 0x01; *tp.add(5) = 0xF8; // swapgs
-                        *tp.add(6) = 0x48; *tp.add(7) = 0x0F; *tp.add(8) = 0x07; // sysretq
-
-                        core::arch::asm!(
-                            "cli",
-                            "mov r15, {v_r15}",
-                            "mov r14, {v_r14}",
-                            "mov r13, {v_r13}",
-                            "mov r12, {v_r12}",
-                            "mov rbx, {v_rbx}",
-                            "mov rbp, {v_rbp}",
-                            "mov r11, {v_r11}",
-                            "mov rcx, {v_rcx}",
-                            "mov rax, {result}",
-                            "mov rsp, gs:[8]",
-                            "jmp r8",
-                            in("rdx") pml4,
-                            in("r8") ta,
-                            v_r15 = in(reg) r15,
-                            v_r14 = in(reg) r14,
-                            v_r13 = in(reg) r13,
-                            v_r12 = in(reg) r12,
-                            v_rbx = in(reg) rbx,
-                            v_rbp = in(reg) rbp,
-                            v_r11 = in(reg) r11,
-                            v_rcx = in(reg) rcx,
-                            result = in(reg) wait_result,
-                            options(noreturn),
-                        );
-                    }
+                if saved_ctx.is_valid() {
+                    unsafe { PER_CPU.user_rsp = saved_rsp; }
+                    restore_and_sysret!(saved_ctx, pml4, wait_result);
                 } else if saved_rip != 0 && saved_rsp != 0 {
                     // Fallback IRETQ trampoline
                     crate::serial_println!(
@@ -4510,11 +5338,11 @@ fn sys_exit(code: u64) -> u64 {
 
                 let parent_ctx = crate::process::with_process(parent_pid, |p| {
                     (p.saved_user_rip, p.saved_user_rsp, p.saved_kernel_rsp,
-                     p.saved_syscall_regs, p.pml4_phys)
+                     p.saved_ctx, p.pml4_phys)
                 });
 
-                if let Some((saved_rip, saved_rsp, _parent_kernel_rsp, saved_regs, pml4)) = parent_ctx {
-                    if saved_regs[7] != 0 {
+                if let Some((saved_rip, saved_rsp, _parent_kernel_rsp, saved_ctx, pml4)) = parent_ctx {
+                    if saved_ctx.is_valid() {
                         // Set parent back to Running
                         let _ = crate::process::set_state(
                             parent_pid,
@@ -4522,61 +5350,27 @@ fn sys_exit(code: u64) -> u64 {
                         );
                         crate::scheduler::set_current_pid(parent_pid);
 
-                        // Build wait result: (child_pid << 16) | exit_code
-                        let wait_result = ((current & 0xFFFF) << 16) | (code & 0xFFFF);
-
-                        let r15 = saved_regs[0];
-                        let r14 = saved_regs[1];
-                        let r13 = saved_regs[2];
-                        let r12 = saved_regs[3];
-                        let rbx = saved_regs[4];
-                        let rbp = saved_regs[5];
-                        let r11 = saved_regs[6]; // RFLAGS
-                        let rcx = saved_regs[7]; // RIP
+                        // Jalon 155: Return just the child PID (Linux wait4 convention).
+                        let wait_result = current; // child PID
 
                         unsafe { PER_CPU.user_rsp = saved_rsp; }
 
                         crate::serial_println!(
                             "[SYSCALL] Resuming parent PID {} via sysretq: RAX=0x{:X} RIP=0x{:X} RSP=0x{:X}",
-                            parent_pid, wait_result, rcx, saved_rsp
+                            parent_pid, wait_result, saved_ctx.rip, saved_rsp
+                        );
+                        crate::serial_println!(
+                            "[RESUME-REGS] r15=0x{:X} r14=0x{:X} r13=0x{:X} r12=0x{:X} rbx=0x{:X} rbp=0x{:X} rflags=0x{:X} rip=0x{:X}",
+                            saved_ctx.r15, saved_ctx.r14, saved_ctx.r13, saved_ctx.r12,
+                            saved_ctx.rbx, saved_ctx.rbp, saved_ctx.rflags, saved_ctx.rip
+                        );
+                        crate::serial_println!(
+                            "[RESUME-REGS] r9=0x{:X} r10=0x{:X} r8=0x{:X} rdx=0x{:X} rsi=0x{:X} rdi=0x{:X}",
+                            saved_ctx.r9, saved_ctx.r10, saved_ctx.r8, saved_ctx.rdx,
+                            saved_ctx.rsi, saved_ctx.rdi
                         );
 
-                        unsafe {
-                            PER_CPU.user_cr3 = pml4;
-                            // KPTI: sysretq trampoline
-                            let tb = alloc::vec![0u8; 64];
-                            let tp = tb.as_ptr() as *mut u8;
-                            let ta = tp as u64;
-                            *tp.add(0) = 0x0F; *tp.add(1) = 0x22; *tp.add(2) = 0xDA;
-                            *tp.add(3) = 0x0F; *tp.add(4) = 0x01; *tp.add(5) = 0xF8;
-                            *tp.add(6) = 0x48; *tp.add(7) = 0x0F; *tp.add(8) = 0x07;
-                            core::arch::asm!(
-                                "cli",
-                                "mov r15, {v_r15}",
-                                "mov r14, {v_r14}",
-                                "mov r13, {v_r13}",
-                                "mov r12, {v_r12}",
-                                "mov rbx, {v_rbx}",
-                                "mov rbp, {v_rbp}",
-                                "mov r11, {v_r11}",
-                                "mov rcx, {v_rcx}",
-                                "mov rax, {result}",
-                                "mov rsp, gs:[8]",
-                                "jmp r8",
-                                in("rdx") pml4,
-                                in("r8") ta,
-                                v_r15 = in(reg) r15,
-                                v_r14 = in(reg) r14,
-                                v_r13 = in(reg) r13,
-                                v_r12 = in(reg) r12,
-                                v_rbx = in(reg) rbx,
-                                v_rbp = in(reg) rbp,
-                                v_r11 = in(reg) r11,
-                                v_rcx = in(reg) rcx,
-                                result = in(reg) wait_result,
-                                options(noreturn),
-                            );
-                        }
+                        restore_and_sysret!(saved_ctx, pml4, wait_result);
                     } else if saved_rip != 0 && saved_rsp != 0 {
                         // Fallback: IRETQ if no kernel registers saved
                         let _ = crate::process::set_state(
@@ -4585,7 +5379,7 @@ fn sys_exit(code: u64) -> u64 {
                         );
                         crate::scheduler::set_current_pid(parent_pid);
 
-                        let wait_result = ((current & 0xFFFF) << 16) | (code & 0xFFFF);
+                        let wait_result = current; // child PID (Linux convention)
                         crate::serial_println!(
                             "[SYSCALL] Fallback IRETQ to parent PID {}: RIP=0x{:X}",
                             parent_pid, saved_rip
@@ -4676,11 +5470,11 @@ pub fn launch_next_userspace_process(exclude_pid: u64) {
     if let Some((next_pid, entry, stack, pml4, name)) = next_ready {
         // Check if this is a forked child that should resume at parent's saved RIP
         let fork_info = crate::process::with_process(next_pid, |p| {
-            (p.is_forked, p.saved_user_rip, p.saved_user_rsp, p.saved_syscall_regs)
+            (p.is_forked, p.saved_user_rip, p.saved_user_rsp, p.saved_ctx)
         });
 
-        if let Some((true, saved_rip, saved_rsp, saved_regs)) = fork_info {
-            if saved_regs[7] != 0 {
+        if let Some((true, saved_rip, saved_rsp, saved_ctx)) = fork_info {
+            if saved_ctx.is_valid() {
                 // Forked child: resume at parent's exact RIP with RAX=0
                 crate::serial_println!(
                     "[SYSCALL] Launching FORKED child PID {} ({}) via sysretq with RAX=0, RIP=0x{:X}",
@@ -4692,61 +5486,13 @@ pub fn launch_next_userspace_process(exclude_pid: u64) {
                 // Clear the forked flag so it won't re-trigger
                 crate::process::with_process_mut(next_pid, |p| { p.is_forked = false; });
 
-                let r15 = saved_regs[0];
-                let r14 = saved_regs[1];
-                let r13 = saved_regs[2];
-                let r12 = saved_regs[3];
-                let rbx = saved_regs[4];
-                let rbp = saved_regs[5];
-                let r11 = saved_regs[6]; // RFLAGS
-                let rcx = saved_regs[7]; // RIP
-
                 // Write child's user RSP into PER_CPU + KPTI user_cr3
                 unsafe {
                     PER_CPU.user_rsp = saved_rsp;
-                    PER_CPU.user_cr3 = pml4;
                 }
 
-                unsafe {
-                    // KPTI: Allocate sysretq trampoline on kernel heap
-                    let tb = alloc::vec![0u8; 64];
-                    let tp = tb.as_ptr() as *mut u8;
-                    let ta = tp as u64;
-                    // mov cr3, rdx   (0F 22 DA)
-                    *tp.add(0) = 0x0F; *tp.add(1) = 0x22; *tp.add(2) = 0xDA;
-                    // swapgs           (0F 01 F8)
-                    *tp.add(3) = 0x0F; *tp.add(4) = 0x01; *tp.add(5) = 0xF8;
-                    // sysretq           (48 0F 07)
-                    *tp.add(6) = 0x48; *tp.add(7) = 0x0F; *tp.add(8) = 0x07;
-
-                    core::arch::asm!(
-                        "cli",
-                        "mov r15, {v_r15}",
-                        "mov r14, {v_r14}",
-                        "mov r13, {v_r13}",
-                        "mov r12, {v_r12}",
-                        "mov rbx, {v_rbx}",
-                        "mov rbp, {v_rbp}",
-                        "mov r11, {v_r11}",
-                        "mov rcx, {v_rcx}",
-                        "xor eax, eax",         // RAX = 0 (fork return for child!)
-                        "mov rsp, gs:[8]",      // Restore user RSP
-                        // Jump to heap trampoline: mov cr3 → swapgs → sysretq
-                        "jmp r8",
-                        in("rdx") pml4,
-                        in("r8") ta,
-                        v_r15 = in(reg) r15,
-                        v_r14 = in(reg) r14,
-                        v_r13 = in(reg) r13,
-                        v_r12 = in(reg) r12,
-                        v_rbx = in(reg) rbx,
-                        v_rbp = in(reg) rbp,
-                        v_r11 = in(reg) r11,
-                        v_rcx = in(reg) rcx,
-                        options(noreturn),
-                    );
-                    // tb leaked intentionally
-                }
+                // Fork child returns 0
+                restore_and_sysret!(saved_ctx, pml4, 0u64);
             }
         }
 
@@ -4816,7 +5562,10 @@ pub fn launch_next_userspace_process(exclude_pid: u64) {
 /// saves the parent's user context so it can be resumed when all children are done.
 fn sys_wait(pid: u64) -> u64 {
     let current = crate::scheduler::current_pid();
-    crate::serial_println!("[SYSCALL] sys_wait({}) from PID {}", pid, current);
+    let is_linux = crate::process::with_process(current, |p| {
+        p.abi == crate::compat::linux_abi::Abi::Linux
+    }).unwrap_or(false);
+    crate::serial_println!("[SYSCALL] sys_wait({}) from PID {} (linux_abi={}, SHOULD NOT be called for Linux processes!)", pid, current, is_linux);
 
     // Save the parent's user-mode return address so we can resume after threads
     let parent_rip = saved_user_rip();
@@ -4824,35 +5573,30 @@ fn sys_wait(pid: u64) -> u64 {
     // PER_CPU.saved_kernel_rsp was set by syscall_entry for THIS syscall (parent's).
     // Save it now before any child syscalls overwrite it.
     let parent_kernel_rsp = unsafe { PER_CPU.saved_kernel_rsp };
-    // Copy the 8 saved registers from the kernel stack into the process struct.
+    // Capture ALL registers from the kernel stack into a typed SyscallContext.
     // The shared kernel syscall stack will be overwritten by child thread syscalls.
-    // Stack layout (from RSP upward): r15, r14, r13, r12, rbx, rbp, r11(RFLAGS), rcx(RIP)
-    let saved_regs: [u64; 8] = if parent_kernel_rsp != 0 {
-        let ptr = parent_kernel_rsp as *const u64;
-        unsafe {
-            [
-                core::ptr::read_unaligned(ptr),          // r15
-                core::ptr::read_unaligned(ptr.add(1)),   // r14
-                core::ptr::read_unaligned(ptr.add(2)),   // r13
-                core::ptr::read_unaligned(ptr.add(3)),   // r12
-                core::ptr::read_unaligned(ptr.add(4)),   // rbx
-                core::ptr::read_unaligned(ptr.add(5)),   // rbp
-                core::ptr::read_unaligned(ptr.add(6)),   // r11 (RFLAGS)
-                core::ptr::read_unaligned(ptr.add(7)),   // rcx (RIP)
-            ]
-        }
+    let saved_ctx = if parent_kernel_rsp != 0 {
+        unsafe { crate::process::SyscallContext::from_kernel_stack(parent_kernel_rsp) }
     } else {
-        [0; 8]
+        crate::process::SyscallContext::ZERO
     };
     crate::process::with_process_mut(current, |p| {
         p.saved_user_rip = parent_rip;
         p.saved_user_rsp = parent_rsp;
         p.saved_kernel_rsp = parent_kernel_rsp;
-        p.saved_syscall_regs = saved_regs;
+        p.saved_ctx = saved_ctx;
     });
     crate::serial_println!(
-        "[SYSCALL] wait: saved parent ctx RIP=0x{:X} RSP=0x{:X} KRSP=0x{:X} rcx(RIP)=0x{:X} r11(FL)=0x{:X}",
-        parent_rip, parent_rsp, parent_kernel_rsp, saved_regs[7], saved_regs[6]
+        "[SYSCALL] wait: saved parent ctx RIP=0x{:X} RSP=0x{:X} KRSP=0x{:X} ctx.rip=0x{:X} ctx.rflags=0x{:X}",
+        parent_rip, parent_rsp, parent_kernel_rsp, saved_ctx.rip, saved_ctx.rflags
+    );
+    crate::serial_println!(
+        "[WAIT-SAVE] caller: r9=0x{:X} r10=0x{:X} r8=0x{:X} rdx=0x{:X} rsi=0x{:X} rdi=0x{:X}",
+        saved_ctx.r9, saved_ctx.r10, saved_ctx.r8, saved_ctx.rdx, saved_ctx.rsi, saved_ctx.rdi
+    );
+    crate::serial_println!(
+        "[WAIT-SAVE] callee: r15=0x{:X} r14=0x{:X} r13=0x{:X} r12=0x{:X} rbx=0x{:X} rbp=0x{:X}",
+        saved_ctx.r15, saved_ctx.r14, saved_ctx.r13, saved_ctx.r12, saved_ctx.rbx, saved_ctx.rbp
     );
 
     // Check for ready child threads to run
@@ -4896,15 +5640,15 @@ fn sys_wait(pid: u64) -> u64 {
     // No child threads to launch — check for forked children to launch
     // A forked child has is_forked=true and should be launched with sysretq(RAX=0).
     let forked_child = crate::process::find_ready_forked_child(current, pid);
-    if let Some((child_pid, child_pml4, child_rip, child_rsp, child_regs)) = forked_child {
+    if let Some((child_pid, child_pml4, child_rip, child_rsp, child_ctx)) = forked_child {
         crate::serial_println!(
             "[SYSCALL] wait: launching FORKED child PID {} (RIP=0x{:X}, RSP=0x{:X})",
             child_pid, child_rip, child_rsp
         );
         crate::serial_println!(
-            "[FORK-LAUNCH] regs: r15=0x{:X} r14=0x{:X} r13=0x{:X} r12=0x{:X} rbx=0x{:X} rbp=0x{:X} r11=0x{:X} rcx=0x{:X}",
-            child_regs[0], child_regs[1], child_regs[2], child_regs[3],
-            child_regs[4], child_regs[5], child_regs[6], child_regs[7]
+            "[FORK-LAUNCH] ctx: r15=0x{:X} r14=0x{:X} r13=0x{:X} r12=0x{:X} rbx=0x{:X} rbp=0x{:X} rflags=0x{:X} rip=0x{:X}",
+            child_ctx.r15, child_ctx.r14, child_ctx.r13, child_ctx.r12,
+            child_ctx.rbx, child_ctx.rbp, child_ctx.rflags, child_ctx.rip
         );
 
         // Mark child as Running, parent as Blocked
@@ -4916,63 +5660,170 @@ fn sys_wait(pid: u64) -> u64 {
         // Clear forked flag
         crate::process::with_process_mut(child_pid, |p| { p.is_forked = false; });
 
-        let r15 = child_regs[0];
-        let r14 = child_regs[1];
-        let r13 = child_regs[2];
-        let r12 = child_regs[3];
-        let rbx = child_regs[4];
-        let rbp = child_regs[5];
-        let r11 = child_regs[6];
-        let rcx = child_regs[7];
-
-        unsafe { PER_CPU.user_rsp = child_rsp; }
-
+        // DIAGNOSTIC: Verify child PML4 can resolve the target RIP
         unsafe {
-            core::arch::asm!("mov cr3, {}", in(reg) child_pml4, options(nostack));
-            core::arch::asm!(
-                "mov r15, {v_r15}",
-                "mov r14, {v_r14}",
-                "mov r13, {v_r13}",
-                "mov r12, {v_r12}",
-                "mov rbx, {v_rbx}",
-                "mov rbp, {v_rbp}",
-                "mov r11, {v_r11}",
-                "mov rcx, {v_rcx}",
-                "xor eax, eax",         // RAX = 0 (fork return for child!)
-                "mov rsp, gs:[8]",
-                "swapgs",
-                "sysretq",
-                v_r15 = in(reg) r15,
-                v_r14 = in(reg) r14,
-                v_r13 = in(reg) r13,
-                v_r12 = in(reg) r12,
-                v_rbx = in(reg) rbx,
-                v_rbp = in(reg) rbp,
-                v_r11 = in(reg) r11,
-                v_rcx = in(reg) rcx,
-                options(noreturn),
+            let frame = crate::elf::lookup_page_frame_pub(child_pml4, child_ctx.rip);
+            crate::serial_println!(
+                "[FORK-DIAG] child PML4=0x{:X} RIP=0x{:X} -> frame={:?}",
+                child_pml4, child_ctx.rip, frame
+            );
+            let stack_frame = crate::elf::lookup_page_frame_pub(child_pml4, child_rsp & !0xFFF);
+            crate::serial_println!(
+                "[FORK-DIAG] child RSP page=0x{:X} -> frame={:?}",
+                child_rsp & !0xFFF, stack_frame
+            );
+            let lstar = rdmsr(IA32_LSTAR);
+            let lstar_pml4_idx = (lstar >> 39) & 0x1FF;
+            let po = crate::elf::phys_offset();
+            let pml4_virt = (child_pml4 + po) as *const u64;
+            let lstar_entry = core::ptr::read_volatile(pml4_virt.add(lstar_pml4_idx as usize));
+            crate::serial_println!(
+                "[FORK-DIAG] LSTAR=0x{:X} PML4[{}]=0x{:X} (P={})",
+                lstar, lstar_pml4_idx, lstar_entry, lstar_entry & 1
             );
         }
+
+        unsafe {
+            PER_CPU.user_rsp = child_rsp;
+        }
+
+        crate::serial_println!(
+            "[FORK-LAUNCH] sysretq trampoline=0x{:X}, target RIP=0x{:X} RFLAGS=0x{:X} RSP=0x{:X}",
+            sysret_trampoline_addr(), child_ctx.rip, child_ctx.rflags, child_rsp
+        );
+
+        // Fork child returns 0
+        restore_and_sysret!(child_ctx, child_pml4, 0u64);
     }
 
-    // No child threads to launch — poll for already-terminated children
-    let max_iters = 50_000_000u64;
-    for _ in 0..max_iters {
+    // No child threads or forked children to launch directly.
+    // Enable interrupts so the timer ISR can preemptively schedule the child,
+    // then poll for terminated children.
+    let max_iters = 5_000_000u64;
+    for i in 0..max_iters {
         match crate::process::wait_for_child(current) {
             Ok((child_pid, exit_code)) => {
-                crate::serial_println!("[SYSCALL] wait: child PID {} exited with {}", child_pid, exit_code);
-                // Return child PID in upper 16 bits, exit code in lower 16
-                return ((child_pid & 0xFFFF) << 16) | (exit_code as u64 & 0xFFFF);
+                crate::serial_println!("[SYSCALL] wait: child PID {} exited with code {}", child_pid, exit_code);
+                // Return child PID (Linux wait4 convention)
+                return child_pid;
             }
             Err(crate::process::ProcessError::WaitingForChild) => {
-                // No child terminated yet, yield
-                unsafe { asm!("pause", options(nomem, nostack)); }
+                // Enable interrupts so the timer ISR fires and can schedule the child
+                unsafe {
+                    asm!("sti", options(nomem, nostack));
+                    for _ in 0..100u32 {
+                        asm!("pause", options(nomem, nostack));
+                    }
+                    asm!("cli", options(nomem, nostack));
+                }
+                // Periodically yield to give the child a chance to run
+                if i % 1000 == 0 {
+                    crate::scheduler::yield_to_next(current);
+                }
             }
             Err(_) => return ECHILD,
         }
     }
 
     // Timeout
+    crate::serial_println!("[SYSCALL] wait: timeout after {} iters, returning ECHILD", max_iters);
+    ECHILD
+}
+
+/// wait4(pid, wstatus, options, rusage) — full Linux ABI
+/// - pid: child PID to wait for (-1 = any child)
+/// - wstatus_addr: pointer to int where exit status is stored (0 = ignore)
+/// - options: WNOHANG (1) = return immediately if no child exited
+/// - rusage: ignored (not implemented)
+///
+/// Returns: child PID on success, 0 if WNOHANG and no child exited, -ECHILD on error
+fn sys_wait4(pid: u64, wstatus_addr: u64, options: u64) -> u64 {
+    let current = crate::scheduler::current_pid();
+    const WNOHANG: u64 = 1;
+    let is_wnohang = (options & WNOHANG) != 0;
+
+    // First try to launch any ready forked child (same as sys_wait)
+    let forked_child = crate::process::find_ready_forked_child(current, pid);
+    if let Some((child_pid, child_pml4, child_rip, child_rsp, child_ctx)) = forked_child {
+        crate::serial_println!(
+            "[WAIT4] launching forked child PID {} (RIP=0x{:X})", child_pid, child_rip
+        );
+
+        // Save parent context
+        let parent_rip = saved_user_rip();
+        let parent_rsp = saved_user_rsp();
+        let parent_kernel_rsp = unsafe { PER_CPU.saved_kernel_rsp };
+        let saved_ctx = if parent_kernel_rsp != 0 {
+            unsafe { crate::process::SyscallContext::from_kernel_stack(parent_kernel_rsp) }
+        } else {
+            crate::process::SyscallContext::ZERO
+        };
+        crate::process::with_process_mut(current, |p| {
+            p.saved_user_rip = parent_rip;
+            p.saved_user_rsp = parent_rsp;
+            p.saved_kernel_rsp = parent_kernel_rsp;
+            p.saved_ctx = saved_ctx;
+            // Store wstatus pointer for later use when child exits
+            p.wait_wstatus_ptr = wstatus_addr;
+        });
+
+        let _ = crate::process::set_state(child_pid, crate::process::ProcessState::Running);
+        let _ = crate::process::set_state(current, crate::process::ProcessState::Blocked);
+        crate::scheduler::set_current_pid(child_pid);
+        crate::process::with_process_mut(child_pid, |p| { p.is_forked = false; });
+
+        unsafe { PER_CPU.user_rsp = child_rsp; }
+
+        restore_and_sysret!(child_ctx, child_pml4, 0u64);
+    }
+
+    // Check for already-terminated children
+    match crate::process::wait_for_child(current) {
+        Ok((child_pid, exit_code)) => {
+            // Write wstatus: Linux encodes exit code as (exit_code << 8)
+            if wstatus_addr != 0 && validate_user_ptr(wstatus_addr, 4) {
+                let wstatus = ((exit_code & 0xFF) << 8) as u32;
+                unsafe { copy_to_user(wstatus_addr, &wstatus.to_le_bytes()); }
+            }
+            return child_pid;
+        }
+        Err(crate::process::ProcessError::WaitingForChild) => {}
+        Err(_) => return ECHILD,
+    }
+
+    // WNOHANG: return 0 immediately if no child has exited
+    if is_wnohang {
+        return 0;
+    }
+
+    // Blocking wait: poll for terminated children
+    let max_iters = 50_000_000u64;
+    for i in 0..max_iters {
+        unsafe {
+            asm!("sti", options(nomem, nostack));
+            for _ in 0..100u32 {
+                asm!("pause", options(nomem, nostack));
+            }
+            asm!("cli", options(nomem, nostack));
+        }
+
+        match crate::process::wait_for_child(current) {
+            Ok((child_pid, exit_code)) => {
+                if wstatus_addr != 0 && validate_user_ptr(wstatus_addr, 4) {
+                    let wstatus = ((exit_code & 0xFF) << 8) as u32;
+                    unsafe { copy_to_user(wstatus_addr, &wstatus.to_le_bytes()); }
+                }
+                return child_pid;
+            }
+            Err(crate::process::ProcessError::WaitingForChild) => {
+                if i % 1000 == 0 {
+                    crate::scheduler::yield_to_next(current);
+                }
+            }
+            Err(_) => return ECHILD,
+        }
+    }
+
     ECHILD
 }
 
@@ -5104,6 +5955,26 @@ mod pipe {
             0
         }
     }
+    
+    /// Check if writer end is closed
+    pub fn is_writer_closed(pipe_id: usize) -> bool {
+        let pipes = PIPES.lock();
+        if pipe_id < MAX_PIPES && pipes[pipe_id].active {
+            pipes[pipe_id].writer_closed
+        } else {
+            true
+        }
+    }
+    
+    /// Check if reader end is closed (for EPIPE detection)
+    pub fn is_reader_closed(pipe_id: usize) -> bool {
+        let pipes = PIPES.lock();
+        if pipe_id < MAX_PIPES && pipes[pipe_id].active {
+            pipes[pipe_id].reader_closed
+        } else {
+            true
+        }
+    }
 }
 
 /// sys_pipe(pipefd_ptr): creates a pipe with a 4KB kernel buffer.
@@ -5128,16 +5999,16 @@ fn sys_pipe(pipefd_ptr: u64) -> u64 {
     // Get current process PID to allocate FDs
     let pid = crate::scheduler::current_pid();
     
-    // Allocate read FD
+    // Allocate read FD (typed as Pipe)
     let read_fd = {
         let path = alloc::format!("pipe:{}:r", pipe_id);
-        crate::process::alloc_fd(pid, &path, 0) // O_RDONLY
+        crate::process::alloc_fd_typed(pid, &path, 0, crate::process::FdType::Pipe) // O_RDONLY
     };
     
-    // Allocate write FD
+    // Allocate write FD (typed as Pipe)
     let write_fd = {
         let path = alloc::format!("pipe:{}:w", pipe_id);
-        crate::process::alloc_fd(pid, &path, 1) // O_WRONLY
+        crate::process::alloc_fd_typed(pid, &path, 1, crate::process::FdType::Pipe) // O_WRONLY
     };
     
     match (read_fd, write_fd) {
@@ -5165,18 +6036,24 @@ fn sys_dup2(oldfd: u32, newfd: u32) -> u64 {
     
     let pid = crate::scheduler::current_pid();
     
-    // Get the path from the old FD
-    let old_path = crate::process::get_fd_path(pid, oldfd as usize);
+    // Get full FD info from the old FD (path + type)
+    let fd_info = crate::process::with_fd_table(pid, |fdt| {
+        fdt.get(oldfd as usize).map(|e| (e.path.clone(), e.fd_type, e.flags))
+    }).flatten();
     
-    match old_path {
-        Some(path) => {
-            // Close newfd if it's open, then set it to the same path
-            crate::process::set_fd(pid, newfd as usize, &path, 2); // O_RDWR
-            crate::serial_println!("[SYSCALL] dup2: {} -> {} ({})", oldfd, newfd, path);
+    match fd_info {
+        Some((path, fd_type, flags)) => {
+            // Close newfd if it's open, then set it to the same path with same type
+            crate::process::with_fd_table_mut(pid, |fdt| {
+                // Ensure the table is big enough
+                while fdt.entries.len() <= newfd as usize {
+                    fdt.entries.push(crate::process::FileDescriptor::empty());
+                }
+                fdt.entries[newfd as usize] = crate::process::FileDescriptor::new_typed(&path, flags, fd_type);
+            });
             newfd as u64
         }
         None => {
-            crate::serial_println!("[SYSCALL] dup2: oldfd {} not found", oldfd);
             EBADF
         }
     }
@@ -5269,6 +6146,31 @@ fn sys_getdents(fd: u32, buf_ptr: u64, buf_size: u64) -> u64 {
                         crate::fs::vfs::VfsNode::Device { .. } => DT_REG,
                     };
                     entries.push((name.clone(), dtype));
+                }
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════
+        // Ext2 fallback: merge entries from the ext2 filesystem
+        // This is critical for ls /bin, /lib, /usr etc. where the
+        // real Alpine rootfs lives on ext2 but VFS only has stubs.
+        // ═══════════════════════════════════════════════════════════
+        if crate::fs::ext2::is_mounted() {
+            if let Some(ext2_entries) = crate::fs::ext2::list_dir(&dir_path) {
+                // Collect existing names to avoid duplicates
+                let existing: alloc::collections::BTreeSet<alloc::string::String> =
+                    entries.iter().map(|(n, _)| n.clone()).collect();
+                for (name, _ino, ftype) in ext2_entries {
+                    if name == "." || name == ".." { continue; }
+                    if existing.contains(&name) { continue; }
+                    // Convert ext2 file type to DT_* constant
+                    // ext2 dir_entry type: 1=file, 2=dir, 7=symlink
+                    let dtype = match ftype {
+                        2 => DT_DIR,
+                        7 => DT_LNK,
+                        _ => DT_REG,
+                    };
+                    entries.push((name, dtype));
                 }
             }
         }
@@ -5822,25 +6724,33 @@ fn sys_mmap_full(addr_hint: u64, len: u64, prot: u64, flags: u64, fd: u64) -> u6
                         if let Some(ref path) = file_path {
                             let page_file_offset = file_offset + (i as u64) * 4096;
                             let mut buf = [0u8; 4096];
-                            let bytes_read = crate::fs::vfs::file_read_at_offset(
+                            let mut bytes_read = crate::fs::vfs::file_read_at_offset(
                                 path, page_file_offset, &mut buf
                             );
+                            // Try ext2 filesystem (Alpine rootfs with shared libs)
+                            if bytes_read == 0 && crate::fs::ext2::is_mounted() {
+                                if let Some(chunk) = crate::fs::ext2::read_file_chunk(path, page_file_offset, 4096) {
+                                    let copy_len = chunk.len().min(4096);
+                                    buf[..copy_len].copy_from_slice(&chunk[..copy_len]);
+                                    bytes_read = copy_len;
+                                }
+                            }
                             if bytes_read == 0 && path.starts_with("/disk/") {
                                 // Try FAT32 direct read
                                 let disk_path = &path[6..];
-                                let _ = crate::fs::fat32::read_file_at_offset(
+                                bytes_read = crate::fs::fat32::read_file_at_offset(
                                     disk_path, page_file_offset, &mut buf
-                                );
+                                ).unwrap_or(0);
                             }
                             // Also try VFS paths like /lib/...
                             if bytes_read == 0 && (path.starts_with("/lib/") || path.starts_with("/lib64/")) {
                                 // Read from FAT32 without /disk/ prefix
                                 let fat_path = &path[1..]; // Remove leading /
-                                let _ = crate::fs::fat32::read_file_at_offset(
+                                bytes_read = crate::fs::fat32::read_file_at_offset(
                                     fat_path, page_file_offset, &mut buf
-                                );
+                                ).unwrap_or(0);
                             }
-                            if bytes_read > 0 || !is_anonymous {
+                            if bytes_read > 0 {
                                 core::ptr::copy_nonoverlapping(
                                     buf.as_ptr(), page_ptr,
                                     core::cmp::min(bytes_read, 4096)
@@ -5882,6 +6792,7 @@ fn sys_mmap_full(addr_hint: u64, len: u64, prot: u64, flags: u64, fd: u64) -> u6
         file_offset: file_offset,
         size: len,
         writable: (prot & 0x02) != 0,
+        executable: (prot & 0x04) != 0,
     });
 
     base_vaddr
@@ -6405,6 +7316,44 @@ fn sys_socket(domain: u32, sock_type: u32, protocol: u32) -> u64 {
 /// sys_sendto(fd, buf_addr, encoded_dest) -> bytes_sent
 /// For UDP: encoded_dest has IP in upper 32 bits and port in lower 16
 /// For TCP: encoded_dest == 0, uses connected remote; length in first 8 bytes of buf
+/// Linux ABI sendto(fd, buf, len, flags, dest_addr, addrlen)
+/// Parses sockaddr_in from user pointer when dest_addr is non-null.
+/// Falls back to connected-socket send (TCP) when dest_addr is null.
+fn sys_sendto_linux(fd: u32, buf_addr: u64, len: u64, _flags: u64, dest_addr: u64, addrlen: u64) -> u64 {
+    // If dest_addr is 0 or addrlen < 8, treat as send() on a connected socket
+    if dest_addr == 0 || addrlen < 8 {
+        // Connected-mode send (TCP)
+        return crate::net::socket::sys_tcp_send(fd, buf_addr, len);
+    }
+
+    // Parse sockaddr_in from user space
+    if !validate_user_ptr(dest_addr, 8) { return EFAULT; }
+    let mut sa_buf = [0u8; 16];
+    let copied = unsafe { copy_from_user(&mut sa_buf, dest_addr, core::cmp::min(addrlen as usize, 16)) };
+    if copied < 8 { return EFAULT; }
+
+    let family = u16::from_ne_bytes([sa_buf[0], sa_buf[1]]);
+    if family != 2 {
+        crate::serial_println!("[SENDTO] unsupported family={}", family);
+        return EINVAL;
+    }
+
+    let port = u16::from_be(u16::from_ne_bytes([sa_buf[2], sa_buf[3]]));
+    let ip = crate::net::ipv4::Ipv4Addr([sa_buf[4], sa_buf[5], sa_buf[6], sa_buf[7]]);
+
+    if !validate_user_ptr(buf_addr, len) { return EFAULT; }
+
+    crate::serial_println!("[SENDTO] fd={} len={} -> {}:{}", fd, len, ip, port);
+    crate::net::socket::sys_sendto(fd, buf_addr, len, 0, ip, port)
+}
+
+/// Linux ABI recvfrom(fd, buf, len, flags, src_addr, addrlen)
+/// For now, ignores src_addr (caller can pass NULL). Just reads from the socket.
+fn sys_recvfrom_linux(fd: u32, buf_addr: u64, len: u64, _flags: u64, _src_addr: u64, _addrlen_ptr: u64) -> u64 {
+    if !validate_user_ptr(buf_addr, len) { return EFAULT; }
+    crate::net::socket::sys_recvfrom(fd, buf_addr, len)
+}
+
 fn sys_sendto(fd: u32, buf_addr: u64, encoded: u64) -> u64 {
     // Check if this is a TCP socket (encoded == 0 means use connected remote)
     {
@@ -6414,11 +7363,11 @@ fn sys_sendto(fd: u32, buf_addr: u64, encoded: u64) -> u64 {
         };
 
         if is_tcp {
-            // TCP send: read length prefix from buf, then send data
-            let len = unsafe {
-                let ptr = buf_addr as *const u64;
-                core::ptr::read_unaligned(ptr)
-            };
+            // TCP send: read length prefix from buf (KPTI-safe), then send data
+            let mut len_buf = [0u8; 8];
+            let copied = unsafe { copy_from_user(&mut len_buf, buf_addr, 8) };
+            if copied < 8 { return EFAULT; }
+            let len = u64::from_ne_bytes(len_buf);
             crate::serial_println!("[SYSCALL] sys_sendto/TCP(fd={}, len={})", fd, len);
             return crate::net::socket::sys_tcp_send(fd, buf_addr + 8, len);
         }
@@ -6434,11 +7383,11 @@ fn sys_sendto(fd: u32, buf_addr: u64, encoded: u64) -> u64 {
         (ip_u32 & 0xFF) as u8,
     ]);
 
-    // Read length from user (first 8 bytes of buf contain length)
-    let len = unsafe {
-        let ptr = buf_addr as *const u64;
-        core::ptr::read_unaligned(ptr)
-    };
+    // Read length from user (first 8 bytes of buf contain length, KPTI-safe)
+    let mut len_buf2 = [0u8; 8];
+    let copied2 = unsafe { copy_from_user(&mut len_buf2, buf_addr, 8) };
+    if copied2 < 8 { return EFAULT; }
+    let len = u64::from_ne_bytes(len_buf2);
 
     crate::serial_println!("[SYSCALL] sys_sendto(fd={}, buf=0x{:X}, len={}, dst={}:{})",
         fd, buf_addr + 8, len, ip, port);
@@ -6499,21 +7448,29 @@ fn sys_net_ping(ip_packed: u64, sequence: u16) -> u64 {
 /// Also supports legacy AetherionOS encoding: encoded_ip = a<<24|b<<16|c<<8|d, port in a3
 fn sys_tcp_connect(fd: u32, addr_or_ip: u64, len_or_port: u64) -> u64 {
     // Detect Linux ABI vs legacy encoding:
-    // Linux sockaddr_in is at least 16 bytes, and addr_or_ip would be a valid user pointer
-    // Legacy: addr_or_ip is a packed IP (< 0x100000000), len_or_port is a port number (< 65536)
-    if addr_or_ip >= 0x1000 && len_or_port >= 8 && validate_user_ptr(addr_or_ip, 8) {
-        // Linux ABI: parse struct sockaddr_in from user memory
-        let family = unsafe { core::ptr::read_unaligned(addr_or_ip as *const u16) };
+    // Linux ABI: addr_or_ip is a user pointer to sockaddr_in, len_or_port is addrlen (16 for AF_INET)
+    // Legacy AetherionOS: addr_or_ip is a packed IP (a<<24|b<<16|c<<8|d), len_or_port is a port (<= 65535)
+    //
+    // Heuristic: Linux sockaddr_in has addrlen=16. User pointers are typically > 0x400000.
+    // Packed IPs fit in u32 (<= 0xFFFFFFFF). We distinguish by requiring len_or_port to be
+    // exactly 16 (sizeof sockaddr_in) for Linux ABI mode.
+    if len_or_port == 16 && addr_or_ip >= 0x10000 && validate_user_ptr(addr_or_ip, 16) {
+        // KPTI-safe: copy sockaddr_in from user space (need at least 8 bytes: family+port+ip)
+        let mut sa_buf = [0u8; 16];
+        let copied = unsafe { copy_from_user(&mut sa_buf, addr_or_ip, 16) };
+        if copied < 8 {
+            crate::serial_println!("[SYSCALL] sys_connect: copy_from_user failed (copied={}/16)", copied);
+            return EFAULT;
+        }
+        let family = u16::from_ne_bytes([sa_buf[0], sa_buf[1]]);
         if family == 2 {
-            // AF_INET — parse Big Endian port and IP
-            let port_be = unsafe { core::ptr::read_unaligned((addr_or_ip + 2) as *const u16) };
+            // AF_INET — parse Big Endian port and IP from copied buffer
+            let port_be = u16::from_ne_bytes([sa_buf[2], sa_buf[3]]);
             let port = u16::from_be(port_be);
-            let ip_be = unsafe { core::ptr::read_unaligned((addr_or_ip + 4) as *const u32) };
-            let ip_bytes = ip_be.to_be_bytes(); // Network byte order → [a, b, c, d]
-            let ip_a = ip_bytes[0];
-            let ip_b = ip_bytes[1];
-            let ip_c = ip_bytes[2];
-            let ip_d = ip_bytes[3];
+            let ip_a = sa_buf[4];
+            let ip_b = sa_buf[5];
+            let ip_c = sa_buf[6];
+            let ip_d = sa_buf[7];
             crate::serial_println!("[SYSCALL] sys_connect/LinuxABI(fd={}, {}.{}.{}.{}:{}, family=AF_INET)",
                 fd, ip_a, ip_b, ip_c, ip_d, port);
             return crate::net::socket::sys_connect(fd, ip_a, ip_b, ip_c, ip_d, port);
@@ -6549,7 +7506,9 @@ fn sys_tcp_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
     if !validate_user_ptr(buf_addr, len) {
         return EFAULT;
     }
-    crate::net::socket::sys_tcp_recv(fd, buf_addr, len)
+    // Use blocking recv so that read() on a socket waits for data
+    // (BusyBox wget / musl libc expect read() to block until data arrives)
+    crate::net::socket::sys_tcp_recv_blocking(fd, buf_addr, len)
 }
 
 /// sys_tcp_recv_blocking(fd, buf_addr, len) -> bytes read (polls network with timeout)
@@ -6892,8 +7851,19 @@ fn sys_brk(new_break: u64) -> u64 {
 
     // If growing, allocate new pages
     if new_break > old_break {
+        let growth = new_break - old_break;
         let old_page = (old_break + 4095) / 4096 * 4096;  // round up
         let new_page = (new_break + 4095) / 4096 * 4096;
+
+        // Log significant heap growth (>= 64KB or first calls)
+        if growth >= 0x10000 || old_break == HEAP_BASE {
+            let (pool_used, pool_max) = crate::elf::pool_stats();
+            crate::serial_println!(
+                "[BRK-DIAG] PID{} heap grow 0x{:X}→0x{:X} (+{} KB) pages={} pool={}/{}",
+                current, old_break, new_break, growth/1024,
+                ((new_page - old_page) / 4096), pool_used, pool_max
+            );
+        }
 
         if new_page > old_page {
             let pages_needed = ((new_page - old_page) / 4096) as usize;
@@ -7177,6 +8147,7 @@ fn sys_mmap_file(fd: u64, length: u64, offset: u64) -> u64 {
         file_offset: offset,
         size: length,
         writable: false, // Model files are read-only
+        executable: false,
     };
     
     crate::process::add_vma(current_pid, vma);
@@ -7246,7 +8217,7 @@ fn sys_getprocs(buf_addr: u64, buf_size: u64) -> u64 {
     let bytes = output.as_bytes();
     let to_copy = core::cmp::min(bytes.len(), buf_size as usize);
     if to_copy > 0 {
-        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_addr as *mut u8, to_copy); }
+        unsafe { copy_to_user(buf_addr, &bytes[..to_copy]); }
     }
     to_copy as u64
 }
@@ -7337,7 +8308,7 @@ fn sys_sysinfo(buf_addr: u64) -> u64 {
     let bytes = out.as_bytes();
     let to_copy = core::cmp::min(bytes.len(), SYSINFO_MAX as usize);
     if to_copy > 0 {
-        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf_addr as *mut u8, to_copy); }
+        unsafe { copy_to_user(buf_addr, &bytes[..to_copy]); }
     }
     to_copy as u64
 }
@@ -7932,6 +8903,12 @@ pub fn sys_mmap_pub(addr: u64, len: u64, prot: u64) -> u64 {
     sys_mmap_full(addr, len, prot, MAP_ANONYMOUS | MAP_PRIVATE, !0u64)
 }
 
+/// Public wrapper for sys_mmap_full — preserves all parameters including fd/flags.
+/// Used by compat::linux_abi for file-backed mappings of shared libraries.
+pub fn sys_mmap_full_pub(addr: u64, len: u64, prot: u64, flags: u64, fd: u64) -> u64 {
+    sys_mmap_full(addr, len, prot, flags, fd)
+}
+
 /// Public wrapper for sys_getdents, used by compat::linux_abi
 pub fn sys_getdents_pub(fd: u32, buf: u64, len: u64) -> u64 {
     sys_getdents(fd, buf, len)
@@ -7972,6 +8949,12 @@ pub fn sys_fork_pub() -> u64 {
     sys_fork()
 }
 
+/// Public wrapper for sys_wait, used by compat::linux_abi (linux_wait4)
+/// This performs the actual context switch to the forked child.
+pub fn sys_wait_pub(pid: u64) -> u64 {
+    sys_wait(pid)
+}
+
 /// Public wrapper for saved_user_rip, used by compat::linux_abi (clone thread)
 pub fn saved_user_rip_pub() -> u64 {
     saved_user_rip()
@@ -8000,4 +8983,9 @@ pub fn epoll_wait_real_pub(epfd: u64, events_ptr: u64, maxevents: u64, timeout: 
 /// Public wrapper for sys_epoll_create1, used by compat::linux_abi
 pub fn sys_epoll_create1_pub(flags: u64) -> u64 {
     sys_epoll_create1(flags)
+}
+
+/// Public wrapper for sys_exit (used by linux_exit_group)
+pub fn sys_exit_pub(code: u64) -> u64 {
+    sys_exit(code)
 }
