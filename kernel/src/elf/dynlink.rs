@@ -725,7 +725,7 @@ fn setup_tls(
 }
 
 /// Store TLS information for a process
-fn set_process_tls(pid: u64, fs_base: u64, tls_base: u64, _tls_size: u64) {
+fn set_process_tls(_pid: u64, fs_base: u64, _tls_base: u64, _tls_size: u64) {
     // Use the existing arch_prctl mechanism to set FS base
     // This will be applied when the process context is restored
     crate::compat::linux_abi::linux_arch_prctl(0x1002, fs_base); // ARCH_SET_FS

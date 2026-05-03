@@ -3904,7 +3904,7 @@ pub fn linux_stat_vfs(path_addr: u64, buf: u64) -> u64 {
             let is_dir = crate::fs::ext2::is_dir(ino).unwrap_or(false);
             let is_link = crate::fs::ext2::is_symlink(ino).unwrap_or(false);
             let is_file = crate::fs::ext2::is_file(ino).unwrap_or(false);
-            stat.st_ino = ino as i64;
+            stat.st_ino = ino as u64;
             stat.st_nlink = 1;
             if is_dir {
                 stat.st_mode = 0o40755; // S_IFDIR | 0755
@@ -4002,7 +4002,7 @@ pub fn linux_fstat_vfs(fd: u64, buf: u64) -> u64 {
                     if let Some(ino) = crate::fs::ext2::lookup_path(path) {
                         let fsize = crate::fs::ext2::file_size(ino).unwrap_or(0);
                         let is_dir = crate::fs::ext2::is_dir(ino).unwrap_or(false);
-                        stat.st_ino = ino as i64;
+                        stat.st_ino = ino as u64;
                         stat.st_mode = if is_dir { 0o40755 } else { 0o100644 };
                         stat.st_size = fsize as i64;
                         stat.st_blocks = (fsize as i64 + 511) / 512;

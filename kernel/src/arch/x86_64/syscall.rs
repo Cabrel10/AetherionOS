@@ -1541,7 +1541,7 @@ fn sys_futex(uaddr: u64, op: u64, val: u64) -> u64 {
 ///   offset 48: u64 stx_size
 ///   offset 56: u64 stx_blocks
 ///   offset 64: u64 stx_attributes_mask
-fn sys_statx(dirfd: u64, path_addr: u64, _flags: u64, _mask: u64, buf_addr: u64) -> u64 {
+fn sys_statx(_dirfd: u64, path_addr: u64, _flags: u64, _mask: u64, buf_addr: u64) -> u64 {
     if !validate_user_ptr(buf_addr, 256) { return EFAULT; }
 
     // Read path from userspace
@@ -3224,7 +3224,7 @@ fn sys_write(fd: u64, buf_addr: u64, len: u64) -> u64 {
         }
     }).flatten();
 
-    let (fd_type, path, flags, offset, socket_id) = match fd_info {
+    let (fd_type, path, _flags, offset, socket_id) = match fd_info {
         Some(info) => info,
         None => {
             // Fallback for fd 1/2 before FD table is set up
