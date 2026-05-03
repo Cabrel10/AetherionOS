@@ -75,10 +75,22 @@ static mut BLK_DEVICE: Option<VirtioBlkDevice> = None;
 static BLK_IO_LOCK: AtomicU8 = AtomicU8::new(0);
 
 #[inline]
-fn blk_lock() {
+fn blk_lock() -> bool {
+    // Read current interrupt flag
+    let mut flags: u64;
+    unsafe {
+        core::arch::asm!("pushfq; pop {}", out(reg) flags, options(nomem, nostack));
+    }
+    let irq_enabled = (flags & 0x200) != 0;
+    
+    // Disable interrupts before locking to prevent preemption deadlock
+    unsafe {
+        core::arch::asm!("cli", options(nomem, nostack));
+    }
+
     loop {
         match BLK_IO_LOCK.compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed) {
-            Ok(_) => return,
+            Ok(_) => return irq_enabled,
             Err(_) => {
                 // Spin with PAUSE for power efficiency
                 while BLK_IO_LOCK.load(Ordering::Relaxed) != 0 {
@@ -90,8 +102,13 @@ fn blk_lock() {
 }
 
 #[inline]
-fn blk_unlock() {
+fn blk_unlock(restore_irq: bool) {
     BLK_IO_LOCK.store(0, Ordering::Release);
+    if restore_irq {
+        unsafe {
+            core::arch::asm!("sti", options(nomem, nostack));
+        }
+    }
 }
 
 pub struct VirtioBlkDevice {
@@ -442,7 +459,7 @@ pub fn is_available() -> bool {
 
 /// Read a sector from the block device (SMP-safe via spinlock)
 pub fn read_sector(lba: u64, buf: &mut [u8]) -> bool {
-    blk_lock();
+    let irq_enabled = blk_lock();
     let result = unsafe {
         if let Some(ref mut dev) = BLK_DEVICE {
             dev.read_sector(lba, buf)
@@ -450,13 +467,13 @@ pub fn read_sector(lba: u64, buf: &mut [u8]) -> bool {
             false
         }
     };
-    blk_unlock();
+    blk_unlock(irq_enabled);
     result
 }
 
 /// Write a sector to the block device (SMP-safe via spinlock)
 pub fn write_sector(lba: u64, buf: &[u8]) -> bool {
-    blk_lock();
+    let irq_enabled = blk_lock();
     let result = unsafe {
         if let Some(ref mut dev) = BLK_DEVICE {
             dev.write_sector(lba, buf)
@@ -464,7 +481,7 @@ pub fn write_sector(lba: u64, buf: &[u8]) -> bool {
             false
         }
     };
-    blk_unlock();
+    blk_unlock(irq_enabled);
     result
 }
 
