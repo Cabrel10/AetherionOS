@@ -326,6 +326,10 @@ pub fn linux_arch_prctl(code: u64, addr: u64) -> u64 {
                     options(nomem, nostack)
                 );
             }
+            let pid = crate::scheduler::current_pid();
+            crate::process::with_process_mut(pid, |p| {
+                p.fs_base = addr;
+            });
             crate::serial_println!("[LINUX-ABI] arch_prctl ARCH_SET_FS=0x{:X}", addr);
             0
         }

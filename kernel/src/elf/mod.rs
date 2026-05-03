@@ -1991,33 +1991,7 @@ pub fn load_elf(path: &str) -> Result<u64, ElfError> {
                     result.phdr_vaddr, result.phdr_count
                 );
 
-                // ═══════════════════════════════════════════
-                // Step 3d: Apply dynamic relocations (kernel-assisted)
-                //
-                // Pre-apply R_X86_64_RELATIVE relocations for the interpreter
-                // so musl's __dls2() self-relocation works correctly.
-                // Also apply GLOB_DAT, JUMP_SLOT, and TLS relocations.
-                // ═══════════════════════════════════════════
-                match dynlink::link_interpreter_and_main(
-                    &data,
-                    interp_result.base_vaddr,
-                    &elf_data,
-                    if result.is_pie { 0x0040_0000u64 } else { 0 },
-                    result.pml4_phys,
-                ) {
-                    Ok(total_relocs) => {
-                        crate::serial_println!(
-                            "[ELF] Dynamic linking complete: {} relocations applied",
-                            total_relocs
-                        );
-                    }
-                    Err(e) => {
-                        crate::serial_println!(
-                            "[ELF] Dynamic linking partial/failed: {} (continuing anyway)",
-                            e
-                        );
-                    }
-                }
+                crate::serial_println!("[DYNLINK] Interpreter detected — skipping kernel-side relocations");
 
                 // Dump diagnostic info for proof logging
                 dynlink::dump_dynlink_info(&data, "ld-musl-x86_64.so.1");
@@ -2277,6 +2251,19 @@ pub unsafe fn exec_switch_cr3_and_ring3(
     }
 
     crate::serial_println!("[TRAMPOLINE] Jumping to naked IRETQ");
+
+    // Restore FS_BASE for TLS
+    let current_pid = crate::scheduler::current_pid();
+    if current_pid != 0 {
+        let fs_base = crate::process::with_process(current_pid, |p| p.fs_base).unwrap_or(0);
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") 0xC000_0100u32, // IA32_FS_BASE
+            in("eax") (fs_base as u32),
+            in("edx") ((fs_base >> 32) as u32),
+            options(nostack)
+        );
+    }
 
     // Call the pure #[naked] function (System V ABI: rdi, rsi, rdx)
     exec_switch_cr3_and_ring3_naked(new_pml4_phys, user_entry, user_rsp);

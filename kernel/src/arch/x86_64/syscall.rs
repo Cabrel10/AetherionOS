@@ -222,6 +222,18 @@ macro_rules! restore_and_sysret {
         let pml4_val: u64 = $pml4;
         let result_val: u64 = $result;
         unsafe {
+            // Restore FS_BASE for TLS
+            let pid = crate::scheduler::current_pid();
+            if pid != 0 {
+                let fs_base = crate::process::with_process(pid, |p| p.fs_base).unwrap_or(0);
+                core::arch::asm!(
+                    "wrmsr",
+                    in("ecx") 0xC000_0100u32, // IA32_FS_BASE
+                    in("eax") (fs_base as u32),
+                    in("edx") ((fs_base >> 32) as u32),
+                    options(nostack)
+                );
+            }
             PER_CPU.user_cr3 = pml4_val;
             let trampoline = sysret_trampoline_addr();
             // Jalon 212: Fix register allocation conflict in sysretq restore.
