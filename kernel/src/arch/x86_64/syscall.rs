@@ -3596,15 +3596,26 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
                 }
 
                 attempts += 1;
-                // Yield to other processes periodically to prevent CPU starvation.
-                // Every 1000 iterations (~2ms), let the scheduler run other tasks.
-                if attempts % 1000 == 0 {
-                    // Re-enable interrupts and do a longer pause to let
-                    // the timer tick and scheduler pick up other work.
+                // Series 1.1 CRITICAL FIX: Voluntary context switch for blocking reads.
+                //
+                // When PID 1 (BusyBox) blocks on read(stdin), PID 2 (python3) can
+                // never get CPU time because:
+                //  - Timer fires during STI window
+                //  - But CS RPL=0 (we're in a syscall), so timer ISR skips preemption
+                //  - PID 2 starves, never prints "1764", CI fails
+                //
+                // Fix: After a brief spin, perform a VOLUNTARY context switch.
+                // This saves PID 1's user state and jumps to PID 2.
+                // When PID 2 finishes or gets preempted, PID 1 resumes at its
+                // saved user RIP (syscall instruction), and musl re-issues read().
+                //
+                // This implements Linux's schedule() for blocking I/O.
+                if attempts % 50 == 0 {
+                    // Re-enable interrupts before the voluntary switch
                     unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
-                    for _ in 0..200u32 {
-                        unsafe { core::arch::asm!("pause", options(nomem, nostack)); }
-                    }
+                    // This may never return if a switch occurs
+                    voluntary_schedule_from_syscall();
+                    // If we get here, no other process was ready
                     unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
                 }
                 // Never return EOF — block indefinitely for interactive TTY.
@@ -3636,7 +3647,7 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
                         }
                         // Check if writer has closed — return EOF
                         if pipe::is_writer_closed(pipe_id) { return 0; }
-                        // Block waiting for data (with scheduler yields)
+                        // Block waiting for data (with voluntary context switches)
                         let mut attempts = 0u64;
                         loop {
                             unsafe {
@@ -3654,8 +3665,11 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
                             // Re-check writer closed
                             if pipe::is_writer_closed(pipe_id) { return 0; }
                             attempts += 1;
-                            if attempts % 1000 == 0 {
-                                crate::scheduler::yield_to_next(current_pid);
+                            // Series 1.1: Use voluntary context switch for pipe reads
+                            if attempts % 50 == 0 {
+                                unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
+                                voluntary_schedule_from_syscall();
+                                unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
                             }
                             if attempts > 50_000_000 { return 0; } // safety timeout
                         }
@@ -6743,8 +6757,39 @@ fn sys_mmap_full(addr_hint: u64, len: u64, prot: u64, flags: u64, fd: u64) -> u6
                             if bytes_read == 0 && crate::fs::ext2::is_mounted() {
                                 if let Some(chunk) = crate::fs::ext2::read_file_chunk(path, page_file_offset, 4096) {
                                     let copy_len = chunk.len().min(4096);
-                                    buf[..copy_len].copy_from_slice(&chunk[..copy_len]);
-                                    bytes_read = copy_len;
+                                    if copy_len > 0 {
+                                        buf[..copy_len].copy_from_slice(&chunk[..copy_len]);
+                                        bytes_read = copy_len;
+                                    }
+                                }
+                                // Series 1.1: If ext2 returned nothing, try resolving symlinks
+                                // The FD table may store a path that is a symlink target
+                                if bytes_read == 0 {
+                                    // Try with /usr/lib/ prefix stripped or added
+                                    let alt_paths: [Option<alloc::string::String>; 2] = [
+                                        if path.starts_with("/usr/lib/") {
+                                            Some(alloc::format!("/lib/{}", &path[9..]))
+                                        } else {
+                                            None
+                                        },
+                                        if path.starts_with("/lib/") {
+                                            Some(alloc::format!("/usr/lib/{}", &path[5..]))
+                                        } else {
+                                            None
+                                        },
+                                    ];
+                                    for alt in &alt_paths {
+                                        if let Some(ref alt_path) = alt {
+                                            if let Some(chunk) = crate::fs::ext2::read_file_chunk(alt_path, page_file_offset, 4096) {
+                                                let copy_len = chunk.len().min(4096);
+                                                if copy_len > 0 {
+                                                    buf[..copy_len].copy_from_slice(&chunk[..copy_len]);
+                                                    bytes_read = copy_len;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             if bytes_read == 0 && path.starts_with("/disk/") {
@@ -6766,6 +6811,15 @@ fn sys_mmap_full(addr_hint: u64, len: u64, prot: u64, flags: u64, fd: u64) -> u6
                                 core::ptr::copy_nonoverlapping(
                                     buf.as_ptr(), page_ptr,
                                     core::cmp::min(bytes_read, 4096)
+                                );
+                            }
+                            // Diagnostic: log first page to verify data was loaded
+                            if i == 0 && log_count < 30 {
+                                let magic = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+                                crate::serial_println!(
+                                    "[MMAP-DATA] PID={} file='{}' off=0x{:X} page0: {} bytes, magic=0x{:08X}{}",
+                                    current_pid, path, page_file_offset, bytes_read, magic,
+                                    if magic == 0x464C457F { " (ELF)" } else if bytes_read == 0 { " EMPTY!" } else { "" }
                                 );
                             }
                         }
@@ -9000,4 +9054,106 @@ pub fn sys_epoll_create1_pub(flags: u64) -> u64 {
 /// Public wrapper for sys_exit (used by linux_exit_group)
 pub fn sys_exit_pub(code: u64) -> u64 {
     sys_exit(code)
+}
+
+/// Public wrapper for saved_user_rsp, used by blocking syscalls for voluntary yield.
+pub fn saved_user_rsp_pub() -> u64 {
+    saved_user_rsp()
+}
+
+/// Series 1.1: Voluntary context switch from a blocking syscall.
+///
+/// When a process is blocked on I/O (e.g., read(stdin)), this function saves
+/// the process's user-mode state and switches to another ready process.
+/// When the original process is rescheduled (by the timer ISR preempting the
+/// new process in user mode), it resumes at its saved user RIP — which is the
+/// `syscall` instruction site. The musl/libc wrapper will then re-issue the
+/// syscall, effectively implementing a blocking retry loop.
+///
+/// This is modeled after Linux's `schedule()` called during blocking I/O:
+/// - Save user RIP/RSP/RFLAGS from per-CPU storage (set at SYSCALL entry)
+/// - Pick the next runnable process via yield_to_next()
+/// - If different process found, perform the actual context switch
+/// - Returns true if a switch was performed (caller should re-check conditions)
+/// - Returns false if no other process is ready (caller should continue spinning)
+///
+/// DESIGN DECISION: We return to the `syscall` instruction rather than continuing
+/// mid-syscall because the kernel doesn't have per-process kernel stacks.
+/// Re-entering the syscall is safe because the blocking read is idempotent.
+pub fn voluntary_schedule_from_syscall() -> bool {
+    let current_pid = crate::scheduler::current_pid();
+    if current_pid == 0 { return false; }
+
+    // Save user-mode state from per-CPU storage
+    let user_rip = saved_user_rip();
+    let user_rsp = saved_user_rsp();
+    // Standard RFLAGS: IF=1 (interrupts enabled in user mode)
+    let user_rflags: u64 = 0x202;
+
+    // Save preempt state so the timer ISR can resume this process later
+    crate::process::save_preempt_state(current_pid, user_rip, user_rsp, user_rflags);
+
+    // Pick next process
+    let next_pid = crate::scheduler::yield_to_next(current_pid);
+    if next_pid == current_pid || next_pid == 0 {
+        return false; // No other process ready
+    }
+
+    // Get the new process's state
+    let (new_rip, new_rsp, _new_rflags, new_pml4) = match crate::process::get_preempt_state(next_pid) {
+        Some((rip, rsp, rflags, pml4, _ctx)) => {
+            if rip != 0 && pml4 != 0 {
+                (rip, rsp, rflags, pml4)
+            } else {
+                // Fresh process: use entry point
+                match crate::process::get_entry_state(next_pid) {
+                    Some((entry, stack, pml4)) => (entry, stack, 0x202, pml4),
+                    None => return false,
+                }
+            }
+        }
+        None => {
+            // Fresh process: use entry point
+            match crate::process::get_entry_state(next_pid) {
+                Some((entry, stack, pml4)) => (entry, stack, 0x202, pml4),
+                None => return false,
+            }
+        }
+    };
+
+    if new_pml4 == 0 || new_rip == 0 { return false; }
+
+    crate::serial_println!(
+        "[VOL-SCHED] PID {}->{}  RIP=0x{:X} RSP=0x{:X}",
+        current_pid, next_pid, new_rip, new_rsp
+    );
+
+    // Update scheduler state
+    crate::scheduler::set_current_pid(next_pid);
+    set_user_cr3(new_pml4);
+
+    // Set up GS bases for the trampoline
+    unsafe {
+        let per_cpu = get_per_cpu_addr();
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") 0xC000_0101u32,
+            in("eax") (per_cpu & 0xFFFF_FFFF) as u32,
+            in("edx") (per_cpu >> 32) as u32,
+            options(nostack),
+        );
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") 0xC000_0102u32,
+            in("eax") 0u32,
+            in("edx") 0u32,
+            options(nostack),
+        );
+    }
+
+    // Perform the context switch (never returns)
+    unsafe {
+        crate::elf::exec_switch_cr3_and_ring3(new_pml4, new_rip, new_rsp);
+    }
+    // unreachable
 }

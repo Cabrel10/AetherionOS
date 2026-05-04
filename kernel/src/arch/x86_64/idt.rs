@@ -1521,7 +1521,24 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
     }
     if let Some((old_pid, new_pid, new_rip, new_rsp, _new_rflags, new_pml4)) = preempt_result
     {
-        if new_pid != old_pid && new_pml4 != 0 && new_rip != 0 {
+        // Series 1.1 CRITICAL FIX: Do NOT preempt a process while it's executing
+        // a non-blocking syscall. If the interrupt frame's CS RPL == 0, we're in
+        // kernel mode (inside a syscall handler). Preempting here would abandon the
+        // syscall mid-execution, and when the process resumes later, it would return
+        // to user mode with a garbage RAX (syscall return value).
+        //
+        // This caused python3 (PID 2) to crash: its mmap syscall was abandoned, and
+        // musl used a wrong return value, crashing at addr=0x28.
+        //
+        // DESIGN (inspired by Linux CONFIG_PREEMPT_NONE):
+        //  - Timer fires during user-mode (CS RPL=3): normal preemption OK
+        //  - Timer fires during kernel-mode (CS RPL=0): skip preemption entirely
+        //  - Blocking syscalls (read stdin, futex_wait) explicitly yield to scheduler
+        //    by calling yield_to_next() which directly invokes the switch
+        let cs = stack_frame.code_segment;
+        let in_user_mode = (cs.0 & 0x3) == 3;
+
+        if new_pid != old_pid && new_pml4 != 0 && new_rip != 0 && in_user_mode {
             // Jalon 140: Log preemptive context switch (compact, ISR-safe)
             crate::serial_println!(
                 "[PREEMPT] PID {}->{}  RIP=0x{:X} RSP=0x{:X} CR3=0x{:X}",
