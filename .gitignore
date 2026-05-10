@@ -66,4 +66,6 @@ disk.img
 models/
 /tmp/
 .agent_target/
-third_party/
+# Third-party build artifacts
+third_party/limine/
+target/

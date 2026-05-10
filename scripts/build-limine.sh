@@ -131,7 +131,10 @@ if [ ! -f "$LINKER_SCRIPT" ]; then
 fi
 
 # Build kernel with limine feature and custom linker script
-RUSTFLAGS="-C link-arg=-T$LINKER_SCRIPT" \
+# CRITICAL: Must pass -no-pie -static -relocation-model=static to produce ET_EXEC.
+# Limine v8.x panics on ET_DYN (PIE) without PT_DYNAMIC segment.
+# Setting RUSTFLAGS overrides .cargo/config.toml, so ALL flags must be listed here.
+RUSTFLAGS="-C link-arg=-T$LINKER_SCRIPT -C link-arg=-no-pie -C link-arg=-static -C relocation-model=static -C code-model=kernel" \
     cargo build -p aetherion-kernel \
     --target x86_64-unknown-none \
     --features limine \
@@ -144,8 +147,17 @@ if [ ! -f "$KERNEL_ELF" ]; then
 fi
 echo "[OK] Kernel ELF: $KERNEL_ELF ($(du -h "$KERNEL_ELF" | cut -f1))"
 
-# Verify ELF format
+# Verify ELF format — MUST be ET_EXEC, not ET_DYN (PIE)
 file "$KERNEL_ELF"
+ELF_TYPE=$(readelf -h "$KERNEL_ELF" 2>/dev/null | grep "Type:" | awk '{print $2}')
+if [ "$ELF_TYPE" = "DYN" ]; then
+    echo ""
+    echo "ERROR: Kernel ELF is ET_DYN (PIE) instead of ET_EXEC!"
+    echo "       Limine v8.x cannot load PIE kernels without PT_DYNAMIC."
+    echo "       Check RUSTFLAGS: must include -C link-arg=-no-pie -C relocation-model=static"
+    exit 1
+fi
+echo "[OK] ELF type: $ELF_TYPE (expected EXEC)"
 
 # === Step 4: Create ISO directory structure ===
 echo ""

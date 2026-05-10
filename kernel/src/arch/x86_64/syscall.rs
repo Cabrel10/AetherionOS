@@ -177,9 +177,21 @@ static GLOBAL_SYSRET_TRAMPOLINE: AtomicU64 = AtomicU64::new(0);
 /// Initialize the global SYSRETQ trampoline. Call once during kernel boot
 /// after the heap is available.
 pub fn init_global_sysret_trampoline() {
-    let buf = alloc::vec![0u8; 64];
-    let ptr = buf.leak().as_mut_ptr();
+    // Jalon 250: Allocate in HHDM (PML4[256]) instead of kernel heap (PML4[136]).
+    // The trampoline executes AFTER CR3 switches to user PML4 — the heap region
+    // may not be accessible in the user PML4, but HHDM (PML4[256]) is always
+    // cloned from the kernel PML4 and remains accessible.
     unsafe {
+        let phys = match crate::elf::alloc_elf_frame() {
+            Some(p) => p,
+            None => {
+                crate::serial_println!("[KPTI] FATAL: Cannot allocate frame for SYSRETQ trampoline!");
+                return;
+            }
+        };
+        let hhdm_virt = crate::elf::phys_to_virt(phys);
+        let ptr = hhdm_virt as *mut u8;
+        core::ptr::write_bytes(ptr, 0, 4096);
         // mov cr3, rdx   => 0F 22 DA
         // (rdx is not an extended register, no REX needed)
         // ModRM: 11 011 010 = 0xDA (mod=11, reg=3=CR3, rm=2=rdx)
@@ -194,10 +206,13 @@ pub fn init_global_sysret_trampoline() {
         *ptr.add(6) = 0x48;
         *ptr.add(7) = 0x0F;
         *ptr.add(8) = 0x07;
+
+        GLOBAL_SYSRET_TRAMPOLINE.store(hhdm_virt, AtomicOrdering::SeqCst);
+        crate::serial_println!(
+            "[KPTI] Global SYSRETQ trampoline: phys=0x{:X}, virt=0x{:X} (HHDM/PML4[256])",
+            phys, hhdm_virt
+        );
     }
-    let addr = ptr as u64;
-    GLOBAL_SYSRET_TRAMPOLINE.store(addr, AtomicOrdering::SeqCst);
-    crate::serial_println!("[KPTI] Global SYSRETQ trampoline at 0x{:X}", addr);
 }
 
 /// Get the address of the global SYSRETQ trampoline.
@@ -1172,7 +1187,7 @@ static SYSCALL_TABLE: [Option<SyscallFn>; SYSCALL_TABLE_LEN] = {
     t[206] = Some(sc_zero);          // io_setup
     t[207] = Some(sc_zero);          // io_destroy
     t[213] = Some(sc_epoll_create);   // epoll_create
-    t[217] = Some(sc_getdents);      // getdents64 — uses same linux_dirent64 format as sc_getdents
+    t[217] = Some(sc_getdents);       // getdents64 — real directory listing
     t[218] = Some(sc_set_tid_address);
     t[220] = Some(sc_zero);          // semtimedop
     t[221] = Some(sc_zero);          // fadvise64
@@ -1393,13 +1408,11 @@ fn sys_stub_access(path_addr: u64, _mode: u64) -> u64 {
         Some(p) => p,
         None => return EFAULT,
     };
-    // Check VFS
+    // Check VFS (includes ext2 fallback for file reads)
     if crate::fs::vfs::file_read(&path).is_ok() { return 0; }
-    // Check ext2 filesystem (Alpine rootfs)
+    // Check ext2 filesystem (directories and files)
     if crate::fs::ext2::is_mounted() {
-        if crate::fs::ext2::file_exists(&path).is_some() { return 0; }
-        // Also check if it's a directory
-        if crate::fs::ext2::list_dir(&path).is_some() { return 0; }
+        if crate::fs::ext2::stat_path(&path).is_some() { return 0; }
     }
     // Check /disk/ paths via FAT32
     if path.starts_with("/disk/") {
@@ -1591,7 +1604,7 @@ fn sys_statx(_dirfd: u64, path_addr: u64, _flags: u64, _mask: u64, buf_addr: u64
         if crate::fs::ext2::is_mounted() {
             if let Some(ino) = crate::fs::ext2::lookup_path(p) {
                 inode = ino as u64;
-                if let Some(sz) = crate::fs::ext2::file_size(ino) {
+                if let Some(sz) = crate::fs::ext2::file_size(p) {
                     file_size = sz as u64;
                 }
             }
@@ -1624,47 +1637,84 @@ fn sys_stub_stat(path_addr: u64, buf_addr: u64) -> u64 {
     if !validate_user_ptr(buf_addr, 144) { return EFAULT; }
     let mut buf = [0u8; 144];
 
-    let path = if validate_user_ptr(path_addr, 1) {
-        unsafe { read_user_string(path_addr) }
-    } else { None };
+    // Try to get real stat info from ext2 if the path is available
+    let mut mode: u32 = 0o100644; // default: S_IFREG | 0644
+    let mut size: u64 = 0;
+    let mut ino: u64 = 0;
 
-    let (mode, size) = if let Some(ref p) = path {
-        // Try ext2 first for real file metadata
-        if crate::fs::ext2::is_mounted() {
-            if let Some(ino) = crate::fs::ext2::lookup_path(p) {
-                let fsize = crate::fs::ext2::file_size(ino).unwrap_or(0);
-                let is_dir = crate::fs::ext2::is_dir(ino).unwrap_or(false);
-                let is_link = crate::fs::ext2::is_symlink(ino).unwrap_or(false);
-                let m = if is_dir { 0o40755u32 } else if is_link { 0o120777u32 } else { 0o100755u32 };
-                (m, fsize)
+    if validate_user_ptr(path_addr, 1) {
+        if let Some(path) = unsafe { read_user_string(path_addr) } {
+            // Check VFS first
+            let root = crate::fs::vfs::lock_root();
+            let components: alloc::vec::Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+            let mut current = &*root;
+            let mut vfs_found = false;
+            if components.is_empty() {
+                mode = 0o40755; // root is a directory
+                vfs_found = true;
             } else {
-                (0o100644u32, 4096u64)
+                for (i, comp) in components.iter().enumerate() {
+                    match current.get(*comp) {
+                        Some(crate::fs::vfs::VfsNode::Directory(ref children)) => {
+                            if i == components.len() - 1 {
+                                mode = 0o40755; // S_IFDIR | 0755
+                                vfs_found = true;
+                            } else {
+                                current = children;
+                            }
+                        }
+                        Some(crate::fs::vfs::VfsNode::File(data)) => {
+                            if i == components.len() - 1 {
+                                mode = 0o100755; // S_IFREG | 0755
+                                size = data.len() as u64;
+                                vfs_found = true;
+                            }
+                            break;
+                        }
+                        Some(crate::fs::vfs::VfsNode::Symlink(_)) => {
+                            if i == components.len() - 1 {
+                                mode = 0o120777; // S_IFLNK | 0777
+                                vfs_found = true;
+                            }
+                            break;
+                        }
+                        Some(crate::fs::vfs::VfsNode::Device { .. }) => {
+                            if i == components.len() - 1 {
+                                mode = 0o20666; // S_IFCHR | 0666
+                                vfs_found = true;
+                            }
+                            break;
+                        }
+                        None => break,
+                    }
+                }
             }
-        } else {
-            (0o100644u32, 4096u64)
-        }
-    } else {
-        (0o100644u32, 4096u64)
-    };
+            drop(root);
 
-    // struct stat layout (x86_64):
-    // offset 0:  st_dev (8 bytes)
-    // offset 8:  st_ino (8 bytes)
-    // offset 16: st_nlink (8 bytes)
-    // offset 24: st_mode (4 bytes)
-    // offset 28: st_uid (4 bytes)
-    // offset 32: st_gid (4 bytes)
-    // offset 40: st_rdev (8 bytes)
-    // offset 48: st_size (8 bytes)
-    // offset 56: st_blksize (8 bytes)
-    // offset 64: st_blocks (8 bytes)
-    buf[8..16].copy_from_slice(&1u64.to_le_bytes()); // st_ino
-    buf[16..24].copy_from_slice(&1u64.to_le_bytes()); // st_nlink
-    buf[24..28].copy_from_slice(&mode.to_le_bytes());
-    buf[48..56].copy_from_slice(&size.to_le_bytes()); // st_size
-    buf[56..64].copy_from_slice(&4096u64.to_le_bytes()); // st_blksize
+            // Ext2 fallback for real filesystem paths
+            if !vfs_found && crate::fs::ext2::is_mounted() {
+                if let Some(info) = crate::fs::ext2::stat_path(&path) {
+                    mode = info.mode as u32;
+                    size = info.size;
+                    ino = info.ino as u64;
+                }
+            }
+        }
+    }
+
+    // struct stat layout on x86_64:
+    // offset 0: st_dev (8), offset 8: st_ino (8), offset 16: st_nlink (8),
+    // offset 24: st_mode (4), offset 28: st_uid (4), offset 32: st_gid (4),
+    // offset 40: st_rdev (8), offset 48: st_size (8), offset 56: st_blksize (8),
+    // offset 64: st_blocks (8)
+    buf[8..16].copy_from_slice(&ino.to_le_bytes());      // st_ino
+    buf[16..24].copy_from_slice(&1u64.to_le_bytes());     // st_nlink = 1
+    buf[24..28].copy_from_slice(&mode.to_le_bytes());     // st_mode
+    buf[48..56].copy_from_slice(&size.to_le_bytes());     // st_size
+    buf[56..64].copy_from_slice(&4096u64.to_le_bytes());  // st_blksize
     let blocks = (size + 511) / 512;
-    buf[64..72].copy_from_slice(&blocks.to_le_bytes()); // st_blocks
+    buf[64..72].copy_from_slice(&blocks.to_le_bytes());   // st_blocks
+
     unsafe { copy_to_user(buf_addr, &buf); }
     0
 }
@@ -1673,50 +1723,58 @@ fn sys_stub_stat(path_addr: u64, buf_addr: u64) -> u64 {
 fn sys_stub_fstat(fd: u32, buf_addr: u64) -> u64 {
     if !validate_user_ptr(buf_addr, 144) { return EFAULT; }
     let mut buf = [0u8; 144];
-    let current_pid = crate::scheduler::current_pid();
+    let pid = crate::scheduler::current_pid();
+    let fd_path = crate::process::get_fd_path(pid, fd as usize);
 
-    // Get FD info for type and path
-    let fd_info = crate::process::with_fd_table(current_pid, |fdt| {
-        fdt.get(fd as usize).map(|e| (e.fd_type, e.path.clone()))
-    }).flatten();
+    let mut mode: u32 = if fd <= 2 { 0o20620 } else { 0o100644 };
+    let mut size: u64 = 0;
+    let mut ino: u64 = 0;
 
-    let is_tty = if fd <= 2 {
-        true
-    } else {
-        fd_info.as_ref().map(|(t, _)| *t == crate::process::FdType::Tty).unwrap_or(false)
-    };
-    let is_pipe = fd_info.as_ref().map(|(t, _)| *t == crate::process::FdType::Pipe).unwrap_or(false);
-
-    let (mode, size): (u32, u64) = if is_tty {
-        (0o20620, 0) // S_IFCHR + perms
-    } else if is_pipe {
-        (0o10600, 0) // S_IFIFO + perms
-    } else if let Some((_, ref path)) = fd_info {
-        // Try to get real file size from ext2
-        if crate::fs::ext2::is_mounted() {
-            if let Some(fsize) = crate::fs::ext2::file_exists(path) {
-                (0o100755, fsize)
-            } else {
-                (0o100644, 4096)
-            }
-        } else if path.starts_with("/disk/") {
-            let disk_path = &path[6..];
-            let fsize = crate::fs::fat32::file_exists(disk_path).unwrap_or(0) as u64;
-            (0o100644, fsize)
+    // Check if this FD points to a directory (important for getdents)
+    if let Some(ref path) = fd_path {
+        // Quick check VFS
+        let root = crate::fs::vfs::lock_root();
+        let components: alloc::vec::Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        let mut current = &*root;
+        if components.is_empty() {
+            mode = 0o40755; // root dir
         } else {
-            (0o100644, 4096)
+            for (i, comp) in components.iter().enumerate() {
+                match current.get(*comp) {
+                    Some(crate::fs::vfs::VfsNode::Directory(ref children)) => {
+                        if i == components.len() - 1 { mode = 0o40755; }
+                        else { current = children; }
+                    }
+                    Some(crate::fs::vfs::VfsNode::File(data)) => {
+                        if i == components.len() - 1 {
+                            mode = 0o100755;
+                            size = data.len() as u64;
+                        }
+                        break;
+                    }
+                    _ => break,
+                }
+            }
         }
-    } else {
-        (0o100644, 4096)
-    };
+        drop(root);
 
-    buf[8..16].copy_from_slice(&1u64.to_le_bytes()); // st_ino
-    buf[16..24].copy_from_slice(&1u64.to_le_bytes()); // st_nlink
+        // Ext2 fallback
+        if mode == 0o100644 && crate::fs::ext2::is_mounted() {
+            if let Some(info) = crate::fs::ext2::stat_path(path) {
+                mode = info.mode as u32;
+                size = info.size;
+                ino = info.ino as u64;
+            }
+        }
+    }
+
+    buf[8..16].copy_from_slice(&ino.to_le_bytes());
+    buf[16..24].copy_from_slice(&1u64.to_le_bytes());
     buf[24..28].copy_from_slice(&mode.to_le_bytes());
-    buf[48..56].copy_from_slice(&size.to_le_bytes()); // st_size
-    buf[56..64].copy_from_slice(&4096u64.to_le_bytes()); // st_blksize
+    buf[48..56].copy_from_slice(&size.to_le_bytes());
+    buf[56..64].copy_from_slice(&4096u64.to_le_bytes());
     let blocks = (size + 511) / 512;
-    buf[64..72].copy_from_slice(&blocks.to_le_bytes()); // st_blocks
+    buf[64..72].copy_from_slice(&blocks.to_le_bytes());
     unsafe { copy_to_user(buf_addr, &buf); }
     0
 }
@@ -3086,23 +3144,19 @@ fn sys_readlink(path_addr: u64, buf_addr: u64, bufsiz: u64) -> u64 {
         crate::process::with_process(current_pid, |p| p.name.clone())
             .unwrap_or_else(|| alloc::string::String::from("/bin/unknown"))
     } else {
-        // Phase 2.1: Check VFS for real symbolic links
+        // Check VFS for real symbolic links
         match crate::fs::vfs::readlink(&path) {
             Ok(t) => t,
             Err(_) => {
-                // Try ext2 filesystem for symlinks
+                // Ext2 fallback: many Alpine paths are symlinks (e.g. /usr/bin/python3 -> python3.12)
                 if crate::fs::ext2::is_mounted() {
-                    if let Some(ino) = crate::fs::ext2::lookup_path(&path) {
-                        if let Some(target) = crate::fs::ext2::read_symlink(ino) {
-                            target
-                        } else {
-                            return EINVAL;
-                        }
+                    if let Some(target) = crate::fs::ext2::readlink_path(&path) {
+                        target
                     } else {
-                        return EINVAL;
+                        return EINVAL; // not a symlink
                     }
                 } else {
-                    return EINVAL; // not a symlink
+                    return EINVAL;
                 }
             }
         }
@@ -3734,6 +3788,20 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
                 });
                 return to_copy as u64;
             }
+            // /proc/self/maps — critical for ld-musl dynamic linker
+            if path == "/proc/self/maps" {
+                let content = crate::compat::linux_abi::generate_proc_self_maps(current_pid);
+                let bytes = content.as_bytes();
+                let start = offset as usize;
+                if start >= bytes.len() { return 0; }
+                let avail = bytes.len() - start;
+                let to_copy = core::cmp::min(avail, len as usize);
+                unsafe { copy_to_user(buf_addr, &bytes[start..start + to_copy]); }
+                crate::process::with_fd_table_mut(current_pid, |fd_table| {
+                    if let Some(entry) = fd_table.get_mut(fd as usize) { entry.offset += to_copy as u64; }
+                });
+                return to_copy as u64;
+            }
 
             // /proc/self/maps — memory mappings for the dynamic linker
             if path == "/proc/self/maps" {
@@ -3820,16 +3888,16 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
 
             // ═══ Ext2 filesystem reads (Alpine rootfs) ═══
             if crate::fs::ext2::is_mounted() {
-                if let Some(chunk) = crate::fs::ext2::read_file_chunk(&path, offset, len) {
-                    let to_copy = chunk.len();
-                    if to_copy == 0 { return 0; } // EOF
-                    unsafe { copy_to_user(buf_addr, &chunk[..to_copy]); }
+                let mut chunk_buf = alloc::vec![0u8; len as usize];
+                let bytes_read = crate::fs::ext2::read_file_chunk(&path, offset, &mut chunk_buf);
+                if bytes_read > 0 {
+                    unsafe { copy_to_user(buf_addr, &chunk_buf[..bytes_read]); }
                     crate::process::with_fd_table_mut(current_pid, |fd_table| {
                         if let Some(entry) = fd_table.get_mut(fd as usize) {
-                            entry.offset += to_copy as u64;
+                            entry.offset += bytes_read as u64;
                         }
                     });
-                    return to_copy as u64;
+                    return bytes_read as u64;
                 }
             }
 
@@ -4041,70 +4109,54 @@ fn sys_open(path_addr: u64, flags: u32) -> u64 {
     };
 
     if !node_found && crate::fs::vfs::file_read(&path).is_err() {
-        // Try with /bin prefix
-        let bin_path = alloc::format!("/bin/{}", path);
-        if crate::fs::vfs::file_read(&bin_path).is_err() {
-            // For /disk/ paths, try checking existence on FAT32 directly
-            // FIX #17: Use file_exists() to avoid loading 2GB files into kernel heap
-            if path.starts_with("/disk/") {
-                let disk_path = &path[6..];
-                match crate::fs::fat32::file_exists(disk_path) {
-                    None => {
-                        crate::serial_println!("[SYSCALL] sys_open: not found '{}'", path);
-                        return ENOENT;
-                    }
-                    Some(_file_size) => {
-                        // crate::serial_println!("[SYSCALL] sys_open: '{}' exists on FAT32 ({} bytes), registering FD (lazy load)", disk_path, file_size);
-                        // Register a placeholder in VFS — actual data read via sys_read with chunked read
-                        {
-                            let mut root = crate::fs::vfs::lock_root();
-                            let parts: alloc::vec::Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-                            let mut current = &mut *root;
-                            for (i, comp) in parts.iter().enumerate() {
-                                if i == parts.len() - 1 {
-                                    // Insert an EMPTY placeholder — actual reads go through FAT32 chunked read
+        // Try ext2 filesystem (critical for /usr/bin, /lib, /etc, etc.)
+        let mut ext2_found = false;
+        if crate::fs::ext2::is_mounted() {
+            if let Some(info) = crate::fs::ext2::stat_path(&path) {
+                ext2_found = true;
+                let _ = info; // We don't need the info, just confirm existence
+            }
+        }
+        if !ext2_found {
+            // Try with /bin prefix
+            let bin_path = alloc::format!("/bin/{}", path);
+            if crate::fs::vfs::file_read(&bin_path).is_err() {
+                // For /disk/ paths, try checking existence on FAT32 directly
+                // FIX #17: Use file_exists() to avoid loading 2GB files into kernel heap
+                if path.starts_with("/disk/") {
+                    let disk_path = &path[6..];
+                    match crate::fs::fat32::file_exists(disk_path) {
+                        None => {
+                            crate::serial_println!("[SYSCALL] sys_open: not found '{}'", path);
+                            return ENOENT;
+                        }
+                        Some(_file_size) => {
+                            // Register a placeholder in VFS — actual data read via sys_read with chunked read
+                            {
+                                let mut root = crate::fs::vfs::lock_root();
+                                let parts: alloc::vec::Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+                                let mut current = &mut *root;
+                                for (i, comp) in parts.iter().enumerate() {
+                                    if i == parts.len() - 1 {
+                                        // Insert an EMPTY placeholder — actual reads go through FAT32 chunked read
+                                        current.entry(alloc::string::String::from(*comp))
+                                            .or_insert_with(|| crate::fs::vfs::VfsNode::File(alloc::vec::Vec::new()));
+                                        break;
+                                    }
                                     current.entry(alloc::string::String::from(*comp))
-                                        .or_insert_with(|| crate::fs::vfs::VfsNode::File(alloc::vec::Vec::new()));
-                                    break;
-                                }
-                                current.entry(alloc::string::String::from(*comp))
-                                    .or_insert_with(|| crate::fs::vfs::VfsNode::Directory(
-                                        alloc::collections::BTreeMap::new()
-                                    ));
-                                if let Some(crate::fs::vfs::VfsNode::Directory(ref mut children)) = current.get_mut(*comp) {
-                                    current = children;
-                                } else {
-                                    break;
+                                        .or_insert_with(|| crate::fs::vfs::VfsNode::Directory(
+                                            alloc::collections::BTreeMap::new()
+                                        ));
+                                    if let Some(crate::fs::vfs::VfsNode::Directory(ref mut children)) = current.get_mut(*comp) {
+                                        current = children;
+                                    } else {
+                                        break;
+                                    }
                                 }
                             }
                         }
                     }
-                }
-            } else {
-                // Jalon 212: Allow opening /proc/* and /dev/* pseudo-filesystem paths.
-                // These are dynamically generated in sys_read, so they don't exist in
-                // the VFS tree, but we still need to allow open() to succeed and return an FD.
-                if path.starts_with("/proc/") || path.starts_with("/dev/") || path.starts_with("/sys/") {
-                    // Fall through to FD allocation for pseudo-filesystem paths
-                }
-                // Try ext2 filesystem — the real Alpine rootfs may have this file
-                // Use file_exists() instead of read_file_path() to avoid loading the file into memory
-                else if crate::fs::ext2::is_mounted() && crate::fs::ext2::file_exists(&path).is_some() {
-                    // File exists on ext2 — allow opening
-                }
-                // Try ext2 for directories too (ls /bin needs to open the directory)
-                else if crate::fs::ext2::is_mounted() {
-                    if let Some(entries) = crate::fs::ext2::list_dir(&path) {
-                        if !entries.is_empty() {
-                            crate::serial_println!("[SYSCALL] sys_open('{}') -> ext2 dir ({} entries)", path, entries.len());
-                        } else {
-                            return ENOENT;
-                        }
-                    } else {
-                        return ENOENT;
-                    }
-                }
-                else {
+                } else {
                     return ENOENT;
                 }
             }
@@ -4662,6 +4714,7 @@ unsafe fn clone_pml4_deep(src_pml4_phys: u64) -> Option<u64> {
 
 /// Read a null-terminated array of string pointers from user space.
 /// Returns up to `max` strings. Used to parse argv[] and envp[].
+/// KPTI-safe: uses copy_from_user to read pointers through page-table walk.
 fn read_user_string_array(array_addr: u64, max: usize) -> alloc::vec::Vec<alloc::string::String> {
     let mut result = alloc::vec::Vec::new();
     if array_addr == 0 || !validate_user_ptr(array_addr, 8) {
@@ -4670,11 +4723,11 @@ fn read_user_string_array(array_addr: u64, max: usize) -> alloc::vec::Vec<alloc:
     for i in 0..max {
         let ptr_addr = array_addr + (i as u64) * 8;
         if !validate_user_ptr(ptr_addr, 8) { break; }
-        // KPTI-safe: copy the string pointer from user space
+        // KPTI-safe: read pointer through HHDM page-table walk
         let mut ptr_buf = [0u8; 8];
         let copied = unsafe { copy_from_user(&mut ptr_buf, ptr_addr, 8) };
         if copied < 8 { break; }
-        let str_ptr = u64::from_ne_bytes(ptr_buf);
+        let str_ptr = u64::from_le_bytes(ptr_buf);
         if str_ptr == 0 { break; } // NULL terminator
         if !validate_user_ptr(str_ptr, 1) { break; }
         match unsafe { read_user_string(str_ptr) } {
@@ -6112,12 +6165,13 @@ fn sys_getdents(fd: u32, buf_ptr: u64, buf_size: u64) -> u64 {
         None => return EBADF,
     };
 
-    // Check if we've already returned all entries (offset-based EOF)
-    let offset = crate::process::with_fd_table(pid, |fd_table| {
+    // ── Pagination: use FD offset as entry skip count ──
+    // On each call, we rebuild the full entry list, skip `offset` entries already
+    // returned, fill the user buffer with the next batch, and update the offset.
+    // Return 0 (EOF) only when ALL entries have been returned.
+    let skip_count = crate::process::with_fd_table(pid, |fd_table| {
         fd_table.get(fd as usize).map(|e| e.offset)
-    }).flatten().unwrap_or(0);
-    // If offset != 0, we already returned entries — return 0 (EOF)
-    if offset != 0 { return 0; }
+    }).flatten().unwrap_or(0) as usize;
 
     const DT_REG: u8 = 8;
     const DT_DIR: u8 = 4;
@@ -6175,49 +6229,74 @@ fn sys_getdents(fd: u32, buf_ptr: u64, buf_size: u64) -> u64 {
                 }
             }
         }
+        drop(root);
 
-        // ═══════════════════════════════════════════════════════════
-        // Ext2 fallback: merge entries from the ext2 filesystem
-        // This is critical for ls /bin, /lib, /usr etc. where the
-        // real Alpine rootfs lives on ext2 but VFS only has stubs.
-        // ═══════════════════════════════════════════════════════════
+        // ── Ext2 filesystem fallback: merge ext2 directory entries ──
+        // This is critical for ls / to show /usr, /bin, /lib, /etc from the Alpine disk
         if crate::fs::ext2::is_mounted() {
-            if let Some(ext2_entries) = crate::fs::ext2::list_dir(&dir_path) {
-                // Collect existing names to avoid duplicates
-                let existing: alloc::collections::BTreeSet<alloc::string::String> =
-                    entries.iter().map(|(n, _)| n.clone()).collect();
-                for (name, _ino, ftype) in ext2_entries {
-                    if name == "." || name == ".." { continue; }
-                    if existing.contains(&name) { continue; }
-                    // Convert ext2 file type to DT_* constant
-                    // ext2 dir_entry type: 1=file, 2=dir, 7=symlink
-                    let dtype = match ftype {
+            if skip_count == 0 {
+                crate::serial_println!("[GETDENTS64] checking ext2 for path='{}'", dir_path);
+            }
+            if let Some(ext2_entries) = crate::fs::ext2::list_directory(&dir_path) {
+                if skip_count == 0 {
+                    crate::serial_println!("[GETDENTS64] ext2 returned {} entries", ext2_entries.len());
+                }
+                // Build a set of names already present to avoid duplicates
+                let mut existing = alloc::collections::BTreeSet::new();
+                for (name, _) in &entries {
+                    existing.insert(name.clone());
+                }
+                for de in ext2_entries {
+                    if de.name == "." || de.name == ".." { continue; }
+                    if existing.contains(&de.name) { continue; }
+                    // Use the ext2 file_type field: 1=REG, 2=DIR, 7=SYMLINK
+                    let dtype = match de.file_type {
                         2 => DT_DIR,
                         7 => DT_LNK,
                         _ => DT_REG,
                     };
-                    entries.push((name, dtype));
+                    entries.push((de.name, dtype));
                 }
+            } else if skip_count == 0 {
+                crate::serial_println!("[GETDENTS64] ext2 list_directory returned None");
             }
         }
     }
 
-    // Serialize into linux_dirent64 format in a kernel buffer
+    let total_entries = entries.len();
+
+    // If we've already returned all entries, signal EOF
+    if skip_count >= total_entries {
+        crate::serial_println!("[GETDENTS64] PID={} path='{}' EOF (skip={} >= total={})",
+            pid, dir_path, skip_count, total_entries);
+        return 0;
+    }
+
+    // Serialize entries starting from skip_count into linux_dirent64 format
     let mut kbuf = alloc::vec![0u8; buf_size as usize];
     let mut pos = 0usize;
-    let mut inode = 1000u64;
     let bsize = buf_size as usize;
+    let mut entries_written = 0usize;
 
-    for (name, dtype) in &entries {
+    crate::serial_println!("[GETDENTS64] PID={} path='{}' total={} skip={} buf_size={}", 
+        pid, dir_path, total_entries, skip_count, buf_size);
+
+    for (idx, (name, dtype)) in entries.iter().enumerate() {
+        // Skip entries already returned in previous calls
+        if idx < skip_count { continue; }
+
         let name_bytes = name.as_bytes();
         // reclen = 19 (fixed header) + name_len + 1 (null) + padding to 8-byte align
         let reclen_raw = 19 + name_bytes.len() + 1;
         let reclen = (reclen_raw + 7) & !7; // 8-byte align
-        if pos + reclen > bsize { break; }
+        if pos + reclen > bsize { 
+            crate::serial_println!("[GETDENTS64] buffer full at entry #{} '{}', will continue next call", idx, name);
+            break; 
+        }
 
-        // d_ino (8 bytes)
+        // d_ino (8 bytes) — use index-based inode for stability across calls
+        let inode = (1000 + idx) as u64;
         kbuf[pos..pos+8].copy_from_slice(&inode.to_le_bytes());
-        inode += 1;
         // d_off (8 bytes) - offset to next entry
         let d_off = (pos + reclen) as u64;
         kbuf[pos+8..pos+16].copy_from_slice(&d_off.to_le_bytes());
@@ -6230,15 +6309,20 @@ fn sys_getdents(fd: u32, buf_ptr: u64, buf_size: u64) -> u64 {
         kbuf[pos+19+name_bytes.len()] = 0;
 
         pos += reclen;
+        entries_written += 1;
     }
+
+    crate::serial_println!("[GETDENTS64] returning {} bytes ({} entries, new_offset={})",
+        pos, entries_written, skip_count + entries_written);
 
     if pos > 0 {
         // KPTI-safe write
         unsafe { copy_to_user(buf_ptr, &kbuf[..pos]); }
-        // Mark offset so next call returns EOF
+        // Update offset to track how many entries have been returned so far
+        let new_offset = (skip_count + entries_written) as u64;
         crate::process::with_fd_table_mut(pid, |fd_table| {
             if let Some(entry) = fd_table.get_mut(fd as usize) {
-                entry.offset = 1; // non-zero = already returned
+                entry.offset = new_offset;
             }
         });
     }
@@ -6661,6 +6745,8 @@ pub unsafe fn set_per_cpu_user_rsp(rsp: u64) {
 const MAP_ANONYMOUS: u64 = 0x20;
 /// MAP_PRIVATE flag (Linux)
 const MAP_PRIVATE: u64 = 0x02;
+/// MAP_SHARED flag (Linux) — treated like MAP_PRIVATE (single-address-space OS)
+const MAP_SHARED: u64 = 0x01;
 /// MAP_FIXED flag (Linux)
 const MAP_FIXED: u64 = 0x10;
 
@@ -6750,68 +6836,26 @@ fn sys_mmap_full(addr_hint: u64, len: u64, prot: u64, flags: u64, fd: u64) -> u6
                         if let Some(ref path) = file_path {
                             let page_file_offset = file_offset + (i as u64) * 4096;
                             let mut buf = [0u8; 4096];
-                            let mut bytes_read = crate::fs::vfs::file_read_at_offset(
+                            // VFS file_read_at_offset already falls through to ext2
+                            let bytes_read = crate::fs::vfs::file_read_at_offset(
                                 path, page_file_offset, &mut buf
                             );
-                            // Try ext2 filesystem (Alpine rootfs with shared libs)
-                            if bytes_read == 0 && crate::fs::ext2::is_mounted() {
-                                if let Some(chunk) = crate::fs::ext2::read_file_chunk(path, page_file_offset, 4096) {
-                                    let copy_len = chunk.len().min(4096);
-                                    if copy_len > 0 {
-                                        buf[..copy_len].copy_from_slice(&chunk[..copy_len]);
-                                        bytes_read = copy_len;
-                                    }
-                                }
-                                // Series 1.1: If ext2 returned nothing, try resolving symlinks
-                                // The FD table may store a path that is a symlink target
-                                if bytes_read == 0 {
-                                    // Try with /usr/lib/ prefix stripped or added
-                                    let alt_paths: [Option<alloc::string::String>; 2] = [
-                                        if path.starts_with("/usr/lib/") {
-                                            Some(alloc::format!("/lib/{}", &path[9..]))
-                                        } else {
-                                            None
-                                        },
-                                        if path.starts_with("/lib/") {
-                                            Some(alloc::format!("/usr/lib/{}", &path[5..]))
-                                        } else {
-                                            None
-                                        },
-                                    ];
-                                    for alt in &alt_paths {
-                                        if let Some(ref alt_path) = alt {
-                                            if let Some(chunk) = crate::fs::ext2::read_file_chunk(alt_path, page_file_offset, 4096) {
-                                                let copy_len = chunk.len().min(4096);
-                                                if copy_len > 0 {
-                                                    buf[..copy_len].copy_from_slice(&chunk[..copy_len]);
-                                                    bytes_read = copy_len;
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            if bytes_read == 0 && path.starts_with("/disk/") {
-                                // Try FAT32 direct read
-                                let disk_path = &path[6..];
-                                bytes_read = crate::fs::fat32::read_file_at_offset(
-                                    disk_path, page_file_offset, &mut buf
-                                ).unwrap_or(0);
-                            }
-                            // Also try VFS paths like /lib/...
-                            if bytes_read == 0 && (path.starts_with("/lib/") || path.starts_with("/lib64/")) {
-                                // Read from FAT32 without /disk/ prefix
-                                let fat_path = &path[1..]; // Remove leading /
-                                bytes_read = crate::fs::fat32::read_file_at_offset(
-                                    fat_path, page_file_offset, &mut buf
-                                ).unwrap_or(0);
-                            }
                             if bytes_read > 0 {
                                 core::ptr::copy_nonoverlapping(
-                                    buf.as_ptr(), page_ptr,
-                                    core::cmp::min(bytes_read, 4096)
+                                    buf.as_ptr(), page_ptr, bytes_read
                                 );
+                            } else if path.starts_with("/disk/") {
+                                // Try FAT32 direct read
+                                let disk_path = &path[6..];
+                                if let Ok(fat_read) = crate::fs::fat32::read_file_at_offset(
+                                    disk_path, page_file_offset, &mut buf
+                                ) {
+                                    if fat_read > 0 {
+                                        core::ptr::copy_nonoverlapping(
+                                            buf.as_ptr(), page_ptr, fat_read
+                                        );
+                                    }
+                                }
                             }
                             // Diagnostic: log first page to verify data was loaded
                             if i == 0 && log_count < 30 {
@@ -8673,7 +8717,7 @@ fn sys_mmap_file_v2(fd: u64, length: u64, offset: u64) -> u64 {
         
         // Check if page is already mapped
         let current_pid = crate::scheduler::current_pid();
-        if let Some((file_path, file_offset, writable)) = crate::process::find_vma(current_pid, page_addr) {
+        if let Some((file_path, file_offset, writable, executable)) = crate::process::find_vma(current_pid, page_addr) {
             // Allocate frame
             let frame_phys = unsafe { crate::elf::alloc_demand_frame() };
             if let Some(phys) = frame_phys {
@@ -8686,7 +8730,7 @@ fn sys_mmap_file_v2(fd: u64, length: u64, offset: u64) -> u64 {
                 // Read 4 KB from file
                 let page_buf = unsafe { core::slice::from_raw_parts_mut(buf_ptr, 4096) };
                 
-                // Try VFS first, then exFAT, then FAT32
+                // Try VFS first (falls through to ext2), then exFAT, then FAT32
                 let mut bytes_read = crate::fs::vfs::file_read_at_offset(&file_path, file_offset, page_buf);
                 if bytes_read == 0 && file_path.starts_with("/disk/") {
                     if crate::fs::exfat::is_mounted() {
@@ -8699,9 +8743,10 @@ fn sys_mmap_file_v2(fd: u64, length: u64, offset: u64) -> u64 {
                         .unwrap_or(0);
                 }
                 
-                // Map the page
-                let mut flags: u64 = 0x01 | 0x04 | (1u64 << 63); // PRESENT | USER | NX
+                // Map the page — respect executable flag for shared libraries
+                let mut flags: u64 = 0x01 | 0x04; // PRESENT | USER
                 if writable { flags |= 0x02; }
+                if !executable { flags |= 1u64 << 63; } // NX only if NOT executable
                 
                 if let Ok(()) = unsafe { crate::elf::demand_map_user_page(pml4_phys, page_addr, phys, flags) } {
                     unsafe {

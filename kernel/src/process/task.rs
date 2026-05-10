@@ -13,7 +13,7 @@ use core::fmt;
 // ===== File Descriptor Table (Jalon 79: Unified FD with FdType) =====
 
 /// Maximum number of file descriptors per process
-pub const MAX_FDS: usize = 32;
+pub const MAX_FDS: usize = 256;
 
 /// FD type discriminator — dispatches read/write/close to the correct subsystem.
 /// Jalon 79: Unified FD table for POSIX compatibility (musl requirement).
@@ -478,7 +478,7 @@ pub struct VirtualMemoryArea {
     pub size: u64,
     /// Is this mapping writable? (false = read-only for model files)
     pub writable: bool,
-    /// Is this mapping executable?
+    /// Is this mapping executable? (PROT_EXEC was set)
     pub executable: bool,
 }
 

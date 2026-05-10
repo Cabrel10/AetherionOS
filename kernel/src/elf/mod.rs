@@ -45,6 +45,8 @@ const AT_SECURE: u64   = 23;  // Secure mode boolean
 const AT_RANDOM: u64   = 25;  // Address of 16 random bytes
 const AT_HWCAP: u64    = 16;  // Hardware capabilities (SSE, AVX, etc.)
 const AT_HWCAP2: u64   = 26;  // Extended hardware capabilities
+const AT_EXECFN: u64   = 31;  // Filename of executed program
+const AT_CLKTCK: u64   = 17;  // Clock ticks per second (usually 100)
 
 /// ELF class: 64-bit
 const ELFCLASS64: u8 = 2;
@@ -542,6 +544,12 @@ fn elf_flags_to_page_flags(p_flags: u32) -> u64 {
 /// Physical memory offset (set during kernel boot)
 static PHYS_MEM_OFFSET: AtomicU64 = AtomicU64::new(0);
 
+/// Kernel physical base address (where Limine loaded the kernel ELF in physical RAM).
+/// Computed during boot Step 5a from the first valid PT entry in the kernel image.
+/// Used by the #PF handler to recover the correct physical address for kernel pages
+/// whose PT entries were corrupted (PT[195]=0x0 bug).
+static KERNEL_PHYS_BASE: AtomicU64 = AtomicU64::new(0);
+
 /// Program name to use as argv[0] for the next ELF load.
 /// Set by load_elf() before calling load_elf_binary().
 static mut ELF_ARGV0: [u8; 128] = [0u8; 128];
@@ -565,59 +573,56 @@ pub fn set_argv0(name: &str) {
 }
 
 /// Set extra arguments for the next ELF load.
-///
-/// Supports two formats:
-/// 1. NUL-delimited: "ash\0-c\0echo hello" → ["ash", "-c", "echo hello"]
-///    (used when the string contains embedded NUL bytes)
-/// 2. Space-separated: "ash -l" → ["ash", "-l"]
-///    (legacy fallback when no NUL bytes are present)
-///
-/// For commands with arguments that contain spaces (like shell -c "..."),
-/// use NUL-delimited format.
+/// Format: NUL-separated string (e.g. "-c\0print(42*42)")
 pub fn set_extra_args(args: &str) {
     unsafe {
-        ELF_EXTRA_ARGS_LEN = 0;
-        ELF_EXTRA_ARGC = 0;
-        if args.is_empty() {
-            return;
-        }
         let bytes = args.as_bytes();
-        // Detect NUL-delimited format: if any NUL byte exists in the string
-        let has_nul = bytes.iter().any(|&b| b == 0);
-        let mut pos = 0;
-        if has_nul {
-            // NUL-delimited: split on \0 boundaries
-            let mut start = 0;
-            while start < bytes.len() {
-                // Find the end of this argument (next NUL or end of string)
-                let end = bytes[start..].iter().position(|&b| b == 0)
-                    .map(|p| start + p)
-                    .unwrap_or(bytes.len());
-                let arg_bytes = &bytes[start..end];
-                if !arg_bytes.is_empty() {
-                    let len = arg_bytes.len();
-                    if pos + len + 1 > 510 { break; }
-                    ELF_EXTRA_ARGS[pos..pos+len].copy_from_slice(arg_bytes);
-                    ELF_EXTRA_ARGS[pos+len] = 0; // null terminate
-                    pos += len + 1;
-                    ELF_EXTRA_ARGC += 1;
-                }
-                start = end + 1;
-            }
-        } else {
-            // Legacy: space-separated
-            for arg in args.split_whitespace() {
-                let arg_bytes = arg.as_bytes();
-                let len = arg_bytes.len();
-                if pos + len + 1 > 510 { break; }
-                ELF_EXTRA_ARGS[pos..pos+len].copy_from_slice(arg_bytes);
-                ELF_EXTRA_ARGS[pos+len] = 0; // null terminate
-                pos += len + 1;
-                ELF_EXTRA_ARGC += 1;
+        let len = core::cmp::min(bytes.len(), 510);
+        ELF_EXTRA_ARGS[..len].copy_from_slice(&bytes[..len]);
+        ELF_EXTRA_ARGS[len] = 0;
+        ELF_EXTRA_ARGS_LEN = len;
+        // Count the number of args by counting NUL-separated segments
+        let mut argc = 0usize;
+        let mut in_arg = false;
+        for i in 0..len {
+            if bytes[i] == 0 {
+                if in_arg { argc += 1; }
+                in_arg = false;
+            } else {
+                in_arg = true;
             }
         }
-        ELF_EXTRA_ARGS_LEN = pos;
+        if in_arg { argc += 1; } // last arg without trailing NUL
+        ELF_EXTRA_ARGC = argc;
     }
+}
+
+/// Clear extra arguments
+pub fn clear_extra_args() {
+    unsafe {
+        ELF_EXTRA_ARGS_LEN = 0;
+        ELF_EXTRA_ARGS[0] = 0;
+        ELF_EXTRA_ARGC = 0;
+    }
+}
+
+/// Get the extra args as a slice of string references (split on NUL bytes)
+pub fn get_extra_args() -> alloc::vec::Vec<&'static str> {
+    let mut args = alloc::vec::Vec::new();
+    unsafe {
+        if ELF_EXTRA_ARGS_LEN == 0 {
+            return args;
+        }
+        let data = &ELF_EXTRA_ARGS[..ELF_EXTRA_ARGS_LEN];
+        for chunk in data.split(|b| *b == 0) {
+            if !chunk.is_empty() {
+                if let Ok(s) = core::str::from_utf8(chunk) {
+                    args.push(s);
+                }
+            }
+        }
+    }
+    args
 }
 
 /// Set the physical memory offset (call during boot)
@@ -629,6 +634,16 @@ pub fn set_phys_mem_offset(offset: u64) {
 #[inline]
 pub fn phys_to_virt(phys: u64) -> u64 {
     phys + phys_offset()
+}
+
+/// Get the kernel physical base address (0 if not yet computed)
+pub fn kernel_phys_base() -> u64 {
+    KERNEL_PHYS_BASE.load(Ordering::SeqCst)
+}
+
+/// Set the kernel physical base address (call once during boot Step 5a)
+pub fn set_kernel_phys_base(base: u64) {
+    KERNEL_PHYS_BASE.store(base, Ordering::SeqCst);
 }
 
 /// Public wrapper for lookup_page_frame (diagnostic use)
@@ -1756,8 +1771,9 @@ pub unsafe fn build_sysv_stack(
     // and AT_BASE (interpreter base, 0 for static binaries).
     let actual_phdr = if phdr_vaddr != 0 { phdr_vaddr } else { main_entry & !0xFFF };
     let actual_phnum = if phdr_count > 0 { phdr_count as u64 } else { 4 };
-    let auxv: [(u64, u64); 14] = [
+    let auxv: [(u64, u64); 16] = [
         (AT_PAGESZ,  4096),
+        (AT_CLKTCK,  100),                     // Clock ticks per second (HZ)
         (AT_PHDR,    actual_phdr),              // Main binary's program headers in memory
         (AT_PHENT,   56),
         (AT_PHNUM,   actual_phnum),             // Main binary's program header count
@@ -1771,6 +1787,7 @@ pub unsafe fn build_sysv_stack(
         (AT_SECURE,  0),
         (AT_RANDOM,  random_vaddr),
         (AT_HWCAP,   0x078bfbff),
+        (AT_EXECFN,  if !argv_vaddrs.is_empty() { argv_vaddrs[0] } else { 0 }),
     ];
 
     // Total u64 entries:
@@ -1843,178 +1860,142 @@ pub fn load_elf(path: &str) -> Result<u64, ElfError> {
     // Set argv[0] to the path so BusyBox can determine its applet
     set_argv0(path);
 
-    // Step 1: Read file — prefer ext2 (dynamic binary) over VFS (may be static)
-    // ext2 has the real Alpine rootfs with dynamic busybox + ld-musl-x86_64.so.1,
-    // while VFS may contain a static busybox from include_bytes!().
-    let elf_data = if crate::fs::ext2::is_mounted() {
-        if let Some(data) = crate::fs::ext2::read_file_path(path) {
-            crate::serial_println!("[ELF] Read {} bytes from ext2 (preferred)", data.len());
-            data
-        } else {
-            // Fallback to VFS
-            let data = crate::fs::vfs::file_read(path).map_err(|e| {
-                crate::serial_println!("[ELF] VFS error reading '{}': {}", path, e);
-                ElfError::VfsError
-            })?;
-            crate::serial_println!("[ELF] Read {} bytes from VFS (fallback)", data.len());
-            data
-        }
-    } else {
-        let data = crate::fs::vfs::file_read(path).map_err(|e| {
-            crate::serial_println!("[ELF] VFS error reading '{}': {}", path, e);
-            ElfError::VfsError
-        })?;
-        crate::serial_println!("[ELF] Read {} bytes from VFS", data.len());
-        data
-    };
+    // Step 1: Read file from VFS (falls through to ext2 if not in RAM-VFS)
+    let elf_data = crate::fs::vfs::file_read(path).map_err(|e| {
+        crate::serial_println!("[ELF] VFS error reading '{}': {}", path, e);
+        ElfError::VfsError
+    })?;
 
-    // Step 2: Load ELF binary (main executable)
+    crate::serial_println!("[ELF] Read {} bytes from VFS/ext2", elf_data.len());
+
+    // Step 2: Load ELF binary
     let result = load_elf_binary(&elf_data)?;
     crate::serial_println!("[ELF] After load_elf_binary: freelist={}", freelist_count());
 
-    // ═══════════════════════════════════════════════════════════════
-    // Step 3: Dynamic Linking — PT_INTERP Interpreter Loading
-    //
-    // If the ELF has PT_INTERP (e.g., "/lib/ld-musl-x86_64.so.1"),
-    // we must:
-    //   a) Read the interpreter binary from VFS
-    //   b) Load it into the same PML4 at a high base (0x7FC0_0000_0000)
-    //   c) Rebuild the auxiliary vector with correct AT_BASE, AT_ENTRY
-    //   d) Set the process entry point to the interpreter's entry
-    //
-    // The interpreter (ld.so) will read AT_PHDR/AT_ENTRY from auxv,
-    // relocate the main binary, resolve symbols, and jump to main.
-    // ═══════════════════════════════════════════════════════════════
+    // Step 3: Handle dynamic linker (PT_INTERP)
+    let mut final_entry = result.entry_point;
+    let mut final_rsp = result.stack_pointer;
 
-    let (final_entry, final_rsp) = if let Some(ref interp_path) = result.interp_path {
+    if let Some(ref interp) = result.interp_path {
+        crate::serial_println!("[ELF] Dynamic binary: interpreter = {}", interp);
+
+        // Read interpreter from ext2/VFS
+        let interp_data = crate::fs::vfs::file_read(interp).map_err(|e| {
+            crate::serial_println!("[ELF] Cannot read interpreter '{}': {}", interp, e);
+            ElfError::VfsError
+        })?;
+        crate::serial_println!("[ELF] Interpreter: {} bytes", interp_data.len());
+
+        // Load interpreter into the same PML4 at high address
+        let interp_base = 0x7FC0_0000_0000u64;
+        let interp_result = load_interp_into_pml4(
+            &interp_data, result.pml4_phys, interp_base
+        )?;
         crate::serial_println!(
-            "[ELF] Dynamic binary detected: interp='{}'", interp_path
+            "[ELF] Interpreter loaded: entry=0x{:X}, base=0x{:X}, segments={}",
+            interp_result.entry_point, interp_result.base_vaddr, interp_result.segments_loaded
         );
 
-        // Step 3a: Read interpreter from VFS (try multiple paths)
-        let interp_data = crate::fs::vfs::file_read(interp_path)
-            .or_else(|_| {
-                // Try /disk/ prefix for FAT32-mounted rootfs
-                let disk_path = alloc::format!("/disk{}", interp_path);
-                crate::serial_println!("[ELF] Trying fallback path: '{}'", disk_path);
-                crate::fs::vfs::file_read(&disk_path)
-            })
-            .or_else(|_| {
-                // Try /lib/ld-musl-x86_64.so.1 directly
-                crate::serial_println!("[ELF] Trying /lib/ld-musl-x86_64.so.1");
-                crate::fs::vfs::file_read("/lib/ld-musl-x86_64.so.1")
-            })
-            .or_else(|_| {
-                // Try ext2 filesystem (persistent storage)
-                if crate::fs::ext2::is_mounted() {
-                    crate::serial_println!("[ELF] Trying ext2: '{}'", interp_path);
-                    crate::fs::ext2::read_file_path(interp_path)
-                        .ok_or(crate::fs::vfs::VfsError::NotFound)
-                } else {
-                    Err(crate::fs::vfs::VfsError::NotFound)
-                }
-            });
+        // Register VMA for interpreter
+        let current_pid = 0u64; // Will be updated after spawn
+        crate::process::add_vma(current_pid, crate::process::VirtualMemoryArea {
+            vaddr_start: interp_base,
+            vaddr_end: interp_base + 0x100000, // ~1 MiB text
+            file_path: alloc::string::String::from(interp),
+            file_offset: 0,
+            size: interp_data.len() as u64,
+            writable: false,
+            executable: true,
+        });
 
-        match interp_data {
-            Ok(data) => {
+        // Build proper System V ABI stack with argv, envp, auxv
+        let mut argv = alloc::vec![alloc::string::String::from(path)];
+        for arg in get_extra_args() {
+            argv.push(alloc::string::String::from(arg));
+        }
+        let envp = alloc::vec![
+            alloc::string::String::from("PATH=/usr/bin:/bin:/sbin:/usr/sbin"),
+            alloc::string::String::from("HOME=/root"),
+            alloc::string::String::from("TERM=linux"),
+            alloc::string::String::from("SHELL=/bin/sh"),
+            alloc::string::String::from("LD_LIBRARY_PATH=/lib:/usr/lib"),
+            alloc::string::String::from("PYTHONHOME=/usr"),
+            alloc::string::String::from("PYTHONDONTWRITEBYTECODE=1"),
+        ];
+
+        if let Some(new_rsp) = unsafe { build_sysv_stack(
+            result.pml4_phys,
+            &argv,
+            &envp,
+            result.entry_point,
+            interp_result.base_vaddr,
+            result.phdr_vaddr,
+            result.phdr_count,
+        ) } {
+            final_rsp = new_rsp;
+            crate::serial_println!("[ELF] SysV stack rebuilt: RSP=0x{:X}", final_rsp);
+        }
+
+        // Use interpreter entry point (ld-musl will jump to main after relocation)
+        final_entry = interp_result.entry_point;
+        crate::serial_println!("[ELF] Dynamic: jumping to interp entry=0x{:X}", final_entry);
+        crate::serial_println!("[DYNLINK] Interpreter detected — skipping kernel-side relocations");
+
+        // Verify interpreter entry point contains valid code
+        unsafe {
+            if let Some(entry_phys) = lookup_page_frame(result.pml4_phys, final_entry) {
+                let entry_offset = final_entry & 0xFFF;
+                let entry_virt = phys_to_virt(entry_phys) + entry_offset;
+                let bytes = core::slice::from_raw_parts(entry_virt as *const u8, 8);
                 crate::serial_println!(
-                    "[ELF] Interpreter loaded: {} bytes from '{}'", data.len(), interp_path
+                    "[DYNLINK] Interp entry bytes: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                    bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]
                 );
-
-                // Step 3b: Load interpreter into the same PML4
-                const INTERP_BASE: u64 = 0x7FC0_0000_0000;
-                let interp_result = load_interp_into_pml4(
-                    &data,
-                    result.pml4_phys,
-                    INTERP_BASE,
-                )?;
-
-                crate::serial_println!(
-                    "[ELF] Interpreter mapped: entry=0x{:X}, base=0x{:X}, segments={}",
-                    interp_result.entry_point,
-                    interp_result.base_vaddr,
-                    interp_result.segments_loaded
-                );
-
-                // Step 3c: Rebuild the stack with correct AuxV
-                // AT_ENTRY = main binary's entry point (ld.so uses this to jump to main)
-                // AT_BASE  = interpreter load base (so ld.so can relocate itself)
-                // AT_PHDR  = main binary's program headers in memory
-                // AT_PHNUM = main binary's program header count
-                let mut argv = alloc::vec![alloc::string::String::from(path)];
-                // Include extra args (e.g., "sh" for busybox)
-                unsafe {
-                    if ELF_EXTRA_ARGS_LEN > 0 {
-                        let mut pos = 0;
-                        while pos < ELF_EXTRA_ARGS_LEN {
-                            let end = ELF_EXTRA_ARGS[pos..ELF_EXTRA_ARGS_LEN].iter()
-                                .position(|&b| b == 0)
-                                .map(|p| pos + p)
-                                .unwrap_or(ELF_EXTRA_ARGS_LEN);
-                            if end > pos {
-                                if let Ok(s) = core::str::from_utf8(&ELF_EXTRA_ARGS[pos..end]) {
-                                    argv.push(alloc::string::String::from(s));
-                                }
-                            }
-                            pos = end + 1;
-                        }
-                    }
-                }
-                let envp = alloc::vec![
-                    alloc::string::String::from("PATH=/usr/bin:/bin:/sbin:/usr/sbin"),
-                    alloc::string::String::from("HOME=/root"),
-                    alloc::string::String::from("TERM=linux"),
-                    alloc::string::String::from("SHELL=/bin/sh"),
-                    alloc::string::String::from("LD_LIBRARY_PATH=/lib:/usr/lib"),
-                ];
-
-                let new_rsp = unsafe {
-                    build_sysv_stack(
-                        result.pml4_phys,
-                        &argv,
-                        &envp,
-                        result.entry_point,         // AT_ENTRY = main binary entry
-                        interp_result.base_vaddr,   // AT_BASE = interp load address
-                        result.phdr_vaddr,          // AT_PHDR = main's phdr vaddr
-                        result.phdr_count,          // AT_PHNUM = main's phdr count
-                    )
-                };
-
-                let rsp = new_rsp.unwrap_or(result.stack_pointer);
-                crate::serial_println!(
-                    "[ELF] Dynamic: jumping to interp entry=0x{:X}, RSP=0x{:X}",
-                    interp_result.entry_point, rsp
-                );
-                crate::serial_println!(
-                    "[ELF] AuxV: AT_ENTRY=0x{:X} AT_BASE=0x{:X} AT_PHDR=0x{:X} AT_PHNUM={}",
-                    result.entry_point, interp_result.base_vaddr,
-                    result.phdr_vaddr, result.phdr_count
-                );
-
-                crate::serial_println!("[DYNLINK] Interpreter detected — skipping kernel-side relocations");
-
-                // Dump diagnostic info for proof logging
-                dynlink::dump_dynlink_info(&data, "ld-musl-x86_64.so.1");
-                dynlink::dump_dynlink_info(&elf_data, path);
-
-                // Entry goes to interpreter; ld.so will later jump to AT_ENTRY
-                (interp_result.entry_point, rsp)
-            }
-            Err(_) => {
-                crate::serial_println!(
-                    "[ELF] WARNING: Interpreter '{}' not found in VFS — running as static",
-                    interp_path
-                );
-                // Fall through: run the binary directly (will likely crash if truly dynamic)
-                (result.entry_point, result.stack_pointer)
+            } else {
+                crate::serial_println!("[DYNLINK] WARNING: Interp entry 0x{:X} NOT MAPPED!", final_entry);
             }
         }
-    } else {
-        // Static binary — use entry point directly
-        (result.entry_point, result.stack_pointer)
-    };
 
-    // Step 4: Create process with Ring 3 context
+        // Log AuxV summary for debugging
+        crate::serial_println!(
+            "[DYNLINK] AuxV: AT_BASE=0x{:X} AT_ENTRY=0x{:X} AT_PHDR=0x{:X} AT_PHNUM={}",
+            interp_result.base_vaddr, result.entry_point, result.phdr_vaddr, result.phdr_count
+        );
+        crate::serial_println!(
+            "[DYNLINK] argv[0]='{}', argc={} (extra_args={})",
+            path, 1 + get_extra_args().len(), get_extra_args().len()
+        );
+    } else {
+        // Static binary: build SysV stack with extra args if any
+        let extra = get_extra_args();
+        if !extra.is_empty() {
+            let mut argv = alloc::vec![alloc::string::String::from(path)];
+            for arg in extra {
+                argv.push(alloc::string::String::from(arg));
+            }
+            let envp = alloc::vec![
+                alloc::string::String::from("PATH=/usr/bin:/bin:/sbin"),
+                alloc::string::String::from("HOME=/root"),
+                alloc::string::String::from("TERM=linux"),
+            ];
+            if let Some(new_rsp) = unsafe { build_sysv_stack(
+                result.pml4_phys,
+                &argv,
+                &envp,
+                result.entry_point,
+                0, // no interpreter
+                result.phdr_vaddr,
+                result.phdr_count,
+            ) } {
+                final_rsp = new_rsp;
+            }
+        }
+    }
+
+    // Clear extra args after use
+    clear_extra_args();
+
+    // Step 4: Create a process with Ring 3 context
     let pid = crate::process::spawn_userspace(
         path,
         0, // ppid: no parent (launched from kernel shell)
@@ -2023,10 +2004,9 @@ pub fn load_elf(path: &str) -> Result<u64, ElfError> {
         result.pml4_phys,
     ).map_err(|_| ElfError::ProcessError)?;
 
-    // Jalon 155: Set Linux ABI if the ELF was detected as a Linux binary.
+    // Tag as Linux ABI process if detected
     if result.is_linux_abi {
         crate::process::set_abi(pid, crate::compat::linux_abi::Abi::Linux);
-        crate::serial_println!("[ELF] PID {} tagged as Linux ABI (musl/uclibc)", pid);
     }
 
     crate::serial_println!(
@@ -2037,17 +2017,13 @@ pub fn load_elf(path: &str) -> Result<u64, ElfError> {
     // Register with scheduler
     crate::scheduler::enqueue_process(pid);
 
-    // Log the IRETQ frame
     crate::serial_println!("[ELF] Ring 3 IRETQ frame:");
     crate::serial_println!("  RIP    = 0x{:X}", final_entry);
     crate::serial_println!("  CS     = 0x23 (User Code, RPL=3)");
     crate::serial_println!("  RFLAGS = 0x202 (IF=1)");
     crate::serial_println!("  RSP    = 0x{:X}", final_rsp);
     crate::serial_println!("  SS     = 0x1B (User Data, RPL=3)");
-    crate::serial_println!(
-        "[ELF] PML4 = 0x{:X}, ready for CR3 switch + IRETQ",
-        result.pml4_phys
-    );
+    crate::serial_println!("[ELF] PML4 = 0x{:X}", result.pml4_phys);
 
     Ok(pid)
 }
@@ -2169,31 +2145,53 @@ pub extern "C" fn exec_trampoline() -> ! {
 static GLOBAL_IRETQ_TRAMPOLINE: AtomicU64 = AtomicU64::new(0);
 
 /// Initialize the global IRETQ trampoline. Must be called once during kernel
-/// boot after the heap is available. The trampoline is a small code buffer
-/// on the kernel heap (PML4[1]) containing: mov cr3,r8 + swapgs + iretq.
+/// boot after the frame pool is available.
+///
+/// FIX: Allocate in HHDM (Physical Offset) region instead of kernel heap.
+/// The HHDM region is PML4[256], which is cloned verbatim into every user PML4.
+/// This guarantees the trampoline remains accessible after `mov cr3, r8`
+/// switches to the user address space. The old heap-based approach (PML4[136])
+/// caused #GP because the heap pages lack execute permission in the user PML4.
 pub fn init_global_iretq_trampoline() {
-    let buf = alloc::vec![0u8; 64]; // 64 bytes, heap-allocated (RWX in identity-mapped region)
-    let ptr = buf.leak().as_mut_ptr(); // leak intentionally — lives forever
     unsafe {
-        // mov cr3, r8   => 41 0F 22 D8
-        // REX.B = 0x41 (r8 uses the B extension for rm field)
-        // Opcode: 0x0F 0x22 (MOV to CRn)
-        // ModRM: 0xD8 = 11 011 000 (mod=11, reg=3=CR3, rm=0+REX.B=r8)
+        // Allocate a physical frame from the ELF pool
+        let phys = match alloc_elf_frame() {
+            Some(p) => p,
+            None => {
+                crate::serial_println!("[KPTI] FATAL: Cannot allocate frame for trampoline!");
+                return;
+            }
+        };
+
+        // Compute the HHDM virtual address: phys_offset + phys_addr
+        // This address lives in PML4[256] which is present in BOTH kernel and user PML4.
+        let hhdm_virt = phys_to_virt(phys);
+        let ptr = hhdm_virt as *mut u8;
+
+        // Zero the entire page first
+        core::ptr::write_bytes(ptr, 0, 4096);
+
+        // Write the trampoline machine code:
+        //   mov cr3, r8   => 41 0F 22 D8  (4 bytes)
+        //   swapgs         => 0F 01 F8     (3 bytes)
+        //   iretq          => 48 CF        (2 bytes)
+        // Total: 9 bytes
         *ptr.add(0) = 0x41; // REX.B (r8 is extended register in rm field)
         *ptr.add(1) = 0x0F;
         *ptr.add(2) = 0x22;
         *ptr.add(3) = 0xD8; // ModRM: CR3, r8
-        // swapgs         => 0F 01 F8
-        *ptr.add(4) = 0x0F;
+        *ptr.add(4) = 0x0F; // swapgs
         *ptr.add(5) = 0x01;
         *ptr.add(6) = 0xF8;
-        // iretq           => 48 CF
-        *ptr.add(7) = 0x48;
+        *ptr.add(7) = 0x48; // iretq (REX.W prefix + CF)
         *ptr.add(8) = 0xCF;
+
+        GLOBAL_IRETQ_TRAMPOLINE.store(hhdm_virt, Ordering::SeqCst);
+        crate::serial_println!(
+            "[KPTI] Global IRETQ trampoline: phys=0x{:X}, virt=0x{:X} (HHDM/PML4[256])",
+            phys, hhdm_virt
+        );
     }
-    let addr = ptr as u64;
-    GLOBAL_IRETQ_TRAMPOLINE.store(addr, Ordering::SeqCst);
-    crate::serial_println!("[KPTI] Global IRETQ trampoline at 0x{:X}", addr);
 }
 
 /// Get the address of the global IRETQ trampoline.
@@ -2230,16 +2228,8 @@ pub unsafe fn exec_switch_cr3_and_ring3(
         "[ELF-DEBUG] Entry 0x{:X} -> phys frame 0x{:X} (OK)",
         user_entry, entry_phys.unwrap()
     );
-    
-    // Diagnostic: check if page 0x4D3000 is mapped (the crash address)
-    let crash_page = 0x4D3000u64;
-    let crash_phys = lookup_page_frame_pub(new_pml4_phys, crash_page);
-    crate::serial_println!(
-        "[ELF-DEBUG] Crash page 0x{:X} mapped={} phys={:X}",
-        crash_page, crash_phys.is_some(), crash_phys.unwrap_or(0)
-    );
 
-    // Verify PML4[256] is present
+    // Verify PML4[256] is present (KPTI trampoline region)
     let pml4_virt = phys_to_virt(new_pml4_phys) as *const u64;
     let e256 = core::ptr::read_volatile(pml4_virt.add(256));
     if e256 & 1 == 0 {
@@ -2250,7 +2240,7 @@ pub unsafe fn exec_switch_cr3_and_ring3(
         loop { core::arch::asm!("cli; hlt"); }
     }
 
-    crate::serial_println!("[TRAMPOLINE] Jumping to naked IRETQ");
+    crate::serial_println!("[TRAMPOLINE] Using KPTI-safe trampoline for CR3 switch");
 
     // Restore FS_BASE for TLS
     let current_pid = crate::scheduler::current_pid();
@@ -2265,95 +2255,46 @@ pub unsafe fn exec_switch_cr3_and_ring3(
         );
     }
 
-    // Call the pure #[naked] function (System V ABI: rdi, rsi, rdx)
-    exec_switch_cr3_and_ring3_naked(new_pml4_phys, user_entry, user_rsp);
-}
+    // CRITICAL FIX: Use the global IRETQ trampoline (mapped in both kernel and user PML4)
+    // instead of executing CR3 switch directly in kernel code.
+    // The trampoline is in the phys_off region (PML4[256]), which is present in both
+    // the kernel and user page tables, so it remains accessible after the CR3 switch.
+    
+    let trampoline_addr = GLOBAL_IRETQ_TRAMPOLINE.load(Ordering::SeqCst);
+    if trampoline_addr == 0 {
+        crate::serial_println!("[FATAL] Global IRETQ trampoline not initialized!");
+        loop { core::arch::asm!("cli; hlt"); }
+    }
 
-/// Jalon 146: Pure #[naked] Ring 3 transition function.
-///
-/// Architect directive: no in(reg) operands.
-/// System V calling convention:
-///   rdi = new PML4 physical address (CR3)
-///   rsi = user entry point (RIP)
-///   rdx = user stack pointer (RSP)
-#[unsafe(naked)]
-pub extern "C" fn exec_switch_cr3_and_ring3_naked(
-    _new_pml4_phys: u64,
-    _user_entry: u64,
-    _user_rsp: u64,
-) -> ! {
-    core::arch::naked_asm!(
-        "cli",
-        "push 0x1B",       // SS  = User Data (RPL=3)
-        "push rdx",        // RSP = user stack pointer
-        "push 0x202",      // RFLAGS (IF=1)
-        "push 0x23",       // CS  = User Code (RPL=3)
-        "push rsi",        // RIP = user entry point
-        "mov cr3, rdi",    // Switch to user address space
-        "swapgs",
-        "xor rax, rax",
-        "xor rbx, rbx",
-        "xor rcx, rcx",
-        "xor rdi, rdi",
-        "xor rsi, rsi",
-        "xor rdx, rdx",
-        "xor r8, r8",
-        "xor r9, r9",
-        "xor r10, r10",
-        "xor r11, r11",
-        "xor r12, r12",
-        "xor r13, r13",
-        "xor r14, r14",
-        "xor r15, r15",
-        "xor rbp, rbp",
-        "iretq",
-    )
-}
-
-#[allow(unused)]
-pub unsafe fn jump_to_ring3(entry_point: u64, stack_pointer: u64) -> ! {
-    // Jalon 133: Direct UART trace (no lock, no formatting) to confirm we reach here
+    // Build IRETQ frame on kernel stack BEFORE jumping to trampoline
+    // The trampoline will execute: mov cr3, r8; swapgs; iretq
+    // Register setup for trampoline (System V ABI):
+    //   r8  = new PML4 physical address
+    //   r9  = user RSP
+    //   r10 = user RIP
+    //   r11 = phys_off base (for stack setup in trampoline)
+    
     core::arch::asm!(
-        "2: mov dx, 0x3FD", "in al, dx", "test al, 0x20", "jz 2b",
-        "mov dx, 0x3F8", "mov al, 0x4A", "out dx, al",  // 'J'
-        out("dx") _, out("al") _, options(nomem, nostack, preserves_flags)
-    );
-    // Jalon 109c+133: Clear all GPRs to prevent leaking kernel state to user mode.
-    // Also prevents stale register values from being misinterpreted as syscall args.
-    let f_rsp = core::ptr::read_volatile(&stack_pointer);
-    let f_rip = core::ptr::read_volatile(&entry_point);
-    core::arch::asm!(
-        // Zero all general-purpose registers that user code might read
-        "xor rax, rax",
-        "xor rbx, rbx",
-        "xor rcx, rcx",
-        "xor rdx, rdx",
-        "xor rsi, rsi",
-        "xor rdi, rdi",
-        "xor rbp, rbp",
-        "xor r8, r8",
-        "xor r11, r11",
-        "xor r12, r12",
-        "xor r13, r13",
-        "xor r14, r14",
-        "xor r15, r15",
-        // Push SS (User Data = 0x1B)
-        "push 0x1B",
-        // Push RSP (user stack pointer, guaranteed in r9)
-        "push r9",
-        // Push RFLAGS (IF=1, bit1=1 -> 0x202)
-        "push 0x202",
-        // Push CS (User Code = 0x23)
-        "push 0x23",
-        // Push RIP (entry point, guaranteed in r10)
-        "push r10",
-        // Execute IRETQ to switch to Ring 3
-        "iretq",
-        in("r9") f_rsp,
-        in("r10") f_rip,
-        options(noreturn),
+        // Build the IRETQ frame on the current kernel stack.
+        // iretq pops (in order): RIP, CS, RFLAGS, RSP, SS
+        // We push them in reverse order so they're in the right position.
+        "push 0x1B",       // SS  = User Data (GDT[3] | RPL 3)
+        "push {user_rsp}", // RSP = user stack pointer
+        "push 0x202",      // RFLAGS = IF set (interrupts enabled)
+        "push 0x23",       // CS  = User Code (GDT[4] | RPL 3)
+        "push {user_rip}", // RIP = user entry point
+        // Set r8 = target CR3 for the trampoline's `mov cr3, r8`
+        "mov r8, {pml4}",
+        // Jump to trampoline: mov cr3, r8 ; swapgs ; iretq
+        "jmp {trampoline}",
+        user_rsp = in(reg) user_rsp,
+        user_rip = in(reg) user_entry,
+        pml4 = in(reg) new_pml4_phys,
+        trampoline = in(reg) trampoline_addr,
+        options(noreturn)
     );
 }
+
 
 // ===== Self-Test Suite =====
 

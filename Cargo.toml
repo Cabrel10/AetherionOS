@@ -45,10 +45,14 @@ license = "MIT"
 # Profiles apply to all workspace members
 [profile.dev]
 panic = "abort"
-opt-level = 1
+opt-level = 0
+codegen-units = 999
+lto = false
+debug = false
 
 [profile.release]
 panic = "abort"
 lto = false
-opt-level = 1
-codegen-units = 8
+opt-level = 0
+codegen-units = 999
+debug = false

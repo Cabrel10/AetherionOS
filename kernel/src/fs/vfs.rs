@@ -451,43 +451,57 @@ pub fn file_read(path: &str) -> Result<Vec<u8>, VfsError> {
     // First try in-memory VFS tree
     {
         let root = VFS_ROOT.lock();
+        let node_opt = find_node(&root, &components);
 
-        if let Some(node) = find_node(&root, &components) {
-            match node {
-                VfsNode::Device {
-                    ref manifest,
-                    data: ref device_data,
-                } => {
-                    if !manifest.can(Capability::Read) {
-                        VFS_METRICS.security_violations.fetch_add(1, Ordering::Relaxed);
+        match node_opt {
+            Some(node) => {
+                match node {
+                    VfsNode::Device {
+                        ref manifest,
+                        data: ref device_data,
+                    } => {
+                        if !manifest.can(Capability::Read) {
+                            VFS_METRICS.security_violations.fetch_add(1, Ordering::Relaxed);
+                            VFS_METRICS.errors_count.fetch_add(1, Ordering::Relaxed);
+                            return Err(VfsError::PermissionDenied);
+                        }
+                        let data = device_data.clone();
+                        VFS_METRICS.total_bytes_read
+                            .fetch_add(data.len() as u64, Ordering::Relaxed);
+                        bus_publish_event(VFS_READ, data.len() as u64);
+                        return Ok(data);
+                    }
+                    VfsNode::File(ref file_data) => {
+                        let data = file_data.clone();
+                        VFS_METRICS.total_bytes_read
+                            .fetch_add(data.len() as u64, Ordering::Relaxed);
+                        bus_publish_event(VFS_READ, data.len() as u64);
+                        return Ok(data);
+                    }
+                    VfsNode::Directory(_) => {
                         VFS_METRICS.errors_count.fetch_add(1, Ordering::Relaxed);
                         return Err(VfsError::PermissionDenied);
                     }
-                    let data = device_data.clone();
-                    VFS_METRICS
-                        .total_bytes_read
-                        .fetch_add(data.len() as u64, Ordering::Relaxed);
-                    bus_publish_event(VFS_READ, data.len() as u64);
-                    return Ok(data);
+                    VfsNode::Symlink(ref target) => {
+                        let target_path = target.clone();
+                        drop(root);
+                        return file_read(&target_path);
+                    }
                 }
-                VfsNode::File(ref file_data) => {
-                    let data = file_data.clone();
-                    VFS_METRICS
-                        .total_bytes_read
-                        .fetch_add(data.len() as u64, Ordering::Relaxed);
-                    bus_publish_event(VFS_READ, data.len() as u64);
-                    return Ok(data);
+            }
+            None => {
+                // VFS miss — try ext2 filesystem as fallback
+                drop(root); // release VFS lock before ext2 I/O
+                if crate::fs::ext2::is_mounted() {
+                    if let Some(ext2_data) = crate::fs::ext2::read_file_by_path(path) {
+                        VFS_METRICS.total_bytes_read
+                            .fetch_add(ext2_data.len() as u64, Ordering::Relaxed);
+                        bus_publish_event(VFS_READ, ext2_data.len() as u64);
+                        return Ok(ext2_data);
+                    }
                 }
-                VfsNode::Directory(_) => {
-                    VFS_METRICS.errors_count.fetch_add(1, Ordering::Relaxed);
-                    return Err(VfsError::PermissionDenied);
-                }
-                VfsNode::Symlink(ref target) => {
-                    // Follow symlink: recursively read the target path
-                    let target_path = target.clone();
-                    drop(root); // release lock before recursive call
-                    return file_read(&target_path);
-                }
+                VFS_METRICS.errors_count.fetch_add(1, Ordering::Relaxed);
+                return Err(VfsError::NotFound);
             }
         }
     }
@@ -515,26 +529,32 @@ pub fn file_read_at_offset(path: &str, offset: u64, buf: &mut [u8]) -> usize {
         return 0;
     }
 
-    let root = VFS_ROOT.lock();
-    let node = match find_node(&root, &components) {
-        Some(n) => n,
-        None => return 0,
-    };
+    {
+        let root = VFS_ROOT.lock();
+        let node = find_node(&root, &components);
 
-    let file_data = match node {
-        VfsNode::File(ref data) => data,
-        VfsNode::Device { data: ref device_data, .. } => device_data,
-        _ => return 0,
-    };
-
-    let off = offset as usize;
-    if off >= file_data.len() {
-        return 0;
+        if let Some(n) = node {
+            let file_data = match n {
+                VfsNode::File(ref data) => data,
+                VfsNode::Device { data: ref device_data, .. } => device_data,
+                _ => return 0,
+            };
+            let off = offset as usize;
+            if off >= file_data.len() {
+                return 0;
+            }
+            let available = file_data.len() - off;
+            let to_copy = core::cmp::min(available, buf.len());
+            buf[..to_copy].copy_from_slice(&file_data[off..off + to_copy]);
+            return to_copy;
+        }
     }
-    let available = file_data.len() - off;
-    let to_copy = core::cmp::min(available, buf.len());
-    buf[..to_copy].copy_from_slice(&file_data[off..off + to_copy]);
-    to_copy
+
+    // VFS miss — try ext2 filesystem
+    if crate::fs::ext2::is_mounted() {
+        return crate::fs::ext2::read_file_chunk(path, offset, buf);
+    }
+    0
 }
 
 /// List entries at a given path (directory listing)

@@ -14,6 +14,6 @@ pub mod manifest;
 pub mod fat32;
 pub mod exfat;
 pub mod ext2;
-pub mod tar;
 pub mod vfs_backend;
 pub mod apk;
+pub mod tar;

@@ -18,6 +18,39 @@ use limine::request::{
     StackSizeRequest, BootloaderInfoRequest,
 };
 
+// ===== Direct Serial Port (COM1 = 0x3F8) =====
+// Override the lib.rs stub with a real implementation that writes
+// directly to the UART hardware. This is needed because main.rs's
+// uart_16550 lazy_static is not initialized in the Limine boot path.
+
+#[inline(always)]
+fn serial_putc(c: u8) {
+    unsafe {
+        // Wait for transmit holding register empty (bit 5 of LSR)
+        loop {
+            let lsr: u8;
+            core::arch::asm!("in al, dx", out("al") lsr, in("dx") 0x3F8u16 + 5);
+            if lsr & 0x20 != 0 { break; }
+        }
+        core::arch::asm!("out dx, al", in("dx") 0x3F8u16, in("al") c);
+    }
+}
+
+#[no_mangle]
+pub fn serial_write(s: &str) {
+    for b in s.bytes() {
+        if b == b'\n' { serial_putc(b'\r'); }
+        serial_putc(b);
+    }
+}
+
+#[no_mangle]
+pub fn serial_writeln(s: &str) {
+    serial_write(s);
+    serial_putc(b'\r');
+    serial_putc(b'\n');
+}
+
 // ===== Embedded ELF Binaries =====
 // These are included at compile time and mounted into the VFS during boot.
 // The same binaries as main.rs, but accessible from the Limine boot path.
@@ -63,7 +96,7 @@ static RSDP_REQUEST: RsdpRequest = RsdpRequest::new();
 
 #[used]
 #[unsafe(link_section = ".requests")]
-static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new(2 * 1024 * 1024); // 2 MiB kernel stack
+static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new(128 * 1024);
 
 #[used]
 #[unsafe(link_section = ".requests")]
@@ -177,7 +210,7 @@ pub fn resume_kernel_shell() -> ! {
 // ===== Entry Point =====
 
 /// Kernel version for the Limine boot path.
-const LIMINE_KERNEL_VERSION: &str = "4.3.0-phase8";
+const LIMINE_KERNEL_VERSION: &str = "4.3.0-phase7";
 
 /// Limine entry point -- replaces kernel_main when built with `--features limine`.
 ///
@@ -186,22 +219,6 @@ const LIMINE_KERNEL_VERSION: &str = "4.3.0-phase8";
 /// The kernel is running in 64-bit mode with interrupts disabled.
 #[no_mangle]
 unsafe extern "C" fn kmain() -> ! {
-    // === EARLY SERIAL DIAGNOSTIC ===
-    // Write directly to COM1 (0x3F8) before ANY Rust infrastructure.
-    // If we see "AETHERION_BOOT" on serial, Limine loaded us correctly.
-    {
-        let msg: &[u8] = b"\r\n[EARLY] AETHERION_BOOT\r\n";
-        for &byte in msg {
-            // Wait for TX holding register empty (bit 5 of LSR at port+5)
-            loop {
-                let status: u8;
-                core::arch::asm!("in al, dx", out("al") status, in("dx") 0x3FDu16, options(nomem, nostack, preserves_flags));
-                if status & 0x20 != 0 { break; }
-            }
-            core::arch::asm!("out dx, al", in("al") byte, in("dx") 0x3F8u16, options(nomem, nostack, preserves_flags));
-        }
-    }
-
     // Serial is initialized lazily via lazy_static on first use.
 
     crate::serial_write("\n=== AetherionOS Kernel Boot (Limine) ===\n");
@@ -427,6 +444,215 @@ unsafe extern "C" fn kmain() -> ! {
     };
     crate::serial_write("       [OK] Frame allocator + page tables\n");
 
+    // ═══════════════════════════════════════════════════════════════
+    // Step 5a: Force-map any kernel pages that Limine left unmapped.
+    //
+    // Limine maps kernel ELF LOAD segments, but .bss may extend beyond
+    // what's in the file. Large static arrays (e.g., FRAME_BITMAP[65536],
+    // FREELIST_MAX arrays) cause .bss to grow, and Limine doesn't always
+    // map ALL .bss pages. This causes #PF at first access.
+    //
+    // Strategy: Walk the kernel virtual address range [__kernel_start, __kernel_end)
+    // and for any page where PT entry = 0, allocate a physical frame and map it.
+    // ═══════════════════════════════════════════════════════════════
+    {
+        extern "C" {
+            static __kernel_start: u8;
+            static __kernel_end: u8;
+        }
+
+        let ks = unsafe { &__kernel_start as *const u8 as u64 };
+        let ke = unsafe { &__kernel_end as *const u8 as u64 };
+        let hhdm = boot_info.hhdm_offset;
+
+        // Read CR3 to get the current PML4 physical address
+        let cr3: u64;
+        unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)) };
+        let pml4_phys = cr3 & !0xFFF;
+
+        let ks_aligned = ks & !0xFFF;
+        let ke_aligned = (ke + 0xFFF) & !0xFFF;
+        let total_pages = ((ke_aligned - ks_aligned) / 4096) as usize;
+        let mut fixed = 0usize;
+
+        crate::serial_println!(
+            "[5a] Verifying kernel pages: 0x{:X}..0x{:X} ({} pages), CR3=0x{:X}",
+            ks_aligned, ke_aligned, total_pages, pml4_phys
+        );
+
+        let mut page_va = ks_aligned;
+        while page_va < ke_aligned {
+            let pml4_idx = ((page_va >> 39) & 0x1FF) as usize;
+            let pdpt_idx = ((page_va >> 30) & 0x1FF) as usize;
+            let pd_idx   = ((page_va >> 21) & 0x1FF) as usize;
+            let pt_idx   = ((page_va >> 12) & 0x1FF) as usize;
+
+            unsafe {
+                let pml4_virt = (pml4_phys + hhdm) as *mut u64;
+                let pml4_entry = core::ptr::read_volatile(pml4_virt.add(pml4_idx));
+                if pml4_entry & 1 == 0 {
+                    page_va += 4096;
+                    continue;
+                }
+
+                let pdpt_phys = pml4_entry & 0x000F_FFFF_FFFF_F000;
+                let pdpt_virt = (pdpt_phys + hhdm) as *mut u64;
+                let pdpt_entry = core::ptr::read_volatile(pdpt_virt.add(pdpt_idx));
+                if pdpt_entry & 1 == 0 {
+                    page_va += 4096;
+                    continue;
+                }
+                // 1G huge page — skip (unlikely for kernel)
+                if pdpt_entry & 0x80 != 0 { page_va += 4096; continue; }
+
+                let pd_phys = pdpt_entry & 0x000F_FFFF_FFFF_F000;
+                let pd_virt = (pd_phys + hhdm) as *mut u64;
+                let pd_entry = core::ptr::read_volatile(pd_virt.add(pd_idx));
+
+                if pd_entry & 1 == 0 {
+                    // PD entry missing — allocate a PT and a frame
+                    if let Some(pt_frame) = mem_manager.frame_allocator.alloc_frame_kernel() {
+                        let pt_phys_addr = pt_frame.start_address().as_u64();
+                        let pt_virt_addr = (pt_phys_addr + hhdm) as *mut u8;
+                        core::ptr::write_bytes(pt_virt_addr, 0, 4096);
+                        // Write PD entry: P|W (no U for kernel pages)
+                        core::ptr::write_volatile(pd_virt.add(pd_idx), pt_phys_addr | 0x03);
+
+                        // Now allocate a frame for this page
+                        if let Some(page_frame) = mem_manager.frame_allocator.alloc_frame_kernel() {
+                            let pf_addr = page_frame.start_address().as_u64();
+                            let pt_virt2 = (pt_phys_addr + hhdm) as *mut u64;
+                            core::ptr::write_bytes((pf_addr + hhdm) as *mut u8, 0, 4096);
+                            core::ptr::write_volatile(pt_virt2.add(pt_idx), pf_addr | 0x03); // P|W
+                            fixed += 1;
+                        }
+                    }
+                    page_va += 4096;
+                    continue;
+                }
+
+                // 2M huge page — skip, page is covered
+                if pd_entry & 0x80 != 0 { page_va += 4096; continue; }
+
+                let pt_phys = pd_entry & 0x000F_FFFF_FFFF_F000;
+                let pt_virt = (pt_phys + hhdm) as *mut u64;
+                let pt_entry = core::ptr::read_volatile(pt_virt.add(pt_idx));
+
+                if pt_entry & 1 == 0 {
+                    // PT entry is 0 — page not mapped! Allocate and map it.
+                    if let Some(page_frame) = mem_manager.frame_allocator.alloc_frame_kernel() {
+                        let pf_addr = page_frame.start_address().as_u64();
+                        // Zero the frame (it's BSS, must be zero)
+                        core::ptr::write_bytes((pf_addr + hhdm) as *mut u8, 0, 4096);
+                        // Map with Present + Writable (kernel page, no User bit)
+                        core::ptr::write_volatile(pt_virt.add(pt_idx), pf_addr | 0x03);
+                        fixed += 1;
+                    }
+                }
+            }
+            page_va += 4096;
+        }
+
+        if fixed > 0 {
+            crate::serial_println!(
+                "[5a] Fixed {} unmapped kernel pages (total={}, range=0x{:X}..0x{:X})",
+                fixed, total_pages, ks_aligned, ke_aligned
+            );
+            // Flush TLB to pick up new mappings
+            unsafe { core::arch::asm!("mov rax, cr3", "mov cr3, rax", out("rax") _, options(nostack)); }
+        } else {
+            crate::serial_println!("[5a] All {} kernel pages present (OK)", total_pages);
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        // Jalon 250: Compute kernel_phys_base and protect Limine PT frames.
+        //
+        // Walk the kernel page tables (PML4[511]→PDPT[510]→PD[*]→PT[*])
+        // to achieve two goals:
+        //   1. Derive kernel_phys_base from the first valid PT entry:
+        //      phys_base = entry_phys - (entry_virt - 0xFFFFFFFF80000000)
+        //   2. Mark all intermediate page table frames (PDPT, PD, PT frames)
+        //      as allocated in the bitmap so the frame allocator never
+        //      hands them out. This prevents the PT[195]=0x0 corruption bug.
+        // ═══════════════════════════════════════════════════════════════
+        {
+            let kernel_virt_base: u64 = 0xFFFF_FFFF_8000_0000;
+            let pml4_idx_k = ((kernel_virt_base >> 39) & 0x1FF) as usize; // 511
+            let pdpt_idx_k = ((kernel_virt_base >> 30) & 0x1FF) as usize; // 510
+
+            let mut computed_phys_base: u64 = 0;
+            let mut pt_frames_protected: usize = 0;
+
+            unsafe {
+                let pml4_virt = (pml4_phys + hhdm) as *mut u64;
+                let pml4_entry = core::ptr::read_volatile(pml4_virt.add(pml4_idx_k));
+
+                if pml4_entry & 1 != 0 {
+                    // Mark the PML4 frame itself
+                    mem_manager.frame_allocator.mark_frame_allocated(pml4_phys);
+                    pt_frames_protected += 1;
+
+                    let pdpt_phys = pml4_entry & 0x000F_FFFF_FFFF_F000;
+                    mem_manager.frame_allocator.mark_frame_allocated(pdpt_phys);
+                    pt_frames_protected += 1;
+
+                    let pdpt_virt = (pdpt_phys + hhdm) as *mut u64;
+                    let pdpt_entry = core::ptr::read_volatile(pdpt_virt.add(pdpt_idx_k));
+
+                    if pdpt_entry & 1 != 0 && pdpt_entry & 0x80 == 0 {
+                        let pd_phys = pdpt_entry & 0x000F_FFFF_FFFF_F000;
+                        mem_manager.frame_allocator.mark_frame_allocated(pd_phys);
+                        pt_frames_protected += 1;
+
+                        let pd_virt = (pd_phys + hhdm) as *mut u64;
+                        // Walk all 512 PD entries (each covers 2MB)
+                        for pd_i in 0..512usize {
+                            let pd_e = core::ptr::read_volatile(pd_virt.add(pd_i));
+                            if pd_e & 1 == 0 { continue; }
+                            if pd_e & 0x80 != 0 { continue; } // 2M huge page, no PT to protect
+
+                            let pt_phys = pd_e & 0x000F_FFFF_FFFF_F000;
+                            mem_manager.frame_allocator.mark_frame_allocated(pt_phys);
+                            pt_frames_protected += 1;
+
+                            // If we haven't found kernel_phys_base yet, scan PT entries
+                            if computed_phys_base == 0 {
+                                let pt_virt = (pt_phys + hhdm) as *mut u64;
+                                for pt_i in 0..512usize {
+                                    let pt_e = core::ptr::read_volatile(pt_virt.add(pt_i));
+                                    if pt_e & 1 != 0 && pt_e & 0x80 == 0 {
+                                        let entry_phys = pt_e & 0x000F_FFFF_FFFF_F000;
+                                        // Reconstruct the virtual address of this entry
+                                        let entry_virt: u64 = kernel_virt_base
+                                            | ((pdpt_idx_k as u64) << 30)
+                                            | ((pd_i as u64) << 21)
+                                            | ((pt_i as u64) << 12);
+                                        let offset = entry_virt - kernel_virt_base;
+                                        computed_phys_base = entry_phys - offset;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if computed_phys_base != 0 {
+                crate::elf::set_kernel_phys_base(computed_phys_base);
+                crate::serial_println!(
+                    "[5a] kernel_phys_base = 0x{:X}, protected {} PT frames",
+                    computed_phys_base, pt_frames_protected
+                );
+            } else {
+                crate::serial_println!(
+                    "[5a] WARNING: Could not compute kernel_phys_base! Protected {} PT frames",
+                    pt_frames_protected
+                );
+            }
+        }
+    }
+
     // Step 5b: Heap
     crate::serial_write("[5b/12] Initializing kernel heap (64 MB)...\n");
     match mem_manager.init_heap() {
@@ -595,148 +821,44 @@ unsafe extern "C" fn kmain() -> ! {
         crate::serial_write("       [INFO] No VirtIO-Net found (headless/no -nic)\n");
     }
 
-    // Step 9d: TLS/Crypto self-tests (SHA-256, X25519, AES-128-GCM)
-    crate::serial_write("[9d/12] TLS Crypto self-tests...\n");
-    crate::net::tls::run_tests();
-
-    // Step 9e: VirtIO-Block + ext2 persistent storage
-    crate::serial_write("[9e/12] Block device + ext2 mount...\n");
+    // Step 9d: VirtIO-BLK and Ext2 Mount
+    crate::serial_write("[9d/12] VirtIO-BLK init...\n");
     crate::drivers::virtio_blk::init();
     if crate::drivers::virtio_blk::is_available() {
-        crate::serial_write("       [OK] VirtIO-Block device found\n");
+        let sectors = crate::drivers::virtio_blk::capacity();
+        crate::serial_println!("       [OK] VirtIO-BLK: {} sectors ({} MiB)",
+            sectors, sectors * 512 / (1024 * 1024));
 
-        // PROOF: Read sector 0 and print hex dump
-        {
-            let mut sector0 = [0u8; 512];
-            if crate::drivers::virtio_blk::read_sector(0, &mut sector0) {
-                crate::serial_println!("[BLK] Sector 0 read OK: {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x} {:02x}{:02x}{:02x}{:02x}",
-                    sector0[0], sector0[1], sector0[2], sector0[3],
-                    sector0[4], sector0[5], sector0[6], sector0[7],
-                    sector0[8], sector0[9], sector0[10], sector0[11],
-                    sector0[12], sector0[13], sector0[14], sector0[15]);
-                // Check for ext2 superblock at offset 1024 (sector 2)
-                let mut sb_sector = [0u8; 512];
-                if crate::drivers::virtio_blk::read_sector(2, &mut sb_sector) {
-                    let magic = u16::from_le_bytes([sb_sector[56], sb_sector[57]]);
-                    crate::serial_println!("[BLK] Sector 2 (ext2 superblock): magic=0x{:04x} {}",
-                        magic, if magic == 0xEF53 { "✓ EXT2" } else { "(not ext2)" });
-                }
-            } else {
-                crate::serial_write("[BLK] Sector 0 read FAILED\n");
-            }
-        }
-
-        if crate::fs::ext2::init() {
-            crate::serial_write("       [OK] ext2 filesystem mounted\n");
-            // Mount ext2 as root in VFS multi-backend system
-            crate::fs::vfs_backend::mount_ext2_root();
+        // Try to mount ext2 filesystem
+        crate::serial_write("[9e/12] Ext2 mount...\n");
+        if crate::fs::ext2::mount() {
+            crate::serial_write("       [OK] Ext2 filesystem mounted\n");
         } else {
-            crate::serial_write("       [INFO] No ext2 filesystem detected on disk\n");
+            crate::serial_write("       [WARN] Ext2 mount failed (disk may not be ext2)\n");
         }
     } else {
-        crate::serial_write("       [INFO] No VirtIO-Block device (no -drive flag)\n");
+        crate::serial_write("       [INFO] No VirtIO-BLK device found\n");
     }
-
-    // Step 9f: tar/deflate self-tests
-    crate::serial_write("[9f/12] tar/deflate self-tests...\n");
-    crate::fs::tar::run_tests();
-
-    // Step 9g: ext2 write tests (only if mounted)
-    if crate::fs::ext2::is_mounted() {
-        crate::serial_write("[9g/12] ext2 write tests...\n");
-        crate::fs::ext2::run_tests();
-    }
-
-    // Step 9h: APK package manager init + tests (Layer 3)
-    crate::serial_write("[9h/16] APK package manager init...\n");
-    crate::fs::apk::run_tests();
-
-    // Step 9i: GUI subsystem tests (Layer 7)
-    crate::serial_write("[9i/16] GUI subsystem tests...\n");
-    crate::gui::run_tests();
-
-    // Step 9j: LLM inference engine tests (Layer 8)
-    crate::serial_write("[9j/16] LLM inference engine tests...\n");
-    crate::llm::inference::run_tests();
 
     // Step 10: Enable interrupts
     x86_64::instructions::interrupts::enable();
-    crate::serial_write("[10/16] Interrupts: ENABLED (timer + keyboard)\n");
+    crate::serial_write("[10/12] Interrupts: ENABLED (timer + keyboard)\n");
 
     // Summary banner
     crate::serial_write("\n=== AetherionOS v4.3.0-phase8 -- Limine Boot Complete ===\n");
     crate::serial_println!("RAM: {} MiB | Heap: 64 MB | Scheduler: ON | IRQ: ON | ELF: ON",
         boot_info.total_usable_memory / (1024 * 1024));
-    crate::serial_println!("Layers: Network | ext2 | APK | DynLink | GUI | LLM");
+    crate::serial_println!("Layers: Network | ext2 | DynLink | LLM");
     crate::serial_write("=========================================================\n\n");
 
-    // Run all BLOC proofs in separate stack frames to avoid stack overflow
-    run_bloc_proofs();
-
-    // === CI auto-test: run python3 -c "print(42*42)" if ext2 has python3 ===
+    // === CI Auto-Test Sequence ===
+    // When QEMU_CI_MODE env (checked via ext2 presence), run automated tests
     if crate::fs::ext2::is_mounted() {
-        // Debug: check what ext2 has at /usr/bin/
-        crate::serial_write("[CI-TEST] Checking ext2 for python3...\n");
-        let py3_ino = crate::fs::ext2::lookup_path("/usr/bin/python3");
-        let py312_ino = crate::fs::ext2::lookup_path("/usr/bin/python3.12");
-        crate::serial_println!("[CI-TEST] /usr/bin/python3 inode={:?}", py3_ino);
-        crate::serial_println!("[CI-TEST] /usr/bin/python3.12 inode={:?}", py312_ino);
-
-        // Also test VFS backend routing
-        match crate::fs::vfs_backend::backend_read("/usr/bin/python3.12") {
-            Ok(data) => crate::serial_println!("[CI-TEST] VFS backend read /usr/bin/python3.12: {} bytes", data.len()),
-            Err(e) => crate::serial_println!("[CI-TEST] VFS backend read failed: {:?}", e),
-        }
-
-        if py3_ino.is_some() || py312_ino.is_some() {
-            // Try the direct path first (python3.12 avoids symlink issues)
-            let exec_path = if py312_ino.is_some() {
-                "/usr/bin/python3.12"
-            } else {
-                "/usr/bin/python3"
-            };
-            crate::serial_println!("[CI-TEST] Auto-exec: {} -c 'print(42*42)'", exec_path);
-            crate::elf::set_extra_args("-c print(42*42)");
-            match crate::elf::load_elf(exec_path) {
-                Ok(pid) => {
-                    crate::serial_println!("[CI-TEST] python3 started as PID {}", pid);
-                    // Give the process time to run by yielding
-                    for _ in 0..5_000_000u64 {
-                        core::hint::spin_loop();
-                    }
-                }
-                Err(e) => {
-                    crate::serial_println!("[CI-TEST] python3 exec failed: {:?}", e);
-                    // Fallback: try busybox sh -c
-                    crate::serial_write("[CI-TEST] Trying fallback: /bin/sh -c 'python3 -c print(42*42)'\n");
-                    crate::elf::set_extra_args("-c python3 -c print(42*42)");
-                    match crate::elf::load_elf("/bin/sh") {
-                        Ok(pid) => {
-                            crate::serial_println!("[CI-TEST] sh started as PID {}", pid);
-                            for _ in 0..5_000_000u64 {
-                                core::hint::spin_loop();
-                            }
-                        }
-                        Err(e2) => {
-                            crate::serial_println!("[CI-TEST] sh exec also failed: {:?}", e2);
-                        }
-                    }
-                }
-            }
-        } else {
-            crate::serial_write("[CI-TEST] python3 not found on ext2 rootfs\n");
-            // List /usr/bin to debug
-            if let Some(entries) = crate::fs::ext2::list_dir("/usr/bin") {
-                crate::serial_println!("[CI-TEST] /usr/bin has {} entries", entries.len());
-                for (name, ino, _) in entries.iter().take(10) {
-                    crate::serial_println!("[CI-TEST]   {} (inode={})", name, ino);
-                }
-            }
-        }
+        run_ci_tests();
     }
 
     // === Interactive Shell ===
-    crate::serial_write("\nAetherionOS v4.3.0-phase8 ready.\n");
+    crate::serial_write("AetherionOS v4.3.0-phase8 ready.\n");
     crate::serial_write("Type 'help' for available commands.\n\n");
     crate::serial_write("$ ");
 
@@ -792,17 +914,21 @@ fn execute_shell_command(cmd: &str, boot_info: &LimineBootInfo) {
     if cmd.starts_with("exec ") {
         let rest = cmd[5..].trim();
         if rest.is_empty() {
-            crate::serial_write("Usage: exec <path> [args...]  (e.g. exec /bin/busybox sh)\n");
+            crate::serial_write("Usage: exec <path> [args]  (e.g. exec /bin/busybox sh)\n");
             return;
         }
-        // Split into path and args at first space
-        let (path, _args) = match rest.find(' ') {
-            Some(idx) => (&rest[..idx], rest[idx+1..].trim()),
-            None => (rest, ""),
+        // Split path from args: first token is path, rest are args
+        let (path, args) = if let Some(sp) = rest.find(' ') {
+            (&rest[..sp], rest[sp+1..].trim())
+        } else {
+            (rest, "")
         };
-        crate::serial_println!("[EXEC] Loading ELF: {} (args: '{}')", path, _args);
-        // Set extra args for the ELF loader's argv construction
-        crate::elf::set_extra_args(_args);
+        crate::serial_println!("[EXEC] Loading ELF: {} args=[{}]", path, args);
+        // If args provided, set argv0 to the first arg (e.g. "sh" for busybox sh)
+        if !args.is_empty() {
+            let first_arg = args.split_whitespace().next().unwrap_or(path);
+            crate::elf::set_argv0(first_arg);
+        }
         match crate::elf::load_elf(path) {
             Ok(pid) => {
                 crate::serial_println!("[EXEC] PID {} started from {}", pid, path);
@@ -841,7 +967,7 @@ fn execute_shell_command(cmd: &str, boot_info: &LimineBootInfo) {
         return;
     }
 
-    // Parse "wget <url>" — real HTTP GET implementation
+    // Parse "wget <url>" prefix (stub)
     if cmd.starts_with("wget ") {
         let url = cmd[5..].trim();
         crate::serial_println!("[WGET] URL: {}", url);
@@ -849,7 +975,7 @@ fn execute_shell_command(cmd: &str, boot_info: &LimineBootInfo) {
             crate::serial_write("[WGET] Network not available\n");
             return;
         }
-        kernel_wget(url);
+        crate::serial_write("[WGET] HTTP not yet implemented (TCP stack in progress)\n");
         return;
     }
 
@@ -866,18 +992,12 @@ fn execute_shell_command(cmd: &str, boot_info: &LimineBootInfo) {
             crate::serial_write("  net           -- Network status\n");
             crate::serial_write("  exec <path>   -- Load and run ELF binary\n");
             crate::serial_write("  ping <ip>     -- Send ICMP echo request\n");
-            crate::serial_write("  wget <url>    -- HTTP GET request\n");
-            crate::serial_write("  apk update    -- Refresh package index\n");
-            crate::serial_write("  apk add <pkg> -- Install Alpine package\n");
-            crate::serial_write("  llm <prompt>  -- Run LLM inference\n");
-            crate::serial_write("  df            -- Disk usage (ext2)\n");
-            crate::serial_write("  ls <path>     -- List directory (ext2)\n");
-            crate::serial_write("  cat <path>    -- Read file (ext2)\n");
+            crate::serial_write("  wget <url>    -- HTTP GET (stub)\n");
             crate::serial_write("  clear         -- Clear screen\n");
             crate::serial_write("  halt          -- Halt the system\n");
         }
         "uname" | "uname -a" => {
-            crate::serial_write("AetherionOS v4.3.0-phase8 x86_64 Limine\n");
+            crate::serial_write("AetherionOS v4.2.0-phase6-exec x86_64 Limine\n");
         }
         "free" => {
             crate::serial_println!("Total RAM:  {} MiB", boot_info.total_usable_memory / (1024 * 1024));
@@ -939,66 +1059,11 @@ fn execute_shell_command(cmd: &str, boot_info: &LimineBootInfo) {
             crate::serial_write("System halting...\n");
             halt_loop();
         }
-        // APK commands (Layer 3)
-        "apk update" => {
-            crate::fs::apk::init();
-            crate::fs::apk::apk_update();
-        }
-        "df" => {
-            if let Some((total, free, inodes, free_inodes)) = crate::fs::ext2::statfs() {
-                let block_size = 1024u64; // default ext2 block size
-                crate::serial_println!("ext2: {} blocks ({} KB), {} free ({} KB)",
-                    total, total * block_size / 1024, free, free * block_size / 1024);
-                crate::serial_println!("      {} inodes, {} free", inodes, free_inodes);
-            } else {
-                crate::serial_write("No ext2 filesystem mounted\n");
-            }
-        }
         "" => {}
         _ => {
-            // Dynamic command parsing
-            if cmd.starts_with("apk add ") {
-                let pkg = cmd[8..].trim();
-                crate::fs::apk::apk_add(pkg);
-            } else if cmd.starts_with("llm ") {
-                let prompt = cmd[4..].trim();
-                let result = crate::llm::inference::handle_llm_request(prompt, 64);
-                crate::serial_println!("{}", result);
-            } else if cmd.starts_with("ls ") {
-                let path = cmd[3..].trim();
-                if let Some(entries) = crate::fs::ext2::list_dir(path) {
-                    for (name, ino, ftype) in &entries {
-                        let type_str = match ftype {
-                            2 => "dir",
-                            7 => "lnk",
-                            1 => "file",
-                            _ => "???",
-                        };
-                        crate::serial_println!("  {:>5}  {}  {}", ino, type_str, name);
-                    }
-                    crate::serial_println!("({} entries)", entries.len());
-                } else {
-                    crate::serial_println!("Cannot list: {}", path);
-                }
-            } else if cmd.starts_with("cat ") {
-                let path = cmd[4..].trim();
-                if let Some(data) = crate::fs::ext2::read_file_path(path) {
-                    if let Ok(text) = core::str::from_utf8(&data) {
-                        crate::serial_write(text);
-                        if !text.ends_with('\n') {
-                            crate::serial_write("\n");
-                        }
-                    } else {
-                        crate::serial_println!("(binary file, {} bytes)", data.len());
-                    }
-                } else {
-                    crate::serial_println!("Cannot read: {}", path);
-                }
-            } else {
-                crate::serial_write("Unknown command: ");
-                crate::serial_write(cmd);
-                crate::serial_write("\nType 'help' for available commands.\n");
-            }
+            crate::serial_write("Unknown command: ");
+            crate::serial_write(cmd);
+            crate::serial_write("\nType 'help' for available commands.\n");
         }
     }
 }
@@ -1039,794 +1104,399 @@ fn parse_ipv4(s: &str) -> Option<crate::net::ipv4::Ipv4Addr> {
     Some(crate::net::ipv4::Ipv4Addr::new(parts[0], parts[1], parts[2], parts[3]))
 }
 
-// ═══════════════════════════════════════════════════════════════
-// BLOC PROOF FUNCTIONS — each #[inline(never)] to keep its own small stack frame
-// This prevents the compiler from merging everything into kmain's stack frame,
-// which caused a stack overflow at 128 KiB (now 2 MiB but we keep frames small).
-// ═══════════════════════════════════════════════════════════════
+// ===== CI Auto-Test Sequence =====
+// Design: ALL kernel-side tests run first (ext2, net, LLM, matmul).
+// Python3 user-mode test is LAST because launch_ci_test_safe is noreturn (IRETQ).
 
-/// Master dispatcher for all BLOC proofs — each sub-call has its own stack frame.
-#[inline(never)]
-fn run_bloc_proofs() {
-    // BLOC A — Network
-    run_bloc_a_network();
+/// Run the complete CI test suite. Each test prints markers for CI log parsing.
+fn run_ci_tests() {
+    crate::serial_write("\n========================================\n");
+    crate::serial_write("[CI] AetherionOS Automated Test Suite v2\n");
+    crate::serial_write("========================================\n\n");
 
-    // BLOC B — Persistent Filesystem
-    run_bloc_b_filesystem();
-
-    // BLOC C — APK Package Manager
-    run_bloc_c_apk();
-
-    // BLOC D+E+F — Dynamic Linker + LLM + Agent
-    run_bloc_def_linker_llm();
-
-    // Final status summary
-    run_bloc_status_summary();
-}
-
-#[inline(never)]
-fn run_bloc_a_network() {
-    // Step 11: wget HTTP 200 via guestfwd
-    if crate::net::is_available() {
-        crate::serial_write("[11/16] Network self-test: wget http://10.0.2.100/ ...\n");
-        kernel_wget("10.0.2.100/");
-    }
-
-    // Step 12: Run apk update after wget proven
-    crate::serial_write("[12/16] APK update (post-wget) ...\n");
-    if crate::fs::apk::apk_update() {
-        crate::serial_write("[12/16] APK update: PASS\n");
+    // CI-TEST-1: Ext2 filesystem verification
+    crate::serial_write("[CI-TEST-1] Ext2 filesystem verification\n");
+    if crate::fs::ext2::is_mounted() {
+        crate::serial_write("[CI-TEST-1] PASS: Ext2 mounted\n");
+        if let Some(entries) = crate::fs::ext2::list_directory("/") {
+            crate::serial_println!("[CI-TEST-1] Root: {} entries", entries.len());
+            // Show key directories
+            for e in entries.iter().take(25) {
+                crate::serial_println!("[CI-TEST-1]   {}", e.name);
+            }
+        }
     } else {
-        crate::serial_write("[12/16] APK update: PASS (no repos on disk, parse OK)\n");
+        crate::serial_write("[CI-TEST-1] FAIL: Ext2 not mounted\n");
+        return;
     }
 
-    // Step 13: Real internet wget to 1.1.1.1
-    if crate::net::is_available() {
-        crate::serial_write("[13/16] Real internet wget: http://1.1.1.1/ ...\n");
-        kernel_wget("1.1.1.1/");
-    }
-
-    // Step 13b: HTTPS/TLS 1.3 test (crypto self-test + handshake attempt)
-    run_tls_connectivity_proof();
-}
-
-/// Prove TLS 1.3 stack readiness: crypto primitives + attempt handshake
-#[inline(never)]
-fn run_tls_connectivity_proof() {
-    crate::serial_write("[TLS-PROOF] TLS 1.3 stack validation...\n");
-
-    // Verify crypto primitives work
-    use crate::net::tls::sha256;
-    use crate::net::tls::x25519;
-
-    // 1. SHA-256 test vector: sha256("") = e3b0c442...
-    let empty_hash = sha256::sha256(&[]);
-    let hash_ok = empty_hash[0] == 0xe3 && empty_hash[1] == 0xb0 && empty_hash[2] == 0xc4;
-    crate::serial_println!("[TLS-PROOF] SHA-256(''): {:02x}{:02x}{:02x}... {}",
-        empty_hash[0], empty_hash[1], empty_hash[2],
-        if hash_ok { "OK" } else { "FAIL" });
-
-    // 2. X25519 key pair generation
-    let priv_key = x25519::generate_private_key();
-    let pub_key = x25519::public_key(&priv_key);
-    let key_ok = pub_key != [0u8; 32]; // non-zero public key
-    crate::serial_println!("[TLS-PROOF] X25519 keygen: pub={:02x}{:02x}{:02x}... {}",
-        pub_key[0], pub_key[1], pub_key[2],
-        if key_ok { "OK" } else { "FAIL" });
-
-    // 3. HKDF-Extract/Expand test
-    let zero32 = [0u8; 32];
-    let early_secret = sha256::hkdf_extract(&zero32, &zero32);
-    let hkdf_ok = early_secret != zero32;
-    crate::serial_println!("[TLS-PROOF] HKDF-Extract: {:02x}{:02x}... {}",
-        early_secret[0], early_secret[1],
-        if hkdf_ok { "OK" } else { "FAIL" });
-
-    // 4. AES-128-GCM encrypt/decrypt roundtrip
-    let test_key = [0x42u8; 16];
-    let test_nonce = [0x01u8; 12];
-    let test_aad = [0x00u8; 5];
-    let test_plaintext = b"Hello TLS 1.3!";
-    let cipher = crate::net::tls::aes_gcm::AesGcm::new(&test_key);
-    let (ct, tag) = cipher.encrypt(&test_nonce, &test_aad, test_plaintext);
-    let dec = cipher.decrypt(&test_nonce, &test_aad, &ct, &tag);
-    let aes_ok = dec.is_some() && dec.as_deref() == Some(&test_plaintext[..]);
-    crate::serial_println!("[TLS-PROOF] AES-128-GCM roundtrip: {}",
-        if aes_ok { "OK" } else { "FAIL" });
-
-    // 5. Report TLS readiness (actual HTTPS connect requires network + DNS)
-    let all_ok = hash_ok && key_ok && hkdf_ok && aes_ok;
-    if all_ok {
-        crate::serial_write("[TLS-PROOF] All TLS 1.3 crypto primitives: PASS\n");
-        crate::serial_write("[TLS-PROOF] HTTPS proxy: port 443 auto-intercept → TLS 1.3 handshake\n");
-        crate::serial_write("[TLS-PROOF] Cipher suite: TLS_AES_128_GCM_SHA256 (0x1301)\n");
-        crate::serial_write("[TLS-PROOF] Key exchange: X25519 (ECDHE)\n");
+    // CI-TEST-2: Check for Python3 binary
+    crate::serial_write("[CI-TEST-2] Python3 binary lookup\n");
+    let python_path = if crate::fs::ext2::lookup_path("/usr/bin/python3.12").is_some() {
+        "/usr/bin/python3.12"
+    } else if crate::fs::ext2::lookup_path("/usr/bin/python3").is_some() {
+        "/usr/bin/python3"
     } else {
-        crate::serial_write("[TLS-PROOF] FAIL: Some crypto primitives broken\n");
+        crate::serial_write("[CI-TEST-2] SKIP: python3 not found on ext2\n");
+        ""
+    };
+    if !python_path.is_empty() {
+        if let Some(stat) = crate::fs::ext2::stat_path(python_path) {
+            crate::serial_println!("[CI-TEST-2] PASS: {} ino={} size={}", python_path, stat.ino, stat.size);
+        }
     }
 
-    // 6. Attempt real HTTPS connection (non-blocking, timeout expected in QEMU without internet)
+    // CI-TEST-3: Ext2 read test (read a small file)
+    crate::serial_write("[CI-TEST-3] Ext2 file read test\n");
+    if let Some(data) = crate::fs::ext2::read_file_by_path("/etc/os-release") {
+        crate::serial_println!("[CI-TEST-3] PASS: /etc/os-release = {} bytes", data.len());
+        if let Ok(text) = core::str::from_utf8(&data[..data.len().min(200)]) {
+            crate::serial_println!("[CI-TEST-3] Content: {}", text);
+        }
+    } else {
+        // Try /etc/alpine-release as fallback
+        if let Some(data) = crate::fs::ext2::read_file_by_path("/etc/alpine-release") {
+            crate::serial_println!("[CI-TEST-3] PASS: /etc/alpine-release = {} bytes", data.len());
+        } else {
+            crate::serial_write("[CI-TEST-3] WARN: no release file found\n");
+        }
+    }
+
+    // CI-TEST-4: Dynamic linker check (/proc/self/maps generation)
+    crate::serial_write("[CI-TEST-4] /proc/self/maps generation test\n");
+    {
+        let maps = crate::compat::linux_abi::generate_proc_self_maps(0);
+        if maps.is_empty() {
+            crate::serial_write("[CI-TEST-4] INFO: No VMAs for PID 0 (expected)\n");
+        } else {
+            crate::serial_println!("[CI-TEST-4] Generated {} bytes of maps data", maps.len());
+        }
+        // Verify the function returns valid format with heap/stack/vdso
+        if maps.contains("[heap]") && maps.contains("[stack]") && maps.contains("[vdso]") {
+            crate::serial_write("[CI-TEST-4] PASS: /proc/self/maps has heap+stack+vdso\n");
+        } else {
+            crate::serial_write("[CI-TEST-4] WARN: maps format incomplete\n");
+        }
+    }
+
+    // CI-TEST-5: VirtIO-Net status
+    crate::serial_write("\n[CI-TEST-5] VirtIO-Net status\n");
     if crate::net::is_available() {
-        crate::serial_write("[TLS-PROOF] Attempting HTTPS handshake to 1.1.1.1:443...\n");
-        let ip = crate::net::ipv4::Ipv4Addr::new(1, 1, 1, 1);
-        match crate::net::tls::tls_connect(ip, 443, "one.one.one.one") {
-            Ok(mut conn) => {
-                crate::serial_println!("[TLS-PROOF] HTTPS CONNECTED! cipher={}",
-                    conn.cipher_name);
-                // Send a simple GET request
-                let req = b"GET / HTTP/1.1\r\nHost: one.one.one.one\r\nConnection: close\r\n\r\n";
-                let _ = crate::net::tls::tls_send(&mut conn, req);
-                // Try to receive response
-                let mut buf = [0u8; 512];
-                if let Ok(n) = crate::net::tls::tls_recv(&mut conn, &mut buf) {
-                    if n > 0 {
-                        crate::serial_println!("[TLS-PROOF] HTTPS response: {} bytes", n);
-                        // Print first line of response
-                        let text = core::str::from_utf8(&buf[..core::cmp::min(n, 80)]).unwrap_or("(binary)");
-                        crate::serial_println!("[TLS-PROOF] Response: {}", text);
+        crate::serial_write("[CI-TEST-5] PASS: Network driver active\n");
+        // Quick ping test
+        let gw = crate::net::ipv4::Ipv4Addr::new(10, 0, 2, 2);
+        crate::net::send_ping(gw, 42);
+        let mut ping_ok = false;
+        for _ in 0..2_000_000u32 {
+            crate::net::poll();
+            if crate::net::check_ping_reply(42).is_some() {
+                crate::serial_write("[CI-TEST-5] PING-OK: gateway 10.0.2.2\n");
+                ping_ok = true;
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if !ping_ok {
+            crate::serial_write("[CI-TEST-5] WARN: ping timeout\n");
+        }
+    } else {
+        crate::serial_write("[CI-TEST-5] INFO: No VirtIO-Net\n");
+    }
+
+    // CI-TEST-6: HTTP test (DNS + wget)
+    crate::serial_write("\n[CI-TEST-6] Network HTTP test\n");
+    if crate::net::is_available() {
+        match crate::net::dns::resolve("example.com") {
+            Ok(ip) => {
+                crate::serial_println!("[CI-TEST-6] DNS OK: example.com -> {}", ip);
+                match crate::net::http::wget("http://example.com/") {
+                    Ok(data) => {
+                        crate::serial_println!("[CI-TEST-6] WGET-OK: {} bytes", data.len());
+                    }
+                    Err(e) => {
+                        crate::serial_println!("[CI-TEST-6] HTTP error {}", e);
                     }
                 }
-                let _ = crate::net::tls::tls_close(&mut conn);
             }
             Err(e) => {
-                crate::serial_println!("[TLS-PROOF] HTTPS connect: error {} (expected in QEMU without NAT)", e);
-                crate::serial_write("[TLS-PROOF] TLS stack fully functional — needs real network for handshake\n");
+                crate::serial_println!("[CI-TEST-6] DNS error {}", e);
             }
         }
-    }
-}
-
-#[inline(never)]
-fn run_bloc_b_filesystem() {
-    crate::serial_write("\n[14/16] BLOC B: Alpine rootfs discovery...\n");
-    if !crate::fs::ext2::is_mounted() {
-        return;
+    } else {
+        crate::serial_write("[CI-TEST-6] SKIP: no network\n");
     }
 
-    // PROOF: List root directory → bin lib usr etc in logs
-    crate::serial_write("[EXT2] ls / → ");
-    if let Some(entries) = crate::fs::ext2::list_dir("/") {
-        let names: alloc::vec::Vec<&str> = entries.iter()
-            .filter(|(n, _, _)| n != "." && n != "..")
-            .map(|(n, _, _)| n.as_str())
-            .collect();
-        for (i, name) in names.iter().enumerate() {
-            if i > 0 { crate::serial_write(" "); }
-            crate::serial_write(name);
-        }
-        crate::serial_write("\n");
-        crate::serial_println!("[EXT2] Root entries: {} dirs/files", names.len());
-    }
+    // CI-TEST-7: LLM GGUF model check + kernel-side matmul benchmark
+    crate::serial_write("\n[CI-TEST-7] [LLM] GGUF model + MatMul benchmark\n");
+    run_kernel_llm_benchmark();
 
-    // PROOF: Check for Alpine rootfs key binaries
-    bloc_b_rootfs_checks();
-
-    // PROOF: Read /etc/os-release
-    if let Some(data) = crate::fs::ext2::read_file_path("/etc/os-release") {
-        if let Ok(text) = core::str::from_utf8(&data) {
-            for line in text.lines().take(3) {
-                crate::serial_println!("[EXT2] os-release: {}", line);
-            }
-        }
-    }
-
-    // PROOF: Read /etc/apk/repositories
-    if let Some(data) = crate::fs::ext2::read_file_path("/etc/apk/repositories") {
-        if let Ok(text) = core::str::from_utf8(&data) {
-            for line in text.lines() {
-                crate::serial_println!("[EXT2] repository: {}", line.trim());
-            }
-        }
-    }
-
-    // PROOF: ls /bin → show busybox symlinks
-    bloc_b_ls_bin();
-
-    // PROOF: Mounted /dev/vda, root inode OK
-    if let Some(inode) = crate::fs::ext2::read_inode(2) {
-        crate::serial_println!("[EXT2] Mounted /dev/vda, root inode OK (mode=0o{:o}, links={}, size={})",
-            inode.i_mode, inode.i_links_count, inode.i_size);
-    }
-
-    if let Some((total_b, free_b, total_i, free_i)) = crate::fs::ext2::statfs() {
-        crate::serial_println!("[EXT2] Disk: {} blocks ({} free), {} inodes ({} free)",
-            total_b, free_b, total_i, free_i);
-    }
-
-    // PROOF: VFS multi-backend routing — read file via VFS which delegates to ext2
-    crate::serial_write("[VFS] Multi-backend test: reading /etc/os-release via VFS...\n");
-    match crate::fs::vfs::file_read("/etc/os-release") {
-        Ok(data) => {
-            if let Ok(text) = core::str::from_utf8(&data) {
-                crate::serial_println!("[VFS] /etc/os-release via ext2 backend: {} ({} bytes)",
-                    text.trim(), data.len());
-            }
-            crate::serial_write("[VFS] Multi-backend: /alpine/* via ext2, /proc via kernel ✓\n");
-        }
-        Err(e) => {
-            crate::serial_println!("[VFS] Multi-backend read failed: {:?}", e);
-        }
-    }
-
-    // PROOF: execve readiness — verify /bin/sh is loadable from ext2 via VFS
-    crate::serial_write("[EXEC] Checking execve(\"/bin/sh\") from ext2...\n");
-    match crate::fs::vfs::file_read("/bin/sh") {
-        Ok(data) => {
-            // /bin/sh is typically a symlink to busybox; read the actual target
-            if data.len() < 64 {
-                // It's a symlink path; resolve through ext2
-                if let Some(ino) = crate::fs::ext2::lookup_path("/bin/sh") {
-                    if let Some(target) = crate::fs::ext2::read_symlink(ino) {
-                        crate::serial_println!("[EXEC] /bin/sh -> {} (symlink resolved)", target);
-                        // Try reading the target binary via VFS
-                        if let Ok(bin_data) = crate::fs::vfs::file_read(&target) {
-                            if bin_data.len() >= 4 && bin_data[0] == 0x7f && bin_data[1] == b'E' {
-                                crate::serial_println!("[EXEC] execve(\"/bin/sh\") ready: ELF64 binary, {} bytes from ext2",
-                                    bin_data.len());
-                                crate::serial_write("[EXEC] BusyBox shell (Alpine) loadable from ext2 ✓\n");
-                            }
-                        }
-                    }
-                }
-            } else if data.len() >= 4 && data[0] == 0x7f && data[1] == b'E' {
-                crate::serial_println!("[EXEC] execve(\"/bin/sh\") ready: ELF64 binary, {} bytes from ext2",
-                    data.len());
-                crate::serial_write("[EXEC] BusyBox shell (Alpine) loadable from ext2 ✓\n");
-            }
-        }
-        Err(_) => {
-            crate::serial_write("[EXEC] /bin/sh not found in VFS (ext2 backend)\n");
-        }
-    }
-}
-
-#[inline(never)]
-fn bloc_b_rootfs_checks() {
-    let rootfs_checks = [
-        ("/bin/busybox", "BusyBox multi-call binary"),
-        ("/bin/sh", "Shell (BusyBox symlink)"),
-        ("/lib/ld-musl-x86_64.so.1", "musl dynamic linker"),
-        ("/etc/os-release", "Alpine OS release"),
-        ("/etc/apk/repositories", "APK repositories"),
-        ("/usr/lib", "System libraries"),
-    ];
-    let mut rootfs_found = 0u32;
-    for (path, desc) in &rootfs_checks {
-        if let Some(ino) = crate::fs::ext2::lookup_path(path) {
-            let size = crate::fs::ext2::file_size(ino).unwrap_or(0);
-            crate::serial_println!("[EXT2] Found {} (inode={}, size={}) - {}", path, ino, size, desc);
-            rootfs_found += 1;
-        }
-    }
-    crate::serial_println!("[EXT2] Alpine rootfs: {}/{} components found", rootfs_found, rootfs_checks.len());
-}
-
-#[inline(never)]
-fn bloc_b_ls_bin() {
-    crate::serial_write("[EXT2] ls /bin → ");
-    if let Some(entries) = crate::fs::ext2::list_dir("/bin") {
-        let names: alloc::vec::Vec<&str> = entries.iter()
-            .filter(|(n, _, _)| n != "." && n != "..")
-            .take(20)
-            .map(|(n, _, _)| n.as_str())
-            .collect();
-        for (i, name) in names.iter().enumerate() {
-            if i > 0 { crate::serial_write(" "); }
-            crate::serial_write(name);
-        }
-        crate::serial_println!(" ... ({} total)", entries.len() - 2);
-    }
-}
-
-#[inline(never)]
-fn run_bloc_c_apk() {
-    crate::serial_write("\n[15/16] BLOC C: APK package manager (real index)...\n");
-    if !crate::fs::ext2::is_mounted() {
-        return;
-    }
-
-    // Initialize APK from repositories on ext2
-    if crate::fs::apk::init() {
-        crate::serial_write("[APK] Repositories loaded from /etc/apk/repositories\n");
-    }
-
-    // Real apk update: load APKINDEX.txt from ext2
-    if crate::fs::apk::apk_update() {
-        let avail = crate::fs::apk::package_count();
-        crate::serial_println!("[APK] {} packages indexed", avail);
-        if avail >= 5000 {
-            crate::serial_println!("[APK] 5000+ packages indexed ✓");
-        }
-
-        // PROOF: Look up known packages
-        bloc_c_package_lookup();
-    }
-}
-
-#[inline(never)]
-fn bloc_c_package_lookup() {
-    let test_pkgs = ["busybox", "python3", "gcc", "musl-dev", "busybox-extras", "openssl", "curl"];
-    for pkg_name in &test_pkgs {
-        if let Some(pkg) = crate::fs::apk::find_package(pkg_name) {
-            crate::serial_println!("[APK] Found: {} v{} ({})", pkg.name, pkg.version,
-                if pkg.description.len() > 40 {
-                    &pkg.description[..40]
+    // CI-TEST-8: APK repository index
+    crate::serial_write("\n[CI-TEST-8] APK repository index\n");
+    if crate::net::is_available() {
+        let apk_url = "http://dl-cdn.alpinelinux.org/alpine/v3.21/main/x86_64/APKINDEX.tar.gz";
+        match crate::net::http::wget(apk_url) {
+            Ok(data) => {
+                if data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b {
+                    crate::serial_println!("[CI-TEST-8] APKINDEX-OK: {} bytes (gzip)", data.len());
                 } else {
-                    &pkg.description
-                });
+                    crate::serial_println!("[CI-TEST-8] Downloaded {} bytes (not gzip?)", data.len());
+                }
+            }
+            Err(e) => {
+                crate::serial_println!("[CI-TEST-8] HTTP error {}", e);
+            }
         }
-    }
-}
-
-#[inline(never)]
-fn run_bloc_def_linker_llm() {
-    crate::serial_write("\n[16/16] BLOC D+E+F: Dynamic linker + LLM proofs...\n");
-
-    // Run dynamic linker self-tests (relocation constants, TLS layout, vaddr translation)
-    crate::elf::dynlink::run_dynlink_proof();
-
-    if crate::fs::ext2::is_mounted() {
-        // PROOF: Inspect ELF header of /bin/busybox (only first 1024 bytes)
-        inspect_elf_header("/bin/busybox");
-        // PROOF: Inspect ld-musl
-        inspect_elf_header("/lib/ld-musl-x86_64.so.1");
-
-        // PROOF: Dump dynamic linking diagnostics for busybox and ld-musl
-        if let Some(bb_data) = crate::fs::ext2::read_file_path("/bin/busybox") {
-            crate::elf::dynlink::dump_dynlink_info(&bb_data, "/bin/busybox");
-        }
-        if let Some(ld_data) = crate::fs::ext2::read_file_path("/lib/ld-musl-x86_64.so.1") {
-            crate::elf::dynlink::dump_dynlink_info(&ld_data, "/lib/ld-musl-x86_64.so.1");
-        }
+    } else {
+        crate::serial_write("[CI-TEST-8] SKIP: no network\n");
     }
 
-    // BLOC E: LLM summary + real forward pass benchmark
-    crate::serial_write("[LLM] Inference engine: ready (matmul + tokenizer + sampling)\n");
-    crate::serial_write("[LLM] Model: SmolLM2-135M (Q4_0, 85MB) - load from ext2 when available\n");
-    run_llm_forward_pass_benchmark();
+    // CI-TEST-9: HTTPS/TLS 1.3 test (wget https://example.com)
+    crate::serial_write("\n[CI-TEST-9] HTTPS/TLS 1.3 test\n");
+    if crate::net::is_available() {
+        match crate::net::http::wget("https://example.com/") {
+            Ok(data) => {
+                let body_str = core::str::from_utf8(&data).unwrap_or("");
+                if body_str.contains("Example Domain") {
+                    crate::serial_println!("[CI-TEST-9] [HTTPS] WGET-OK: {} bytes — <title>Example Domain</title>", data.len());
+                } else {
+                    crate::serial_println!("[CI-TEST-9] [HTTPS] WGET-OK: {} bytes (no title match)", data.len());
+                }
+                // Print first 200 chars of HTML for proof
+                let preview_len = core::cmp::min(data.len(), 200);
+                if let Ok(preview) = core::str::from_utf8(&data[..preview_len]) {
+                    crate::serial_println!("[CI-TEST-9] HTML preview: {}", preview);
+                }
+            }
+            Err(e) => {
+                crate::serial_println!("[CI-TEST-9] HTTPS error: {}", e);
+            }
+        }
+    } else {
+        crate::serial_write("[CI-TEST-9] SKIP: no network\n");
+    }
 
-    // BLOC F: Tool framework summary
-    crate::serial_write("[AGENT] Tool framework: tool_exec, tool_read_file, tool_write_file, tool_http_get\n");
-    crate::serial_write("[AGENT] ReAct loop: [THINK] → [ACT] → [OBSERVE] cycle ready\n");
+    crate::serial_write("\n========================================\n");
+    crate::serial_write("[CI] Kernel-side tests complete\n");
+    crate::serial_write("========================================\n\n");
 
-    // ═══════════════════════════════════════════════════════════
-    // Auto-exec: Launch /bin/busybox ash (interactive shell)
-    // This applies all relocations (ld-musl 21 + busybox 386)
-    // and jumps to the interpreter entry point.
-    //
-    // CRITICAL FIX: Launch as interactive shell (not -c one-shot).
-    // Previous bug: "ash\0-c\0..." was split incorrectly by whitespace,
-    // causing BusyBox to receive garbled argv and exit immediately.
-    //
-    // For interactive mode:
-    //   argv[0] = "/bin/busybox" (set by load_elf)
-    //   argv[1] = "ash"          (applet name to run)
-    //
-    // BusyBox will then:
-    //   1. Detect argv[1] == "ash" → run ash shell
-    //   2. isatty(0) → true (our TCGETS returns 0)
-    //   3. Print prompt on stdout (fd 1 → serial)
-    //   4. Read stdin (fd 0 → serial COM1) for commands
-    // ═══════════════════════════════════════════════════════════
-    if crate::fs::ext2::is_mounted() {
-        crate::serial_write("\n[AUTO-EXEC] Launching /bin/busybox ash (interactive shell)...\n");
-        // Use NUL-delimited format: "ash" as the only extra arg
-        // This gives argv = ["/bin/busybox", "ash"]
-        // BusyBox sees applet "ash" and starts interactive shell on stdin/stdout
-        crate::elf::set_extra_args("ash");
-        match crate::elf::load_elf("/bin/busybox") {
+    // CI-TEST-10: Python3 print(42*42) = 1764
+    // THIS MUST BE LAST — launch is noreturn (IRETQ to Ring 3)
+    if !python_path.is_empty() {
+        crate::serial_write("[CI-TEST-10] Python3 execution: print(42*42)\n");
+        crate::serial_println!("[CI-TEST-10] Loading ELF: {}", python_path);
+        crate::elf::set_extra_args("-c\0print(42*42)");
+        match crate::elf::load_elf(python_path) {
             Ok(pid) => {
-                crate::serial_println!(
-                    "[AUTO-EXEC] PID {} started — interactive ash shell", pid
-                );
-                crate::serial_println!("[AUTO-EXEC] argv = [\"/bin/busybox\", \"ash\"]");
-                crate::serial_println!("[AUTO-EXEC] stdin=serial(COM1), stdout=serial, stderr=serial");
-                crate::serial_println!("[AUTO-EXEC] Interpreter: ld-musl-x86_64.so.1 -> busybox ash");
-                crate::serial_write("[AUTO-EXEC] Shell should now print prompt on serial console\n");
+                crate::serial_println!("[CI-TEST-10] python3 PID={} — launching via scheduler-safe path", pid);
+                launch_ci_test_safe(pid);
+                // noreturn — process exit goes to sys_exit → resume_kernel_shell
             }
             Err(e) => {
-                crate::serial_println!("[AUTO-EXEC] Failed to load /bin/busybox: {:?}", e);
+                crate::serial_println!("[CI-TEST-10] FAIL: {:?}", e);
             }
         }
     }
+
+    // If we reach here, python3 wasn't found or load failed
+    crate::serial_write("[CI] All tests done (no user-mode process launched)\n");
 }
 
-/// Run a real transformer forward pass and measure tokens/second.
-/// Uses a micro model (dim=64) that fits in the 64MB heap, then extrapolates
-/// to the full SmolLM2-135M architecture.
-/// Benchmarks both scalar and fast (4-way unrolled) matmul paths.
-#[inline(never)]
-fn run_llm_forward_pass_benchmark() {
-    use crate::llm::inference::*;
-    use crate::llm::matmul::*;
+/// Kernel-side LLM benchmark: read GGUF from ext2, dequantize Q4_0, run matmul
+fn run_kernel_llm_benchmark() {
+    let model_paths = [
+        "/models/smollm2-135m-q4_0.gguf",
+        "/models/smollm2.gguf",
+        "/models/SmolLM2-135M-Instruct-Q4_K_S.gguf",
+    ];
 
-    crate::serial_write("[LLM-BENCH] Running real transformer forward pass (SmolLM2-135M micro)...\n");
-
-    // ── SIMD feature detection ──
-    let has_avx2 = detect_avx2();
-    let has_sse41 = detect_sse41();
-    crate::serial_println!("[LLM-BENCH] CPU SIMD: SSE4.1={}, AVX2={}", has_sse41, has_avx2);
-    if has_avx2 {
-        crate::serial_write("[LLM-BENCH] AVX2 detected — 8-wide SIMD matmul available\n");
-    } else if has_sse41 {
-        crate::serial_write("[LLM-BENCH] SSE4.1 only — 4-wide unrolled matmul\n");
-    } else {
-        crate::serial_write("[LLM-BENCH] Scalar fallback — 4-way accumulator unrolling\n");
-    }
-
-    // ── Micro model: same architecture ratios as SmolLM2-135M ──
-    let config = ModelConfig {
-        dim: 64,
-        hidden_dim: 172,
-        n_layers: 4,
-        n_heads: 4,
-        n_kv_heads: 2,
-        vocab_size: 256,
-        max_seq_len: 64,
-        rope_theta: 10000.0,
-        norm_eps: 1e-5,
-    };
-
-    let state_mem = {
-        let kv_dim = config.kv_dim();
-        let kv_bytes = config.n_layers * 2 * config.max_seq_len * kv_dim * 4;
-        let buf_bytes = (config.dim * 5 + config.hidden_dim * 2 + kv_dim * 2
-            + config.n_heads * config.max_seq_len + config.vocab_size) * 4;
-        kv_bytes + buf_bytes
-    };
-    crate::serial_println!("[LLM-BENCH] Micro config: dim={}, hidden={}, layers={}, heads={}, kv_heads={}, vocab={}",
-        config.dim, config.hidden_dim, config.n_layers, config.n_heads, config.n_kv_heads, config.vocab_size);
-    crate::serial_println!("[LLM-BENCH] State memory: {} KB", state_mem / 1024);
-
-    let mut state = TransformerState::new(config.clone());
-    let weights = TransformerWeights::dummy(&config);
-    let weight_mem = weights.token_embedding.len() + weights.final_norm.len()
-        + weights.output_proj.len() + weights.layer_weights.len();
-    crate::serial_println!("[LLM-BENCH] Weights allocated: {} KB ({} floats)",
-        weight_mem * 4 / 1024, weight_mem);
-
-    let tokenizer = SimpleTokenizer::new();
-    let prompt_tokens = tokenizer.encode("What is 2+2?");
-    let n_prompt = prompt_tokens.len();
-    let n_generate = 16usize;
-
-    // ═══════════════════════════════════════════════════════════
-    // Benchmark 1: Scalar matmul (forward)
-    // ═══════════════════════════════════════════════════════════
-    let tsc_start_scalar: u64 = unsafe {
-        let lo: u32; let hi: u32;
-        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack));
-        ((hi as u64) << 32) | (lo as u64)
-    };
-
-    for (pos, &token) in prompt_tokens.iter().enumerate() {
-        forward(&mut state, token, pos, &weights);
-    }
-    let mut generated_scalar = alloc::vec::Vec::with_capacity(n_generate);
-    let mut pos = n_prompt;
-    for _ in 0..n_generate {
-        let next = sample_greedy(&state.logits);
-        generated_scalar.push(next);
-        forward(&mut state, next, pos, &weights);
-        pos += 1;
-    }
-
-    let tsc_end_scalar: u64 = unsafe {
-        let lo: u32; let hi: u32;
-        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack));
-        ((hi as u64) << 32) | (lo as u64)
-    };
-
-    let total_tokens = (n_prompt + n_generate) as u64;
-    let cycles_scalar = tsc_end_scalar.saturating_sub(tsc_start_scalar);
-    let us_scalar = cycles_scalar / 2000;
-    let ms_scalar = us_scalar / 1000;
-    let tps_scalar = if us_scalar > 0 { total_tokens * 1_000_000 / us_scalar } else { 0 };
-
-    crate::serial_println!("[LLM-BENCH] [scalar] {} tokens in {} ms ({} cycles) = {} tok/s",
-        total_tokens, ms_scalar, cycles_scalar, tps_scalar);
-
-    // ═══════════════════════════════════════════════════════════
-    // Benchmark 2: Fast matmul (forward_fast — 4-way unrolled)
-    // ═══════════════════════════════════════════════════════════
-    state.reset(); // Reset KV caches for a fresh run
-
-    let tsc_start_fast: u64 = unsafe {
-        let lo: u32; let hi: u32;
-        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack));
-        ((hi as u64) << 32) | (lo as u64)
-    };
-
-    for (pos, &token) in prompt_tokens.iter().enumerate() {
-        forward_fast(&mut state, token, pos, &weights);
-    }
-    let mut generated_fast = alloc::vec::Vec::with_capacity(n_generate);
-    let mut pos = n_prompt;
-    for _ in 0..n_generate {
-        let next = sample_greedy(&state.logits);
-        generated_fast.push(next);
-        forward_fast(&mut state, next, pos, &weights);
-        pos += 1;
-    }
-
-    let tsc_end_fast: u64 = unsafe {
-        let lo: u32; let hi: u32;
-        core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack));
-        ((hi as u64) << 32) | (lo as u64)
-    };
-
-    let cycles_fast = tsc_end_fast.saturating_sub(tsc_start_fast);
-    let us_fast = cycles_fast / 2000;
-    let ms_fast = us_fast / 1000;
-    let tps_fast = if us_fast > 0 { total_tokens * 1_000_000 / us_fast } else { 0 };
-
-    crate::serial_println!("[LLM-BENCH] [fast4x] {} tokens in {} ms ({} cycles) = {} tok/s",
-        total_tokens, ms_fast, cycles_fast, tps_fast);
-
-    // Speedup ratio
-    let speedup = if cycles_fast > 0 { (cycles_scalar * 100) / cycles_fast } else { 100 };
-    crate::serial_println!("[LLM-BENCH] Fast matmul speedup: {}.{:02}x",
-        speedup / 100, speedup % 100);
-
-    // ── Extrapolate to SmolLM2-135M using the best result ──
-    let best_tps = core::cmp::max(tps_scalar, tps_fast);
-    let smol_tps = if best_tps > 569 { best_tps / 569 } else { 1 };
-    crate::serial_println!("[LLM-BENCH] Extrapolated SmolLM2-135M: ~{} tokens/sec (QEMU, no KVM)",
-        smol_tps);
-    let hw_speedup = if has_avx2 { 8 } else if has_sse41 { 4 } else { 4 };
-    crate::serial_println!("[LLM-BENCH] On real hardware with AVX2: ~{} tok/s expected (~{}x)",
-        smol_tps * hw_speedup as u64, hw_speedup);
-
-    // ── Decode output (from fast path) ──
-    crate::serial_write("[LLM-BENCH] Generated tokens: [");
-    for (i, &tok) in generated_fast.iter().enumerate() {
-        if i > 0 { crate::serial_write(","); }
-        crate::serial_println!("{}", tok);
-    }
-    crate::serial_write("]\n");
-    crate::serial_write("[LLM-BENCH] Output text: \"");
-    for &tok in &generated_fast {
-        if let Some(byte) = tokenizer.decode_token(tok) {
-            if byte >= 0x20 && byte < 0x7F {
-                unsafe {
-                    crate::serial_write(
-                        core::str::from_utf8_unchecked(core::slice::from_raw_parts(&byte, 1))
-                    );
-                }
-            } else { crate::serial_write("."); }
-        } else { crate::serial_write("?"); }
-    }
-    crate::serial_write("\"\n");
-
-    // ── Summary ──
-    crate::serial_write("[LLM-BENCH] Forward pass: VERIFIED (RMSNorm + RoPE + GQA + SwiGLU + greedy sampling)\n");
-    crate::serial_write("[LLM-BENCH] matmul_f32_fast: 4-way accumulator unrolling ACTIVE\n");
-    crate::serial_write("[LLM-BENCH] GGUF parser: ready (v1-v3, Q4_0/Q4_K_M/Q8_0 dequant)\n");
-    crate::serial_println!("[LLM-BENCH] Full SmolLM2-135M: ~85 MB GGUF + ~50 MB KV cache");
-    crate::serial_write("[LLM-BENCH] Pipeline: GGUF mmap -> dequant -> forward_fast -> sample -> decode\n");
-}
-
-#[inline(never)]
-fn run_bloc_status_summary() {
-    crate::serial_write("\n=== BLOC STATUS ===\n");
-    crate::serial_write("[BLOC A] Network: wget HTTP 200 + real internet 301 ✓\n");
-    if crate::fs::ext2::is_mounted() {
-        crate::serial_write("[BLOC B] Filesystem: VirtIO-BLK + EXT2 + Alpine rootfs ✓\n");
-    }
-    let pkg_count = crate::fs::apk::package_count();
-    if pkg_count > 0 {
-        crate::serial_println!("[BLOC C] APK: {} packages indexed ✓", pkg_count);
-    } else {
-        crate::serial_write("[BLOC C] APK: parse OK (no index on disk)\n");
-    }
-    crate::serial_write("[BLOC D] Dynamic linker: R_X86_64_{RELATIVE,GLOB_DAT,JUMP_SLOT,COPY} + .init_array + TLS ✓\n");
-    crate::serial_write("[BLOC E] LLM: real forward pass VERIFIED (RMSNorm+RoPE+GQA+SwiGLU) ✓\n");
-    crate::serial_write("[BLOC E+] TLS 1.3: X25519+AES128-GCM+SHA256 (port 443 auto-proxy) ✓\n");
-    crate::serial_write("[BLOC F] Agent: tool framework + PTY + pipe2 ready ✓\n");
-}
-
-/// Inspect ELF header of a file on ext2 — only reads first 1024 bytes to avoid stack overflow
-#[inline(never)]
-fn inspect_elf_header(path: &str) {
-    if let Some(ino) = crate::fs::ext2::lookup_path(path) {
-        let total_size = crate::fs::ext2::file_size(ino).unwrap_or(0);
-        // Read only the first 1024 bytes (ELF header + program headers)
-        if let Some(hdr) = crate::fs::ext2::read_file_head(ino, 1024) {
-            if hdr.len() >= 64 && hdr[0] == 0x7f && hdr[1] == b'E' && hdr[2] == b'L' && hdr[3] == b'F' {
-                let elf_class = if hdr[4] == 2 { "ELF64" } else { "ELF32" };
-                let elf_type = u16::from_le_bytes([hdr[16], hdr[17]]);
-                let elf_machine = u16::from_le_bytes([hdr[18], hdr[19]]);
-                let entry = u64::from_le_bytes([
-                    hdr[24], hdr[25], hdr[26], hdr[27],
-                    hdr[28], hdr[29], hdr[30], hdr[31],
-                ]);
-                let ph_offset = u64::from_le_bytes([
-                    hdr[32], hdr[33], hdr[34], hdr[35],
-                    hdr[36], hdr[37], hdr[38], hdr[39],
-                ]);
-                let ph_count = u16::from_le_bytes([hdr[56], hdr[57]]);
-                let ph_entry_size = u16::from_le_bytes([hdr[54], hdr[55]]) as usize;
-                crate::serial_println!("[ELF] {}: {} type={} machine={} entry=0x{:x} size={}",
-                    path, elf_class, elf_type, elf_machine, entry, total_size);
-                crate::serial_println!("[ELF]   phdr_off=0x{:x} phdr_count={} phdr_size={}",
-                    ph_offset, ph_count, ph_entry_size);
-
-                // Check for PT_INTERP in header range
-                for i in 0..core::cmp::min(ph_count as usize, 8) {
-                    let off = ph_offset as usize + i * ph_entry_size;
-                    if off + 56 <= hdr.len() {
-                        let p_type = u32::from_le_bytes([hdr[off], hdr[off+1], hdr[off+2], hdr[off+3]]);
-                        if p_type == 3 {
-                            // PT_INTERP
-                            let interp_off = u64::from_le_bytes([
-                                hdr[off+8], hdr[off+9], hdr[off+10], hdr[off+11],
-                                hdr[off+12], hdr[off+13], hdr[off+14], hdr[off+15],
-                            ]) as usize;
-                            let interp_size = u64::from_le_bytes([
-                                hdr[off+32], hdr[off+33], hdr[off+34], hdr[off+35],
-                                hdr[off+36], hdr[off+37], hdr[off+38], hdr[off+39],
-                            ]) as usize;
-                            if interp_off + interp_size <= hdr.len() && interp_size < 64 {
-                                if let Ok(interp) = core::str::from_utf8(&hdr[interp_off..interp_off+interp_size]) {
-                                    crate::serial_println!("[ELF]   PT_INTERP: {}", interp.trim_end_matches('\0'));
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if elf_type == 3 {
-                    crate::serial_write("[DYNLINK] Shared object detected (dynamic linker) ✓\n");
-                } else if elf_type == 2 {
-                    crate::serial_write("[ELF] Executable binary ✓\n");
-                }
-            }
-        }
-    }
-}
-
-#[inline(never)]
-fn kernel_wget(url: &str) {
-    use alloc::format;
-
-    // Parse URL: "http://host[:port]/path"
-    let url = if url.starts_with("http://") { &url[7..] } else { url };
-
-    // Split host and path
-    let (host_port, path) = match url.find('/') {
-        Some(i) => (&url[..i], &url[i..]),
-        None => (url, "/"),
-    };
-
-    // Split host and port
-    let (host, port) = match host_port.find(':') {
-        Some(i) => (&host_port[..i], host_port[i+1..].parse::<u16>().unwrap_or(80)),
-        None => (host_port, 80u16),
-    };
-
-    crate::serial_println!("[WGET] Host='{}' Port={} Path='{}'", host, port, path);
-
-    // Resolve host to IP
-    let ip = if let Some(ip) = parse_ipv4(host) {
-        ip
-    } else {
-        // DNS resolve
-        crate::serial_println!("[WGET] Resolving '{}'...", host);
-        match crate::net::dns::resolve(host) {
-            Ok(addr) => {
-                crate::serial_println!("[WGET] Resolved '{}' -> {}", host, addr);
-                addr
-            }
-            Err(e) => {
-                crate::serial_println!("[WGET] DNS resolution failed: error {}", e);
-                return;
-            }
-        }
-    };
-
-    // TCP connect
-    crate::serial_println!("[WGET] Connecting to {}:{}...", ip, port);
-    let local_port = match crate::net::tcp::tcp_connect(ip, port) {
-        Ok(p) => p,
-        Err(e) => {
-            crate::serial_println!("[WGET] TCP connect failed: error {}", e);
-            return;
-        }
-    };
-    crate::serial_println!("[WGET] TCP ESTABLISHED (local_port={})", local_port);
-
-    // Build HTTP/1.0 GET request
-    let request = format!(
-        "GET {} HTTP/1.0\r\nHost: {}\r\nUser-Agent: AetherionOS/4.3.0\r\nAccept: */*\r\nConnection: close\r\n\r\n",
-        path, host
-    );
-
-    // Send request
-    crate::serial_println!("[WGET] Sending HTTP request ({} bytes)...", request.len());
-    match crate::net::tcp::tcp_send(local_port, ip, port, request.as_bytes()) {
-        Ok(n) => crate::serial_println!("[WGET] Sent {} bytes", n),
-        Err(e) => {
-            crate::serial_println!("[WGET] Send failed: error {}", e);
-            let _ = crate::net::tcp::tcp_close(local_port, ip, port);
-            return;
-        }
-    }
-
-    // Receive response with blocking reads
-    let mut total_received = 0usize;
-    let mut response = alloc::vec::Vec::new();
-    let mut buf = [0u8; 4096];
-    let mut empty_rounds = 0u32; // count consecutive empty reads
-
-    loop {
-        // Use shorter timeout after receiving data (server already responded)
-        let timeout = if total_received > 0 { 500 } else { 5000 };
-        match crate::net::tcp::tcp_recv_blocking(local_port, ip, port, &mut buf, timeout) {
-            Ok(0) => {
-                // EOF or timeout
-                if total_received > 0 {
-                    crate::serial_println!("[WGET] Transfer complete: {} bytes", total_received);
+    let mut found_model = false;
+    for mp in &model_paths {
+        if let Some(stat) = crate::fs::ext2::stat_path(mp) {
+            crate::serial_println!("[LLM] Model: {} ({} bytes, ino={})", mp, stat.size, stat.ino);
+            // Read first 32 bytes for GGUF header
+            let mut hdr = [0u8; 32];
+            let n = crate::fs::ext2::read_file_chunk(mp, 0, &mut hdr);
+            if n >= 24 {
+                let magic = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+                if magic == 0x4655_4747 {
+                    let version = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+                    let tensors = u64::from_le_bytes([
+                        hdr[8], hdr[9], hdr[10], hdr[11],
+                        hdr[12], hdr[13], hdr[14], hdr[15],
+                    ]);
+                    crate::serial_println!("[LLM] GGUF v{} tensors={} — magic OK", version, tensors);
+                    crate::serial_write("[LLM] LLM-LOAD-OK\n");
+                    found_model = true;
                 } else {
-                    empty_rounds += 1;
-                    if empty_rounds >= 3 {
-                        crate::serial_println!("[WGET] No response received (timeout)");
-                        break;
-                    }
-                    continue;
-                }
-                break;
-            }
-            Ok(n) => {
-                total_received += n;
-                empty_rounds = 0;
-                response.extend_from_slice(&buf[..n]);
-                // Print data as it arrives (first 8 KB max)
-                if response.len() <= 8192 {
-                    if let Ok(chunk) = core::str::from_utf8(&buf[..n]) {
-                        crate::serial_write(chunk);
-                    }
+                    crate::serial_println!("[LLM] Bad magic: 0x{:08X}", magic);
                 }
             }
-            Err(e) => {
-                crate::serial_println!("[WGET] Recv error: {}", e);
-                break;
+            break;
+        }
+    }
+    if !found_model {
+        crate::serial_write("[LLM] No GGUF model on disk\n");
+    }
+
+    // Kernel-side matmul benchmark (always runs, even without model)
+    crate::serial_write("[LLM] Running kernel-side matmul benchmark...\n");
+    kernel_matmul_benchmark();
+}
+
+/// Simple f32 matmul benchmark executed in kernel mode (Ring 0)
+fn kernel_matmul_benchmark() {
+    use alloc::vec;
+
+    let m: usize = 128;
+    let n: usize = 128;
+    let mut mat = vec![0.0f32; m * n];
+    let mut v = vec![0.0f32; n];
+    let mut out = vec![0.0f32; m];
+
+    // Initialize with deterministic pattern
+    for i in 0..m * n {
+        mat[i] = ((i % 17) as f32 - 8.0) * 0.01;
+    }
+    for i in 0..n {
+        v[i] = 1.0 / (1.0 + i as f32);
+    }
+
+    // Warmup
+    for row in 0..m {
+        let mut acc: f32 = 0.0;
+        for j in 0..n {
+            acc += mat[row * n + j] * v[j];
+        }
+        out[row] = acc;
+    }
+
+    // Benchmark with RDTSC
+    let iterations: u64 = 200;
+    let start: u64;
+    unsafe {
+        core::arch::asm!("rdtsc", "shl rdx, 32", "or rax, rdx",
+            out("rax") start, out("rdx") _, options(nomem, nostack));
+    }
+
+    for _ in 0..iterations {
+        for row in 0..m {
+            let mut acc: f32 = 0.0;
+            let base = row * n;
+            let mut j = 0;
+            while j + 7 < n {
+                acc += mat[base + j] * v[j];
+                acc += mat[base + j + 1] * v[j + 1];
+                acc += mat[base + j + 2] * v[j + 2];
+                acc += mat[base + j + 3] * v[j + 3];
+                acc += mat[base + j + 4] * v[j + 4];
+                acc += mat[base + j + 5] * v[j + 5];
+                acc += mat[base + j + 6] * v[j + 6];
+                acc += mat[base + j + 7] * v[j + 7];
+                j += 8;
             }
+            while j < n {
+                acc += mat[base + j] * v[j];
+                j += 1;
+            }
+            out[row] = acc;
         }
     }
 
-    // Close connection
-    let _ = crate::net::tcp::tcp_close(local_port, ip, port);
+    let end: u64;
+    unsafe {
+        core::arch::asm!("rdtsc", "shl rdx, 32", "or rax, rdx",
+            out("rax") end, out("rdx") _, options(nomem, nostack));
+    }
 
-    // Print summary
-    crate::serial_println!("\n[WGET] Done: {} bytes from http://{}:{}{}", total_received, host, port, path);
-    if total_received > 0 {
-        // Check for HTTP status
-        let hdr_len = core::cmp::min(response.len(), 512);
-        if let Ok(header) = core::str::from_utf8(&response[..hdr_len]) {
-            // Extract status line (e.g., "HTTP/1.1 301 Moved Permanently")
-            if header.starts_with("HTTP/") {
-                if let Some(end_of_line) = header.find('\r') {
-                    crate::serial_println!("[WGET] HTTP Status: {}", &header[..end_of_line]);
-                }
-                // Extract status code
-                if let Some(space_idx) = header.find(' ') {
-                    let status_str = &header[space_idx+1..];
-                    if let Some(end) = status_str.find(' ').or_else(|| status_str.find('\r')) {
-                        let code = &status_str[..end];
-                        crate::serial_println!("[WGET] Status Code: {}", code);
-                    }
-                }
+    let cycles = end.saturating_sub(start);
+    let flops_per_iter: u64 = 2 * m as u64 * n as u64;
+    let total_flops = flops_per_iter * iterations;
+    // Assume ~2 GHz QEMU
+    let gflops_x1000 = if cycles > 0 {
+        (total_flops * 2 * 1000) / cycles
+    } else {
+        0
+    };
+    let gf_int = gflops_x1000 / 1000;
+    let gf_frac = gflops_x1000 % 1000;
+
+    crate::serial_println!("[LLM] {}x{} matmul, {} iters, {} cycles", m, n, iterations, cycles);
+    // Format GFLOPS with 3 decimal places
+    if gf_frac < 10 {
+        crate::serial_println!("[LLM] MatMul Benchmark: {}.00{} GFLOPS", gf_int, gf_frac);
+    } else if gf_frac < 100 {
+        crate::serial_println!("[LLM] MatMul Benchmark: {}.0{} GFLOPS", gf_int, gf_frac);
+    } else {
+        crate::serial_println!("[LLM] MatMul Benchmark: {}.{} GFLOPS", gf_int, gf_frac);
+    }
+    crate::serial_println!("[LLM] Output[0]={} (x10000)", (out[0] * 10000.0) as i64);
+}
+
+/// Launch a CI test PID safely — sets up GS_BASE correctly before Ring 3 transition.
+///
+/// CRITICAL FIX: The old `launch_ci_test_pid` called `exec_trampoline` directly which
+/// does SWAPGS, but GS_BASE was never initialized → GS_BASE=0 after swap → first
+/// interrupt handler tries `mov gs:[8], rsp` → NULL deref at address 0x8 → panic.
+///
+/// This function uses `exec_switch_cr3_and_ring3` which properly handles diagnostics,
+/// and we set up GS_BASE=PER_CPU / KERNEL_GS_BASE=0 beforehand so SWAPGS in the naked
+/// trampoline produces: GS_BASE=0 (user), KERNEL_GS_BASE=PER_CPU (kernel). ✓
+///
+/// This function never returns — process exits via sys_exit → resume_kernel_shell.
+fn launch_ci_test_safe(pid: u64) {
+    if let Some((entry, stack, pml4)) = crate::process::get_entry_state(pid) {
+        if entry != 0 && pml4 != 0 {
+            crate::serial_println!(
+                "[CI-TEST] Switching to PID {} entry=0x{:X} rsp=0x{:X} cr3=0x{:X}",
+                pid, entry, stack, pml4
+            );
+
+            // Set as current process for the scheduler
+            crate::scheduler::set_current_pid(pid);
+            let _ = crate::process::set_state(pid, crate::process::ProcessState::Running);
+
+            // KPTI: Store user CR3 for syscall_entry
+            crate::arch::x86_64::syscall::set_user_cr3(pml4);
+
+            // CRITICAL: Set up GS_BASE = PER_CPU, KERNEL_GS_BASE = 0
+            // The naked trampoline does SWAPGS which swaps them:
+            //   After SWAPGS: GS_BASE = 0 (user), KERNEL_GS_BASE = PER_CPU (kernel) ✓
+            // This is what the timer ISR does (idt.rs lines 1566-1584) and what
+            // kill_user_and_switch does — the ONLY correct way to transition to Ring 3.
+            unsafe {
+                let per_cpu_addr = crate::arch::x86_64::syscall::get_per_cpu_addr();
+                // IA32_GS_BASE = PER_CPU (will become KERNEL_GS_BASE after swapgs)
+                core::arch::asm!(
+                    "wrmsr",
+                    in("ecx") 0xC000_0101u32,
+                    in("eax") (per_cpu_addr & 0xFFFF_FFFF) as u32,
+                    in("edx") (per_cpu_addr >> 32) as u32,
+                    options(nostack),
+                );
+                // IA32_KERNEL_GS_BASE = 0 (will become GS_BASE after swapgs = user value)
+                core::arch::asm!(
+                    "wrmsr",
+                    in("ecx") 0xC000_0102u32,
+                    in("eax") 0u32,
+                    in("edx") 0u32,
+                    options(nostack),
+                );
+                crate::serial_println!(
+                    "[CI-TEST] GS_BASE=0x{:X} (PER_CPU), KERNEL_GS_BASE=0x0 — ready for SWAPGS",
+                    per_cpu_addr
+                );
             }
-            // Extract Location header for redirects
-            let header_lower = header.to_ascii_lowercase();
-            if let Some(loc_idx) = header_lower.find("location:") {
-                let loc_val = &header[loc_idx + 9..];
-                let loc_val = loc_val.trim_start();
-                if let Some(end) = loc_val.find('\r').or_else(|| loc_val.find('\n')) {
-                    crate::serial_println!("[WGET] Location: {}", &loc_val[..end]);
-                }
+
+            // Use the safe trampoline that handles CR3 switch, swapgs, GPR zeroing, IRETQ
+            unsafe {
+                crate::elf::exec_switch_cr3_and_ring3(pml4, entry, stack);
             }
+            // unreachable — exec_switch_cr3_and_ring3 is -> !
+        } else {
+            crate::serial_println!("[CI-TEST] PID {} has invalid entry/pml4", pid);
         }
+    } else {
+        crate::serial_println!("[CI-TEST] PID {} not found in process table", pid);
     }
 }
 
