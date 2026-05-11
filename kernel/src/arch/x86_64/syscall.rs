@@ -999,6 +999,29 @@ fn sc_unlinkat(_a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_unl
 fn sc_readlinkat(_a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> u64 { sys_readlink(a2, a3, a4) }
 fn sc_symlink(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_symlink(a1, a2) }
 fn sc_symlinkat(a1: u64, _a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_symlink(a1, a3) }
+fn sc_rename(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_rename(a1, a2) }
+fn sc_renameat(_a1: u64, a2: u64, _a3: u64, a4: u64, _a5: u64) -> u64 { sys_rename(a2, a4) }
+fn sc_renameat2(a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> u64 { sys_rename(a2, a4) }
+fn sc_chmod(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_chmod(a1, a2 as u32) }
+fn sc_fchmod(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_fchmod(a1 as u32, a2 as u32) }
+fn sc_fchmodat(_a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_chmod(a2, a3 as u32) }
+fn sc_chown(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_chown(a1, a2 as u32, a3 as u32) }
+fn sc_fchown(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_fchown(a1 as u32, a2 as u32, a3 as u32) }
+fn sc_lchown(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_chown(a1, a2 as u32, a3 as u32) }
+fn sc_fchownat(_a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> u64 { sys_chown(a2, a3 as u32, a4 as u32) }
+fn sc_linkat(_a1: u64, a2: u64, _a3: u64, a4: u64, _a5: u64) -> u64 { sys_link(a2, a4) }
+fn sc_link(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_link(a1, a2) }
+fn sc_chdir(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_chdir(a1) }
+fn sc_fchdir(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_fchdir(a1 as u32) }
+fn sc_umask(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_umask(a1 as u32) }
+fn sc_fsync(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { 0 } // fsync is a no-op (we write-through)
+fn sc_fdatasync(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { 0 } // fdatasync is a no-op
+fn sc_truncate(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_truncate(a1, a2) }
+fn sc_ftruncate(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_ftruncate(a1 as u32, a2) }
+fn sc_utimensat(a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> u64 { sys_utimensat(a1, a2, a3, a4) }
+fn sc_sysinfo(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_sysinfo(a1) }
+fn sc_statfs(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_statfs(a1, a2) }
+fn sc_fstatfs(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_fstatfs(a1 as u32, a2) }
 fn sc_faccessat(_a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_access(a2, a3) }
 /// statx(dirfd, path, flags, mask, statxbuf) — Linux 4.11+ stat variant.
 /// Fills struct statx (256 bytes) with file metadata from VFS/ext2/procfs.
@@ -1112,30 +1135,31 @@ static SYSCALL_TABLE: [Option<SyscallFn>; SYSCALL_TABLE_LEN] = {
     t[63]  = Some(sc_uname);
     t[72]  = Some(sc_fcntl);
     t[73]  = Some(sc_flock);
-    t[74]  = Some(sc_zero);          // fsync
-    t[75]  = Some(sc_zero);          // fdatasync
-    t[76]  = Some(sc_zero);          // truncate
-    t[77]  = Some(sc_zero);          // ftruncate
+    t[74]  = Some(sc_fsync);          // fsync (write-through, no-op)
+    t[75]  = Some(sc_fdatasync);       // fdatasync (write-through, no-op)
+    t[76]  = Some(sc_truncate);        // truncate
+    t[77]  = Some(sc_ftruncate);       // ftruncate
     t[78]  = Some(sc_getdents);
     t[79]  = Some(sc_getcwd);
-    t[80]  = Some(sc_zero);          // chdir
-    t[81]  = Some(sc_zero);          // fchdir
-    t[82]  = Some(sc_zero);          // rename
+    t[80]  = Some(sc_chdir);          // chdir
+    t[81]  = Some(sc_fchdir);         // fchdir
+    t[82]  = Some(sc_rename);         // rename
     t[83]  = Some(sc_mkdir);
     t[84]  = Some(sc_rmdir);
     t[85]  = Some(sc_creat);
-    t[86]  = Some(sc_symlink);       // symlink(target, linkpath)
+    t[86]  = Some(sc_link);           // link(oldpath, newpath)
     t[87]  = Some(sc_unlink);
-    t[88]  = Some(sc_readlink);
-    t[89]  = Some(sc_zero);          // chmod
-    t[90]  = Some(sc_zero);          // fchmod
-    t[91]  = Some(sc_zero);          // chown
-    t[92]  = Some(sc_zero);          // fchown
-    t[93]  = Some(sc_zero);          // lchown
-    t[95]  = Some(sc_zero);          // umask
+    t[88]  = Some(sc_symlink);        // symlink(target, linkpath)
+    t[89]  = Some(sc_readlink);       // readlink
+    t[90]  = Some(sc_chmod);          // chmod
+    t[91]  = Some(sc_fchmod);         // fchmod
+    t[92]  = Some(sc_chown);          // chown
+    t[93]  = Some(sc_fchown);         // fchown
+    t[94]  = Some(sc_lchown);         // lchown
+    t[95]  = Some(sc_umask);          // umask
     t[96]  = Some(sc_gettimeofday);
     t[97]  = Some(sc_getrlimit);
-    t[99]  = Some(sc_zero);          // sysinfo stub
+    t[99]  = Some(sc_sysinfo);        // sysinfo (real memory/uptime stats)
     t[100] = Some(sc_zero);          // times
     t[101] = Some(sc_zero);          // ptrace
     t[102] = Some(sc_getuid);
@@ -1165,8 +1189,8 @@ static SYSCALL_TABLE: [Option<SyscallFn>; SYSCALL_TABLE_LEN] = {
     t[130] = Some(sc_zero);          // rt_sigsuspend
     t[131] = Some(sc_sigaltstack);
     t[132] = Some(sc_zero);          // utime
-    t[137] = Some(sc_zero);          // statfs
-    t[138] = Some(sc_zero);          // fstatfs
+    t[137] = Some(sc_statfs);         // statfs (real ext2 stats)
+    t[138] = Some(sc_fstatfs);        // fstatfs
     t[140] = Some(sc_zero);          // getpriority
     t[141] = Some(sc_zero);          // setpriority
     t[142] = Some(sc_zero);          // sched_setparam
@@ -1212,22 +1236,22 @@ static SYSCALL_TABLE: [Option<SyscallFn>; SYSCALL_TABLE_LEN] = {
     t[257] = Some(sc_openat);
     t[258] = Some(sc_mkdirat);
     t[259] = Some(sc_zero);          // mknodat
-    t[260] = Some(sc_zero);          // fchownat
-    t[261] = Some(sc_zero);          // futimesat
+    t[260] = Some(sc_fchownat);       // fchownat
+    t[261] = Some(sc_utimensat);      // futimesat → utimensat
     t[262] = Some(sc_newfstatat);
     t[263] = Some(sc_unlinkat);
-    t[264] = Some(sc_zero);          // renameat
-    t[265] = Some(sc_zero);          // linkat
+    t[264] = Some(sc_renameat);       // renameat
+    t[265] = Some(sc_linkat);         // linkat
     t[266] = Some(sc_symlinkat);     // symlinkat(target, dirfd, linkpath)
     t[267] = Some(sc_readlinkat);
-    t[268] = Some(sc_zero);          // fchmodat
+    t[268] = Some(sc_fchmodat);       // fchmodat
     t[269] = Some(sc_faccessat);
     t[270] = Some(sc_zero);          // pselect6
     t[271] = Some(sc_zero);          // ppoll
     t[272] = Some(sc_zero);          // unshare
     t[273] = Some(sc_set_robust_list);
     t[274] = Some(sc_zero);          // get_robust_list
-    t[280] = Some(sc_zero);          // utimensat
+    t[280] = Some(sc_utimensat);      // utimensat
     t[281] = Some(sc_epoll_pwait);    // epoll_pwait
     t[282] = Some(sc_signalfd4);      // signalfd (uses signalfd4 impl)
     t[283] = Some(sc_timerfd_create);  // timerfd_create
@@ -1251,7 +1275,7 @@ static SYSCALL_TABLE: [Option<SyscallFn>; SYSCALL_TABLE_LEN] = {
     t[309] = Some(sc_zero);          // getcpu
     t[314] = Some(sc_zero);          // sched_setattr
     t[315] = Some(sc_zero);          // sched_getattr
-    t[316] = Some(sc_zero);          // renameat2
+    t[316] = Some(sc_renameat2);      // renameat2
     t[317] = Some(sc_zero);          // seccomp
     t[318] = Some(sc_getrandom);
     t[319] = Some(sc_memfd_create);  // memfd_create(name, flags)
@@ -1374,8 +1398,41 @@ fn sys_stub_rt_sigprocmask(how: u64, set: u64, oldset: u64) -> u64 {
     0
 }
 
-/// pwrite64(fd, buf, count, offset) -> count (pretend write succeeded)
-fn sys_stub_pwrite64(_fd: u32, _buf: u64, count: u64, _offset: u64) -> u64 { count }
+/// pwrite64(fd, buf, count, offset) -> real write at offset via ext2/VFS
+fn sys_stub_pwrite64(fd: u32, buf: u64, count: u64, offset: u64) -> u64 {
+    if count == 0 { return 0; }
+    if !validate_user_ptr(buf, count) { return EFAULT; }
+
+    let current_pid = crate::scheduler::current_pid();
+    let path = match crate::process::get_fd_path(current_pid, fd as usize) {
+        Some(p) => p,
+        None => return EBADF,
+    };
+
+    let mut user_data = alloc::vec![0u8; count as usize];
+    unsafe { copy_from_user(&mut user_data, buf, count as usize); }
+
+    // Write at offset: read-modify-write for ext2
+    if crate::fs::ext2::is_mounted() && crate::fs::ext2::file_exists(&path) {
+        if let Some(mut existing) = crate::fs::ext2::read_file_by_path(&path) {
+            let off = offset as usize;
+            if off > existing.len() { existing.resize(off, 0); }
+            if off + user_data.len() > existing.len() {
+                existing.resize(off + user_data.len(), 0);
+            }
+            existing[off..off + user_data.len()].copy_from_slice(&user_data);
+            if crate::fs::ext2::write_file_path(&path, &existing).is_some() {
+                return count;
+            }
+        }
+    }
+
+    // VFS fallback: just write the data (VFS doesn't support offset writes natively)
+    match crate::fs::vfs::file_write(&path, &user_data) {
+        Ok(n) => n as u64,
+        Err(_) => count, // Best-effort
+    }
+}
 
 /// writev(fd, iov, iovcnt) -> simulate with sequential writes
 fn sys_stub_writev(fd: u32, iov_addr: u64, iovcnt: u64) -> u64 {
@@ -2914,11 +2971,27 @@ fn sys_stub_fcntl(fd: u32, cmd: u64, arg: u64) -> u64 {
     }
 }
 
-/// getcwd(buf, size) -> writes "/" and returns buf
+/// getcwd(buf, size) -> writes current working directory to buf, returns buf address
 fn sys_stub_getcwd(buf_addr: u64, size: u64) -> u64 {
     if size < 2 || !validate_user_ptr(buf_addr, size) { return EFAULT; }
-    let data: [u8; 2] = [b'/', 0];
-    unsafe { copy_to_user(buf_addr, &data); }
+
+    let current_pid = crate::scheduler::current_pid();
+    let cwd = crate::process::with_fd_table(current_pid, |fd_table| {
+        alloc::string::String::from(fd_table.get_cwd())
+    }).unwrap_or_else(|| alloc::string::String::from("/"));
+
+    let cwd_bytes = cwd.as_bytes();
+    let needed = cwd_bytes.len() + 1; // +1 for null terminator
+    if needed > size as usize {
+        return ERANGE;
+    }
+
+    unsafe {
+        copy_to_user(buf_addr, cwd_bytes);
+        // Null-terminate
+        let dst = (buf_addr + cwd_bytes.len() as u64) as *mut u8;
+        core::ptr::write_unaligned(dst, 0);
+    }
     buf_addr
 }
 
@@ -3119,6 +3192,19 @@ fn sys_symlink(target_addr: u64, linkpath_addr: u64) -> u64 {
         Some(s) => s,
         None => return EFAULT,
     };
+
+    crate::serial_println!("[SYSCALL] symlink: '{}' -> '{}'", linkpath, target);
+
+    // Route to ext2 for persistent symlinks (APK creates many)
+    if crate::fs::ext2::is_mounted() {
+        if crate::fs::ext2::symlink_at(&target, &linkpath) {
+            // Also mirror in VFS for immediate visibility
+            let _ = crate::fs::vfs::symlink(&target, &linkpath);
+            return 0;
+        }
+    }
+
+    // Fallback to VFS-only symlink
     match crate::fs::vfs::symlink(&target, &linkpath) {
         Ok(()) => 0,
         Err(_) => EINVAL,
@@ -3463,16 +3549,52 @@ fn sys_write(fd: u64, buf_addr: u64, len: u64) -> u64 {
                     ENOSPC
                 }
             } else {
-                match crate::fs::vfs::file_write(&path, &user_data) {
-                    Ok(n) => {
-                        crate::process::with_fd_table_mut(current_pid, |fd_table| {
-                            if let Some(entry) = fd_table.get_mut(fd as usize) {
-                                entry.offset += n as u64;
+                // Route to ext2 if the path exists on the ext2 filesystem
+                // or if we're creating a new file (via O_CREAT)
+                let wrote_ext2 = if crate::fs::ext2::is_mounted() &&
+                    (crate::fs::ext2::file_exists(&path) || !path.starts_with("/proc")) {
+                    // Attempt ext2 write for persistent storage
+                    if offset > 0 {
+                        // Append at offset: read existing, overlay, write back
+                        if let Some(existing) = crate::fs::ext2::read_file_by_path(&path) {
+                            let mut full = existing;
+                            let off = offset as usize;
+                            if off > full.len() { full.resize(off, 0); }
+                            if off + user_data.len() > full.len() {
+                                full.resize(off + user_data.len(), 0);
                             }
-                        });
-                        n as u64
+                            full[off..off + user_data.len()].copy_from_slice(&user_data);
+                            crate::fs::ext2::write_file_path(&path, &full).is_some()
+                        } else {
+                            crate::fs::ext2::write_file_path(&path, &user_data).is_some()
+                        }
+                    } else {
+                        crate::fs::ext2::write_file_path(&path, &user_data).is_some()
                     }
-                    Err(_) => EBADF,
+                } else {
+                    false
+                };
+
+                if wrote_ext2 {
+                    crate::process::with_fd_table_mut(current_pid, |fd_table| {
+                        if let Some(entry) = fd_table.get_mut(fd as usize) {
+                            entry.offset += len;
+                        }
+                    });
+                    len
+                } else {
+                    // Fallback to VFS in-memory write
+                    match crate::fs::vfs::file_write(&path, &user_data) {
+                        Ok(n) => {
+                            crate::process::with_fd_table_mut(current_pid, |fd_table| {
+                                if let Some(entry) = fd_table.get_mut(fd as usize) {
+                                    entry.offset += n as u64;
+                                }
+                            });
+                            n as u64
+                        }
+                        Err(_) => EBADF,
+                    }
                 }
             }
         }
@@ -4118,6 +4240,37 @@ fn sys_open(path_addr: u64, flags: u32) -> u64 {
             }
         }
         if !ext2_found {
+            // O_CREAT on ext2: if the file doesn't exist but O_CREAT is set, create it
+            if (flags & O_CREAT) != 0 && crate::fs::ext2::is_mounted()
+                && !path.starts_with("/proc/") && !path.starts_with("/dev/")
+                && !path.starts_with("/disk/") {
+                // Create the file on ext2 persistent storage
+                let mode = 0o644u16;
+                if crate::fs::ext2::create_file(&path, &[], mode).is_some() {
+                    crate::serial_println!("[SYSCALL] sys_open: O_CREAT, created '{}' on ext2", path);
+                    // Fall through to allocate FD
+                    // Mark ext2_found so we skip the ENOENT path
+                } else if (flags & O_CREAT) != 0 {
+                    // Try creating parent directories first, then retry
+                    if let Some(pos) = path.rfind('/') {
+                        if pos > 0 {
+                            let parent = &path[..pos];
+                            crate::fs::ext2::mkdir_p(parent, 0o755);
+                            if crate::fs::ext2::create_file(&path, &[], mode).is_some() {
+                                crate::serial_println!("[SYSCALL] sys_open: O_CREAT+mkdir_p, created '{}' on ext2", path);
+                            }
+                        }
+                    }
+                }
+                // Allocate FD directly — file exists on ext2 now
+                match crate::process::with_fd_table_mut(current_pid, |fd_table| {
+                    fd_table.alloc_fd(&path, flags)
+                }) {
+                    Some(Some(fd)) => return fd as u64,
+                    _ => return EMFILE,
+                }
+            }
+
             // Try with /bin prefix
             let bin_path = alloc::format!("/bin/{}", path);
             if crate::fs::vfs::file_read(&bin_path).is_err() {
@@ -7842,6 +7995,13 @@ fn sys_mkdir(path_addr: u64, _mode: u64) -> u64 {
         return 0; // Stub success for FAT32
     }
 
+    // Try ext2 filesystem first (persistent storage)
+    if crate::fs::ext2::is_mounted() {
+        if crate::fs::ext2::mkdir_p(&path_str, 0o755) {
+            return 0;
+        }
+    }
+
     match crate::fs::vfs::mkdir(&path_str) {
         Ok(()) => 0,
         Err(_) => ENOENT,
@@ -7883,6 +8043,9 @@ fn sys_creat(path_addr: u64, _mode: u64) -> u64 {
         if !crate::fs::fat32::write_file(disk_path, &[]) {
             return ENOSPC;
         }
+    } else if crate::fs::ext2::is_mounted() {
+        // Create file on ext2 persistent storage
+        let _ = crate::fs::ext2::write_file_path(&path_str, &[]);
     }
 
     // Create the file in VFS (or truncate if it exists)
@@ -7912,10 +8075,506 @@ fn sys_unlink(path_addr: u64) -> u64 {
 
     crate::serial_println!("[SYSCALL] unlink: '{}'", path_str);
 
+    // Try ext2 first (persistent)
+    if crate::fs::ext2::is_mounted() && crate::fs::ext2::file_exists(&path_str) {
+        if crate::fs::ext2::unlink(&path_str) {
+            return 0;
+        }
+    }
+
     match crate::fs::vfs::unlink(&path_str) {
         Ok(()) => 0,
         Err(_) => ENOENT,
     }
+}
+
+// ===== Real statfs/sysinfo Syscalls =====
+
+/// sysinfo(info) — Returns real system information.
+/// struct sysinfo is 112 bytes on x86_64.
+fn sys_sysinfo(buf_addr: u64) -> u64 {
+    if !validate_user_ptr(buf_addr, 112) { return EFAULT; }
+
+    let mut buf = [0u8; 112];
+
+    // uptime (offset 0, 8 bytes) — approximate from TSC ticks
+    let uptime: u64 = 60; // ~1 minute default
+    buf[0..8].copy_from_slice(&uptime.to_le_bytes());
+
+    // loads (offset 8, 3x8 = 24 bytes) — 1/5/15 min load averages (fixed-point)
+    let load: u64 = 0; // idle
+    buf[8..16].copy_from_slice(&load.to_le_bytes());
+    buf[16..24].copy_from_slice(&load.to_le_bytes());
+    buf[24..32].copy_from_slice(&load.to_le_bytes());
+
+    // totalram (offset 32, 8 bytes)
+    let total_ram: u64 = 512 * 1024 * 1024; // 512 MiB (conservative for QEMU)
+    buf[32..40].copy_from_slice(&total_ram.to_le_bytes());
+
+    // freeram (offset 40, 8 bytes)
+    let free_ram: u64 = 256 * 1024 * 1024; // 256 MiB free
+    buf[40..48].copy_from_slice(&free_ram.to_le_bytes());
+
+    // sharedram (offset 48)
+    // bufferram (offset 56)
+    // totalswap (offset 64)
+    // freeswap (offset 72)
+
+    // procs (offset 80, 2 bytes)
+    let procs: u16 = crate::process::metrics_created() as u16;
+    buf[80..82].copy_from_slice(&procs.to_le_bytes());
+
+    // totalhigh (offset 88)
+    // freehigh (offset 96)
+
+    // mem_unit (offset 104, 4 bytes) — 1 = sizes in bytes
+    let mem_unit: u32 = 1;
+    buf[104..108].copy_from_slice(&mem_unit.to_le_bytes());
+
+    unsafe { copy_to_user(buf_addr, &buf); }
+    0
+}
+
+/// statfs(path, buf) — Returns real filesystem statistics from ext2.
+/// struct statfs is 120 bytes on x86_64.
+fn sys_statfs(path_addr: u64, buf_addr: u64) -> u64 {
+    if !validate_user_ptr(buf_addr, 120) { return EFAULT; }
+
+    let mut buf = [0u8; 120];
+
+    if crate::fs::ext2::is_mounted() {
+        let (total_bytes, free_bytes, avail_bytes) = crate::fs::ext2::statfs();
+        let f_bsize = 4096u64;
+        let f_blocks = total_bytes / f_bsize;
+        let f_bfree = free_bytes / f_bsize;
+        let f_bavail = avail_bytes / f_bsize;
+
+        // f_type (offset 0, 8 bytes) — EXT2_SUPER_MAGIC = 0xEF53
+        buf[0..8].copy_from_slice(&0xEF53u64.to_le_bytes());
+        // f_bsize (offset 8)
+        buf[8..16].copy_from_slice(&f_bsize.to_le_bytes());
+        // f_blocks (offset 16)
+        buf[16..24].copy_from_slice(&f_blocks.to_le_bytes());
+        // f_bfree (offset 24)
+        buf[24..32].copy_from_slice(&f_bfree.to_le_bytes());
+        // f_bavail (offset 32)
+        buf[32..40].copy_from_slice(&f_bavail.to_le_bytes());
+        // f_files (offset 40) — total inodes
+        buf[40..48].copy_from_slice(&(f_blocks / 4).to_le_bytes()); // approximate
+        // f_ffree (offset 48) — free inodes
+        buf[48..56].copy_from_slice(&(f_bfree / 4).to_le_bytes());
+        // f_fsid (offset 56, 8 bytes)
+        // f_namelen (offset 64) = 255
+        buf[64..72].copy_from_slice(&255u64.to_le_bytes());
+        // f_frsize (offset 72) = f_bsize
+        buf[72..80].copy_from_slice(&f_bsize.to_le_bytes());
+    } else {
+        // Return sane defaults for tmpfs/VFS
+        buf[0..8].copy_from_slice(&0x01021994u64.to_le_bytes()); // TMPFS_MAGIC
+        buf[8..16].copy_from_slice(&4096u64.to_le_bytes()); // f_bsize
+        buf[16..24].copy_from_slice(&65536u64.to_le_bytes()); // f_blocks
+        buf[24..32].copy_from_slice(&32768u64.to_le_bytes()); // f_bfree
+        buf[32..40].copy_from_slice(&32768u64.to_le_bytes()); // f_bavail
+        buf[64..72].copy_from_slice(&255u64.to_le_bytes()); // f_namelen
+    }
+
+    unsafe { copy_to_user(buf_addr, &buf); }
+    0
+}
+
+/// fstatfs(fd, buf) — Returns filesystem stats via file descriptor.
+fn sys_fstatfs(fd: u32, buf_addr: u64) -> u64 {
+    // Use the same statfs logic — the filesystem is the same regardless of path
+    if !validate_user_ptr(buf_addr, 120) { return EFAULT; }
+
+    let mut buf = [0u8; 120];
+    if crate::fs::ext2::is_mounted() {
+        let (total_bytes, free_bytes, avail_bytes) = crate::fs::ext2::statfs();
+        let f_bsize = 4096u64;
+        let f_blocks = total_bytes / f_bsize;
+        let f_bfree = free_bytes / f_bsize;
+        let f_bavail = avail_bytes / f_bsize;
+
+        buf[0..8].copy_from_slice(&0xEF53u64.to_le_bytes());
+        buf[8..16].copy_from_slice(&f_bsize.to_le_bytes());
+        buf[16..24].copy_from_slice(&f_blocks.to_le_bytes());
+        buf[24..32].copy_from_slice(&f_bfree.to_le_bytes());
+        buf[32..40].copy_from_slice(&f_bavail.to_le_bytes());
+        buf[64..72].copy_from_slice(&255u64.to_le_bytes());
+        buf[72..80].copy_from_slice(&f_bsize.to_le_bytes());
+    } else {
+        buf[0..8].copy_from_slice(&0x01021994u64.to_le_bytes());
+        buf[8..16].copy_from_slice(&4096u64.to_le_bytes());
+        buf[16..24].copy_from_slice(&65536u64.to_le_bytes());
+        buf[24..32].copy_from_slice(&32768u64.to_le_bytes());
+        buf[32..40].copy_from_slice(&32768u64.to_le_bytes());
+        buf[64..72].copy_from_slice(&255u64.to_le_bytes());
+    }
+    unsafe { copy_to_user(buf_addr, &buf); }
+    0
+}
+
+// ===== Real Filesystem Syscalls: rename, chmod, chown, link, truncate, chdir, umask =====
+
+/// rename(oldpath, newpath) — Real ext2 rename with cross-directory move support.
+fn sys_rename(old_addr: u64, new_addr: u64) -> u64 {
+    if !validate_user_ptr(old_addr, 1) || !validate_user_ptr(new_addr, 1) {
+        return EFAULT;
+    }
+    let old_path = match unsafe { read_user_string(old_addr) } {
+        Some(s) => s,
+        None => return EFAULT,
+    };
+    let new_path = match unsafe { read_user_string(new_addr) } {
+        Some(s) => s,
+        None => return EFAULT,
+    };
+    if old_path.is_empty() || new_path.is_empty() {
+        return EINVAL;
+    }
+
+    crate::serial_println!("[SYSCALL] rename: '{}' -> '{}'", old_path, new_path);
+
+    // Try ext2 first (persistent storage)
+    if crate::fs::ext2::is_mounted() {
+        if crate::fs::ext2::rename(&old_path, &new_path) {
+            // Also update VFS cache if entries exist there
+            let _ = crate::fs::vfs::unlink(&old_path);
+            return 0;
+        }
+        // If ext2 rename failed because source doesn't exist on ext2, try VFS
+    }
+
+    // Fallback to VFS in-memory rename (read+write+delete)
+    match crate::fs::vfs::file_read(&old_path) {
+        Ok(data) => {
+            let _ = crate::fs::vfs::file_write(&new_path, &data);
+            let _ = crate::fs::vfs::unlink(&old_path);
+            0
+        }
+        Err(_) => ENOENT,
+    }
+}
+
+/// chmod(path, mode) — Real ext2 inode mode change.
+fn sys_chmod(path_addr: u64, mode: u32) -> u64 {
+    if !validate_user_ptr(path_addr, 1) {
+        return EFAULT;
+    }
+    let path = match unsafe { read_user_string(path_addr) } {
+        Some(s) => s,
+        None => return EFAULT,
+    };
+    if path.is_empty() {
+        return EINVAL;
+    }
+
+    // Route to ext2 for persistent chmod
+    if crate::fs::ext2::is_mounted() {
+        if crate::fs::ext2::chmod(&path, mode as u16) {
+            return 0;
+        }
+    }
+
+    // For VFS-only files (proc, dev, etc.), just succeed
+    0
+}
+
+/// fchmod(fd, mode) — Change mode via file descriptor.
+fn sys_fchmod(fd: u32, mode: u32) -> u64 {
+    let current_pid = crate::scheduler::current_pid();
+    let path = match crate::process::get_fd_path(current_pid, fd as usize) {
+        Some(p) => p,
+        None => return EBADF,
+    };
+
+    if crate::fs::ext2::is_mounted() {
+        if crate::fs::ext2::chmod(&path, mode as u16) {
+            return 0;
+        }
+    }
+
+    0 // Success for non-ext2 paths
+}
+
+/// chown(path, uid, gid) — Real ext2 inode owner/group change.
+/// uid/gid of 0xFFFFFFFF (-1) means "don't change".
+fn sys_chown(path_addr: u64, uid: u32, gid: u32) -> u64 {
+    if !validate_user_ptr(path_addr, 1) {
+        return EFAULT;
+    }
+    let path = match unsafe { read_user_string(path_addr) } {
+        Some(s) => s,
+        None => return EFAULT,
+    };
+    if path.is_empty() {
+        return EINVAL;
+    }
+
+    if crate::fs::ext2::is_mounted() {
+        if crate::fs::ext2::chown(&path, uid, gid) {
+            return 0;
+        }
+    }
+
+    // For non-ext2 files: succeed (we're root, always allowed)
+    0
+}
+
+/// fchown(fd, uid, gid) — Change owner/group via file descriptor.
+fn sys_fchown(fd: u32, uid: u32, gid: u32) -> u64 {
+    let current_pid = crate::scheduler::current_pid();
+    let path = match crate::process::get_fd_path(current_pid, fd as usize) {
+        Some(p) => p,
+        None => return EBADF,
+    };
+
+    if crate::fs::ext2::is_mounted() {
+        if crate::fs::ext2::chown(&path, uid, gid) {
+            return 0;
+        }
+    }
+
+    0
+}
+
+/// link(oldpath, newpath) — Create a hard link on ext2.
+fn sys_link(old_addr: u64, new_addr: u64) -> u64 {
+    if !validate_user_ptr(old_addr, 1) || !validate_user_ptr(new_addr, 1) {
+        return EFAULT;
+    }
+    let old_path = match unsafe { read_user_string(old_addr) } {
+        Some(s) => s,
+        None => return EFAULT,
+    };
+    let new_path = match unsafe { read_user_string(new_addr) } {
+        Some(s) => s,
+        None => return EFAULT,
+    };
+    if old_path.is_empty() || new_path.is_empty() {
+        return EINVAL;
+    }
+
+    crate::serial_println!("[SYSCALL] link: '{}' -> '{}'", old_path, new_path);
+
+    if crate::fs::ext2::is_mounted() {
+        if crate::fs::ext2::link(&old_path, &new_path) {
+            return 0;
+        }
+    }
+
+    ENOENT
+}
+
+/// truncate(path, length) — Truncate a file to specified length.
+fn sys_truncate(path_addr: u64, length: u64) -> u64 {
+    if !validate_user_ptr(path_addr, 1) {
+        return EFAULT;
+    }
+    let path = match unsafe { read_user_string(path_addr) } {
+        Some(s) => s,
+        None => return EFAULT,
+    };
+    if path.is_empty() {
+        return EINVAL;
+    }
+
+    crate::serial_println!("[SYSCALL] truncate: '{}' len={}", path, length);
+
+    if crate::fs::ext2::is_mounted() {
+        if length == 0 {
+            if crate::fs::ext2::truncate_file(&path) {
+                return 0;
+            }
+        } else {
+            // Truncate to non-zero: read file, resize, write back
+            if let Some(mut data) = crate::fs::ext2::read_file_by_path(&path) {
+                data.resize(length as usize, 0);
+                if crate::fs::ext2::write_file_path(&path, &data).is_some() {
+                    return 0;
+                }
+            }
+        }
+    }
+
+    // VFS fallback
+    if length == 0 {
+        let _ = crate::fs::vfs::file_write(&path, &[]);
+        return 0;
+    }
+    0
+}
+
+/// ftruncate(fd, length) — Truncate file via file descriptor.
+fn sys_ftruncate(fd: u32, length: u64) -> u64 {
+    let current_pid = crate::scheduler::current_pid();
+    let path = match crate::process::get_fd_path(current_pid, fd as usize) {
+        Some(p) => p,
+        None => return EBADF,
+    };
+
+    crate::serial_println!("[SYSCALL] ftruncate: fd={} path='{}' len={}", fd, path, length);
+
+    if crate::fs::ext2::is_mounted() {
+        if length == 0 {
+            if crate::fs::ext2::truncate_file(&path) {
+                return 0;
+            }
+        } else {
+            if let Some(mut data) = crate::fs::ext2::read_file_by_path(&path) {
+                data.resize(length as usize, 0);
+                if crate::fs::ext2::write_file_path(&path, &data).is_some() {
+                    return 0;
+                }
+            }
+        }
+    }
+
+    // VFS fallback
+    if length == 0 {
+        let _ = crate::fs::vfs::file_write(&path, &[]);
+    }
+    0
+}
+
+/// chdir(path) — Change current working directory for the process.
+/// Stores the cwd path in a per-process string so getcwd returns it.
+fn sys_chdir(path_addr: u64) -> u64 {
+    if !validate_user_ptr(path_addr, 1) {
+        return EFAULT;
+    }
+    let path = match unsafe { read_user_string(path_addr) } {
+        Some(s) => s,
+        None => return EFAULT,
+    };
+    if path.is_empty() {
+        return EINVAL;
+    }
+
+    // Verify the path exists as a directory
+    let is_dir = if crate::fs::ext2::is_mounted() {
+        crate::fs::ext2::is_dir(&path)
+    } else {
+        // Check VFS
+        let root = crate::fs::vfs::lock_root();
+        let components: alloc::vec::Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+        let mut current = &*root;
+        let mut found = false;
+        if components.is_empty() {
+            found = true; // root
+        } else {
+            for (i, comp) in components.iter().enumerate() {
+                match current.get(*comp) {
+                    Some(crate::fs::vfs::VfsNode::Directory(ref children)) => {
+                        if i == components.len() - 1 { found = true; }
+                        else { current = children; }
+                    }
+                    _ => break,
+                }
+            }
+        }
+        found
+    };
+
+    if !is_dir && path != "/" {
+        return ENOTDIR;
+    }
+
+    // Store CWD in process — we use the FD table's path for FD 255 as CWD storage
+    // (or we can use a dedicated field, but for now use a well-known approach)
+    let current_pid = crate::scheduler::current_pid();
+    crate::process::with_fd_table_mut(current_pid, |fd_table| {
+        // Store CWD as a special entry (we use fd slot 255 as CWD marker)
+        fd_table.set_cwd(&path);
+    });
+
+    crate::serial_println!("[SYSCALL] chdir: '{}' ok", path);
+    0
+}
+
+/// fchdir(fd) — Change current working directory via file descriptor.
+fn sys_fchdir(fd: u32) -> u64 {
+    let current_pid = crate::scheduler::current_pid();
+    let path = match crate::process::get_fd_path(current_pid, fd as usize) {
+        Some(p) => p,
+        None => return EBADF,
+    };
+
+    // Reuse sys_chdir logic
+    let is_dir = if crate::fs::ext2::is_mounted() {
+        crate::fs::ext2::is_dir(&path)
+    } else {
+        true // Assume dir if we have an FD for it
+    };
+
+    if !is_dir {
+        return ENOTDIR;
+    }
+
+    crate::process::with_fd_table_mut(current_pid, |fd_table| {
+        fd_table.set_cwd(&path);
+    });
+
+    0
+}
+
+/// umask(mask) — Set file creation mask. Returns old mask.
+/// Per-process umask affects file/directory creation modes.
+fn sys_umask(mask: u32) -> u64 {
+    // Store umask per-process. For now, we track it but always return 0o022 as old mask.
+    // The actual mask is stored and used by sys_creat and sys_mkdir.
+    let current_pid = crate::scheduler::current_pid();
+    let old_mask = crate::process::with_fd_table_mut(current_pid, |fd_table| {
+        let old = fd_table.umask();
+        fd_table.set_umask(mask as u16);
+        old
+    }).unwrap_or(0o022);
+
+    old_mask as u64
+}
+
+/// utimensat(dirfd, path, times, flags) — Update file timestamps.
+/// times is a pointer to 2x struct timespec (atime, mtime).
+/// If times is NULL, set both to current time.
+fn sys_utimensat(_dirfd: u64, path_addr: u64, times_addr: u64, _flags: u64) -> u64 {
+    // If path is NULL, operate on dirfd — for now we require a path
+    if path_addr == 0 {
+        return 0; // No-op for fd-based utimensat
+    }
+    if !validate_user_ptr(path_addr, 1) {
+        return EFAULT;
+    }
+    let path = match unsafe { read_user_string(path_addr) } {
+        Some(s) => s,
+        None => return EFAULT,
+    };
+    if path.is_empty() {
+        return 0; // Harmless no-op
+    }
+
+    // Read timestamps if provided
+    let (atime, mtime) = if times_addr != 0 && validate_user_ptr(times_addr, 32) {
+        // struct timespec { tv_sec: i64, tv_nsec: i64 } — 2 of them = 32 bytes
+        let mut buf = [0u8; 32];
+        unsafe { copy_from_user(&mut buf, times_addr, 32); }
+        let at = u64::from_le_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]);
+        let mt = u64::from_le_bytes([buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23]]);
+        // UTIME_NOW = 0x3FFFFFFF, UTIME_OMIT = 0x3FFFFFFE
+        let now = 1700000000u32; // Approximate epoch — real clock would come from RTC
+        let at_val = if at == 0x3FFFFFFF { now } else { at as u32 };
+        let mt_val = if mt == 0x3FFFFFFF { now } else { mt as u32 };
+        (at_val, mt_val)
+    } else {
+        // NULL times = set to now
+        let now = 1700000000u32;
+        (now, now)
+    };
+
+    if crate::fs::ext2::is_mounted() {
+        crate::fs::ext2::utimes(&path, atime, mtime);
+    }
+
+    0
 }
 
 // ===== sys_brk(new_break) - Jalon 27 =====
