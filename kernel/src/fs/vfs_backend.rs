@@ -705,8 +705,8 @@ impl FsBackend for Ext2Backend {
     fn readdir(&self, path: &str) -> Result<Vec<String>, FsError> {
         if let Some(entries) = crate::fs::ext2::list_dir(path) {
             Ok(entries.into_iter()
-                .filter(|(n, _, _)| n != "." && n != "..")
-                .map(|(n, _, _)| n)
+                .filter(|e| e.name != "." && e.name != "..")
+                .map(|e| e.name)
                 .collect())
         } else {
             Err(FsError::NotFound)
@@ -760,9 +760,10 @@ impl FsBackend for Ext2Backend {
     }
 
     fn readlink(&self, path: &str) -> Result<String, FsError> {
-        let ino = crate::fs::ext2::lookup_path(path)
+        // Verify path exists first
+        let _ino = crate::fs::ext2::lookup_path(path)
             .ok_or(FsError::NotFound)?;
-        crate::fs::ext2::read_symlink(ino)
+        crate::fs::ext2::read_symlink(path)
             .ok_or(FsError::IoError)
     }
 }

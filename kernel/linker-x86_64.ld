@@ -22,6 +22,9 @@ SECTIONS
     /* Limine spec mandates kernel in the upper 2GiB */
     . = 0xffffffff80000000;
 
+    /* Kernel start marker for page table verification */
+    __kernel_start = .;
+
     .text : {
         *(.text .text.*)
     } :text
@@ -48,6 +51,9 @@ SECTIONS
         *(.bss .bss.*)
         *(COMMON)
     } :data
+
+    /* Kernel end marker for page table verification */
+    __kernel_end = .;
 
     /DISCARD/ : {
         *(.eh_frame*)

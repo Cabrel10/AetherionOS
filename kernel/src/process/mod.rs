@@ -17,8 +17,9 @@ use spin::Mutex;
 use lazy_static::lazy_static;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-pub use task::{AgentRole, Process, ProcessState, FdTable, FdType, FileDescriptor, VirtualMemoryArea,
-    EpollInterest, TimerFdState, EPOLLIN, EPOLLOUT, EPOLLHUP, SyscallContext};
+pub use task::{AgentRole, Process, ProcessState, FdTable, FdType, VirtualMemoryArea,
+    EpollInterest, TimerFdState, EPOLLIN, EPOLLOUT, EPOLLHUP,
+    SyscallContext, FileDescriptor};
 pub use crate::arch::x86_64::context::TaskContext;
 
 // ===== Keyboard Input Buffer =====
@@ -1054,33 +1055,25 @@ pub fn add_vma(pid: u64, vma: VirtualMemoryArea) -> Option<()> {
     })
 }
 
-/// Get a copy of all VMAs for the process (used by /proc/self/maps)
-pub fn get_vmas(pid: u64) -> Option<alloc::vec::Vec<VirtualMemoryArea>> {
+/// Get all VMAs for a process (used by /proc/self/maps generation)
+pub fn get_vmas(pid: u64) -> Option<Vec<VirtualMemoryArea>> {
     with_process(pid, |p| {
-        p.vmas.iter().map(|v| VirtualMemoryArea {
-            vaddr_start: v.vaddr_start,
-            vaddr_end: v.vaddr_end,
-            file_path: v.file_path.clone(),
-            file_offset: v.file_offset,
-            size: v.size,
-            writable: v.writable,
-            executable: v.executable,
-        }).collect()
+        p.vmas.clone()
     })
 }
 
 /// Find a VMA that contains the given virtual address
-/// Returns (file_path, file_offset_for_this_page, writable)
+/// Returns (file_path, file_offset_for_this_page, writable, executable)
 /// NOTE: The returned file_offset is page-aligned so the page fault handler
 /// reads exactly 4 KiB starting at the correct file page boundary.
-pub fn find_vma(pid: u64, addr: u64) -> Option<(String, u64, bool)> {
+pub fn find_vma(pid: u64, addr: u64) -> Option<(String, u64, bool, bool)> {
     with_process(pid, |p| {
         for vma in &p.vmas {
             if addr >= vma.vaddr_start && addr < vma.vaddr_end {
                 // Page-align: compute offset from start of VMA, rounded down to 4K
                 let offset_in_vma = (addr - vma.vaddr_start) & !0xFFF;
                 let file_offset = vma.file_offset + offset_in_vma;
-                return Some((vma.file_path.clone(), file_offset, vma.writable));
+                return Some((vma.file_path.clone(), file_offset, vma.writable, vma.executable));
             }
         }
         None

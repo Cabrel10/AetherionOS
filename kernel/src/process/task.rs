@@ -13,7 +13,7 @@ use core::fmt;
 // ===== File Descriptor Table (Jalon 79: Unified FD with FdType) =====
 
 /// Maximum number of file descriptors per process
-pub const MAX_FDS: usize = 32;
+pub const MAX_FDS: usize = 256;
 
 /// FD type discriminator — dispatches read/write/close to the correct subsystem.
 /// Jalon 79: Unified FD table for POSIX compatibility (musl requirement).
@@ -135,6 +135,10 @@ impl FileDescriptor {
 #[derive(Debug, Clone)]
 pub struct FdTable {
     pub entries: Vec<FileDescriptor>,
+    /// Current working directory for the process (absolute path)
+    pub cwd: String,
+    /// File creation mask (umask)
+    pub process_umask: u16,
 }
 
 impl FdTable {
@@ -145,12 +149,20 @@ impl FdTable {
         entries.push(FileDescriptor::new_typed("stdin", 0, FdType::Tty));   // FD 0 = stdin
         entries.push(FileDescriptor::new_typed("stdout", 1, FdType::Tty));  // FD 1 = stdout
         entries.push(FileDescriptor::new_typed("stderr", 1, FdType::Tty));  // FD 2 = stderr
-        FdTable { entries }
+        FdTable {
+            entries,
+            cwd: String::from("/"),
+            process_umask: 0o022,
+        }
     }
 
     /// Create an empty FD table (for kernel threads)
     pub fn empty() -> Self {
-        FdTable { entries: Vec::new() }
+        FdTable {
+            entries: Vec::new(),
+            cwd: String::from("/"),
+            process_umask: 0o022,
+        }
     }
 
     /// Allocate a new FD, returns the FD number or None
@@ -213,6 +225,27 @@ impl FdTable {
     /// Get a mutable reference to an FD entry
     pub fn get_mut(&mut self, fd: usize) -> Option<&mut FileDescriptor> {
         self.entries.get_mut(fd).filter(|e| e.active)
+    }
+
+    /// Get the current working directory
+    pub fn get_cwd(&self) -> &str {
+        &self.cwd
+    }
+
+    /// Set the current working directory
+    pub fn set_cwd(&mut self, path: &str) {
+        self.cwd.clear();
+        self.cwd.push_str(path);
+    }
+
+    /// Get the current umask
+    pub fn umask(&self) -> u16 {
+        self.process_umask
+    }
+
+    /// Set the umask, returns the old value
+    pub fn set_umask(&mut self, mask: u16) {
+        self.process_umask = mask;
     }
 }
 
@@ -478,7 +511,7 @@ pub struct VirtualMemoryArea {
     pub size: u64,
     /// Is this mapping writable? (false = read-only for model files)
     pub writable: bool,
-    /// Is this mapping executable?
+    /// Is this mapping executable? (PROT_EXEC was set)
     pub executable: bool,
 }
 

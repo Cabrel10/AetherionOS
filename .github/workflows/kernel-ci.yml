@@ -198,8 +198,9 @@ jobs:
         run: |
           LINKER_SCRIPT="$(pwd)/kernel/linker-x86_64.ld"
           # -C relocation-model=static => ET_EXEC (not PIE/ET_DYN)
+          # -C link-arg=-static => force static linking (no dynamic symbols)
           # Limine v8.x panics on ET_DYN without PT_DYNAMIC segment
-          RUSTFLAGS="-C opt-level=2 -C relocation-model=static -C link-arg=-T${LINKER_SCRIPT} -C link-arg=-no-pie" \
+          RUSTFLAGS="-C opt-level=2 -C relocation-model=static -C link-arg=-T${LINKER_SCRIPT} -C link-arg=-no-pie -C link-arg=-static" \
             cargo build -p aetherion-kernel \
             --target x86_64-unknown-none \
             --features limine \
@@ -321,6 +322,18 @@ jobs:
           sudo ls -la "$MNTDIR/usr/bin/python3"* 2>/dev/null || true
           file "$MNTDIR/usr/bin/python3" 2>/dev/null || true
           sudo ls -la "$MNTDIR/usr/lib/libpython"* 2>/dev/null || true
+
+          # Verify Python3 stdlib is present (critical for encodings module)
+          echo "=== Python3 stdlib verification ==="
+          PYVER=$(sudo chroot "$MNTDIR" /usr/bin/python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "3.12")
+          echo "  Python version: $PYVER"
+          echo "  Checking /usr/lib/python${PYVER}/encodings/:"
+          sudo ls "$MNTDIR/usr/lib/python${PYVER}/encodings/__init__.py" 2>/dev/null && echo "  [OK] encodings/__init__.py found" || echo "  [MISSING] encodings/__init__.py"
+          sudo ls "$MNTDIR/usr/lib/python${PYVER}/encodings/" 2>/dev/null | head -10
+          echo "  Checking /usr/lib/python${PYVER}/importlib/:"
+          sudo ls "$MNTDIR/usr/lib/python${PYVER}/importlib/__init__.py" 2>/dev/null && echo "  [OK] importlib/__init__.py found" || echo "  [MISSING] importlib/__init__.py"
+          echo "  Checking /usr/lib/python${PYVER}/:"
+          sudo ls "$MNTDIR/usr/lib/python${PYVER}/" 2>/dev/null | head -20
 
           # Show total size
           echo "=== Disk usage ==="

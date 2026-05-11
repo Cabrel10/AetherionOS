@@ -199,6 +199,21 @@ impl FrameAllocator {
         PhysFrame::from_start_address(phys_addr).ok()
     }
 
+    /// Mark a specific physical frame as allocated (protect from reuse).
+    ///
+    /// Used during boot to protect Limine page table frames that may live
+    /// inside USABLE memory regions. Without this, the frame allocator could
+    /// hand out a PT frame, the new owner zeroes it, and kernel page table
+    /// entries are destroyed (the PT[195]=0x0 bug).
+    pub fn mark_frame_allocated(&mut self, phys_addr: u64) {
+        let frame = (phys_addr / FRAME_SIZE as u64) as usize;
+        if frame == 0 || frame >= MAX_FRAMES { return; }
+        if !Self::is_allocated(frame) {
+            unsafe { Self::set_bit_static(frame); }
+            self.allocated_count = self.allocated_count.saturating_add(1);
+        }
+    }
+
     /// Free a previously allocated frame (return it to the pool).
     ///
     /// # Safety

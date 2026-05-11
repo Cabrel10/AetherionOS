@@ -9,6 +9,7 @@
 // panic_info_message is stabilized in nightly-2026
 // naked_functions is stabilized in nightly-2026
 #![allow(dead_code)]
+#![allow(static_mut_refs)]
 #![test_runner(crate::test_runner)]
 #![reexport_test_harness_main = "test_main"]
 

@@ -23,6 +23,7 @@ pub mod virtio_net;
 pub mod udp;
 pub mod tcp;
 pub mod dns;
+pub mod http;
 pub mod socket;
 pub mod tls;
 

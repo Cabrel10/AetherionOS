@@ -572,10 +572,14 @@ pub fn linux_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
     }
     // If PROT_EXEC is set, NX bit is left clear (page is executable)
 
-    // Get current PML4 from CR3
-    let cr3: u64;
-    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)); }
-    let pml4_phys = cr3 & !0xFFF;
+    // KPTI fix: Get PML4 from process table, not CR3 (which points to kernel PML4)
+    let current_pid = crate::scheduler::current_pid();
+    let pml4_phys = crate::process::get_pml4_phys(current_pid).unwrap_or_else(|| {
+        // Fallback to CR3 if process not found
+        let cr3: u64;
+        unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)); }
+        cr3 & !0xFFF
+    });
     let phys_offset = crate::elf::phys_offset();
 
     let mut modified = 0u64;
@@ -800,7 +804,7 @@ pub fn linux_access(path_addr: u64, _mode: u64) -> u64 {
     if path.starts_with("/proc/") || path.starts_with("/dev/") || path.starts_with("/sys/") { return 0; }
     // Series 1.1: Check ext2 filesystem (Alpine rootfs has most files)
     if crate::fs::ext2::is_mounted() {
-        if crate::fs::ext2::file_exists(path).is_some() { return 0; }
+        if crate::fs::ext2::file_exists(path) { return 0; }
         // Also check directories
         if let Some(entries) = crate::fs::ext2::list_dir(path) {
             if !entries.is_empty() { return 0; }
@@ -1615,6 +1619,65 @@ pub fn generate_proc_version() -> alloc::string::String {
     )
 }
 
+/// Generate /proc/self/maps content for the dynamic linker (ld-musl).
+/// This is critical: ld-musl reads /proc/self/maps to discover its own
+/// load address and the main binary's segments for ASLR-aware relocation.
+/// Format: start-end perms offset dev inode pathname
+pub fn generate_proc_self_maps(pid: u64) -> alloc::string::String {
+    use alloc::format;
+    let mut out = alloc::string::String::new();
+
+    // Get process VMAs
+    if let Some(vmas) = crate::process::get_vmas(pid) {
+        for vma in vmas.iter() {
+            let perm_r = 'r';
+            let perm_w = if vma.writable { 'w' } else { '-' };
+            let perm_x = if vma.executable { 'x' } else { '-' };
+            let perm_p = 'p'; // Private mapping
+
+            let path = if vma.file_path.is_empty() || vma.file_path == "[anon]" {
+                alloc::string::String::new()
+            } else {
+                vma.file_path.clone()
+            };
+
+            // Generate ext2 inode for the path if available
+            let inode = if !path.is_empty() && crate::fs::ext2::is_mounted() {
+                crate::fs::ext2::lookup_path(&path).unwrap_or(0)
+            } else {
+                0
+            };
+
+            out.push_str(&format!(
+                "{:012x}-{:012x} {}{}{}{} {:08x} 00:00 {} {}\n",
+                vma.vaddr_start, vma.vaddr_end,
+                perm_r, perm_w, perm_x, perm_p,
+                vma.file_offset, inode, path.trim()
+            ));
+        }
+    }
+
+    // Add heap entry
+    out.push_str(&format!(
+        "{:012x}-{:012x} rw-p 00000000 00:00 0 [heap]\n",
+        0x0000_1000_0000u64, 0x0000_2000_0000u64
+    ));
+
+    // Add stack entry
+    out.push_str(&format!(
+        "{:012x}-{:012x} rw-p 00000000 00:00 0 [stack]\n",
+        0x7FFF_FFDF_F000u64, 0x7FFF_FFFF_F000u64
+    ));
+
+    // Add vDSO entry (required by musl)
+    out.push_str(&format!(
+        "{:012x}-{:012x} r-xp 00000000 00:00 0 [vdso]\n",
+        0x7FFF_F7FF_0000u64, 0x7FFF_F7FF_1000u64
+    ));
+
+    out
+}
+
 /// Linux sigaction/sigprocmask — upgraded with real signal table
 pub fn linux_rt_sigaction(sig: u64, act: u64, oldact: u64, sigsetsize: u64) -> u64 {
     linux_rt_sigaction_v2(sig, act, oldact, sigsetsize)
@@ -2392,7 +2455,8 @@ fn linux_syscall_dispatch_inner(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5:
         326 => Some(linux_copy_file_range(a1, a2, a3, a4)),
 
         // statx(332) — extended stat for APK/musl
-        332 => Some(linux_statx(a1, a2, a3, a4)),
+        // statx(dirfd, pathname, flags, mask, statxbuf) — 5 args
+        332 => Some(linux_statx(a1, a2, a3, a4, a5)),
 
         // renameat2(316) — rename with flags, needed by APK
         316 => Some(linux_renameat2(a1, a2, a3, a4)),
@@ -3126,6 +3190,26 @@ pub fn linux_close(fd: u64) -> u64 {
 /// Critical fix: musl's dynamic linker uses open() (syscall 2) to open shared libraries.
 /// The standard AetherionOS handler doesn't properly resolve ext2 paths or handle
 /// Linux-specific flags like O_CLOEXEC (0x80000) and O_DIRECTORY (0x10000).
+/// Normalize a path by resolving `.` and `..` components.
+/// e.g., "/usr/lib/../lib/python3.12" → "/usr/lib/python3.12"
+fn normalize_path(path: &str) -> alloc::string::String {
+    let mut parts: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+    let absolute = path.starts_with('/');
+    for component in path.split('/') {
+        match component {
+            "" | "." => continue,
+            ".." => { parts.pop(); }
+            _ => parts.push(component),
+        }
+    }
+    let joined = parts.join("/");
+    if absolute {
+        alloc::format!("/{}", joined)
+    } else {
+        joined
+    }
+}
+
 pub fn linux_open(pathname: u64, flags: u64, mode: u64) -> u64 {
     linux_openat((-100i64) as u64, pathname, flags, mode)
 }
@@ -3233,45 +3317,46 @@ pub fn linux_openat(dirfd: u64, pathname: u64, flags: u64, _mode: u64) -> u64 {
 
     // ═══ Series 1.1: Check ext2 filesystem FIRST (Alpine rootfs) ═══
     // This is the critical path for ld-musl opening shared libraries
+    // and Python3 opening its stdlib directories.
     if crate::fs::ext2::is_mounted() {
         // Resolve symlinks (up to 8 levels) before checking existence
         let mut resolved = alloc::string::String::from(path_str);
+        // Strip trailing slash for consistent ext2 lookup
+        while resolved.len() > 1 && resolved.ends_with('/') {
+            resolved.pop();
+        }
         for _depth in 0..8 {
-            if let Some(ino) = crate::fs::ext2::lookup_path(&resolved) {
-                if crate::fs::ext2::is_symlink(ino).unwrap_or(false) {
-                    if let Some(target) = crate::fs::ext2::read_symlink(ino) {
-                        if target.starts_with('/') {
-                            resolved = target;
+            if crate::fs::ext2::is_symlink(&resolved) {
+                if let Some(target) = crate::fs::ext2::read_symlink(&resolved) {
+                    if target.starts_with('/') {
+                        resolved = target;
+                    } else {
+                        // Relative symlink: resolve against parent directory
+                        if let Some(last_slash) = resolved.rfind('/') {
+                            let parent = &resolved[..last_slash + 1];
+                            resolved = alloc::format!("{}{}", parent, target);
                         } else {
-                            // Relative symlink: resolve against parent directory
-                            if let Some(last_slash) = resolved.rfind('/') {
-                                let parent = &resolved[..last_slash + 1];
-                                resolved = alloc::format!("{}{}", parent, target);
-                            } else {
-                                resolved = target;
-                            }
+                            resolved = target;
                         }
-                        continue;
                     }
+                    // Clean up resolved path (remove /./  and /../)
+                    resolved = normalize_path(&resolved);
+                    continue;
                 }
             }
             break;
         }
 
-        // Check if the resolved path exists in ext2
-        let ext2_exists = crate::fs::ext2::file_exists(&resolved).is_some();
+        // Check if the resolved path exists in ext2 using lookup_path (works for both files and dirs)
+        let ext2_inode = crate::fs::ext2::lookup_path(&resolved);
+        let ext2_exists = ext2_inode.is_some();
         let ext2_is_dir = if ext2_exists {
-            if let Some(ino) = crate::fs::ext2::lookup_path(&resolved) {
-                crate::fs::ext2::is_dir(ino).unwrap_or(false)
-            } else {
-                false
-            }
+            crate::fs::ext2::is_dir(&resolved)
         } else {
-            // Also check if it's a directory
-            crate::fs::ext2::list_dir(&resolved).map(|e| !e.is_empty()).unwrap_or(false)
+            false
         };
 
-        if ext2_exists || ext2_is_dir {
+        if ext2_exists {
             // O_DIRECTORY: fail if target is not a directory
             if (flags & O_DIRECTORY) != 0 && !ext2_is_dir {
                 return (-20i64) as u64; // ENOTDIR
@@ -3282,17 +3367,24 @@ pub fn linux_openat(dirfd: u64, pathname: u64, flags: u64, _mode: u64) -> u64 {
                 fd_table.alloc_fd(&resolved, base_flags as u32)
             }) {
                 Some(Some(fd)) => {
-                    // Log opens of shared libraries for debugging
-                    if resolved.ends_with(".so") || resolved.contains(".so.") {
+                    // Log opens of shared libraries and directories for debugging
+                    if resolved.ends_with(".so") || resolved.contains(".so.")
+                       || (flags & O_DIRECTORY) != 0 {
                         crate::serial_println!(
-                            "[OPENAT] PID {} opened '{}' (ext2) = FD {}",
-                            pid, resolved, fd
+                            "[OPENAT] PID {} opened '{}' (ext2, dir={}) = FD {}",
+                            pid, resolved, ext2_is_dir, fd
                         );
                     }
                     return fd as u64;
                 }
                 _ => return (-24i64) as u64, // EMFILE
             }
+        } else if (flags & O_DIRECTORY) != 0 {
+            // O_DIRECTORY failed on ext2 — log the exact path for debugging
+            crate::serial_println!(
+                "[OPENAT-FAIL] PID {} O_DIRECTORY '{}' NOT FOUND on ext2",
+                pid, resolved
+            );
         }
     }
 
@@ -3813,18 +3905,65 @@ pub fn linux_mmap_enhanced(addr: u64, length: u64, prot: u64, flags: u64, fd: u6
 /// Enhanced munmap with VMA tracking
 pub fn linux_munmap_enhanced(addr: u64, length: u64) -> u64 {
     if addr == 0 || length == 0 { return (-22i64) as u64; }
+    if addr & 0xFFF != 0 { return (-22i64) as u64; } // Must be page-aligned
 
     let pid = crate::scheduler::current_pid();
+
+    // Remove from VMA tracking
     let mut table = ANON_VMA_TABLE.lock();
     for slot in table.iter_mut() {
         if slot.active && slot.pid == pid && slot.start == addr {
             slot.active = false;
-            // Pages are not physically freed (our allocator doesn't support that yet)
-            // but the VMA is removed so re-mmap can reuse the virtual range
-            return 0;
+            break;
         }
     }
-    0 // Accept silently even if not tracked
+    drop(table);
+
+    // Actually clear PTEs for the unmapped range.
+    // This prevents stale mappings from causing issues when the range is re-mmaped.
+    let pml4_phys = crate::process::with_process(pid, |p| p.pml4_phys).unwrap_or(0);
+    if pml4_phys != 0 {
+        let aligned_len = (length + 0xFFF) & !0xFFF;
+        let num_pages = aligned_len / 4096;
+        let phys_off = crate::elf::phys_offset();
+
+        for i in 0..num_pages {
+            let vaddr = addr + i * 4096;
+            // Walk page tables and clear PTE
+            unsafe {
+                let pml4_virt = (pml4_phys + phys_off) as *const u64;
+                let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
+                let pml4_entry = core::ptr::read_volatile(pml4_virt.add(pml4_idx));
+                if pml4_entry & 1 == 0 { continue; }
+
+                let pdpt_phys = pml4_entry & 0x000F_FFFF_FFFF_F000;
+                let pdpt_virt = (pdpt_phys + phys_off) as *const u64;
+                let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
+                let pdpt_entry = core::ptr::read_volatile(pdpt_virt.add(pdpt_idx));
+                if pdpt_entry & 1 == 0 { continue; }
+                if pdpt_entry & 0x80 != 0 { continue; } // 1G huge page
+
+                let pd_phys = pdpt_entry & 0x000F_FFFF_FFFF_F000;
+                let pd_virt = (pd_phys + phys_off) as *const u64;
+                let pd_idx = ((vaddr >> 21) & 0x1FF) as usize;
+                let pd_entry = core::ptr::read_volatile(pd_virt.add(pd_idx));
+                if pd_entry & 1 == 0 { continue; }
+                if pd_entry & 0x80 != 0 { continue; } // 2M huge page
+
+                let pt_phys = pd_entry & 0x000F_FFFF_FFFF_F000;
+                let pt_virt = (pt_phys + phys_off) as *mut u64;
+                let pt_idx = ((vaddr >> 12) & 0x1FF) as usize;
+
+                // Clear the PTE (unmap the page)
+                core::ptr::write_volatile(pt_virt.add(pt_idx), 0);
+
+                // Invalidate TLB for this address
+                core::arch::asm!("invlpg [{}]", in(reg) vaddr, options(nostack, preserves_flags));
+            }
+        }
+    }
+
+    0
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -4038,11 +4177,11 @@ pub unsafe fn prepare_interpreter_stack(
     }
 
     let envp: &[&[u8]] = &[
-        b"PATH=/disk/bin:/bin",
-        b"HOME=/",
-        b"PYTHONHOME=/disk/lib/python",
-        b"PYTHONPATH=/disk/lib/python",
-        b"NODE_PATH=/disk/lib/node_modules",
+        b"PATH=/usr/bin:/bin:/sbin:/usr/sbin",
+        b"HOME=/root",
+        b"PYTHONHOME=/usr",
+        b"PYTHONDONTWRITEBYTECODE=1",
+        b"LD_LIBRARY_PATH=/lib:/usr/lib",
         b"LANG=C.UTF-8",
         b"TERM=linux",
         b"USER=root",
@@ -4142,10 +4281,10 @@ pub fn linux_stat_vfs(path_addr: u64, buf: u64) -> u64 {
     if crate::fs::ext2::is_mounted() {
         if let Some(ino) = crate::fs::ext2::lookup_path(path_str) {
             let mut stat = LinuxStat::default();
-            let fsize = crate::fs::ext2::file_size(ino).unwrap_or(0);
-            let is_dir = crate::fs::ext2::is_dir(ino).unwrap_or(false);
-            let is_link = crate::fs::ext2::is_symlink(ino).unwrap_or(false);
-            let is_file = crate::fs::ext2::is_file(ino).unwrap_or(false);
+            let fsize = crate::fs::ext2::file_size(path_str).unwrap_or(0);
+            let is_dir = crate::fs::ext2::is_dir(path_str);
+            let is_link = crate::fs::ext2::is_symlink(path_str);
+            let is_file = crate::fs::ext2::is_file(path_str);
             stat.st_ino = ino as u64;
             stat.st_nlink = 1;
             if is_dir {
@@ -4193,15 +4332,18 @@ pub fn linux_stat_vfs(path_addr: u64, buf: u64) -> u64 {
         return 0;
     }
 
-    // Path is a directory? Try common prefixes
-    if path_str == "/" || path_str.starts_with("/disk") || path_str.starts_with("/bin")
+    // Path is a directory? Try common prefixes — only if the last component has no file extension
+    // This prevents incorrectly claiming files like "/__init__.py" are directories.
+    let last_component = path_str.rsplit('/').next().unwrap_or("");
+    let looks_like_file = last_component.contains('.') && !last_component.is_empty();
+    if !looks_like_file && (path_str == "/" || path_str.starts_with("/disk") || path_str.starts_with("/bin")
        || path_str.starts_with("/sys") || path_str.starts_with("/tmp")
        || path_str.starts_with("/var") || path_str.starts_with("/usr")
        || path_str.starts_with("/lib") || path_str.starts_with("/etc")
        || path_str.starts_with("/sbin") || path_str.starts_with("/run")
        || path_str.starts_with("/home") || path_str.starts_with("/opt")
        || path_str.starts_with("/root") || path_str.starts_with("/mnt")
-       || path_str.starts_with("/dev/shm") || path_str.starts_with("/dev/pts") {
+       || path_str.starts_with("/dev/shm") || path_str.starts_with("/dev/pts")) {
         let mut stat = LinuxStat::default();
         stat.st_mode = 0o40755; // S_IFDIR | 0755
         stat.st_nlink = 2;
@@ -4244,8 +4386,8 @@ pub fn linux_fstat_vfs(fd: u64, buf: u64) -> u64 {
             if let Some(ref path) = file_path {
                 if crate::fs::ext2::is_mounted() {
                     if let Some(ino) = crate::fs::ext2::lookup_path(path) {
-                        let fsize = crate::fs::ext2::file_size(ino).unwrap_or(0);
-                        let is_dir = crate::fs::ext2::is_dir(ino).unwrap_or(false);
+                        let fsize = crate::fs::ext2::file_size(path).unwrap_or(0);
+                        let is_dir = crate::fs::ext2::is_dir(path);
                         stat.st_ino = ino as u64;
                         stat.st_mode = if is_dir { 0o40755 } else { 0o100644 };
                         stat.st_size = fsize as i64;
@@ -4312,8 +4454,16 @@ pub fn linux_readlink_enhanced(path: u64, buf: u64, bufsiz: u64) -> u64 {
         reply_str = alloc::string::String::from("/dev/null");
         reply_str.as_bytes()
     } else {
+        // Check ext2 symlinks first (Alpine rootfs has many)
+        if crate::fs::ext2::is_mounted() && crate::fs::ext2::is_symlink(path_str) {
+            if let Some(target) = crate::fs::ext2::read_symlink(path_str) {
+                reply_str = target;
+                reply_str.as_bytes()
+            } else {
+                return (-22i64) as u64; // EINVAL
+            }
         // Check VFS symlinks
-        if let Ok(target) = crate::fs::vfs::readlink(path_str) {
+        } else if let Ok(target) = crate::fs::vfs::readlink(path_str) {
             reply_str = target;
             reply_str.as_bytes()
         } else {
@@ -4346,15 +4496,8 @@ pub fn linux_newfstatat_vfs(_dirfd: u64, path: u64, buf: u64, _flag: u64) -> u64
 /// Linux statx(dirfd, pathname, flags, mask, statxbuf) -> 0 on success
 /// Syscall 332. Required by musl >= 1.2 and APK package manager.
 /// struct statx is 256 bytes.
-pub fn linux_statx(_dirfd: u64, pathname: u64, _flags: u64, _mask: u64) -> u64 {
-    // a4 is actually the 5th argument (statxbuf) passed via r8 in the
-    // Linux syscall ABI. However our dispatch passes a1..a4 = rdi,rsi,rdx,r10.
-    // For statx: rdi=dirfd, rsi=pathname, rdx=flags, r10=mask, r8=statxbuf.
-    // We receive a4=mask. The actual statxbuf is the 5th arg.
-    // Since our syscall dispatch only passes 4 args, we use r8 directly.
-    // For now, treat a4 as statxbuf (the caller should adapt).
-    let statxbuf = _mask; // In our 4-arg dispatch, a4 is actually the 5th positional
-    
+/// Args: a1=dirfd, a2=pathname, a3=flags, a4=mask, a5=statxbuf
+pub fn linux_statx(_dirfd: u64, pathname: u64, _flags: u64, _mask: u64, statxbuf: u64) -> u64 {
     if statxbuf == 0 { return (-14i64) as u64; } // EFAULT
     if !crate::arch::x86_64::syscall::validate_user_ptr_pub(statxbuf, 256) {
         return (-14i64) as u64;
@@ -4374,20 +4517,66 @@ pub fn linux_statx(_dirfd: u64, pathname: u64, _flags: u64, _mask: u64) -> u64 {
         alloc::string::String::from(".")
     };
 
-    // Try VFS lookup to get file size
-    let (file_size, is_dir, _exists) = if let Ok(data) = crate::fs::vfs::file_read(&path_str) {
-        (data.len() as u64, false, true)
-    } else if crate::fs::vfs::list_path(&path_str).is_ok() {
-        (4096u64, true, true)
-    } else if path_str.starts_with("/proc") || path_str.starts_with("/dev") || path_str.starts_with("/sys") {
-        (0u64, path_str.ends_with('/') || !path_str.contains('.'), true)
+    // Resolve symlinks on ext2
+    let resolved = if crate::fs::ext2::is_mounted() {
+        let mut r = alloc::string::String::from(path_str.as_str());
+        for _depth in 0..8 {
+            if crate::fs::ext2::is_symlink(&r) {
+                if let Some(target) = crate::fs::ext2::read_symlink(&r) {
+                    if target.starts_with('/') {
+                        r = target;
+                    } else {
+                        if let Some(last_slash) = r.rfind('/') {
+                            let parent = &r[..last_slash + 1];
+                            r = alloc::format!("{}{}", parent, target);
+                        } else {
+                            r = target;
+                        }
+                    }
+                    continue;
+                }
+            }
+            break;
+        }
+        r
     } else {
-        // File not found
+        alloc::string::String::from(path_str.as_str())
+    };
+
+    // Try ext2 filesystem FIRST (Alpine rootfs has most files)
+    let (file_size, is_dir, ino, found) = if crate::fs::ext2::is_mounted() {
+        if let Some(ino) = crate::fs::ext2::lookup_path(&resolved) {
+            let fsize = crate::fs::ext2::file_size(&resolved).unwrap_or(0);
+            let dir = crate::fs::ext2::is_dir(&resolved);
+            (fsize, dir, ino as u64, true)
+        } else {
+            (0u64, false, 0u64, false)
+        }
+    } else {
+        (0u64, false, 0u64, false)
+    };
+
+    // If not found on ext2, try VFS and pseudo-filesystems
+    let (file_size, is_dir, ino) = if found {
+        (file_size, is_dir, ino)
+    } else if let Ok(data) = crate::fs::vfs::file_read(&resolved) {
+        (data.len() as u64, false, 1u64)
+    } else if crate::fs::vfs::list_path(&resolved).is_ok() {
+        (4096u64, true, 1u64)
+    } else if resolved.starts_with("/proc") || resolved.starts_with("/dev") || resolved.starts_with("/sys") {
+        let d = resolved.ends_with('/') || !resolved.contains('.');
+        (0u64, d, 1u64)
+    } else if resolved == "/" || resolved == "/tmp" || resolved == "/var"
+           || resolved == "/run" || resolved == "/home" || resolved == "/etc"
+           || resolved == "/usr" || resolved == "/lib" || resolved == "/bin"
+           || resolved == "/sbin" || resolved == "/usr/bin" || resolved == "/usr/lib" {
+        (4096u64, true, 2u64)
+    } else {
         return (-2i64) as u64; // ENOENT
     };
 
     // Fill struct statx fields
-    let mode: u32 = if is_dir { 0o40755 } else { 0o100644 };
+    let mode: u32 = if is_dir { 0o40755 } else { 0o100755 };
     let nlink: u32 = if is_dir { 2 } else { 1 };
     let blksize: u32 = 4096;
     let stx_mask: u32 = 0x17FF; // STATX_BASIC_STATS | STATX_BTIME
@@ -4405,17 +4594,17 @@ pub fn linux_statx(_dirfd: u64, pathname: u64, _flags: u64, _mask: u64) -> u64 {
     // stx_mode (offset 28, u16)
     sxbuf[28..30].copy_from_slice(&(mode as u16).to_ne_bytes());
     // stx_ino (offset 32, u64)
-    sxbuf[32..40].copy_from_slice(&1u64.to_ne_bytes());
+    sxbuf[32..40].copy_from_slice(&ino.to_ne_bytes());
     // stx_size (offset 40, u64)
     sxbuf[40..48].copy_from_slice(&file_size.to_ne_bytes());
     // stx_blocks (offset 48, u64)
     sxbuf[48..56].copy_from_slice(&((file_size + 511) / 512).to_ne_bytes());
+    // stx_dev_major (offset 56, u32) = 8
+    sxbuf[56..60].copy_from_slice(&8u32.to_ne_bytes());
+    // stx_dev_minor (offset 60, u32) = 1
+    sxbuf[60..64].copy_from_slice(&1u32.to_ne_bytes());
     unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(statxbuf, &sxbuf); }
 
-    crate::serial_println!(
-        "[LINUX-ABI] statx('{}') -> mode=0o{:o}, size={}, dir={}",
-        path_str, mode, file_size, is_dir
-    );
     0
 }
 
@@ -4505,15 +4694,10 @@ pub fn linux_chdir(path_addr: u64) -> u64 {
 
 /// Linux lseek(fd, offset, whence) → new offset
 pub fn linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
-    // Minimal: for special files (stdin/stdout/stderr, /dev/null), return ESPIPE
+    // For special files (stdin/stdout/stderr), return ESPIPE
     if fd <= 2 { return (-29i64) as u64; } // ESPIPE for pipes/ttys
-    // For regular files: return the offset (stub — pretend it worked)
-    match whence {
-        0 => offset,        // SEEK_SET
-        1 => offset,        // SEEK_CUR (stub)
-        2 => 0,             // SEEK_END (stub: file size 0)
-        _ => (-22i64) as u64, // EINVAL
-    }
+    // Delegate to the real sys_lseek implementation which updates fd offset
+    crate::arch::x86_64::syscall::sys_lseek_pub(fd as u32, offset as i64, whence as u32)
 }
 
 /// Linux pread64(fd, buf, count, offset) → bytes read

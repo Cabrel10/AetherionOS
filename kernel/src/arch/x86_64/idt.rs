@@ -1161,7 +1161,7 @@ extern "x86-interrupt" fn page_fault_handler(
     if is_user_mode {
         let current_pid = crate::scheduler::current_pid();
         if current_pid != 0 {
-            if let Some((_file_path, _file_offset, _writable)) = crate::process::find_vma(current_pid, addr_raw) {
+            if let Some((_file_path, _file_offset, _writable, _executable)) = crate::process::find_vma(current_pid, addr_raw) {
                 // Readahead: map the faulting page + up to 7 adjacent pages
                 // This reduces page-fault overhead for sequential model weight access
                 const READAHEAD_PAGES: u64 = 8; // 32 KiB readahead window
@@ -1180,7 +1180,7 @@ extern "x86-interrupt" fn page_fault_handler(
                     let ra_page_addr = page_addr + ra_idx * 4096;
                     
                     // Check this readahead page is still within the VMA
-                    if let Some((ra_path, ra_file_offset, ra_writable)) = crate::process::find_vma(current_pid, ra_page_addr) {
+                    if let Some((ra_path, ra_file_offset, ra_writable, ra_executable)) = crate::process::find_vma(current_pid, ra_page_addr) {
                         // Allocate a physical frame
                         let frame_phys = unsafe { crate::elf::alloc_demand_frame() };
                         if let Some(phys) = frame_phys {
@@ -1211,8 +1211,9 @@ extern "x86-interrupt" fn page_fault_handler(
                             }
                             
                             // Map the page (even if bytes_read < 4096, rest is zeroed)
-                            let mut flags: u64 = 0x01 | 0x04 | (1u64 << 63); // PRESENT | USER | NX
-                            if ra_writable { flags |= 0x02; }
+                            let mut flags: u64 = 0x01 | 0x04; // PRESENT | USER
+                            if ra_writable { flags |= 0x02; } // WRITABLE
+                            if !ra_executable { flags |= 1u64 << 63; } // NX only if NOT executable
                             
                             match unsafe { crate::elf::demand_map_user_page(pml4_phys, ra_page_addr, phys, flags) } {
                                 Ok(()) => {
@@ -1329,7 +1330,162 @@ extern "x86-interrupt" fn page_fault_handler(
         }
     }
 
-    // True kernel-mode page fault (address in kernel space) — log and halt this core only.
+    // ═══════════════════════════════════════════════════════════════════
+    // Jalon 250: Lazy kernel page mapping.
+    //
+    // Something between Step 5a (boot-time kernel page verification) and
+    // Step 9b (VFS mount) corrupts PT entries for kernel .bss pages —
+    // likely the x86_64 crate's map_to() during heap init splitting or
+    // replacing intermediate page tables. Instead of halting, we recover
+    // by allocating a fresh frame and mapping it with P|W (0x03) flags.
+    //
+    // This handles THREE cases:
+    //   A) Kernel image pages (PML4[511], 0xFFFFFFFF80000000+): recover the
+    //      original physical address by scanning neighboring PT entries.
+    //      Limine maps the kernel contiguously, so PT[N] + delta*4096 = PT[M].
+    //      This preserves .text/.rodata/.data content (not just .bss zeros).
+    //   B) HHDM pages (PML4[256..511)): map the corresponding physical
+    //      address (vaddr - hhdm_offset) as an identity mapping.
+    //   C) Other kernel space: allocate a zero frame.
+    //
+    // We do NOT use demand_map_user_page() because:
+    //   - It deep-copies intermediate tables and sets the User bit (0x07)
+    //   - Kernel pages must have flags 0x03 (Present|Writable, no User)
+    //   - The kernel's intermediate tables (PML4[511]→PDPT[510]→PD[*])
+    //     should already exist; only the PT leaf entry is cleared.
+    // ═══════════════════════════════════════════════════════════════════
+    if addr_raw >= 0xFFFF_8000_0000_0000 {
+        let phys_off = crate::elf::phys_offset();
+        if phys_off != 0 {
+            let cr3_val: u64;
+            unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3_val, options(nomem, nostack)); }
+            let pml4_phys = cr3_val & !0xFFF;
+
+            let pml4_idx = ((page_addr >> 39) & 0x1FF) as usize;
+            let pdpt_idx = ((page_addr >> 30) & 0x1FF) as usize;
+            let pd_idx   = ((page_addr >> 21) & 0x1FF) as usize;
+            let pt_idx   = ((page_addr >> 12) & 0x1FF) as usize;
+
+            let mut ok = false;
+            unsafe {
+                let pml4_virt = (pml4_phys + phys_off) as *mut u64;
+                let mut pml4_entry = core::ptr::read_volatile(pml4_virt.add(pml4_idx));
+
+                // If PML4 entry missing, allocate a PDPT
+                if pml4_entry & 1 == 0 {
+                    if let Some(f) = crate::elf::alloc_demand_frame() {
+                        core::ptr::write_bytes((f + phys_off) as *mut u8, 0, 4096);
+                        pml4_entry = f | 0x03; // P|W, no U for kernel
+                        core::ptr::write_volatile(pml4_virt.add(pml4_idx), pml4_entry);
+                        crate::serial_println!("[PF-KERN-FIX] Allocated PML4[{}] -> 0x{:X}", pml4_idx, f);
+                    }
+                }
+                if pml4_entry & 1 != 0 {
+                    let pdpt_phys = pml4_entry & 0x000F_FFFF_FFFF_F000;
+                    let pdpt_virt = (pdpt_phys + phys_off) as *mut u64;
+                    let mut pdpt_entry = core::ptr::read_volatile(pdpt_virt.add(pdpt_idx));
+
+                    // If PDPT entry missing, allocate a PD
+                    if pdpt_entry & 1 == 0 {
+                        if let Some(f) = crate::elf::alloc_demand_frame() {
+                            core::ptr::write_bytes((f + phys_off) as *mut u8, 0, 4096);
+                            pdpt_entry = f | 0x03;
+                            core::ptr::write_volatile(pdpt_virt.add(pdpt_idx), pdpt_entry);
+                            crate::serial_println!("[PF-KERN-FIX] Allocated PDPT[{}] -> 0x{:X}", pdpt_idx, f);
+                        }
+                    }
+                    // Skip 1G huge pages — they cover the address
+                    if pdpt_entry & 1 != 0 && pdpt_entry & 0x80 == 0 {
+                        let pd_phys = pdpt_entry & 0x000F_FFFF_FFFF_F000;
+                        let pd_virt = (pd_phys + phys_off) as *mut u64;
+                        let mut pd_entry = core::ptr::read_volatile(pd_virt.add(pd_idx));
+
+                        // If PD entry missing, allocate a PT
+                        if pd_entry & 1 == 0 {
+                            if let Some(f) = crate::elf::alloc_demand_frame() {
+                                core::ptr::write_bytes((f + phys_off) as *mut u8, 0, 4096);
+                                pd_entry = f | 0x03;
+                                core::ptr::write_volatile(pd_virt.add(pd_idx), pd_entry);
+                                crate::serial_println!("[PF-KERN-FIX] Allocated PD[{}] -> 0x{:X}", pd_idx, f);
+                            }
+                        }
+                        // Skip 2M huge pages — they cover the address
+                        if pd_entry & 1 != 0 && pd_entry & 0x80 == 0 {
+                            let pt_phys = pd_entry & 0x000F_FFFF_FFFF_F000;
+                            let pt_virt = (pt_phys + phys_off) as *mut u64;
+                            let pt_entry = core::ptr::read_volatile(pt_virt.add(pt_idx));
+
+                            if pt_entry & 1 == 0 {
+                                // PT entry is zero — the page is not mapped.
+                                // Determine the physical frame to use:
+                                //   - HHDM region: identity map (phys = vaddr - hhdm_offset)
+                                //   - Kernel image (PML4[511]): recover original physical
+                                //     frame by scanning neighboring PT entries. Limine maps
+                                //     the kernel contiguously: if PT[N] = P, then PT[M] should
+                                //     be P + (M-N)*4096. This handles .text/.rodata/.data/.bss.
+                                //   - Other kernel space: allocate a zero frame.
+                                let frame_phys: Option<u64>;
+
+                                // Check if this is an HHDM address (PML4[256..511) but not
+                                // the kernel image at PML4[511])
+                                if pml4_idx >= 256 && pml4_idx < 511 {
+                                    // HHDM identity: physical = virtual - phys_offset
+                                    frame_phys = Some(page_addr - phys_off);
+                                } else if pml4_idx == 511 {
+                                    // Kernel image region: use kernel_phys_base to compute
+                                    // the correct physical address directly.
+                                    // phys = kernel_phys_base + (vaddr - 0xFFFFFFFF80000000)
+                                    let kphys_base = crate::elf::kernel_phys_base();
+                                    if kphys_base != 0 {
+                                        let offset = page_addr - 0xFFFF_FFFF_8000_0000u64;
+                                        frame_phys = Some(kphys_base + offset);
+                                        crate::serial_println!(
+                                            "[PF-KERN-FIX] Kernel image: 0x{:X} -> phys 0x{:X} (base=0x{:X} + offset=0x{:X})",
+                                            page_addr, kphys_base + offset, kphys_base, offset
+                                        );
+                                    } else {
+                                        // Fallback: kernel_phys_base not yet computed,
+                                        // allocate a zero frame (only correct for .bss)
+                                        frame_phys = crate::elf::alloc_demand_frame();
+                                        if let Some(f) = frame_phys {
+                                            core::ptr::write_bytes((f + phys_off) as *mut u8, 0, 4096);
+                                        }
+                                        crate::serial_println!(
+                                            "[PF-KERN-FIX] No kernel_phys_base, allocated zero frame for 0x{:X}",
+                                            page_addr
+                                        );
+                                    }
+                                } else {
+                                    // Other kernel space: allocate a zero frame
+                                    frame_phys = crate::elf::alloc_demand_frame();
+                                    if let Some(f) = frame_phys {
+                                        core::ptr::write_bytes((f + phys_off) as *mut u8, 0, 4096);
+                                    }
+                                }
+
+                                if let Some(f) = frame_phys {
+                                    // Map with P|W (0x03), no User bit, no NX (kernel code may execute here)
+                                    core::ptr::write_volatile(pt_virt.add(pt_idx), f | 0x03);
+                                    // Flush TLB for this address
+                                    core::arch::asm!("invlpg [{}]", in(reg) page_addr, options(nostack));
+                                    ok = true;
+                                    crate::serial_println!(
+                                        "[PF-KERN-FIX] Mapped 0x{:X} -> phys 0x{:X} (PML4[{}] PT[{}] flags=0x03)",
+                                        page_addr, f, pml4_idx, pt_idx
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if ok {
+                return; // Resume — the faulting instruction will retry successfully
+            }
+        }
+    }
+
+    // True kernel-mode page fault that could NOT be recovered — log and halt this core.
     // Jalon 109: Downgraded from panic! to hlt-loop so the other core survives.
     {
         let rip_val = stack_frame.instruction_pointer.as_u64();

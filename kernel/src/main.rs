@@ -38,6 +38,7 @@
 // panic_info_message stabilized in nightly-2026
 // naked_functions stabilized in nightly-2026
 #![allow(dead_code)]
+#![allow(static_mut_refs)]
 
 use core::panic::PanicInfo;
 use core::fmt::Write;
@@ -3093,12 +3094,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                             scheduler::enqueue_process(pid);
                         }
                         unsafe {
-                            core::arch::asm!(
-                                "mov cr3, {}",
-                                in(reg) result.pml4_phys,
-                                options(nostack)
-                            );
-                            elf::jump_to_ring3(result.entry_point, result.stack_pointer);
+                            elf::exec_switch_cr3_and_ring3(result.pml4_phys, result.entry_point, result.stack_pointer);
                         }
                     }
                     Err(e2) => {

@@ -626,7 +626,7 @@ pub fn extract_tar_gz_to_ext2(tar_gz_data: &[u8], mount_point: &str) -> Option<u
                         crate::fs::ext2::create_dir(
                             if parent.is_empty() { "/" } else { parent },
                             name,
-                            (entry.mode & 0o7777) as u16,
+                            (entry.mode & 0o7777) as u32,
                         );
                     }
                 }
