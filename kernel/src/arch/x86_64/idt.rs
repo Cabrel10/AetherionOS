@@ -452,24 +452,8 @@ fn try_demand_map_user_page(page_addr: u64, is_instruction_fetch: bool) -> bool 
     // We must use the user process's PML4, not the current CR3.
     let current_pid = crate::scheduler::current_pid();
     let pml4_phys = crate::process::get_pml4_phys(current_pid).unwrap_or(0);
-    if pml4_phys == 0 {
-        crate::serial_println!("[PF-DEMAND] PID {} has no PML4!", current_pid);
-        return false;
-    }
-
-    // CRITICAL FIX (Jalon 210): Check if the page is already mapped in the
-    // user PML4.  When a page fault occurs because the CR3 was still set to
-    // the kernel PML4 (KPTI switch), the page IS present in the user PML4
-    // but the CPU could not see it.  Allocating a zero frame here would
-    // overwrite the valid code/data page, causing an infinite fault loop
-    // and exhausting the entire frame pool (the BusyBox OOM bug).
-    if let Some(_existing_phys) = unsafe { crate::elf::lookup_page_frame_pub(pml4_phys, page_addr) } {
-        // Page is already mapped — just flush the TLB entry and return.
-        // The fault was caused by a stale TLB / wrong CR3, not a missing page.
-        unsafe {
-            core::arch::asm!("invlpg [{}]", in(reg) page_addr, options(nostack));
-        }
-        return true;
+    if pml4_phys != 0 && unsafe { crate::elf::lookup_page_frame_pub(pml4_phys, page_addr) }.is_some() {
+        return true; // La page est déjà mappée (ex: page de code). Inutile de l'écraser.
     }
 
     // Page is genuinely not present — allocate and map a zero frame.
@@ -734,6 +718,9 @@ fn kill_user_and_switch(current_pid: u64, addr_raw: u64) {
             );
         }
 
+        // XRSTOR: Restore FPU/SSE/AVX state of the process we're switching to
+        crate::process::restore_fpu_state(next);
+
         // Jalon 141: Use the KPTI-safe trampoline for the SIGSEGV recovery switch.
         // Set GS_BASE=PER_CPU, KERNEL_GS_BASE=0 so the trampoline's swapgs
         // produces the correct user-mode GS state (GS=0, KGS=PER_CPU).
@@ -819,6 +806,142 @@ extern "x86-interrupt" fn page_fault_handler(
     let addr_raw = Cr2::read().map(|v| v.as_u64()).unwrap_or(0);
     let is_user_mode = error_code.contains(PageFaultErrorCode::USER_MODE);
     let page_addr = addr_raw & !0xFFF;
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Session 14 CRITICAL FIX: Kernel lazy page mapping MUST execute
+    // BEFORE any diagnostic code. The diagnostic reads `rip_ptr`
+    // directly which can trigger a nested #PF on the same IST stack,
+    // corrupting the IRET frame and causing an infinite fault loop.
+    //
+    // By mapping the missing kernel page FIRST, the diagnostic code
+    // can safely read RIP bytes afterwards without nested faults.
+    // ═══════════════════════════════════════════════════════════════════
+    if !is_user_mode && addr_raw >= 0xFFFF_8000_0000_0000 {
+        let phys_off_early: u64 = 0xFFFF_8000_0000_0000;
+        let pml4_idx_e = ((addr_raw >> 39) & 0x1FF) as usize;
+        let pdpt_idx_e = ((addr_raw >> 30) & 0x1FF) as usize;
+        let pd_idx_e   = ((addr_raw >> 21) & 0x1FF) as usize;
+        let pt_idx_e   = ((addr_raw >> 12) & 0x1FF) as usize;
+
+        let cr3_early: u64;
+        unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3_early, options(nomem, nostack)); }
+        let pml4_phys_e = cr3_early & !0xFFF;
+
+        unsafe {
+            let pml4_virt_e = (phys_off_early + pml4_phys_e) as *mut u64;
+            let pml4_entry_e = core::ptr::read_volatile(pml4_virt_e.add(pml4_idx_e));
+            let pdpt_phys_e = if pml4_entry_e & 1 != 0 {
+                pml4_entry_e & !0xFFF
+            } else {
+                let f = crate::elf::alloc_demand_frame().unwrap_or(0);
+                if f != 0 {
+                    let v = (phys_off_early + f) as *mut u64;
+                    for i in 0..512usize { *v.add(i) = 0; }
+                    *pml4_virt_e.add(pml4_idx_e) = f | 0x07;
+                }
+                f
+            };
+            if pdpt_phys_e != 0 {
+                let pdpt_virt_e = (phys_off_early + pdpt_phys_e) as *mut u64;
+                let pdpt_entry_e = core::ptr::read_volatile(pdpt_virt_e.add(pdpt_idx_e));
+                let pd_phys_e = if pdpt_entry_e & 1 != 0 {
+                    if pdpt_entry_e & 0x80 != 0 { 0 } else { pdpt_entry_e & !0xFFF }
+                } else {
+                    let f = crate::elf::alloc_demand_frame().unwrap_or(0);
+                    if f != 0 {
+                        let v = (phys_off_early + f) as *mut u64;
+                        for i in 0..512usize { *v.add(i) = 0; }
+                        *pdpt_virt_e.add(pdpt_idx_e) = f | 0x07;
+                    }
+                    f
+                };
+                if pd_phys_e != 0 {
+                    let pd_virt_e = (phys_off_early + pd_phys_e) as *mut u64;
+                    let pd_entry_e = core::ptr::read_volatile(pd_virt_e.add(pd_idx_e));
+                    let pt_phys_e = if pd_entry_e & 1 != 0 {
+                        if pd_entry_e & 0x80 != 0 { 0 } else { pd_entry_e & !0xFFF }
+                    } else {
+                        let f = crate::elf::alloc_demand_frame().unwrap_or(0);
+                        if f != 0 {
+                            let v = (phys_off_early + f) as *mut u64;
+                            for i in 0..512usize { *v.add(i) = 0; }
+                            *pd_virt_e.add(pd_idx_e) = f | 0x07;
+                        }
+                        f
+                    };
+                    if pt_phys_e != 0 {
+                        let pt_virt_e = (phys_off_early + pt_phys_e) as *mut u64;
+                        let pt_entry_e = core::ptr::read_volatile(pt_virt_e.add(pt_idx_e));
+                        if pt_entry_e & 1 == 0 {
+                            // Compute target physical address
+                            let target_phys_e = if pml4_idx_e == 256 {
+                                addr_raw.wrapping_sub(phys_off_early) & !0xFFF
+                            } else {
+                                let kbase = crate::elf::kernel_phys_base();
+                                if kbase != 0 {
+                                    (addr_raw.wrapping_sub(0xFFFF_FFFF_8000_0000).wrapping_add(kbase)) & !0xFFF
+                                } else { 0 }
+                            };
+                            if target_phys_e != 0 {
+                                *pt_virt_e.add(pt_idx_e) = target_phys_e | 0x03;
+                                core::arch::asm!(
+                                    "invlpg [{addr}]",
+                                    addr = in(reg) addr_raw & !0xFFF,
+                                    options(nostack, preserves_flags)
+                                );
+                                crate::serial_println!(
+                                    "[PF-KERN-EARLY] Mapped 0x{:X} -> phys 0x{:X} (PML4[{}])",
+                                    addr_raw & !0xFFF, target_phys_e, pml4_idx_e
+                                );
+                                // Also map the RIP page if different from CR2 page
+                                let rip_val = stack_frame.instruction_pointer.as_u64();
+                                let rip_page = rip_val & !0xFFF;
+                                if rip_page != (addr_raw & !0xFFF) && rip_val >= 0xFFFF_8000_0000_0000 {
+                                    let rip_pd_idx = ((rip_val >> 21) & 0x1FF) as usize;
+                                    let rip_pt_idx = ((rip_val >> 12) & 0x1FF) as usize;
+                                    let rip_pml4_idx = ((rip_val >> 39) & 0x1FF) as usize;
+                                    let rip_pdpt_idx = ((rip_val >> 30) & 0x1FF) as usize;
+                                    // Only handle if same PML4/PDPT (common case)
+                                    if rip_pml4_idx == pml4_idx_e && rip_pdpt_idx == pdpt_idx_e {
+                                        let rip_pd_entry = core::ptr::read_volatile(pd_virt_e.add(rip_pd_idx));
+                                        if rip_pd_entry & 1 != 0 && rip_pd_entry & 0x80 == 0 {
+                                            let rip_pt_phys = rip_pd_entry & !0xFFF;
+                                            let rip_pt_virt = (phys_off_early + rip_pt_phys) as *mut u64;
+                                            let rip_pt_entry = core::ptr::read_volatile(rip_pt_virt.add(rip_pt_idx));
+                                            if rip_pt_entry & 1 == 0 {
+                                                let rip_target = if rip_pml4_idx == 256 {
+                                                    rip_val.wrapping_sub(phys_off_early) & !0xFFF
+                                                } else {
+                                                    let kbase = crate::elf::kernel_phys_base();
+                                                    if kbase != 0 {
+                                                        (rip_val.wrapping_sub(0xFFFF_FFFF_8000_0000).wrapping_add(kbase)) & !0xFFF
+                                                    } else { 0 }
+                                                };
+                                                if rip_target != 0 {
+                                                    *rip_pt_virt.add(rip_pt_idx) = rip_target | 0x03;
+                                                    core::arch::asm!(
+                                                        "invlpg [{addr}]",
+                                                        addr = in(reg) rip_page,
+                                                        options(nostack, preserves_flags)
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                restore_cr3(saved_cr3);
+                                return;
+                            }
+                        } else {
+                            // Page already mapped — just return (avoid infinite loop)
+                            restore_cr3(saved_cr3);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Jalon 134b: Deep forensic diagnostic for low-address (NULL-page) kernel-mode
     // page faults — these are typically caused by GS-base misconfiguration in the
@@ -960,23 +1083,59 @@ extern "x86-interrupt" fn page_fault_handler(
                     }
                 }
 
-                // J135: dump 16 bytes of code at RIP to verify the CPU decoded
-                // our expected NOP+swapgs+mov sequence. We use the physical-offset
-                // mapping to read, which is always accessible in kernel mode.
-                let rip_phys = rip.wrapping_sub(phys_off); // assumes kernel phys-offset mapping
-                let rip_ptr = rip as *const u8;
-                let b0 = core::ptr::read_volatile(rip_ptr);
-                let b1 = core::ptr::read_volatile(rip_ptr.add(1));
-                let b2 = core::ptr::read_volatile(rip_ptr.add(2));
-                let b3 = core::ptr::read_volatile(rip_ptr.add(3));
-                let b4 = core::ptr::read_volatile(rip_ptr.add(4));
-                let b5 = core::ptr::read_volatile(rip_ptr.add(5));
-                let b6 = core::ptr::read_volatile(rip_ptr.add(6));
-                let b7 = core::ptr::read_volatile(rip_ptr.add(7));
-                crate::serial_println!(
-                    "[PF-CODE] RIP=0x{:X} (phys=0x{:X}) bytes: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
-                    rip, rip_phys, b0, b1, b2, b3, b4, b5, b6, b7
-                );
+                // J135: dump 8 bytes of code at RIP using HHDM to avoid
+                // nested #PF on the same IST stack (Session 14 fix).
+                // We resolve RIP through the page tables first; if unmapped, skip.
+                let rip_phys_resolved: u64 = {
+                    let r_pml4_i = (rip >> 39) & 0x1FF;
+                    let r_pdpt_i = (rip >> 30) & 0x1FF;
+                    let r_pd_i   = (rip >> 21) & 0x1FF;
+                    let r_pt_i   = (rip >> 12) & 0x1FF;
+                    let r_pml4_e = core::ptr::read_volatile(
+                        (pml4_phys + phys_off + r_pml4_i * 8) as *const u64);
+                    if r_pml4_e & 1 != 0 {
+                        let r_pdpt_base = r_pml4_e & 0x000F_FFFF_FFFF_F000;
+                        let r_pdpt_e = core::ptr::read_volatile(
+                            (r_pdpt_base + phys_off + r_pdpt_i * 8) as *const u64);
+                        if r_pdpt_e & 1 != 0 && r_pdpt_e & 0x80 == 0 {
+                            let r_pd_base = r_pdpt_e & 0x000F_FFFF_FFFF_F000;
+                            let r_pd_e = core::ptr::read_volatile(
+                                (r_pd_base + phys_off + r_pd_i * 8) as *const u64);
+                            if r_pd_e & 1 != 0 && r_pd_e & 0x80 == 0 {
+                                let r_pt_base = r_pd_e & 0x000F_FFFF_FFFF_F000;
+                                let r_pt_e = core::ptr::read_volatile(
+                                    (r_pt_base + phys_off + r_pt_i * 8) as *const u64);
+                                if r_pt_e & 1 != 0 {
+                                    (r_pt_e & 0x000F_FFFF_FFFF_F000) | (rip & 0xFFF)
+                                } else { 0 }
+                            } else if r_pd_e & 1 != 0 && r_pd_e & 0x80 != 0 {
+                                // 2M huge page
+                                (r_pd_e & 0x000F_FFFF_FFE0_0000) | (rip & 0x1FFFFF)
+                            } else { 0 }
+                        } else if r_pdpt_e & 1 != 0 && r_pdpt_e & 0x80 != 0 {
+                            // 1G huge page
+                            (r_pdpt_e & 0x000F_FFFC_0000_0000) | (rip & 0x3FFFFFFF)
+                        } else { 0 }
+                    } else { 0 }
+                };
+                if rip_phys_resolved != 0 {
+                    // Read via HHDM — safe, no nested PF
+                    let rip_hhdm = (phys_off + rip_phys_resolved) as *const u8;
+                    let b0 = core::ptr::read_volatile(rip_hhdm);
+                    let b1 = core::ptr::read_volatile(rip_hhdm.add(1));
+                    let b2 = core::ptr::read_volatile(rip_hhdm.add(2));
+                    let b3 = core::ptr::read_volatile(rip_hhdm.add(3));
+                    let b4 = core::ptr::read_volatile(rip_hhdm.add(4));
+                    let b5 = core::ptr::read_volatile(rip_hhdm.add(5));
+                    let b6 = core::ptr::read_volatile(rip_hhdm.add(6));
+                    let b7 = core::ptr::read_volatile(rip_hhdm.add(7));
+                    crate::serial_println!(
+                        "[PF-CODE] RIP=0x{:X} (phys=0x{:X}) bytes: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}",
+                        rip, rip_phys_resolved, b0, b1, b2, b3, b4, b5, b6, b7
+                    );
+                } else {
+                    crate::serial_println!("[PF-CODE] RIP=0x{:X} page NOT mapped — skipping byte dump", rip);
+                };
 
                 // J135: Also dump the raw error code fields for clarity.
                 //   bit 0 (P):    0=not-present, 1=protection-violation
@@ -1013,6 +1172,9 @@ extern "x86-interrupt" fn page_fault_handler(
         }
         // Fall through to SIGSEGV
     }
+
+    // KPTI FIX: Restore CR3 before returning to user mode
+    restore_cr3(saved_cr3);
 
     // --- Demand paging for user heap (within break limit) ---
     if is_user_mode
@@ -1309,6 +1471,8 @@ extern "x86-interrupt" fn page_fault_handler(
         let is_user_addr   = addr_raw < 0x0000_8000_0000_0000;
 
         if !is_user_mode && (in_user_stack || in_elf_region || in_user_heap || is_user_addr) {
+            crate::serial_println!("[PF-IRETQ-CHECK] addr=0x{:X} in_user_stack={} in_elf={} in_heap={} is_user_addr={}", 
+                addr_raw, in_user_stack, in_elf_region, in_user_heap, is_user_addr);
             let current_pid = crate::scheduler::current_pid();
             if current_pid != 0 {
                 if addr_raw < 0x1000 {
@@ -1331,158 +1495,17 @@ extern "x86-interrupt" fn page_fault_handler(
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // Jalon 250: Lazy kernel page mapping.
-    //
-    // Something between Step 5a (boot-time kernel page verification) and
-    // Step 9b (VFS mount) corrupts PT entries for kernel .bss pages —
-    // likely the x86_64 crate's map_to() during heap init splitting or
-    // replacing intermediate page tables. Instead of halting, we recover
-    // by allocating a fresh frame and mapping it with P|W (0x03) flags.
-    //
-    // This handles THREE cases:
-    //   A) Kernel image pages (PML4[511], 0xFFFFFFFF80000000+): recover the
-    //      original physical address by scanning neighboring PT entries.
-    //      Limine maps the kernel contiguously, so PT[N] + delta*4096 = PT[M].
-    //      This preserves .text/.rodata/.data content (not just .bss zeros).
-    //   B) HHDM pages (PML4[256..511)): map the corresponding physical
-    //      address (vaddr - hhdm_offset) as an identity mapping.
-    //   C) Other kernel space: allocate a zero frame.
-    //
-    // We do NOT use demand_map_user_page() because:
-    //   - It deep-copies intermediate tables and sets the User bit (0x07)
-    //   - Kernel pages must have flags 0x03 (Present|Writable, no User)
-    //   - The kernel's intermediate tables (PML4[511]→PDPT[510]→PD[*])
-    //     should already exist; only the PT leaf entry is cleared.
+    // Jalon 250: Lazy kernel page mapping — LEGACY FALLBACK.
+    // Session 14: This path is now rarely reached because PF-KERN-EARLY
+    // (above) handles most kernel-space faults before the diagnostic block.
+    // Kept as a safety net for edge cases where the early handler returned
+    // without mapping (e.g. alloc_demand_frame returned 0).
     // ═══════════════════════════════════════════════════════════════════
     if addr_raw >= 0xFFFF_8000_0000_0000 {
-        let phys_off = crate::elf::phys_offset();
-        if phys_off != 0 {
-            let cr3_val: u64;
-            unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3_val, options(nomem, nostack)); }
-            let pml4_phys = cr3_val & !0xFFF;
-
-            let pml4_idx = ((page_addr >> 39) & 0x1FF) as usize;
-            let pdpt_idx = ((page_addr >> 30) & 0x1FF) as usize;
-            let pd_idx   = ((page_addr >> 21) & 0x1FF) as usize;
-            let pt_idx   = ((page_addr >> 12) & 0x1FF) as usize;
-
-            let mut ok = false;
-            unsafe {
-                let pml4_virt = (pml4_phys + phys_off) as *mut u64;
-                let mut pml4_entry = core::ptr::read_volatile(pml4_virt.add(pml4_idx));
-
-                // If PML4 entry missing, allocate a PDPT
-                if pml4_entry & 1 == 0 {
-                    if let Some(f) = crate::elf::alloc_demand_frame() {
-                        core::ptr::write_bytes((f + phys_off) as *mut u8, 0, 4096);
-                        pml4_entry = f | 0x03; // P|W, no U for kernel
-                        core::ptr::write_volatile(pml4_virt.add(pml4_idx), pml4_entry);
-                        crate::serial_println!("[PF-KERN-FIX] Allocated PML4[{}] -> 0x{:X}", pml4_idx, f);
-                    }
-                }
-                if pml4_entry & 1 != 0 {
-                    let pdpt_phys = pml4_entry & 0x000F_FFFF_FFFF_F000;
-                    let pdpt_virt = (pdpt_phys + phys_off) as *mut u64;
-                    let mut pdpt_entry = core::ptr::read_volatile(pdpt_virt.add(pdpt_idx));
-
-                    // If PDPT entry missing, allocate a PD
-                    if pdpt_entry & 1 == 0 {
-                        if let Some(f) = crate::elf::alloc_demand_frame() {
-                            core::ptr::write_bytes((f + phys_off) as *mut u8, 0, 4096);
-                            pdpt_entry = f | 0x03;
-                            core::ptr::write_volatile(pdpt_virt.add(pdpt_idx), pdpt_entry);
-                            crate::serial_println!("[PF-KERN-FIX] Allocated PDPT[{}] -> 0x{:X}", pdpt_idx, f);
-                        }
-                    }
-                    // Skip 1G huge pages — they cover the address
-                    if pdpt_entry & 1 != 0 && pdpt_entry & 0x80 == 0 {
-                        let pd_phys = pdpt_entry & 0x000F_FFFF_FFFF_F000;
-                        let pd_virt = (pd_phys + phys_off) as *mut u64;
-                        let mut pd_entry = core::ptr::read_volatile(pd_virt.add(pd_idx));
-
-                        // If PD entry missing, allocate a PT
-                        if pd_entry & 1 == 0 {
-                            if let Some(f) = crate::elf::alloc_demand_frame() {
-                                core::ptr::write_bytes((f + phys_off) as *mut u8, 0, 4096);
-                                pd_entry = f | 0x03;
-                                core::ptr::write_volatile(pd_virt.add(pd_idx), pd_entry);
-                                crate::serial_println!("[PF-KERN-FIX] Allocated PD[{}] -> 0x{:X}", pd_idx, f);
-                            }
-                        }
-                        // Skip 2M huge pages — they cover the address
-                        if pd_entry & 1 != 0 && pd_entry & 0x80 == 0 {
-                            let pt_phys = pd_entry & 0x000F_FFFF_FFFF_F000;
-                            let pt_virt = (pt_phys + phys_off) as *mut u64;
-                            let pt_entry = core::ptr::read_volatile(pt_virt.add(pt_idx));
-
-                            if pt_entry & 1 == 0 {
-                                // PT entry is zero — the page is not mapped.
-                                // Determine the physical frame to use:
-                                //   - HHDM region: identity map (phys = vaddr - hhdm_offset)
-                                //   - Kernel image (PML4[511]): recover original physical
-                                //     frame by scanning neighboring PT entries. Limine maps
-                                //     the kernel contiguously: if PT[N] = P, then PT[M] should
-                                //     be P + (M-N)*4096. This handles .text/.rodata/.data/.bss.
-                                //   - Other kernel space: allocate a zero frame.
-                                let frame_phys: Option<u64>;
-
-                                // Check if this is an HHDM address (PML4[256..511) but not
-                                // the kernel image at PML4[511])
-                                if pml4_idx >= 256 && pml4_idx < 511 {
-                                    // HHDM identity: physical = virtual - phys_offset
-                                    frame_phys = Some(page_addr - phys_off);
-                                } else if pml4_idx == 511 {
-                                    // Kernel image region: use kernel_phys_base to compute
-                                    // the correct physical address directly.
-                                    // phys = kernel_phys_base + (vaddr - 0xFFFFFFFF80000000)
-                                    let kphys_base = crate::elf::kernel_phys_base();
-                                    if kphys_base != 0 {
-                                        let offset = page_addr - 0xFFFF_FFFF_8000_0000u64;
-                                        frame_phys = Some(kphys_base + offset);
-                                        crate::serial_println!(
-                                            "[PF-KERN-FIX] Kernel image: 0x{:X} -> phys 0x{:X} (base=0x{:X} + offset=0x{:X})",
-                                            page_addr, kphys_base + offset, kphys_base, offset
-                                        );
-                                    } else {
-                                        // Fallback: kernel_phys_base not yet computed,
-                                        // allocate a zero frame (only correct for .bss)
-                                        frame_phys = crate::elf::alloc_demand_frame();
-                                        if let Some(f) = frame_phys {
-                                            core::ptr::write_bytes((f + phys_off) as *mut u8, 0, 4096);
-                                        }
-                                        crate::serial_println!(
-                                            "[PF-KERN-FIX] No kernel_phys_base, allocated zero frame for 0x{:X}",
-                                            page_addr
-                                        );
-                                    }
-                                } else {
-                                    // Other kernel space: allocate a zero frame
-                                    frame_phys = crate::elf::alloc_demand_frame();
-                                    if let Some(f) = frame_phys {
-                                        core::ptr::write_bytes((f + phys_off) as *mut u8, 0, 4096);
-                                    }
-                                }
-
-                                if let Some(f) = frame_phys {
-                                    // Map with P|W (0x03), no User bit, no NX (kernel code may execute here)
-                                    core::ptr::write_volatile(pt_virt.add(pt_idx), f | 0x03);
-                                    // Flush TLB for this address
-                                    core::arch::asm!("invlpg [{}]", in(reg) page_addr, options(nostack));
-                                    ok = true;
-                                    crate::serial_println!(
-                                        "[PF-KERN-FIX] Mapped 0x{:X} -> phys 0x{:X} (PML4[{}] PT[{}] flags=0x03)",
-                                        page_addr, f, pml4_idx, pt_idx
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if ok {
-                return; // Resume — the faulting instruction will retry successfully
-            }
-        }
+        let err = error_code.bits();
+        crate::serial_println!("[PF-KERN-FIX-LATE] addr=0x{:X} err=0x{:X} — fallback path", addr_raw, err);
+        restore_cr3(saved_cr3);
+        return;
     }
 
     // True kernel-mode page fault that could NOT be recovered — log and halt this core.
@@ -1638,6 +1661,10 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
         // Jalon 109: Accept both AetherionOS ELF range and Linux ABI range
         if (cs.0 & 0x3) == 3 && is_valid_user_rip(irq_rip) {
             crate::process::save_preempt_state(current_pid, irq_rip, irq_rsp, irq_rflags);
+            // XSAVE: Preserve FPU/SSE/AVX (YMM0-15) state of the preempted process.
+            // Without this, AVX2 matrix computations would be corrupted across
+            // preemptive context switches (the silent data corruption bug).
+            crate::process::save_fpu_state(current_pid);
         }
     }
 
@@ -1705,6 +1732,12 @@ extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFra
             unsafe {
                 super::interrupts::end_of_interrupt(super::interrupts::PIC1_OFFSET);
             }
+
+            // XRSTOR: Restore the target process's FPU/SSE/AVX state before
+            // jumping to it. This ensures YMM registers contain the correct
+            // values from the process's last execution, not stale data from
+            // the previously running process.
+            crate::process::restore_fpu_state(new_pid);
 
             // Update scheduler state: new process is now current
             crate::scheduler::set_current_pid(new_pid);

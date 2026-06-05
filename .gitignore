@@ -69,3 +69,4 @@ models/
 # Third-party build artifacts
 third_party/limine/
 target/
+AetherionOS/

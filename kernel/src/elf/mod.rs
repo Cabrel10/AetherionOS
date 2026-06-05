@@ -92,8 +92,10 @@ const USER_STACK_TOP: u64 = 0x7FFF_FFFF_F000;
 /// - Safe: 16 bytes below unmapped boundary at 0x7FFF_FFFF_F000
 const USER_STACK_INITIAL_RSP: u64 = USER_STACK_TOP - 16;
 /// User stack size: 8 MiB virtual range reserved.
-/// 512 pages (2 MiB) initially mapped — sufficient for SmolLM2 GGUF parsing (272 tensors).
-const USER_STACK_PAGES: u64 = 512; // 2 MiB initial mapping
+/// 32 pages (128 KiB) initially mapped — Python3/musl will mmap() more via brk/mmap.
+/// Reduced from 512 to avoid page-table deep-copy storm in map_user_page()
+/// that caused load_elf to hang when kernel heap was fragmented by prior CI tests.
+const USER_STACK_PAGES: u64 = 32; // 128 KiB initial mapping
 
 /// Maximum valid user-space address
 const USER_ADDR_LIMIT: u64 = 0x0000_8000_0000_0000;
@@ -271,6 +273,13 @@ pub unsafe fn alloc_elf_frame() -> Option<u64> {
     if ELF_POOL.freelist_count > 0 {
         ELF_POOL.freelist_count -= 1;
         let phys = ELF_POOL.freelist[ELF_POOL.freelist_count];
+        
+        // ⚠️ SECURITY CHECK: Reject if in kernel zone
+        if is_kernel_zone(phys) {
+            crate::serial_println!("[POOL] ERROR: Attempted to reuse kernel memory 0x{:X} from freelist!", phys);
+            return None;
+        }
+        
         ELF_POOL.total_recycled += 1;
         let n = ALLOC_COUNTER.fetch_add(1, Ordering::Relaxed);
         // Print every 1000th allocation to track where frames go
@@ -287,6 +296,13 @@ pub unsafe fn alloc_elf_frame() -> Option<u64> {
         return None;
     }
     let phys = ELF_POOL.base_frame + (ELF_POOL.frames_used as u64) * PAGE_SIZE;
+    
+    // ⚠️ SECURITY CHECK: Reject if in kernel zone
+    if is_kernel_zone(phys) {
+        crate::serial_println!("[POOL] ERROR: Attempted to allocate kernel memory 0x{:X}! Pool base=0x{:X}, used={}", phys, ELF_POOL.base_frame, ELF_POOL.frames_used);
+        return None;
+    }
+    
     ELF_POOL.frames_used += 1;
     Some(phys)
 }
@@ -550,6 +566,11 @@ static PHYS_MEM_OFFSET: AtomicU64 = AtomicU64::new(0);
 /// whose PT entries were corrupted (PT[195]=0x0 bug).
 static KERNEL_PHYS_BASE: AtomicU64 = AtomicU64::new(0);
 
+/// Kernel memory zone boundaries (from Limine MEMMAP_EXECUTABLE_AND_MODULES)
+/// Used to prevent frame allocator from allocating kernel memory
+static KERNEL_ZONE_START: AtomicU64 = AtomicU64::new(0);
+static KERNEL_ZONE_END: AtomicU64 = AtomicU64::new(0);
+
 /// Program name to use as argv[0] for the next ELF load.
 /// Set by load_elf() before calling load_elf_binary().
 static mut ELF_ARGV0: [u8; 128] = [0u8; 128];
@@ -646,9 +667,157 @@ pub fn set_kernel_phys_base(base: u64) {
     KERNEL_PHYS_BASE.store(base, Ordering::SeqCst);
 }
 
+/// Set kernel memory zone boundaries (call once during boot from Limine memory map)
+pub fn set_kernel_zone(start: u64, end: u64) {
+    KERNEL_ZONE_START.store(start, Ordering::SeqCst);
+    KERNEL_ZONE_END.store(end, Ordering::SeqCst);
+    crate::serial_println!("[ELF] Kernel zone protected: 0x{:X} - 0x{:X}", start, end);
+}
+
+/// Check if a physical address is in the kernel zone
+pub fn is_kernel_zone(phys: u64) -> bool {
+    let start = KERNEL_ZONE_START.load(Ordering::SeqCst);
+    let end = KERNEL_ZONE_END.load(Ordering::SeqCst);
+    if start == 0 || end == 0 {
+        return false; // Zone not set, allow allocation
+    }
+    phys >= start && phys < end
+}
+
 /// Public wrapper for lookup_page_frame (diagnostic use)
 pub unsafe fn lookup_page_frame_pub(pml4_phys: u64, vaddr: u64) -> Option<u64> {
     lookup_page_frame(pml4_phys, vaddr)
+}
+
+/// Ensure ALL kernel image pages are mapped in the current CR3's page tables.
+///
+/// Limine maps only the ELF segments it loaded, leaving gaps in the kernel
+/// virtual address range (0xFFFFFFFF80000000+). This causes cascading page
+/// faults when newly-compiled kernel functions (e.g., alloc_pid, process::task)
+/// are accessed for the first time.
+///
+/// This function walks the entire kernel image range and ensures every 4KB
+/// page has a valid PT entry, using `kernel_phys_base + offset` to compute
+/// the correct physical address. Called once before cloning to user PML4.
+///
+/// SAFETY: Must be called with a valid CR3 pointing to the kernel PML4.
+unsafe fn ensure_kernel_pages_mapped() {
+    // FIX 1: Once-guard — run only once at boot. Repeated calls during
+    // process creation would re-walk page tables and corrupt TLB entries
+    // for the PER_CPU BSS page, causing infinite #PF loops.
+    static DONE: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
+    if DONE.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        return; // Already ran during boot, skip
+    }
+
+    let kphys_base = KERNEL_PHYS_BASE.load(Ordering::SeqCst);
+    if kphys_base == 0 {
+        crate::serial_println!("[KERN-MAP] kernel_phys_base not set, skipping");
+        DONE.store(false, Ordering::SeqCst); // Reset so we can try again
+        return;
+    }
+    let phys_off = phys_offset();
+    if phys_off == 0 {
+        return;
+    }
+
+    let cr3: u64;
+    core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
+    let pml4_phys = cr3 & !0xFFF;
+
+    // Kernel image: 0xFFFFFFFF80000000 .. 0xFFFFFFFF80600000 (6 MiB, conservative)
+    // __kernel_end is typically around 0xFFFFFFFF805DC000 (~5.9 MiB).
+    const KERN_VADDR_BASE: u64 = 0xFFFF_FFFF_8000_0000;
+    const KERN_SIZE_PAGES: u64 = 2560; // 10 MiB / 4 KiB = 2560 pages
+
+    let mut mapped = 0u64;
+    let mut already_present = 0u64;
+
+    for page_idx in 0..KERN_SIZE_PAGES {
+        let vaddr = KERN_VADDR_BASE + page_idx * PAGE_SIZE;
+        let expected_phys = kphys_base + page_idx * PAGE_SIZE;
+
+        // Walk page tables: PML4[511] -> PDPT -> PD -> PT
+        let pml4_idx = ((vaddr >> 39) & 0x1FF) as usize;
+        let pdpt_idx = ((vaddr >> 30) & 0x1FF) as usize;
+        let pd_idx   = ((vaddr >> 21) & 0x1FF) as usize;
+        let pt_idx   = ((vaddr >> 12) & 0x1FF) as usize;
+
+        let pml4_virt = (pml4_phys + phys_off) as *mut u64;
+        let pml4_entry = core::ptr::read_volatile(pml4_virt.add(pml4_idx));
+        if pml4_entry & 1 == 0 {
+            // PML4 entry missing — allocate PDPT
+            let pdpt_frame = match alloc_elf_frame() {
+                Some(f) => f,
+                None => break,
+            };
+            core::ptr::write_bytes((pdpt_frame + phys_off) as *mut u8, 0, PAGE_SIZE as usize);
+            core::ptr::write_volatile(pml4_virt.add(pml4_idx), pdpt_frame | 0x03);
+        }
+        let pml4_entry = core::ptr::read_volatile(pml4_virt.add(pml4_idx));
+        let pdpt_phys = pml4_entry & 0x000F_FFFF_FFFF_F000;
+        let pdpt_virt = (pdpt_phys + phys_off) as *mut u64;
+        let pdpt_entry = core::ptr::read_volatile(pdpt_virt.add(pdpt_idx));
+
+        // Skip 1 GiB huge pages — they cover everything
+        if pdpt_entry & 1 != 0 && pdpt_entry & 0x80 != 0 {
+            already_present += 1;
+            continue;
+        }
+        if pdpt_entry & 1 == 0 {
+            // PDPT entry missing — allocate PD
+            let pd_frame = match alloc_elf_frame() {
+                Some(f) => f,
+                None => break,
+            };
+            core::ptr::write_bytes((pd_frame + phys_off) as *mut u8, 0, PAGE_SIZE as usize);
+            core::ptr::write_volatile(pdpt_virt.add(pdpt_idx), pd_frame | 0x03);
+        }
+        let pdpt_entry = core::ptr::read_volatile(pdpt_virt.add(pdpt_idx));
+        let pd_phys = pdpt_entry & 0x000F_FFFF_FFFF_F000;
+        let pd_virt = (pd_phys + phys_off) as *mut u64;
+        let pd_entry = core::ptr::read_volatile(pd_virt.add(pd_idx));
+
+        // Skip 2 MiB huge pages — they cover the address
+        if pd_entry & 1 != 0 && pd_entry & 0x80 != 0 {
+            already_present += 1;
+            continue;
+        }
+        if pd_entry & 1 == 0 {
+            // PD entry missing — allocate PT
+            let pt_frame = match alloc_elf_frame() {
+                Some(f) => f,
+                None => break,
+            };
+            core::ptr::write_bytes((pt_frame + phys_off) as *mut u8, 0, PAGE_SIZE as usize);
+            core::ptr::write_volatile(pd_virt.add(pd_idx), pt_frame | 0x03);
+        }
+        let pd_entry = core::ptr::read_volatile(pd_virt.add(pd_idx));
+        let pt_phys = pd_entry & 0x000F_FFFF_FFFF_F000;
+        let pt_virt = (pt_phys + phys_off) as *mut u64;
+        let pt_entry = core::ptr::read_volatile(pt_virt.add(pt_idx));
+
+        if pt_entry & 1 == 0 {
+            // Map the page: phys = kernel_phys_base + page_offset
+            core::ptr::write_volatile(pt_virt.add(pt_idx), expected_phys | 0x03);
+            // FIX 2: invlpg REMOVED — new mappings do not need TLB invalidation
+            // because these virtual addresses were never cached in the TLB before.
+            // The invlpg was corrupting TLB entries for adjacent kernel BSS pages
+            // (notably PER_CPU at 0xffffffff8066b4d0), causing infinite #PF when
+            // the page fault handler tried to read PER_CPU via get_kernel_cr3().
+            mapped += 1;
+        } else {
+            already_present += 1;
+        }
+    }
+
+    if mapped > 0 {
+        crate::serial_println!(
+            "[KERN-MAP] Pre-populated {} kernel pages ({} already present) base=0x{:X}",
+            mapped, already_present, kphys_base
+        );
+    }
 }
 
 /// Create a new PML4 page table for a user process.
@@ -666,6 +835,10 @@ pub unsafe fn lookup_page_frame_pub(pml4_phys: u64, vaddr: u64) -> Option<u64> {
 ///
 /// Returns the physical address of the new PML4.
 unsafe fn create_user_pml4() -> Result<u64, ElfError> {
+    // JALON 250-FIX: Pre-populate ALL kernel pages in the boot PML4 before
+    // cloning. This eliminates cascading page faults from Limine's incomplete
+    // kernel mappings. The cost is ~1500 PT writes, done once per process.
+    ensure_kernel_pages_mapped();
     // Allocate a frame for the new PML4
     let new_pml4_phys = alloc_elf_frame().ok_or(ElfError::OutOfMemory)?;
 
@@ -682,7 +855,9 @@ unsafe fn create_user_pml4() -> Result<u64, ElfError> {
 
     // Copy ALL kernel PML4 entries INCLUDING PML4[1].
     //
-    // PML4[0]: kernel identity mapping (code, GDT, IDT, kernel stacks)
+    // PML4[0]: user ELF region (0x0 - 0x7FFFFFFF_FFFFFFFF)
+    //          NOT present in kernel PML4, but needed for user processes.
+    //          Will be populated by map_user_page() as ELF segments are loaded.
     // PML4[1]: kernel BSS/data + user ELF region (0x8000000000)
     //          Kernel statics (AP GDT, TSS, per-core stacks) live here.
     //          map_user_page() deep-copies PML4[1]'s sub-tables to add
@@ -691,7 +866,7 @@ unsafe fn create_user_pml4() -> Result<u64, ElfError> {
     // PML4[136+]: physical memory offset mapping (bootloader 0.9.x)
     // PML4[256-511]: kernel upper half (physical memory, kernel heap)
     //
-    // Ring 3 code cannot access PML4[0], PML4[1] kernel pages, or PML4[256+]
+    // Ring 3 code cannot access PML4[1] kernel pages or PML4[256+]
     // because those entries don't have the USER_ACCESSIBLE bit set — KPTI-lite.
     let mut copied = 0usize;
     let mut cloned_indices: [u16; 16] = [0xFFFF; 16];
@@ -708,13 +883,34 @@ unsafe fn create_user_pml4() -> Result<u64, ElfError> {
         }
     }
 
+    // JALON 136: Ensure PML4[0] exists for user ELF loading.
+    // If PML4[0] is not present in the kernel PML4 (which is typical for
+    // kernel-only systems), allocate a fresh PDPT for user address space.
+    let pml4_0_entry = core::ptr::read_volatile(new_pml4_virt.add(0));
+    crate::serial_println!("[ELF-J136] Checking PML4[0]: entry=0x{:X} present={}", pml4_0_entry, pml4_0_entry & 0x01 != 0);
+    if pml4_0_entry & 0x01 == 0 {
+        // PML4[0] not present — allocate a new PDPT for user space
+        crate::serial_println!("[ELF-J136] Allocating fresh PDPT for PML4[0]...");
+        let user_pdpt = alloc_elf_frame().ok_or(ElfError::OutOfMemory)?;
+        crate::serial_println!("[ELF-J136] Allocated frame: phys=0x{:X}", user_pdpt);
+        let pdpt_virt = phys_to_virt(user_pdpt) as *mut u8;
+        crate::serial_println!("[ELF-J136] PDPT virt addr: 0x{:X}", pdpt_virt as u64);
+        core::ptr::write_bytes(pdpt_virt, 0, PAGE_SIZE as usize);
+        crate::serial_println!("[ELF-J136] PDPT zeroed");
+        // Set PML4[0] = user_pdpt | P | W | U (present, writable, user-accessible)
+        let pml4_entry = user_pdpt | 0x07;
+        crate::serial_println!("[ELF-J136] Writing PML4[0] entry: 0x{:X}", pml4_entry);
+        core::ptr::write_volatile(new_pml4_virt.add(0), pml4_entry);
+        crate::serial_println!("[ELF-J136] PML4[0] written successfully");
+    }
+
     // DIAGNOSTIC: Verify kernel mapping is intact in new PML4
-    // Kernel .text is at ~0x408560 = PML4[0], PDPT[0], PD[2]
+    // Kernel .text is at ~0x408560 = PML4[511], PDPT[0], PD[2]
     let new_pml4_e0 = core::ptr::read_volatile(new_pml4_virt.add(0));
-    let has_kernel = new_pml4_e0 & 0x01 != 0;
+    let has_user = new_pml4_e0 & 0x01 != 0;
     crate::serial_println!(
-        "[ELF] User PML4 created: phys=0x{:X} ({} entries cloned) PML4[0]=0x{:X} kernel={}",
-        new_pml4_phys, copied, new_pml4_e0, has_kernel
+        "[ELF] User PML4 created: phys=0x{:X} ({} entries cloned) PML4[0]=0x{:X} user={}",
+        new_pml4_phys, copied, new_pml4_e0, has_user
     );
     // J134c: list which PML4 indices were cloned (LSTAR is at 0xFFFF8000... which is PML4[256])
     crate::serial_println!(
@@ -782,6 +978,13 @@ pub unsafe fn map_user_page(
     paddr: u64,
     flags: u64,
 ) -> Result<(), ElfError> {
+    // Diagnostic: log every 4th page mapping to detect hangs
+    static MAP_COUNTER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    let n = MAP_COUNTER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if n < 10 || n % 4 == 0 {
+        crate::serial_println!("[MAP-USER-PAGE] #{} vaddr=0x{:X} paddr=0x{:X} flags=0x{:X}", n, vaddr, paddr, flags);
+    }
+
     let indices = [
         ((vaddr >> 39) & 0x1FF) as usize, // PML4 index
         ((vaddr >> 30) & 0x1FF) as usize, // PDPT index
@@ -1230,9 +1433,17 @@ pub fn load_elf_binary(elf_data: &[u8]) -> Result<ElfLoadResult, ElfError> {
             map_user_page(pml4_phys, page_vaddr, frame_phys, stack_flags)?;
         }
     }
+    crate::serial_println!(
+        "[ELF] Stack allocation complete: {} pages mapped, top_frame=0x{:X}",
+        USER_STACK_PAGES, top_stack_frame_phys
+    );
 
     let fl_after = unsafe { ELF_POOL.freelist_count };
     let frames_consumed = if fl_before > fl_after { fl_before - fl_after } else { 0 };
+    crate::serial_println!(
+        "[ELF] Frames consumed: {} (before={}, after={})",
+        frames_consumed, fl_before, fl_after
+    );
 
     // ═══════════════════════════════════════════════════════════════
     // Step 7: Linux ABI Stack Layout — Inject AuxV, argv, envp
@@ -1707,9 +1918,13 @@ pub unsafe fn build_sysv_stack(
     phdr_vaddr: u64,
     phdr_count: u16,
 ) -> Option<u64> {
+    crate::serial_println!("[BUILD-SYSV] START: pml4=0x{:X}, argv.len={}, envp.len={}", pml4_phys, argv.len(), envp.len());
+    
     // Find the physical frame backing the top stack page
     let top_stack_page_vaddr = USER_STACK_TOP - PAGE_SIZE; // 0x7FFF_FFFF_E000
+    crate::serial_println!("[BUILD-SYSV] Looking up stack page: vaddr=0x{:X}", top_stack_page_vaddr);
     let frame_phys = lookup_page_frame(pml4_phys, top_stack_page_vaddr)?;
+    crate::serial_println!("[BUILD-SYSV] Stack page found: phys=0x{:X}", frame_phys);
     let virt_addr = phys_to_virt(frame_phys);
     crate::serial_println!(
         "[ELF] build_sysv_stack: pml4=0x{:X}, stack_page=0x{:X}, frame=0x{:X}, virt=0x{:X}",
@@ -2266,27 +2481,44 @@ pub unsafe fn exec_switch_cr3_and_ring3(
         loop { core::arch::asm!("cli; hlt"); }
     }
 
-    // Build IRETQ frame on kernel stack BEFORE jumping to trampoline
-    // The trampoline will execute: mov cr3, r8; swapgs; iretq
-    // Register setup for trampoline (System V ABI):
-    //   r8  = new PML4 physical address
-    //   r9  = user RSP
-    //   r10 = user RIP
-    //   r11 = phys_off base (for stack setup in trampoline)
+    // CRITICAL FIX (Session 8): Build the IRETQ frame on the HHDM mini-stack,
+    // NOT on the kernel stack. The kernel stack lives in PML4[1] region which
+    // is NOT accessible after `mov cr3, r8` switches to the user PML4.
+    // The previous code pushed the frame onto the kernel stack, then the
+    // trampoline did `mov cr3, r8; iretq` — but iretq would read from
+    // unmapped kernel stack memory → triple fault → black screen.
+    //
+    // Fix: Use phys_off + 0x7000 as the stack for the IRETQ frame.
+    // Physical address 0x7000 is conventional low memory, always identity-
+    // mapped in the HHDM region (PML4[256]), which is cloned into every
+    // user PML4. This guarantees the IRETQ frame survives the CR3 switch.
+    //
+    // The trampoline (9 bytes): mov cr3, r8 ; swapgs ; iretq
+    let phys_off: u64 = phys_offset();
     
     core::arch::asm!(
-        // Build the IRETQ frame on the current kernel stack.
-        // iretq pops (in order): RIP, CS, RFLAGS, RSP, SS
-        // We push them in reverse order so they're in the right position.
+        // Step 1: Switch RSP to HHDM mini-stack (survives CR3 switch)
+        // phys_off + 0x7000 is in PML4[256] — mapped in both kernel and user PML4
+        "lea rsp, [{phys_off} + 0x7000]",
+        
+        // Step 2: Build IRETQ frame on the HHDM mini-stack
+        // iretq pops: RIP, CS, RFLAGS, RSP, SS (in that order from [RSP])
+        // Push in reverse order:
         "push 0x1B",       // SS  = User Data (GDT[3] | RPL 3)
         "push {user_rsp}", // RSP = user stack pointer
         "push 0x202",      // RFLAGS = IF set (interrupts enabled)
         "push 0x23",       // CS  = User Code (GDT[4] | RPL 3)
         "push {user_rip}", // RIP = user entry point
-        // Set r8 = target CR3 for the trampoline's `mov cr3, r8`
+        
+        // Step 3: Set r8 = target CR3 for the trampoline's `mov cr3, r8`
         "mov r8, {pml4}",
-        // Jump to trampoline: mov cr3, r8 ; swapgs ; iretq
+        
+        // Step 4: Jump to trampoline (in HHDM region, survives CR3 switch)
+        // Trampoline code: mov cr3, r8 → swapgs → iretq
+        // After mov cr3: kernel stack gone, but RSP points to HHDM mini-stack (still mapped)
+        // iretq reads frame from HHDM mini-stack → transitions to Ring 3
         "jmp {trampoline}",
+        phys_off = in(reg) phys_off,
         user_rsp = in(reg) user_rsp,
         user_rip = in(reg) user_entry,
         pml4 = in(reg) new_pml4_phys,

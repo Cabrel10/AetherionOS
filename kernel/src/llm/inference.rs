@@ -151,6 +151,74 @@ impl TransformerState {
     }
 }
 
+/// Dequantize a single embedding row from Q4_0 data on-the-fly.
+/// Q4_0 format: blocks of 32 elements, 18 bytes each (2 byte f16 scale + 16 byte nibbles).
+/// The embedding matrix is stored row-major: row[tok_idx] starts at tok_idx*dim elements.
+fn dequant_embedding_row(q4_data: &[u8], tok_idx: usize, dim: usize, out: &mut [f32]) {
+    use super::matmul::f16_to_f32;
+    // Each row has `dim` elements. In Q4_0, each block of 32 elements = 18 bytes.
+    let blocks_per_row = dim / 32;
+    let bytes_per_row = blocks_per_row * 18;
+    let row_start = tok_idx * bytes_per_row;
+
+    if row_start + bytes_per_row > q4_data.len() {
+        // Out of bounds — fill with zeros
+        for v in out.iter_mut().take(dim) { *v = 0.0; }
+        return;
+    }
+
+    for b in 0..blocks_per_row {
+        let off = row_start + b * 18;
+        let scale = f16_to_f32(u16::from_le_bytes([q4_data[off], q4_data[off + 1]]));
+        for i in 0..32 {
+            let byte_idx = i / 2;
+            let nibble = if i % 2 == 0 {
+                (q4_data[off + 2 + byte_idx] & 0x0F) as i8 - 8
+            } else {
+                ((q4_data[off + 2 + byte_idx] >> 4) & 0x0F) as i8 - 8
+            };
+            let elem_idx = b * 32 + i;
+            if elem_idx < dim {
+                out[elem_idx] = scale * nibble as f32;
+            }
+        }
+    }
+}
+
+/// Compute logits = x × embedding_matrix^T using Q4_0 data on-the-fly.
+/// For each vocab token i, computes logits[i] = dot(x, embed_row[i]).
+/// Dequantizes each row on-the-fly to avoid storing full f32 embedding (112 MB).
+fn matmul_q4_0_logits(logits: &mut [f32], x: &[f32], q4_data: &[u8], dim: usize, vocab_size: usize) {
+    use super::matmul::f16_to_f32;
+    let blocks_per_row = dim / 32;
+    let bytes_per_row = blocks_per_row * 18;
+
+    for tok in 0..vocab_size {
+        let row_start = tok * bytes_per_row;
+        if row_start + bytes_per_row > q4_data.len() {
+            logits[tok] = 0.0;
+            continue;
+        }
+
+        let mut dot = 0.0f32;
+        for b in 0..blocks_per_row {
+            let off = row_start + b * 18;
+            let scale = f16_to_f32(u16::from_le_bytes([q4_data[off], q4_data[off + 1]]));
+            for i in 0..32 {
+                let byte_idx = i / 2;
+                let nibble = if i % 2 == 0 {
+                    (q4_data[off + 2 + byte_idx] & 0x0F) as i8 - 8
+                } else {
+                    ((q4_data[off + 2 + byte_idx] >> 4) & 0x0F) as i8 - 8
+                };
+                let elem_idx = b * 32 + i;
+                dot += x[elem_idx] * scale * nibble as f32;
+            }
+        }
+        logits[tok] = dot;
+    }
+}
+
 /// Transformer forward pass for a single token at position `pos`.
 ///
 /// This implements the full Llama-style architecture:
@@ -184,12 +252,17 @@ pub fn forward(
     let n_kv_heads = config.n_kv_heads;
     let n_rep = config.n_rep();
 
-    // 1. Token embedding
+    // 1. Token embedding (supports Q4_0 on-the-fly dequant or f32 direct)
     let tok_idx = token as usize;
     if tok_idx < config.vocab_size {
-        let emb_offset = tok_idx * dim;
-        if emb_offset + dim <= weights.token_embedding.len() {
-            state.x.copy_from_slice(&weights.token_embedding[emb_offset..emb_offset + dim]);
+        if !weights.token_embd_q4.is_empty() {
+            // Q4_0 on-the-fly: dequantize only the row we need
+            dequant_embedding_row(&weights.token_embd_q4, tok_idx, dim, &mut state.x);
+        } else if !weights.token_embedding.is_empty() {
+            let emb_offset = tok_idx * dim;
+            if emb_offset + dim <= weights.token_embedding.len() {
+                state.x.copy_from_slice(&weights.token_embedding[emb_offset..emb_offset + dim]);
+            }
         }
     }
 
@@ -302,8 +375,15 @@ pub fn forward(
     // 3. Final RMSNorm
     rmsnorm(&mut state.x, &weights.final_norm, config.norm_eps);
 
-    // 4. Logits projection
-    matmul_f32(&mut state.logits, &state.x, &weights.output_proj, dim, config.vocab_size);
+    // 4. Logits projection (supports Q4_0 tied weights to save memory)
+    if weights.tied_output && !weights.token_embd_q4.is_empty() {
+        // Q4_0 on-the-fly: compute logits[i] = dot(x, embd_row[i]) for each vocab token
+        matmul_q4_0_logits(&mut state.logits, &state.x, &weights.token_embd_q4, dim, config.vocab_size);
+    } else if weights.tied_output && !weights.token_embedding.is_empty() {
+        matmul_f32(&mut state.logits, &state.x, &weights.token_embedding, dim, config.vocab_size);
+    } else if !weights.output_proj.is_empty() {
+        matmul_f32(&mut state.logits, &state.x, &weights.output_proj, dim, config.vocab_size);
+    }
 }
 
 /// Transformer weights container
@@ -316,10 +396,18 @@ pub struct TransformerWeights {
     // Per-layer weights packed sequentially
     pub layer_weights: Vec<f32>,
     // Config for offset calculation
-    dim: usize,
-    hidden_dim: usize,
-    kv_dim: usize,
-    n_layers: usize,
+    pub(crate) dim: usize,
+    pub(crate) hidden_dim: usize,
+    pub(crate) kv_dim: usize,
+    pub(crate) n_layers: usize,
+    /// When true, output_proj is empty and token_embedding should be used for logits.
+    /// Saves ~112 MB in 512 MB QEMU by not duplicating the embedding table.
+    pub tied_output: bool,
+    /// Raw Q4_0 data for token embedding (avoids 112 MB f32 dequant).
+    /// When non-empty, token_embedding is empty and this is used for on-the-fly lookup.
+    pub token_embd_q4: Vec<u8>,
+    /// vocab_size for Q4_0 embedding lookup
+    pub vocab_size: usize,
 }
 
 impl TransformerWeights {
@@ -363,6 +451,9 @@ impl TransformerWeights {
             hidden_dim,
             kv_dim,
             n_layers,
+            tied_output: false,
+            token_embd_q4: Vec::new(),
+            vocab_size: config.vocab_size,
         }
     }
 
@@ -421,6 +512,209 @@ impl TransformerWeights {
         let base = self.layer_offset(layer) + 2 * dim + 2 * dim * dim + 2 * dim * self.kv_dim
             + dim * hidden_dim + hidden_dim * dim;
         &self.layer_weights[base..base + dim * hidden_dim]
+    }
+
+    /// Load real weights from a parsed GGUF model.
+    /// Dequantizes Q4_0/Q8_0/F16 blocks on-the-fly.
+    /// `n_layers_limit`: max layers to load (to fit in memory under QEMU).
+    /// `file_data` must contain the full GGUF file (including tensor data region).
+    pub fn from_gguf(
+        model: &super::gguf::GgufModel,
+        config: &ModelConfig,
+        file_data: &[u8],
+        n_layers_limit: usize,
+    ) -> Option<Self> {
+        use super::matmul::dequant_q4_0;
+        use super::gguf::GgmlType;
+        use super::matmul::f16_to_f32;
+
+        let dim = config.dim;
+        let hidden_dim = config.hidden_dim;
+        let kv_dim = config.kv_dim();
+        let vocab_size = config.vocab_size;
+        let n_layers = n_layers_limit.min(config.n_layers);
+
+        crate::serial_println!("[LLM] Loading weights: dim={}, hidden={}, layers={}/{}, vocab={}, kv_dim={}",
+            dim, hidden_dim, n_layers, config.n_layers, vocab_size, kv_dim);
+
+        // Helper: dequantize a tensor to f32 vec
+        let dequant_tensor = |name: &str, expected: usize| -> Option<Vec<f32>> {
+            let info = model.tensors.get(name)?;
+            let data = model.tensor_data(name, file_data)?;
+            let n_elem = info.n_elements() as usize;
+            match info.dtype {
+                GgmlType::F32 => {
+                    let mut out = Vec::with_capacity(n_elem);
+                    for i in 0..n_elem {
+                        let off = i * 4;
+                        if off + 4 > data.len() { break; }
+                        out.push(f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]));
+                    }
+                    Some(out)
+                },
+                GgmlType::F16 => {
+                    let mut out = Vec::with_capacity(n_elem);
+                    for i in 0..n_elem {
+                        let off = i * 2;
+                        if off + 2 > data.len() { break; }
+                        out.push(f16_to_f32(u16::from_le_bytes([data[off], data[off+1]])));
+                    }
+                    Some(out)
+                },
+                GgmlType::Q4_0 => {
+                    Some(dequant_q4_0(data, n_elem))
+                },
+                GgmlType::Q8_0 => {
+                    // Q8_0: blocks of 32 elements, 2 bytes scale (f16) + 32 bytes data (int8)
+                    let block_size = 32;
+                    let bytes_per_block = 34;
+                    let n_blocks = n_elem / block_size;
+                    let mut out = vec![0.0f32; n_elem];
+                    for b in 0..n_blocks {
+                        let off = b * bytes_per_block;
+                        if off + bytes_per_block > data.len() { break; }
+                        let scale = f16_to_f32(u16::from_le_bytes([data[off], data[off+1]]));
+                        for i in 0..32 {
+                            let val = data[off + 2 + i] as i8;
+                            let idx = b * block_size + i;
+                            if idx < n_elem {
+                                out[idx] = scale * val as f32;
+                            }
+                        }
+                    }
+                    Some(out)
+                },
+                _other => {
+                    // Return zeros as fallback for unsupported types
+                    Some(vec![0.0f32; expected])
+                }
+            }
+        };
+
+        // Load token embedding as RAW Q4_0 data (saves 112 MB vs f32 dequant)
+        // Q4_0: vocab_size*dim elements, 18 bytes per 32-element block
+        // = 576*49152/32*18 ≈ 16 MB raw vs 112 MB f32
+        crate::serial_write("[LLM] Loading token_embd (raw Q4_0)...\n");
+        let mut token_embd_q4 = Vec::new();
+        let token_embedding = Vec::new(); // empty — we use Q4_0 on-the-fly
+        if let Some(info) = model.tensors.get("token_embd.weight") {
+            if let Some(data) = model.tensor_data("token_embd.weight", file_data) {
+                token_embd_q4 = data.to_vec();
+                crate::serial_println!("[LLM] token_embd: {} bytes raw {:?}", token_embd_q4.len(), info.dtype);
+            } else {
+                crate::serial_write("[LLM] WARN: token_embd.weight data not found\n");
+            }
+        } else {
+            crate::serial_write("[LLM] WARN: token_embd.weight tensor not found\n");
+        }
+
+        // Load final norm
+        let final_norm = dequant_tensor("output_norm.weight", dim)
+            .unwrap_or_else(|| vec![1.0f32; dim]);
+
+        // Output projection: always tied in 64 MB heap mode (no room for 112 MB f32)
+        let output_proj = Vec::new();
+        let tied = true;
+        crate::serial_write("[LLM] output tied to token_embd Q4_0 (saves 112 MB)\n");
+
+        // Per-layer weight sizes
+        let per_layer = dim + dim * dim + dim * kv_dim + dim * kv_dim + dim * dim
+            + dim + dim * hidden_dim + hidden_dim * dim + dim * hidden_dim;
+        let total_layer = per_layer * n_layers;
+
+        crate::serial_println!("[LLM] Allocating layer weights: {} floats ({} MB)",
+            total_layer, total_layer * 4 / 1024 / 1024);
+
+        let mut layer_weights = vec![0.0f32; total_layer];
+
+        for l in 0..n_layers {
+            let base = l * per_layer;
+
+            // Attention norm
+            let name = alloc::format!("blk.{}.attn_norm.weight", l);
+            if let Some(w) = dequant_tensor(&name, dim) {
+                let copy_len = w.len().min(dim);
+                layer_weights[base..base + copy_len].copy_from_slice(&w[..copy_len]);
+            }
+
+            // Q, K, V, O projections
+            let name = alloc::format!("blk.{}.attn_q.weight", l);
+            let wq_off = base + dim;
+            if let Some(w) = dequant_tensor(&name, dim * dim) {
+                let copy_len = w.len().min(dim * dim);
+                layer_weights[wq_off..wq_off + copy_len].copy_from_slice(&w[..copy_len]);
+            }
+
+            let name = alloc::format!("blk.{}.attn_k.weight", l);
+            let wk_off = wq_off + dim * dim;
+            if let Some(w) = dequant_tensor(&name, dim * kv_dim) {
+                let copy_len = w.len().min(dim * kv_dim);
+                layer_weights[wk_off..wk_off + copy_len].copy_from_slice(&w[..copy_len]);
+            }
+
+            let name = alloc::format!("blk.{}.attn_v.weight", l);
+            let wv_off = wk_off + dim * kv_dim;
+            if let Some(w) = dequant_tensor(&name, dim * kv_dim) {
+                let copy_len = w.len().min(dim * kv_dim);
+                layer_weights[wv_off..wv_off + copy_len].copy_from_slice(&w[..copy_len]);
+            }
+
+            let name = alloc::format!("blk.{}.attn_output.weight", l);
+            let wo_off = wv_off + dim * kv_dim;
+            if let Some(w) = dequant_tensor(&name, dim * dim) {
+                let copy_len = w.len().min(dim * dim);
+                layer_weights[wo_off..wo_off + copy_len].copy_from_slice(&w[..copy_len]);
+            }
+
+            // FFN norm + gate + down + up
+            let name = alloc::format!("blk.{}.ffn_norm.weight", l);
+            let ffn_norm_off = wo_off + dim * dim;
+            if let Some(w) = dequant_tensor(&name, dim) {
+                let copy_len = w.len().min(dim);
+                layer_weights[ffn_norm_off..ffn_norm_off + copy_len].copy_from_slice(&w[..copy_len]);
+            }
+
+            let name = alloc::format!("blk.{}.ffn_gate.weight", l);
+            let w1_off = ffn_norm_off + dim;
+            if let Some(w) = dequant_tensor(&name, dim * hidden_dim) {
+                let copy_len = w.len().min(dim * hidden_dim);
+                layer_weights[w1_off..w1_off + copy_len].copy_from_slice(&w[..copy_len]);
+            }
+
+            let name = alloc::format!("blk.{}.ffn_down.weight", l);
+            let w2_off = w1_off + dim * hidden_dim;
+            if let Some(w) = dequant_tensor(&name, hidden_dim * dim) {
+                let copy_len = w.len().min(hidden_dim * dim);
+                layer_weights[w2_off..w2_off + copy_len].copy_from_slice(&w[..copy_len]);
+            }
+
+            let name = alloc::format!("blk.{}.ffn_up.weight", l);
+            let w3_off = w2_off + hidden_dim * dim;
+            if let Some(w) = dequant_tensor(&name, dim * hidden_dim) {
+                let copy_len = w.len().min(dim * hidden_dim);
+                layer_weights[w3_off..w3_off + copy_len].copy_from_slice(&w[..copy_len]);
+            }
+
+            if l == 0 || l == n_layers - 1 {
+                crate::serial_println!("[LLM] Layer {} loaded", l);
+            }
+        }
+
+        crate::serial_println!("[LLM] All {} layers loaded", n_layers);
+
+        Some(Self {
+            token_embedding,
+            final_norm,
+            output_proj,
+            layer_weights,
+            dim,
+            hidden_dim,
+            kv_dim,
+            n_layers,
+            tied_output: tied,
+            token_embd_q4,
+            vocab_size,
+        })
     }
 }
 
@@ -555,12 +849,16 @@ pub fn forward_fast(
     let n_kv_heads = config.n_kv_heads;
     let n_rep = config.n_rep();
 
-    // 1. Token embedding
+    // 1. Token embedding (supports Q4_0 on-the-fly dequant)
     let tok_idx = token as usize;
     if tok_idx < config.vocab_size {
-        let emb_offset = tok_idx * dim;
-        if emb_offset + dim <= weights.token_embedding.len() {
-            state.x.copy_from_slice(&weights.token_embedding[emb_offset..emb_offset + dim]);
+        if !weights.token_embd_q4.is_empty() {
+            dequant_embedding_row(&weights.token_embd_q4, tok_idx, dim, &mut state.x);
+        } else if !weights.token_embedding.is_empty() {
+            let emb_offset = tok_idx * dim;
+            if emb_offset + dim <= weights.token_embedding.len() {
+                state.x.copy_from_slice(&weights.token_embedding[emb_offset..emb_offset + dim]);
+            }
         }
     }
 
@@ -646,8 +944,14 @@ pub fn forward_fast(
     // 3. Final RMSNorm
     rmsnorm(&mut state.x, &weights.final_norm, config.norm_eps);
 
-    // 4. Logits projection (fast)
-    matmul_f32_fast(&mut state.logits, &state.x, &weights.output_proj, dim, config.vocab_size);
+    // 4. Logits projection (fast, supports Q4_0 tied weights)
+    if weights.tied_output && !weights.token_embd_q4.is_empty() {
+        matmul_q4_0_logits(&mut state.logits, &state.x, &weights.token_embd_q4, dim, config.vocab_size);
+    } else if weights.tied_output && !weights.token_embedding.is_empty() {
+        matmul_f32_fast(&mut state.logits, &state.x, &weights.token_embedding, dim, config.vocab_size);
+    } else if !weights.output_proj.is_empty() {
+        matmul_f32_fast(&mut state.logits, &state.x, &weights.output_proj, dim, config.vocab_size);
+    }
 }
 
 /// REST API endpoint for LLM inference

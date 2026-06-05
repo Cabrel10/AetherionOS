@@ -228,9 +228,18 @@ pub fn register_vfs_nodes() {
     let _ = crate::fs::vfs::file_write("/sys/class/backlight/panel0/actual_brightness", b"100");
     let _ = crate::fs::vfs::file_write("/sys/class/backlight/panel0/type", b"raw");
 
+    // Create /dev/input/ directory and evdev device nodes
+    let _ = crate::fs::vfs::mkdir("/dev/input");
+    let _ = crate::fs::vfs::file_write("/dev/input/event0", b""); // Keyboard evdev
+    let _ = crate::fs::vfs::file_write("/dev/input/event1", b""); // Mouse evdev
+    let _ = crate::fs::vfs::file_write("/dev/input/mice", b"");   // PS/2 mouse (legacy)
+
     crate::serial_println!(
         "[FB] VFS: /dev/fb0 registered ({}x{}), /sys/class/backlight/panel0 created",
         info.width, info.height
+    );
+    crate::serial_println!(
+        "[FB] VFS: /dev/input/event0 (kbd), /dev/input/event1 (mouse), /dev/input/mice registered"
     );
 }
 

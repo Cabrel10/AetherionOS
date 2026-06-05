@@ -307,15 +307,19 @@ impl VirtioNetDevice {
         // === VirtIO Device Initialization Sequence ===
 
         // 1. Reset
+        crate::serial_write("[VIRTIO-NET] Step 1: Reset...\n");
         unsafe { outb(io_base + 0x12, VIRTIO_STATUS_RESET); }
 
         // 2. Acknowledge
+        crate::serial_write("[VIRTIO-NET] Step 2: Acknowledge...\n");
         unsafe { outb(io_base + 0x12, VIRTIO_STATUS_ACKNOWLEDGE); }
 
         // 3. Driver
+        crate::serial_write("[VIRTIO-NET] Step 3: Driver...\n");
         unsafe { outb(io_base + 0x12, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER); }
 
         // 4. Read device features
+        crate::serial_write("[VIRTIO-NET] Step 4: Reading features...\n");
         let device_features = unsafe { inl(io_base + 0x00) };
         crate::serial_println!("[VIRTIO-NET] Device features: 0x{:08X}", device_features);
 
@@ -324,12 +328,14 @@ impl VirtioNetDevice {
         unsafe { outl(io_base + 0x04, guest_features); }
 
         // 5. Features OK
+        crate::serial_write("[VIRTIO-NET] Step 5: Features OK...\n");
         unsafe {
             let status = inb(io_base + 0x12);
             outb(io_base + 0x12, status | VIRTIO_STATUS_FEATURES_OK);
         }
 
         // 6. Read MAC address from device config (offset 0x14..0x19)
+        crate::serial_write("[VIRTIO-NET] Step 6: Reading MAC...\n");
         let mut mac_bytes = [0u8; 6];
         for i in 0..6 {
             mac_bytes[i] = unsafe { inb(io_base + 0x14 + i as u16) };
@@ -338,14 +344,20 @@ impl VirtioNetDevice {
         crate::serial_println!("[VIRTIO-NET] MAC address: {}", mac);
 
         // 7. Setup VirtQueues (RX=0, TX=1)
+        crate::serial_write("[VIRTIO-NET] Step 7: Setting up VirtQueues...\n");
         let phys_offset = crate::elf::phys_offset();
 
         // --- Setup RX Queue (index 0) ---
+        crate::serial_write("[VIRTIO-NET] Setting up RX queue...\n");
         let rx_queue = Self::setup_queue(io_base, 0, phys_offset)?;
+        crate::serial_write("[VIRTIO-NET] RX queue OK\n");
         // --- Setup TX Queue (index 1) ---
+        crate::serial_write("[VIRTIO-NET] Setting up TX queue...\n");
         let tx_queue = Self::setup_queue(io_base, 1, phys_offset)?;
+        crate::serial_write("[VIRTIO-NET] TX queue OK\n");
 
         // 8. Allocate RX buffers
+        crate::serial_write("[VIRTIO-NET] Step 8: Allocating buffers...\n");
         let rx_bufs_phys = [0u64; RX_BUF_COUNT];
         let rx_bufs_virt = [0u64; RX_BUF_COUNT];
 

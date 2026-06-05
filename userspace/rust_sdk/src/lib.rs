@@ -698,6 +698,73 @@ pub fn sys_lseek(fd: u32, offset: i64, whence: u32) -> i64 {
     syscall3(8, fd as u64, offset as u64, whence as u64) as i64
 }
 
+/// fstat(fd, &mut StatBuf) — Get file metadata (size, mode, inode).
+/// Linux struct stat layout (x86_64, 144 bytes):
+///   offset  0: st_dev    (u64)
+///   offset  8: st_ino    (u64)
+///   offset 16: st_nlink  (u64)
+///   offset 24: st_mode   (u32)
+///   offset 28: st_uid    (u32)
+///   offset 32: st_gid    (u32)
+///   offset 36: __pad0    (u32)
+///   offset 40: st_rdev   (u64)
+///   offset 48: st_size   (i64)  ← file size
+///   offset 56: st_blksize(i64)
+///   offset 64: st_blocks (i64)
+/// Returns 0 on success, negative error on failure.
+pub fn sys_fstat(fd: u32, buf: &mut [u8; 144]) -> i64 {
+    syscall2(5, fd as u64, buf.as_mut_ptr() as u64) as i64
+}
+
+/// Extract st_size (offset 48, i64 LE) from a stat buffer.
+pub fn stat_size(buf: &[u8; 144]) -> u64 {
+    u64::from_le_bytes([
+        buf[48], buf[49], buf[50], buf[51],
+        buf[52], buf[53], buf[54], buf[55],
+    ])
+}
+
+// POSIX mmap constants
+pub const PROT_READ: u64  = 0x1;
+pub const PROT_WRITE: u64 = 0x2;
+pub const PROT_EXEC: u64  = 0x4;
+pub const MAP_SHARED: u64  = 0x01;
+pub const MAP_PRIVATE: u64 = 0x02;
+pub const MAP_ANONYMOUS: u64 = 0x20;
+
+/// POSIX mmap(addr, length, prot, flags, fd, offset) via syscall 9.
+/// Full 6-argument Linux mmap for file-backed mappings.
+/// For zero-copy file mapping: mmap(0, size, PROT_READ, MAP_SHARED, fd, 0)
+/// Returns: virtual address of the mapping, or error (> 0xFFFF_FFFF_FFFF_F000).
+pub fn sys_mmap_posix(addr: u64, length: u64, prot: u64, flags: u64, fd: i64, offset: u64) -> u64 {
+    // Linux mmap uses 6 args: rdi=addr, rsi=len, rdx=prot, r10=flags, r8=fd, r9=offset
+    // Our syscall infrastructure passes 5 args + r9 is the 6th read by kernel from saved frame
+    // Use inline asm for proper 6-arg syscall
+    let ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "mov r10, {flags}",
+            "mov r8, {fd}",
+            "mov r9, {offset}",
+            "syscall",
+            inlateout("rax") 9u64 => ret,
+            in("rdi") addr,
+            in("rsi") length,
+            in("rdx") prot,
+            flags = in(reg) flags,
+            fd = in(reg) fd as u64,
+            offset = in(reg) offset,
+            out("rcx") _,
+            out("r11") _,
+            lateout("r10") _,
+            lateout("r8") _,
+            lateout("r9") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
 /// POSIX pread64: Read up to `buf.len()` bytes from file at a given offset WITHOUT
 /// changing the file descriptor's position. Critical for streaming model loading.
 ///

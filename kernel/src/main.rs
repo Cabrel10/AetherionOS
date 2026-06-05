@@ -1959,6 +1959,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                             resolved = Some(data.clone());
                             break;
                         }
+                        if let Some(fs::vfs::VfsNode::StaticFile(data)) = lib_dir.get(*cand) {
+                            resolved = Some(alloc::vec::Vec::from(*data));
+                            break;
+                        }
                     }
                     if let Some(data) = resolved {
                         // Install every well-known alias that musl binaries/ld.so may resolve
@@ -1993,10 +1997,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
                 let lib_files: alloc::vec::Vec<(alloc::string::String, alloc::vec::Vec<u8>)> = {
                     if let Some(fs::vfs::VfsNode::Directory(ref lib_dir)) = root.get("lib") {
                         lib_dir.iter().filter_map(|(name, node)| {
-                            if let fs::vfs::VfsNode::File(ref data) = node {
-                                Some((name.clone(), data.clone()))
-                            } else {
-                                None
+                            match node {
+                                fs::vfs::VfsNode::File(ref data) => Some((name.clone(), data.clone())),
+                                fs::vfs::VfsNode::StaticFile(data) => Some((name.clone(), alloc::vec::Vec::from(*data))),
+                                _ => None,
                             }
                         }).collect()
                     } else {

@@ -73,8 +73,14 @@ impl core::fmt::Display for VfsError {
 /// A node in the virtual filesystem tree
 #[derive(Debug, Clone)]
 pub enum VfsNode {
-    /// A file with data content
+    /// A file with data content (heap-allocated)
     File(Vec<u8>),
+    /// A file backed by static data (zero-copy, no heap allocation).
+    /// Used for `include_bytes!` binaries embedded in the kernel image.
+    /// Eliminates 1.1 MB+ heap allocations during boot that caused triple faults
+    /// when the linked_list_allocator couldn't satisfy large contiguous requests
+    /// inside a VFS mutex lock.
+    StaticFile(&'static [u8]),
     /// A directory containing child nodes
     Directory(BTreeMap<String, VfsNode>),
     /// A mounted device with manifest
@@ -418,6 +424,11 @@ pub fn file_write(path: &str, data: &[u8]) -> Result<usize, VfsError> {
                 file_data.extend_from_slice(data);
                 bytes_written = data.len();
             }
+            VfsNode::StaticFile(_) => {
+                // Upgrade StaticFile to heap-allocated File on write
+                *node = VfsNode::File(Vec::from(data));
+                bytes_written = data.len();
+            }
             VfsNode::Directory(_) | VfsNode::Symlink(_) => {
                 VFS_METRICS.errors_count.fetch_add(1, Ordering::Relaxed);
                 return Err(VfsError::PermissionDenied);
@@ -473,6 +484,13 @@ pub fn file_read(path: &str) -> Result<Vec<u8>, VfsError> {
                     }
                     VfsNode::File(ref file_data) => {
                         let data = file_data.clone();
+                        VFS_METRICS.total_bytes_read
+                            .fetch_add(data.len() as u64, Ordering::Relaxed);
+                        bus_publish_event(VFS_READ, data.len() as u64);
+                        return Ok(data);
+                    }
+                    VfsNode::StaticFile(static_data) => {
+                        let data = Vec::from(*static_data);
                         VFS_METRICS.total_bytes_read
                             .fetch_add(data.len() as u64, Ordering::Relaxed);
                         bus_publish_event(VFS_READ, data.len() as u64);
@@ -534,9 +552,10 @@ pub fn file_read_at_offset(path: &str, offset: u64, buf: &mut [u8]) -> usize {
         let node = find_node(&root, &components);
 
         if let Some(n) = node {
-            let file_data = match n {
-                VfsNode::File(ref data) => data,
-                VfsNode::Device { data: ref device_data, .. } => device_data,
+            let file_data: &[u8] = match n {
+                VfsNode::File(ref data) => data.as_slice(),
+                VfsNode::StaticFile(data) => data,
+                VfsNode::Device { data: ref device_data, .. } => device_data.as_slice(),
                 _ => return 0,
             };
             let off = offset as usize;
@@ -674,7 +693,7 @@ pub fn unlink(path: &str) -> Result<(), VfsError> {
     };
 
     match parent.get(target_name[0]) {
-        Some(VfsNode::File(_)) => {
+        Some(VfsNode::File(_)) | Some(VfsNode::StaticFile(_)) => {
             parent.remove(target_name[0]);
             crate::serial_println!("[VFS] unlink: removed {}", path);
             Ok(())

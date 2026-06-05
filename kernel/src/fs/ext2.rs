@@ -2258,3 +2258,283 @@ pub fn init() -> bool {
 pub fn run_tests() {
     crate::serial_println!("[EXT2] Self-tests: write layer operational");
 }
+
+// ===== Write Layer: Chunk Write (Session 15) =====
+//
+// Write `data` into an existing file at byte offset `offset`.
+// Allocates new blocks as needed (extending the file if offset+data.len > i_size).
+// Does NOT read the entire file into memory — writes block-by-block.
+
+/// Ensure inode has a physical block at `logical_block`. Allocates if needed.
+/// Returns the physical block number on success.
+fn ensure_block_at_logical(inode: &mut Ext2Inode, _ino: u32, logical_block: u32) -> Option<u32> {
+    let bs = BLOCK_SIZE.load(Ordering::Relaxed) as usize;
+    let ptrs_per_block = (bs / 4) as u32;
+
+    if logical_block < 12 {
+        // Direct block
+        if inode.i_block[logical_block as usize] == 0 {
+            let b = alloc_block()?;
+            inode.i_block[logical_block as usize] = b;
+            inode.i_blocks += (bs / 512) as u32;
+            // Zero the new block
+            let zbuf = vec![0u8; bs];
+            write_block(b, &zbuf);
+        }
+        return Some(inode.i_block[logical_block as usize]);
+    }
+
+    let remaining = logical_block - 12;
+    if remaining < ptrs_per_block {
+        // Single indirect
+        if inode.i_block[12] == 0 {
+            let ib = alloc_block()?;
+            inode.i_block[12] = ib;
+            inode.i_blocks += (bs / 512) as u32;
+            let zbuf = vec![0u8; bs];
+            write_block(ib, &zbuf);
+        }
+        let ib = inode.i_block[12];
+        let existing = read_block_ptr(ib, remaining)?;
+        if existing != 0 {
+            return Some(existing);
+        }
+        // Allocate new data block
+        let b = alloc_block()?;
+        inode.i_blocks += (bs / 512) as u32;
+        // Write pointer into indirect block
+        let mut ibuf = vec![0u8; bs];
+        if !read_block(ib, &mut ibuf) { return None; }
+        ibuf[(remaining as usize * 4)..(remaining as usize * 4 + 4)]
+            .copy_from_slice(&b.to_le_bytes());
+        write_block(ib, &ibuf);
+        // Zero the new data block
+        let zbuf = vec![0u8; bs];
+        write_block(b, &zbuf);
+        return Some(b);
+    }
+
+    let remaining2 = remaining - ptrs_per_block;
+    if remaining2 < ptrs_per_block * ptrs_per_block {
+        // Double indirect
+        if inode.i_block[13] == 0 {
+            let dib = alloc_block()?;
+            inode.i_block[13] = dib;
+            inode.i_blocks += (bs / 512) as u32;
+            let zbuf = vec![0u8; bs];
+            write_block(dib, &zbuf);
+        }
+        let dib = inode.i_block[13];
+        let idx1 = remaining2 / ptrs_per_block;
+        let idx2 = remaining2 % ptrs_per_block;
+
+        // Read/alloc level-1 indirect
+        let mut dib_buf = vec![0u8; bs];
+        if !read_block(dib, &mut dib_buf) { return None; }
+        let off1 = idx1 as usize * 4;
+        let ib1 = u32::from_le_bytes([dib_buf[off1], dib_buf[off1+1], dib_buf[off1+2], dib_buf[off1+3]]);
+        let ib1 = if ib1 == 0 {
+            let nb = alloc_block()?;
+            inode.i_blocks += (bs / 512) as u32;
+            dib_buf[off1..off1+4].copy_from_slice(&nb.to_le_bytes());
+            write_block(dib, &dib_buf);
+            let zbuf = vec![0u8; bs];
+            write_block(nb, &zbuf);
+            nb
+        } else { ib1 };
+
+        // Read/alloc data block
+        let existing = read_block_ptr(ib1, idx2).unwrap_or(0);
+        if existing != 0 { return Some(existing); }
+
+        let b = alloc_block()?;
+        inode.i_blocks += (bs / 512) as u32;
+        let mut ib1_buf = vec![0u8; bs];
+        if !read_block(ib1, &mut ib1_buf) { return None; }
+        let off2 = idx2 as usize * 4;
+        ib1_buf[off2..off2+4].copy_from_slice(&b.to_le_bytes());
+        write_block(ib1, &ib1_buf);
+        let zbuf = vec![0u8; bs];
+        write_block(b, &zbuf);
+        return Some(b);
+    }
+
+    None // Triple indirect not implemented (files > ~4 GiB)
+}
+
+/// Write `data` into an existing file at byte `offset`.
+/// Creates the file if it doesn't exist.
+/// Extends the file if offset+data.len > current size.
+/// Returns bytes written.
+pub fn write_file_chunk(path: &str, offset: u64, data: &[u8]) -> usize {
+    if !is_mounted() || data.is_empty() { return 0; }
+
+    let bs = BLOCK_SIZE.load(Ordering::Relaxed) as usize;
+
+    let ino = match resolve_path_to_inode(path) {
+        Some(i) => i,
+        None => {
+            // File doesn't exist — create with enough size
+            let end = offset as usize + data.len();
+            let mut buf = vec![0u8; end];
+            buf[offset as usize..end].copy_from_slice(data);
+            return match create_file_internal(path, &buf, 0o644) {
+                Some(_) => data.len(),
+                None => 0,
+            };
+        }
+    };
+
+    let mut inode = match read_inode(ino) {
+        Some(i) => i,
+        None => return 0,
+    };
+
+    let mut written = 0usize;
+    let mut pos = offset as usize;
+
+    while written < data.len() {
+        let logical_block = (pos / bs) as u32;
+        let block_offset = pos % bs;
+        let chunk_len = (bs - block_offset).min(data.len() - written);
+
+        // Ensure block exists
+        let phys_block = match ensure_block_at_logical(&mut inode, ino, logical_block) {
+            Some(b) => b,
+            None => break,
+        };
+
+        // Read existing block, patch, write back
+        let mut block_buf = vec![0u8; bs];
+        let _ = read_block(phys_block, &mut block_buf);
+        block_buf[block_offset..block_offset + chunk_len]
+            .copy_from_slice(&data[written..written + chunk_len]);
+        if !write_block(phys_block, &block_buf) { break; }
+
+        written += chunk_len;
+        pos += chunk_len;
+    }
+
+    // Update file size if we extended it
+    let new_end = offset as u32 + written as u32;
+    if new_end > inode.i_size {
+        inode.i_size = new_end;
+    }
+    write_inode(ino, &inode);
+
+    written
+}
+
+/// Resize file to `new_size` bytes.
+/// If shrinking, frees excess blocks.
+/// If growing, file is extended (new bytes are zero).
+pub fn set_file_size(path: &str, new_size: u64) -> bool {
+    if !is_mounted() { return false; }
+
+    let ino = match resolve_path_to_inode(path) {
+        Some(i) => i,
+        None => return false,
+    };
+    let mut inode = match read_inode(ino) {
+        Some(i) => i,
+        None => return false,
+    };
+
+    let bs = BLOCK_SIZE.load(Ordering::Relaxed) as usize;
+    let old_size = inode_size(&inode) as usize;
+    let new_sz = new_size as usize;
+
+    if new_sz > old_size {
+        // Grow: allocate blocks for the new region
+        let old_blocks = (old_size + bs - 1) / bs;
+        let new_blocks = (new_sz + bs - 1) / bs;
+        for lb in old_blocks..new_blocks {
+            if ensure_block_at_logical(&mut inode, ino, lb as u32).is_none() {
+                return false;
+            }
+        }
+        inode.i_size = new_sz as u32;
+    } else if new_sz < old_size {
+        // Shrink: free excess blocks
+        let keep_blocks = if new_sz == 0 { 0 } else { (new_sz + bs - 1) / bs };
+        let old_blocks = (old_size + bs - 1) / bs;
+
+        for lb in keep_blocks..old_blocks {
+            if let Some(phys) = resolve_block(&inode, lb as u32) {
+                if phys != 0 {
+                    free_block(phys);
+                    inode.i_blocks = inode.i_blocks.saturating_sub((bs / 512) as u32);
+                }
+            }
+        }
+        // Zero out block pointers for freed direct blocks
+        for i in keep_blocks..12.min(old_blocks) {
+            inode.i_block[i] = 0;
+        }
+        inode.i_size = new_sz as u32;
+    }
+
+    write_inode(ino, &inode);
+    true
+}
+
+/// Remove a directory and all its contents (recursive rm -rf)
+pub fn rmdir(path: &str) -> bool {
+    if !is_mounted() { return false; }
+    if path == "/" { return false; }
+
+    // List contents and remove each
+    if let Some(entries) = list_directory(path) {
+        for e in &entries {
+            if e.name == "." || e.name == ".." { continue; }
+            let child = if path == "/" {
+                alloc::format!("/{}", e.name)
+            } else {
+                alloc::format!("{}/{}", path, e.name)
+            };
+            if e.file_type == EXT2_FT_DIR {
+                rmdir(&child);
+            } else {
+                unlink(&child);
+            }
+        }
+    }
+
+    // Now remove the empty directory entry from parent
+    let (parent_path, dirname) = match split_path(path) {
+        Some(p) => p,
+        None => return false,
+    };
+    let parent_ino = match resolve_path_to_inode(parent_path) {
+        Some(i) => i,
+        None => return false,
+    };
+    let dir_ino = match resolve_path_to_inode(path) {
+        Some(i) => i,
+        None => return false,
+    };
+
+    if !remove_dir_entry(parent_ino, dirname) { return false; }
+
+    // Free the directory inode
+    if let Some(mut dir_inode) = read_inode(dir_ino) {
+        // Free data blocks
+        for i in 0..12 {
+            if dir_inode.i_block[i] != 0 {
+                free_block(dir_inode.i_block[i]);
+            }
+        }
+        dir_inode.i_links_count = 0;
+        dir_inode.i_dtime = 1;
+        write_inode(dir_ino, &dir_inode);
+        free_inode(dir_ino);
+    }
+
+    // Decrement parent link count
+    if let Some(mut pi) = read_inode(parent_ino) {
+        pi.i_links_count = pi.i_links_count.saturating_sub(1);
+        write_inode(parent_ino, &pi);
+    }
+
+    true
+}

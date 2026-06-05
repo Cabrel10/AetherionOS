@@ -14,8 +14,9 @@ use linked_list_allocator::LockedHeap;
 /// Adresse de debut du heap
 pub const HEAP_START: usize = 0x_4444_4444_0000;
 
-/// Taille du heap: 64 MB (supports LLM weight loading, FAT32 cache, TCP/IP, agents)
-/// Increased from 8 MB to handle GGUF tensor data in kernel space
+/// Taille du heap: 64 MB — safe for QEMU 512 MB boot time (~2s for 16384 page mappings).
+/// 256 MB was too slow: 65536 individual page mappings took >3 min under QEMU, causing timeout.
+/// LLM forward pass uses on-the-fly Q4_0 dequantization to avoid 112 MB token_embd allocation.
 pub const HEAP_SIZE: usize = 64 * 1024 * 1024;
 
 /// Nombre de pages necessaires pour le heap

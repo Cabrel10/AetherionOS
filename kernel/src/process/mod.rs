@@ -995,6 +995,30 @@ pub fn get_preempt_state(pid: u64) -> Option<(u64, u64, u64, u64, SyscallContext
     }
 }
 
+/// Save the current FPU/SSE/AVX state into the process's fpu_state buffer.
+/// Must be called with interrupts disabled (inside ISR or with CLI).
+/// Uses XSAVE64 which preserves x87, SSE (XMM0-15), and AVX (YMM0-15).
+pub fn save_fpu_state(pid: u64) {
+    let mut table = PROCESS_TABLE.lock();
+    if let Some(p) = table.get_mut(&pid) {
+        unsafe {
+            crate::arch::x86_64::context::fpu_save(&mut p.fpu_state as *mut _);
+        }
+    }
+}
+
+/// Restore the FPU/SSE/AVX state from the process's fpu_state buffer.
+/// Must be called before returning to user-mode (IRETQ/SYSRETQ).
+/// Uses XRSTOR64 to restore x87, SSE (XMM0-15), and AVX (YMM0-15).
+pub fn restore_fpu_state(pid: u64) {
+    let table = PROCESS_TABLE.lock();
+    if let Some(p) = table.get(&pid) {
+        unsafe {
+            crate::arch::x86_64::context::fpu_restore(&p.fpu_state as *const _);
+        }
+    }
+}
+
 /// Get entry point state for a fresh (never-preempted) process.
 /// Returns (entry_point, stack_pointer, pml4_phys).
 pub fn get_entry_state(pid: u64) -> Option<(u64, u64, u64)> {

@@ -180,20 +180,25 @@ impl FrameAllocator {
         self.search_hint = frame + 1;
 
         let phys_addr = PhysAddr::new((frame as u64).checked_mul(FRAME_SIZE as u64)?);
-        // J135: sanity check — if we're allocating a frame that overlaps the
-        // kernel image (approx 0x200000-0xC10000 for this build), log a
-        // warning. The bootloader should have marked this region as non-usable,
-        // but double-check at runtime to catch regressions.
+        // Session 12: Updated range check to use dynamic kernel_phys_base.
+        // The kernel is loaded by Limine at ~0x1F299000 (computed at boot in Step 5a).
+        // The old hardcoded range 0x200000-0xD00000 was WRONG and caused false positives
+        // because that region is actually usable RAM (Limine marks it as USABLE).
+        // Now we use the runtime-computed kernel base address instead.
         let phys_u64 = phys_addr.as_u64();
-        if phys_u64 >= 0x200_000 && phys_u64 < 0xD00_000 {
-            // Only log the first such overlap to avoid serial flooding.
-            static ONCE: core::sync::atomic::AtomicBool =
-                core::sync::atomic::AtomicBool::new(false);
-            if !ONCE.swap(true, core::sync::atomic::Ordering::SeqCst) {
-                crate::serial_println!(
-                    "[FRAME-WARN] Allocated frame at phys 0x{:X} overlaps kernel image!",
-                    phys_u64
-                );
+        let kern_base = crate::elf::kernel_phys_base();
+        if kern_base != 0 {
+            // Kernel ELF is ~10 MiB (KERN_SIZE_PAGES=2560 * 4096)
+            let kern_end = kern_base + 2560 * 4096;
+            if phys_u64 >= kern_base && phys_u64 < kern_end {
+                static ONCE: core::sync::atomic::AtomicBool =
+                    core::sync::atomic::AtomicBool::new(false);
+                if !ONCE.swap(true, core::sync::atomic::Ordering::SeqCst) {
+                    crate::serial_println!(
+                        "[FRAME-WARN] Allocated frame at phys 0x{:X} overlaps kernel image (0x{:X}..0x{:X})!",
+                        phys_u64, kern_base, kern_end
+                    );
+                }
             }
         }
         PhysFrame::from_start_address(phys_addr).ok()
@@ -327,12 +332,20 @@ pub unsafe fn alloc_contiguous_dma(count: usize) -> Option<u64> {
     let preferred_max = 262144usize.min(max_frame); // 1 GiB
 
     // Helper: check & allocate a contiguous run starting at `start_frame`.
+    // Session 13 FIX: Also reject frames in the kernel zone to prevent
+    // handing out frames that overlap the kernel image or PT structures.
     let try_range = |limit: usize| -> Option<u64> {
         let mut start_frame = 1usize; // skip frame 0
         'outer: while start_frame + count - 1 <= limit {
             for offset in 0..count {
                 let f = start_frame + offset;
                 if FrameAllocator::is_allocated(f) {
+                    start_frame = f + 1;
+                    continue 'outer;
+                }
+                // Session 13: Reject frames in kernel zone
+                let phys_check = (f as u64) * (FRAME_SIZE as u64);
+                if crate::elf::is_kernel_zone(phys_check) {
                     start_frame = f + 1;
                     continue 'outer;
                 }
