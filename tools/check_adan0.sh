@@ -67,9 +67,6 @@ fi
 # 7. Critical model.zip / checkpoint files
 section "Critical model.zip / checkpoint files"
 find /mnt/new_data/adan_logs/checkpoints -name "model.zip" 2>/dev/null | head -20
-find /mnt
-
-# Continue finding other critical files
 find /mnt/new_data/adan_logs/checkpoints -name "vecnormalize.pkl" 2>/dev/null | head -20
 find . -name "model.zip" 2>/dev/null | head -20
 find . -name "checkpoint_*" -type d 2>/dev/null | head -10
