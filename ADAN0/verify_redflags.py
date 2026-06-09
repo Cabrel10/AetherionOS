@@ -38,7 +38,7 @@ from typing import Dict, List
 # Promotion‑bonus schedule (example values – replace with your actual bonuses)
 BONUS_SCHEDULE = {
     "micro_to_small": 5.0,
-    "high_to_enterprise": 40.0,
+    "high_to_enterprise": 40.0,  # note: "enterprise" is the original key; keep it for compatibility
 }
 
 # Time‑decay applied per training step (negative value means a penalty)
@@ -146,8 +146,11 @@ def detect_promotion_bonus(training: Dict, events: List[Dict], report: RedFlagRe
     if not events:
         return
 
-    total_pnl = sum(ev.get("pnl", 0.0) for ev in events
-                    if ev.get("event") == "trade_closed")
+    total_pnl = sum(
+        ev.get("pnl", 0.0)
+        for ev in events
+        if ev.get("event") == "trade_closed"
+    )
     if total_pnl == 0:
         return
 
@@ -175,8 +178,11 @@ def detect_time_decay(training: Dict, events: List[Dict], report: RedFlagReport)
     net_profit = training.get("net_profit")
     if net_profit is None:
         # Fallback to summed PnL from metric events
-        net_profit = sum(ev.get("pnl", 0.0) for ev in events
-                     if ev.get("event") == "trade_closed")
+        net_profit = sum(
+            ev.get("pnl", 0.0)
+            for ev in events
+            if ev.get("event") == "trade_closed"
+        )
 
     # If profit is less than |decay| × TIME_DECAY_PROFIT_RATIO, flag it.
     required_profit = abs(cumulative_decay) * TIME_DECAY_PROFIT_RATIO
