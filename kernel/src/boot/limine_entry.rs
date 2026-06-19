@@ -2153,7 +2153,7 @@ fn run_kernel_llm_benchmark() {
             //   - Total: ~142 MB << 256 MB heap
             // matmul_q8_0() reads Q8_0 blocks directly during forward pass.
 
-            let n_layers_to_load = 3; // TEMP: quick E2E test — will restore to cfg.n_layers after validation
+            let n_layers_to_load = cfg.n_layers; // ALL 30 layers for full inference
             let mut run_cfg = cfg.clone();
             run_cfg.max_seq_len = 64;
             run_cfg.n_layers = n_layers_to_load; // CRITICAL: sync config with actual loaded layers
