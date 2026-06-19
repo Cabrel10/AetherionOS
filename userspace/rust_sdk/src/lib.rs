@@ -737,28 +737,30 @@ pub const MAP_ANONYMOUS: u64 = 0x20;
 /// For zero-copy file mapping: mmap(0, size, PROT_READ, MAP_SHARED, fd, 0)
 /// Returns: virtual address of the mapping, or error (> 0xFFFF_FFFF_FFFF_F000).
 pub fn sys_mmap_posix(addr: u64, length: u64, prot: u64, flags: u64, fd: i64, offset: u64) -> u64 {
-    // Linux mmap uses 6 args: rdi=addr, rsi=len, rdx=prot, r10=flags, r8=fd, r9=offset
-    // Our syscall infrastructure passes 5 args + r9 is the 6th read by kernel from saved frame
-    // Use inline asm for proper 6-arg syscall
+    // Linux mmap syscall 9 — all 6 arguments placed in explicit registers:
+    //   rax=9 (nr), rdi=addr, rsi=len, rdx=prot, r10=flags, r8=fd, r9=offset
+    //
+    // BUG FIX (Jalon 126): Previously used `in(reg)` for flags/fd/offset, letting
+    // the compiler freely allocate R8/R9 for those intermediates. When the compiler
+    // chose R8 for `offset` and R9 for `fd`:
+    //   mov r8, r9  → r8 = fd=3 ✓
+    //   mov r9, r8  → r9 = 3 (was supposed to be offset=0) ✗
+    // The `mov r8` instruction clobbered R8 before the next instruction read it.
+    //
+    // Fix: Place all arguments directly into their target registers, no MOV needed.
     let ret: u64;
     unsafe {
         core::arch::asm!(
-            "mov r10, {flags}",
-            "mov r8, {fd}",
-            "mov r9, {offset}",
             "syscall",
             inlateout("rax") 9u64 => ret,
             in("rdi") addr,
             in("rsi") length,
             in("rdx") prot,
-            flags = in(reg) flags,
-            fd = in(reg) fd as u64,
-            offset = in(reg) offset,
-            out("rcx") _,
-            out("r11") _,
-            lateout("r10") _,
-            lateout("r8") _,
-            lateout("r9") _,
+            in("r10") flags,
+            in("r8")  fd as u64,
+            in("r9")  offset,
+            lateout("rcx") _,
+            lateout("r11") _,
             options(nostack),
         );
     }

@@ -4277,7 +4277,19 @@ pub fn linux_stat_vfs(path_addr: u64, buf: u64) -> u64 {
         return 0;
     }
 
-    // ═══ Check ext2 filesystem first (Alpine rootfs has most files) ═══
+    // ═══ Check VFS in-memory files first (StaticFile models, etc.) ═══
+    if let Some((vfs_size, vfs_mode)) = crate::fs::vfs::file_stat(path_str) {
+        let mut stat = LinuxStat::default();
+        stat.st_mode = vfs_mode;
+        stat.st_size = vfs_size as i64;
+        stat.st_blocks = (stat.st_size + 511) / 512;
+        stat.st_blksize = 4096;
+        let src_bytes = unsafe { core::slice::from_raw_parts(&stat as *const LinuxStat as *const u8, 144) };
+        unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(buf, src_bytes); }
+        return 0;
+    }
+
+    // ═══ Check ext2 filesystem (Alpine rootfs has most files) ═══
     if crate::fs::ext2::is_mounted() {
         if let Some(ino) = crate::fs::ext2::lookup_path(path_str) {
             let mut stat = LinuxStat::default();
@@ -4376,31 +4388,52 @@ pub fn linux_fstat_vfs(fd: u64, buf: u64) -> u64 {
         if fd_type == Some(crate::process::FdType::Socket) {
             stat.st_mode = 0o140777; // S_IFSOCK | 0777
         } else {
-            // Try ext2 first for accurate file metadata
+            // Resolve the file path from the FD table
             let current_pid = crate::scheduler::current_pid();
             let file_path = crate::process::with_fd_table(current_pid, |fdt| {
                 fdt.get(fd as usize).map(|e| e.path.clone())
             }).flatten();
 
-            let mut found_ext2 = false;
+            let mut found = false;
+
+            // -- Priority 1: VFS in-memory files (StaticFile, File, Device) --
+            // This catches include_bytes! models at /models/smollm2-135m-q4_0.gguf
             if let Some(ref path) = file_path {
-                if crate::fs::ext2::is_mounted() {
-                    if let Some(ino) = crate::fs::ext2::lookup_path(path) {
-                        let fsize = crate::fs::ext2::file_size(path).unwrap_or(0);
-                        let is_dir = crate::fs::ext2::is_dir(path);
-                        stat.st_ino = ino as u64;
-                        stat.st_mode = if is_dir { 0o40755 } else { 0o100644 };
-                        stat.st_size = fsize as i64;
-                        stat.st_blocks = (fsize as i64 + 511) / 512;
-                        stat.st_blksize = 4096;
-                        stat.st_dev = 0x0801;
-                        found_ext2 = true;
+                if let Some((vfs_size, vfs_mode)) = crate::fs::vfs::file_stat(path) {
+                    stat.st_mode = vfs_mode;
+                    stat.st_size = vfs_size as i64;
+                    stat.st_blocks = (stat.st_size + 511) / 512;
+                    stat.st_blksize = 4096;
+                    found = true;
+                    // Debug: log fstat results for /models/ paths
+                    if path.contains("/models/") {
+                        crate::serial_println!("[LINUX-FSTAT] fd={} path='{}' VFS size={} mode=0o{:o}",
+                            fd, path, vfs_size, vfs_mode);
                     }
                 }
             }
 
-            if !found_ext2 {
-                // Fallback: get size via seek
+            // -- Priority 2: ext2 persistent filesystem --
+            if !found {
+                if let Some(ref path) = file_path {
+                    if crate::fs::ext2::is_mounted() {
+                        if let Some(ino) = crate::fs::ext2::lookup_path(path) {
+                            let fsize = crate::fs::ext2::file_size(path).unwrap_or(0);
+                            let is_dir = crate::fs::ext2::is_dir(path);
+                            stat.st_ino = ino as u64;
+                            stat.st_mode = if is_dir { 0o40755 } else { 0o100644 };
+                            stat.st_size = fsize as i64;
+                            stat.st_blocks = (fsize as i64 + 511) / 512;
+                            stat.st_blksize = 4096;
+                            stat.st_dev = 0x0801;
+                            found = true;
+                        }
+                    }
+                }
+            }
+
+            // -- Priority 3: lseek fallback --
+            if !found {
                 let current_pos = crate::arch::x86_64::syscall::sys_lseek_pub(fd as u32, 0, 1);
                 let size = crate::arch::x86_64::syscall::sys_lseek_pub(fd as u32, 0, 2);
                 if (current_pos as i64) >= 0 {

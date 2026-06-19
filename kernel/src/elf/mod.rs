@@ -199,7 +199,7 @@ impl core::fmt::Display for ElfError {
 
 /// Maximum number of freed frames we can track for recycling.
 /// When a process exits, its frames are pushed here and reused by the next allocation.
-const FREELIST_MAX: usize = 32768; // 128 MiB of recyclable frames
+const FREELIST_MAX: usize = 32768; // 128 MiB static freelist + on-demand kernel frame alloc overflow
 
 struct ElfFramePool {
     base_frame: u64,    // Physical base address (frame-aligned)
@@ -290,6 +290,17 @@ pub unsafe fn alloc_elf_frame() -> Option<u64> {
     }
     // Priority 2: Bump allocate a new frame
     if ELF_POOL.frames_used >= ELF_POOL.max_frames {
+        // Priority 3: Overflow — allocate directly from kernel bitmap allocator
+        // This allows agent_inference + smollm2 mmap to exceed the 32768-frame
+        // freelist capacity without a static array > 256KB (LLVM stack limit).
+        static OVERFLOW_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+        if let Some(phys) = crate::memory::frame::alloc_contiguous_dma(1) {
+            let oc = OVERFLOW_COUNT.fetch_add(1, Ordering::Relaxed);
+            if oc % 5000 == 0 {
+                crate::serial_println!("[POOL-OVERFLOW] {} frames from kernel bitmap", oc + 1);
+            }
+            return Some(phys);
+        }
         let n = ALLOC_COUNTER.load(Ordering::Relaxed);
         let pool_snap = core::ptr::addr_of!(ELF_POOL).read_volatile();
         crate::serial_println!("[POOL] EXHAUSTED: used={} max={} freelist=0 total_allocs={}", pool_snap.frames_used, pool_snap.max_frames, n);
@@ -729,7 +740,7 @@ unsafe fn ensure_kernel_pages_mapped() {
     // Kernel image: 0xFFFFFFFF80000000 .. 0xFFFFFFFF80600000 (6 MiB, conservative)
     // __kernel_end is typically around 0xFFFFFFFF805DC000 (~5.9 MiB).
     const KERN_VADDR_BASE: u64 = 0xFFFF_FFFF_8000_0000;
-    const KERN_SIZE_PAGES: u64 = 2560; // 10 MiB / 4 KiB = 2560 pages
+    const KERN_SIZE_PAGES: u64 = 4096; // 16 MiB / 4 KiB = 4096 pages (big kernel with 31 agents)
 
     let mut mapped = 0u64;
     let mut already_present = 0u64;

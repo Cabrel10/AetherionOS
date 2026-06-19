@@ -15,7 +15,7 @@ use x86_64::registers::control::Cr3;
 /// `phys_addr = virt_addr - physical_memory_offset`
 pub struct OffsetPageTableManager {
     /// Mapper de x86_64 crate (offset-based)
-    mapper: OffsetPageTable<'static>,
+    pub(crate) mapper: OffsetPageTable<'static>,
     /// Offset pour accès mémoire physique
     physical_memory_offset: VirtAddr,
 }

@@ -774,6 +774,79 @@ extern "x86-interrupt" fn page_fault_handler(
     error_code: PageFaultErrorCode,
 ) {
     use x86_64::registers::control::Cr2;
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    // Recursion guard: if we are already inside the #PF handler (e.g. because
+    // accessing PER_CPU.kernel_cr3 itself triggers a nested #PF on an unmapped
+    // BSS page), we must NOT call get_kernel_cr3() again. Instead, just use
+    // the current CR3 (which is whatever the bootloader/Limine set up).
+    static PF_REENTRANT: AtomicBool = AtomicBool::new(false);
+    if PF_REENTRANT.swap(true, Ordering::SeqCst) {
+        // We are in a recursive page fault. Do minimal work: try the demand
+        // paging path with the current CR3, then halt if that fails.
+        let addr_recursive = Cr2::read().map(|v| v.as_u64()).unwrap_or(0);
+        crate::serial_println!(
+            "[PF-RECURSIVE] Nested #PF at 0x{:X} — attempting demand map with current CR3",
+            addr_recursive
+        );
+        // Attempt demand mapping using current CR3 directly (no PER_CPU access)
+        unsafe {
+            let cr3_now: u64;
+            core::arch::asm!("mov {}, cr3", out(reg) cr3_now, options(nomem, nostack));
+            let phys_off = 0xFFFF_8000_0000_0000u64;
+            let pml4_phys = cr3_now & !0xFFF;
+            let pml4_idx = ((addr_recursive >> 39) & 0x1FF) as usize;
+            let pdpt_idx = ((addr_recursive >> 30) & 0x1FF) as usize;
+            let pd_idx   = ((addr_recursive >> 21) & 0x1FF) as usize;
+            let pt_idx   = ((addr_recursive >> 12) & 0x1FF) as usize;
+
+            let pml4_virt = (phys_off + pml4_phys) as *mut u64;
+            let pml4e = core::ptr::read_volatile(pml4_virt.add(pml4_idx));
+            if pml4e & 1 != 0 {
+                let pdpt_phys = pml4e & !0xFFF;
+                let pdpt_virt = (phys_off + pdpt_phys) as *mut u64;
+                let pdpte = core::ptr::read_volatile(pdpt_virt.add(pdpt_idx));
+                if pdpte & 1 != 0 && pdpte & 0x80 == 0 {
+                    let pd_phys = pdpte & !0xFFF;
+                    let pd_virt = (phys_off + pd_phys) as *mut u64;
+                    let pde = core::ptr::read_volatile(pd_virt.add(pd_idx));
+                    if pde & 1 != 0 && pde & 0x80 == 0 {
+                        let pt_phys = pde & !0xFFF;
+                        let pt_virt = (phys_off + pt_phys) as *mut u64;
+                        let pte = core::ptr::read_volatile(pt_virt.add(pt_idx));
+                        if pte & 1 == 0 {
+                            // Map identity: kernel high-half → physical
+                            let target = if pml4_idx == 256 {
+                                addr_recursive.wrapping_sub(phys_off) & !0xFFF
+                            } else {
+                                let kbase = crate::elf::kernel_phys_base();
+                                if kbase != 0 {
+                                    (addr_recursive.wrapping_sub(0xFFFF_FFFF_8000_0000).wrapping_add(kbase)) & !0xFFF
+                                } else { 0 }
+                            };
+                            if target != 0 {
+                                *pt_virt.add(pt_idx) = target | 0x03;
+                                core::arch::asm!(
+                                    "invlpg [{a}]",
+                                    a = in(reg) addr_recursive & !0xFFF,
+                                    options(nostack, preserves_flags)
+                                );
+                                PF_REENTRANT.store(false, Ordering::SeqCst);
+                                return;
+                            }
+                        } else {
+                            // Already mapped — spurious recursive fault
+                            PF_REENTRANT.store(false, Ordering::SeqCst);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        // If we get here, we couldn't resolve the recursive fault
+        PF_REENTRANT.store(false, Ordering::SeqCst);
+        // Fall through to normal handler logic
+    }
 
     // KPTI: Ensure we are running with kernel CR3. If a fault occurs after
     // CR3 was switched to the user PML4 (e.g. during IRETQ), the IST handler
@@ -788,6 +861,7 @@ extern "x86-interrupt" fn page_fault_handler(
             core::arch::asm!("mov cr3, {}", in(reg) kernel_cr3, options(nostack));
         }
     }
+    PF_REENTRANT.store(false, Ordering::SeqCst);
 
     // Helper: restore CR3 to the value it had when the page fault occurred.
     // This is critical for KPTI: we switch to kernel CR3 above for kernel

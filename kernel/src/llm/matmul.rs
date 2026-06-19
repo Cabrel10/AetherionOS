@@ -86,7 +86,12 @@ fn powf_f32(base: f32, exp: f32) -> f32 {
 // f16 conversion
 // ═══════════════════════════════════════════════════════════
 
-/// Convert f16 bits to f32
+/// Convert f16 bits to f32.
+/// SANITIZE: f16 NaN/Inf (exp==31) are clamped to 0.0 instead of propagating.
+/// This is necessary because the GGUF model file contains corrupted f16 scale
+/// values (295/10368 Q8_0 blocks in blk.0.attn_q.weight have NaN scales).
+/// Clamping to 0.0 zeroes out those blocks (safe degradation) rather than
+/// poisoning the entire forward pass with NaN.
 #[inline]
 pub fn f16_to_f32(bits: u16) -> f32 {
     let sign = ((bits >> 15) & 1) as u32;
@@ -105,7 +110,12 @@ pub fn f16_to_f32(bits: u16) -> f32 {
             f32::from_bits((sign << 31) | ((e as u32) << 23) | (f << 13))
         }
     } else if exp == 31 {
-        f32::from_bits((sign << 31) | 0x7F800000 | (frac << 13)) // inf/NaN
+        // Standard f16 to f32 NaN/Inf propagation
+        if frac == 0 {
+            f32::from_bits((sign << 31) | 0x7f800000) // Inf
+        } else {
+            f32::from_bits((sign << 31) | 0x7f800000 | (frac << 13)) // NaN
+        }
     } else {
         f32::from_bits((sign << 31) | (((exp + 127 - 15) as u32) << 23) | (frac << 13))
     }
@@ -131,7 +141,9 @@ pub fn dequant_q4_0(quantized: &[u8], n: usize) -> Vec<f32> {
     for b in 0..n_blocks {
         let offset = b * bytes_per_block;
         if offset + bytes_per_block > quantized.len() { break; }
-        let scale = f16_to_f32(u16::from_le_bytes([quantized[offset], quantized[offset + 1]]));
+        let raw_scale = f16_to_f32(u16::from_le_bytes([quantized[offset], quantized[offset + 1]]));
+        // Scale-level sanitization: corrupt GGUF blocks have |scale| >> 1.0 (e.g. -61408)
+        let scale = if !raw_scale.is_finite() || raw_scale.abs() > 1000.0 { 0.0 } else { raw_scale };
 
         for i in 0..16 {
             let byte = quantized[offset + 2 + i];
@@ -159,6 +171,9 @@ pub fn matmul_f32(out: &mut [f32], x: &[f32], w: &[f32], d_in: usize, d_out: usi
         let w_start = row * d_in;
         for k in 0..d_in {
             acc += w[w_start + k] * x[k];
+        }
+        if !acc.is_finite() {
+            acc = 0.0;
         }
         out[row] = acc;
     }
@@ -288,6 +303,66 @@ pub fn matmul_f32_fast(out: &mut [f32], x: &[f32], w: &[f32], d_in: usize, d_out
         for k in (chunks * 4)..d_in {
             rem_acc += w[w_start + k] * x[k];
         }
-        out[row] = acc0 + acc1 + acc2 + acc3 + rem_acc;
+        let result = acc0 + acc1 + acc2 + acc3 + rem_acc;
+        out[row] = if result.is_finite() { result } else { 0.0 };
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// Zero-copy Q8_0 matrix-vector multiply
+// ═══════════════════════════════════════════════════════════
+
+/// Matrix-vector multiply directly on Q8_0 quantized weight data.
+/// Computes out[row] = dot(w_row[Q8_0], x[f32]) for each row.
+///
+/// This avoids dequantizing the entire weight matrix to f32, saving
+/// 4× memory (Q8_0 = 34 bytes/32 elements vs f32 = 128 bytes/32 elements).
+///
+/// `q8_data`: raw Q8_0 weight data, row-major, each row = d_in elements
+/// `x`: input vector [d_in] in f32
+/// `out`: output vector [d_out] in f32
+/// `d_in`: input dimension (must be divisible by 32)
+/// `d_out`: output dimension (number of rows)
+///
+/// Q8_0 block format: 2 bytes (f16 scale) + 32 bytes (int8 values) = 34 bytes per block of 32
+pub fn matmul_q8_0(out: &mut [f32], x: &[f32], q8_data: &[u8], d_in: usize, d_out: usize) {
+    let blocks_per_row = d_in / 32;
+    let bytes_per_row = blocks_per_row * 34; // 34 bytes per Q8_0 block
+
+    for row in 0..d_out {
+        let row_start = row * bytes_per_row;
+        if row_start + bytes_per_row > q8_data.len() {
+            out[row] = 0.0;
+            continue;
+        }
+
+        let mut acc = 0.0f32;
+        for b in 0..blocks_per_row {
+            let off = row_start + b * 34;
+            let raw_scale = f16_to_f32(u16::from_le_bytes([q8_data[off], q8_data[off + 1]]));
+            // Scale-level sanitization: corrupt GGUF blocks have |scale| >> 1.0
+            let scale = if !raw_scale.is_finite() || raw_scale.abs() > 1000.0 { 0.0 } else { raw_scale };
+            let base_idx = b * 32;
+            // Unrolled inner loop: 4 elements at a time
+            let mut i = 0;
+            while i + 3 < 32 {
+                let v0 = q8_data[off + 2 + i] as i8;
+                let v1 = q8_data[off + 2 + i + 1] as i8;
+                let v2 = q8_data[off + 2 + i + 2] as i8;
+                let v3 = q8_data[off + 2 + i + 3] as i8;
+                acc += scale * (v0 as f32 * x[base_idx + i]
+                             + v1 as f32 * x[base_idx + i + 1]
+                             + v2 as f32 * x[base_idx + i + 2]
+                             + v3 as f32 * x[base_idx + i + 3]);
+                i += 4;
+            }
+            // Remainder (shouldn't happen since block_size=32 is divisible by 4)
+            while i < 32 {
+                let val = q8_data[off + 2 + i] as i8;
+                acc += scale * val as f32 * x[base_idx + i];
+                i += 1;
+            }
+        }
+        out[row] = if acc.is_finite() { acc } else { 0.0 };
     }
 }

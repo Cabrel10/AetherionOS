@@ -40,6 +40,10 @@ SECTIONS
     .data : {
         *(.data .data.*)
 
+        /* GOT and relocation tables — must be inside a mapped segment */
+        *(.got .got.*)
+        *(.got.plt)
+
         /* Limine request sections */
         KEEP(*(.requests_start_marker))
         KEEP(*(.requests))

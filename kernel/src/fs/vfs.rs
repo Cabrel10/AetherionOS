@@ -508,8 +508,10 @@ pub fn file_read(path: &str) -> Result<Vec<u8>, VfsError> {
                 }
             }
             None => {
-                // VFS miss — try ext2 filesystem as fallback
-                drop(root); // release VFS lock before ext2 I/O
+                // VFS miss — release lock before doing any I/O
+                drop(root);
+
+                // Fallback 1: try ext2 filesystem
                 if crate::fs::ext2::is_mounted() {
                     if let Some(ext2_data) = crate::fs::ext2::read_file_by_path(path) {
                         VFS_METRICS.total_bytes_read
@@ -518,22 +520,20 @@ pub fn file_read(path: &str) -> Result<Vec<u8>, VfsError> {
                         return Ok(ext2_data);
                     }
                 }
+
+                // Fallback 2: multi-backend VFS mount table (procfs, devfs, sysfs, etc.)
+                if let Ok(data) = crate::fs::vfs_backend::backend_read(path) {
+                    VFS_METRICS
+                        .total_bytes_read
+                        .fetch_add(data.len() as u64, Ordering::Relaxed);
+                    bus_publish_event(VFS_READ, data.len() as u64);
+                    return Ok(data);
+                }
+
                 VFS_METRICS.errors_count.fetch_add(1, Ordering::Relaxed);
                 return Err(VfsError::NotFound);
             }
         }
-    }
-
-    // Fall through to multi-backend VFS (ext2, procfs, devfs, sysfs)
-    match crate::fs::vfs_backend::backend_read(path) {
-        Ok(data) => {
-            VFS_METRICS
-                .total_bytes_read
-                .fetch_add(data.len() as u64, Ordering::Relaxed);
-            bus_publish_event(VFS_READ, data.len() as u64);
-            Ok(data)
-        }
-        Err(_) => Err(VfsError::NotFound),
     }
 }
 
@@ -574,6 +574,25 @@ pub fn file_read_at_offset(path: &str, offset: u64, buf: &mut [u8]) -> usize {
         return crate::fs::ext2::read_file_chunk(path, offset, buf);
     }
     0
+}
+
+/// Return (size, mode) for a VFS node at the given path.
+/// Uses the reliable `find_node` traversal.  Does NOT allocate
+/// or copy file data — only inspects the node variant.
+/// Returns None when the path does not exist in the in-memory VFS.
+pub fn file_stat(path: &str) -> Option<(u64, u32)> {
+    let components = path_components(path);
+    if components.is_empty() { return None; }
+
+    let root = VFS_ROOT.lock();
+    match find_node(&root, &components) {
+        Some(VfsNode::File(data))       => Some((data.len() as u64, 0o100755)),
+        Some(VfsNode::StaticFile(data)) => Some((data.len() as u64, 0o100755)),
+        Some(VfsNode::Device { data, .. }) => Some((data.len() as u64, 0o100644)),
+        Some(VfsNode::Directory(_))     => Some((0, 0o40755)),
+        Some(VfsNode::Symlink(_))       => Some((0, 0o120777)),
+        None                            => None,
+    }
 }
 
 /// List entries at a given path (directory listing)

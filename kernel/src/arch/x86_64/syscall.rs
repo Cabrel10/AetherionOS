@@ -639,7 +639,10 @@ extern "C" fn syscall_entry() {
         // Align RSP to 16 bytes (ABI requirement), use R15 as frame save
         "mov r15, rsp",
         "and rsp, -16",
+        "mov r10, gs:[56]",   // Load original user R9 (6th syscall arg)
+        "push r10",           // Push as 7th argument for System V ABI (on stack)
         "call {handler}",
+        "add rsp, 8",         // Clean up 7th argument from stack
         "mov rsp, r15",       // restore stack pointer to saved-regs frame
 
         // RAX = return value from Rust handler
@@ -732,8 +735,8 @@ fn print_hex_raw(val: u64) {
 /// touches XMM/YMM registers.  User FPU state therefore survives every
 /// syscall automatically — no fxsave/fxrstor needed in the fast path.
 #[no_mangle]
-extern "C" fn syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
-    syscall_dispatch(nr, a1, a2, a3, a4, a5)
+extern "C" fn syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> u64 {
+    syscall_dispatch(nr, a1, a2, a3, a4, a5, a6)
 }
 
 /// Internal syscall dispatch (separated for FPU save/restore wrapper).
@@ -744,7 +747,7 @@ extern "C" fn syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, 
 /// Last syscall number (for GP fault diagnostics)
 pub static LAST_SYSCALL_NR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
+fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> u64 {
     LAST_SYSCALL_NR.store(nr, core::sync::atomic::Ordering::Relaxed);
     let current_pid = crate::scheduler::current_pid();
     // ══════════════════ Millimeter-level tracing ══════════════════
@@ -765,7 +768,7 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         // Log mmap calls with full detail
         if nr == 9 {
             crate::serial_println!("[MMAP] PID1 SC#{} mmap(addr=0x{:X}, len=0x{:X}, prot=0x{:X}, flags=0x{:X}, fd={}, off=0x{:X})",
-                c, a1, a2, a3, a4, a5 as i64, saved_user_r9());
+                c, a1, a2, a3, a4, a5 as i64, a6);
         }
         // Log mprotect
         if nr == 10 {
@@ -785,7 +788,7 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
     if current_pid == 2 {
         let c = TRACE_COUNT2.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         if c < 200 || is_critical_nr {
-            crate::serial_println!("[P2-SC#{}] nr={} a1=0x{:X} a2=0x{:X} a3=0x{:X} a4=0x{:X}", c, nr, a1, a2, a3, a4);
+            crate::serial_println!("[P2-SC#{}] nr={} a1=0x{:X} a2=0x{:X} a3=0x{:X} a4=0x{:X} a5=0x{:X} a6=0x{:X}", c, nr, a1, a2, a3, a4, a5, a6);
         }
     }
     // Jalon 105: Check if this process uses Linux ABI and route to Linux-specific handlers
@@ -795,7 +798,6 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         }).unwrap_or(false);
 
         if is_linux {
-            let a6 = saved_user_r9();  // 6th syscall arg (r9), e.g. mmap offset
             if let Some(result) = crate::compat::linux_abi::linux_syscall_override(nr, a1, a2, a3, a4, a5, a6) {
                 return result;
             }
@@ -2450,23 +2452,8 @@ fn sys_ioctl(fd: u32, cmd: u64, arg: u64) -> u64 {
             }
             0
         }
-        // EVIOCGNAME = 0x80FF4506..0x80FF4506 — Get device name
-        // Actually encoded as _IOC(_IOC_READ, 'E', 0x06, len) — varies by length
-        // We match the common range
-        0x80004506..=0x80FF4506 => {
-            let pid = crate::scheduler::current_pid();
-            let is_mouse = crate::process::with_fd_table(pid, |fdt| {
-                fdt.get(fd as usize)
-                    .map(|e| e.path.contains("mice") || e.path.contains("mouse"))
-                    .unwrap_or(false)
-            }).unwrap_or(false);
-            let name: &[u8] = if is_mouse { b"AetherionOS PS/2 Mouse\0" } else { b"AetherionOS PS/2 Keyboard\0" };
-            if arg != 0 && validate_user_ptr(arg, name.len() as u64) {
-                unsafe { copy_to_user(arg, name); }
-            }
-            name.len() as u64
-        }
-        // EVIOCGBIT — Get event type bits (various sub-commands)
+        // EVIOCGBIT — specific commands BEFORE broad EVIOCGNAME range
+        // (specific values must precede the catch-all range 0x80004506..=0x80FF4506)
         // 0x80204520 = EVIOCGBIT(0, 32) — supported event types
         0x80204520 => {
             if arg != 0 && validate_user_ptr(arg, 32) {
@@ -2491,7 +2478,7 @@ fn sys_ioctl(fd: u32, cmd: u64, arg: u64) -> u64 {
         // EVIOCGBIT for EV_KEY (0x80604521) — Key capability bits
         0x80604521 => {
             if arg != 0 && validate_user_ptr(arg, 96) {
-                let mut bits = [0xFFu8; 96]; // Report all keys supported
+                let bits = [0xFFu8; 96]; // Report all keys supported
                 unsafe { copy_to_user(arg, &bits); }
             }
             0
@@ -2506,6 +2493,22 @@ fn sys_ioctl(fd: u32, cmd: u64, arg: u64) -> u64 {
                 unsafe { copy_to_user(arg, &bits); }
             }
             0
+        }
+        // EVIOCGNAME = 0x80FF4506..0x80FF4506 — Get device name
+        // Actually encoded as _IOC(_IOC_READ, 'E', 0x06, len) — varies by length
+        // We match the common range
+        0x80004506..=0x80FF4506 => {
+            let pid = crate::scheduler::current_pid();
+            let is_mouse = crate::process::with_fd_table(pid, |fdt| {
+                fdt.get(fd as usize)
+                    .map(|e| e.path.contains("mice") || e.path.contains("mouse"))
+                    .unwrap_or(false)
+            }).unwrap_or(false);
+            let name: &[u8] = if is_mouse { b"AetherionOS PS/2 Mouse\0" } else { b"AetherionOS PS/2 Keyboard\0" };
+            if arg != 0 && validate_user_ptr(arg, name.len() as u64) {
+                unsafe { copy_to_user(arg, name); }
+            }
+            name.len() as u64
         }
         // EVIOCGRAB = 0x40044590 — Grab device (exclusive access)
         0x40044590 => 0, // Accept silently

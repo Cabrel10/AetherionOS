@@ -57,7 +57,7 @@ pub fn serial_writeln(s: &str) {
 static HELLO_ELF: &[u8] = include_bytes!("../../../userspace/hello.elf");
 static HELLO_C_ELF: &[u8] = include_bytes!("../../../userspace/c_apps/hello_c.elf");
 static BUSYBOX_ELF: &[u8] = include_bytes!("../../../userspace/busybox.elf");
-static AGENT_AUTONOMOUS_ELF: &[u8] = include_bytes!("../../../userspace/agent_autonomous.elf");
+static AGENT_AUTONOMOUS_ELF: &[u8] = include_bytes!("../../../bin_cache/agent_autonomous");
 static AGENT_INFERENCE_ELF: &[u8] = include_bytes!("../../../bin_cache/agent_inference");
 static MINI_MODEL_GGUF: &[u8] = include_bytes!("../../../bin_cache/mini_model.gguf");
 
@@ -458,6 +458,28 @@ unsafe extern "C" fn kmain() -> ! {
     };
     crate::serial_write("       [OK] Frame allocator + page tables\n");
 
+    // Phase 7 FIX: Protect BOOTLOADER_RECLAIMABLE regions from being handed out
+    // by the frame allocator. These regions contain Limine's stack, GDT, IDT,
+    // and other data that we still need until the kernel is fully autonomous.
+    // If the ELF frame pool (Step 9a) allocates these frames, it will overwrite
+    // the bootloader data and cause a triple fault on the next interrupt.
+    {
+        let mut protected_count = 0usize;
+        for entry in entries.iter() {
+            if entry.type_ == limine::memmap::MEMMAP_BOOTLOADER_RECLAIMABLE {
+                let start = entry.base;
+                let end = entry.base + entry.length;
+                let start_frame = (start / 4096) as u64;
+                let end_frame = (end / 4096) as u64;
+                for frame in start_frame..end_frame {
+                    mem_manager.frame_allocator.mark_frame_allocated(frame * 4096);
+                    protected_count += 1;
+                }
+            }
+        }
+        crate::serial_println!("       [PHASE7] Protected {} reclaimable frames (bootloader data)", protected_count);
+    }
+
     // ═══════════════════════════════════════════════════════════════
     // Step 5a: Force-map any kernel pages that Limine left unmapped.
     //
@@ -680,6 +702,133 @@ unsafe extern "C" fn kmain() -> ! {
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════
+    // Step 5a-RELOC: Relocate kernel page tables out of BOOTLOADER_RECLAIMABLE.
+    // Limine places PML4/PDPT/PD/PT in RECLAIMABLE. User PML4s copy entries
+    // 256-511 which point to those sub-tables. This causes #PF when the
+    // shared sub-tables become inaccessible. Deep-copy into USABLE frames.
+    // ═══════════════════════════════════════════════════════════════
+    {
+        let hhdm_reloc = boot_info.hhdm_offset;
+        let cr3_reloc: u64;
+        unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3_reloc, options(nomem, nostack)) };
+        let old_pml4_phys = cr3_reloc & !0xFFF;
+
+        // Collect RECLAIMABLE zones from memory map
+        let mut reclaim_zones: [(u64, u64); 8] = [(0, 0); 8];
+        let mut rz_count = 0usize;
+        for entry in entries.iter() {
+            if entry.type_ == limine::memmap::MEMMAP_BOOTLOADER_RECLAIMABLE && rz_count < 8 {
+                reclaim_zones[rz_count] = (entry.base, entry.base + entry.length);
+                rz_count += 1;
+            }
+        }
+
+        let in_reclaim = |phys: u64| -> bool {
+            for i in 0..rz_count {
+                let (s, e) = reclaim_zones[i];
+                if phys >= s && phys < e { return true; }
+            }
+            false
+        };
+
+        if in_reclaim(old_pml4_phys) {
+            crate::serial_println!(
+                "[5a-RELOC] PML4 0x{:X} in RECLAIMABLE — relocating", old_pml4_phys
+            );
+            if let Some(new_pml4_f) = mem_manager.frame_allocator.alloc_frame_kernel() {
+                let np4 = new_pml4_f.start_address().as_u64();
+                let np4_ptr = (np4 + hhdm_reloc) as *mut u64;
+                let op4_ptr = (old_pml4_phys + hhdm_reloc) as *const u64;
+                unsafe { core::ptr::write_bytes(np4_ptr, 0, 512); }
+                let mut reloc_n = 0usize;
+
+                for i4 in 0..512usize {
+                    let e4 = unsafe { core::ptr::read_volatile(op4_ptr.add(i4)) };
+                    if e4 & 1 == 0 { continue; }
+                    let pdpt_p = e4 & 0x000F_FFFF_FFFF_F000;
+                    let f4 = e4 & 0xFFF0_0000_0000_0FFF;
+                    if !in_reclaim(pdpt_p) {
+                        unsafe { core::ptr::write_volatile(np4_ptr.add(i4), e4); }
+                        continue;
+                    }
+                    let n3 = match mem_manager.frame_allocator.alloc_frame_kernel() {
+                        Some(f) => f.start_address().as_u64(),
+                        None => { unsafe { core::ptr::write_volatile(np4_ptr.add(i4), e4); } continue; }
+                    };
+                    let o3p = (pdpt_p + hhdm_reloc) as *const u64;
+                    let n3p = (n3 + hhdm_reloc) as *mut u64;
+                    reloc_n += 1;
+                    for i3 in 0..512usize {
+                        let e3 = unsafe { core::ptr::read_volatile(o3p.add(i3)) };
+                        if e3 & 1 == 0 || e3 & 0x80 != 0 {
+                            unsafe { core::ptr::write_volatile(n3p.add(i3), e3); }
+                            continue;
+                        }
+                        let pd_p = e3 & 0x000F_FFFF_FFFF_F000;
+                        let f3 = e3 & 0xFFF0_0000_0000_0FFF;
+                        if !in_reclaim(pd_p) {
+                            unsafe { core::ptr::write_volatile(n3p.add(i3), e3); }
+                            continue;
+                        }
+                        let n2 = match mem_manager.frame_allocator.alloc_frame_kernel() {
+                            Some(f) => f.start_address().as_u64(),
+                            None => { unsafe { core::ptr::write_volatile(n3p.add(i3), e3); } continue; }
+                        };
+                        let o2p = (pd_p + hhdm_reloc) as *const u64;
+                        let n2p = (n2 + hhdm_reloc) as *mut u64;
+                        reloc_n += 1;
+                        for i2 in 0..512usize {
+                            let e2 = unsafe { core::ptr::read_volatile(o2p.add(i2)) };
+                            if e2 & 1 == 0 || e2 & 0x80 != 0 {
+                                unsafe { core::ptr::write_volatile(n2p.add(i2), e2); }
+                                continue;
+                            }
+                            let pt_p = e2 & 0x000F_FFFF_FFFF_F000;
+                            let f2 = e2 & 0xFFF0_0000_0000_0FFF;
+                            if !in_reclaim(pt_p) {
+                                unsafe { core::ptr::write_volatile(n2p.add(i2), e2); }
+                                continue;
+                            }
+                            let n1 = match mem_manager.frame_allocator.alloc_frame_kernel() {
+                                Some(f) => f.start_address().as_u64(),
+                                None => { unsafe { core::ptr::write_volatile(n2p.add(i2), e2); } continue; }
+                            };
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    (pt_p + hhdm_reloc) as *const u8,
+                                    (n1 + hhdm_reloc) as *mut u8, 4096,
+                                );
+                                core::ptr::write_volatile(n2p.add(i2), n1 | f2);
+                            }
+                            reloc_n += 1;
+                        }
+                        unsafe { core::ptr::write_volatile(n3p.add(i3), n2 | f3); }
+                    }
+                    unsafe { core::ptr::write_volatile(np4_ptr.add(i4), n3 | f4); }
+                }
+                // Switch to relocated PML4
+                unsafe { core::arch::asm!("mov cr3, {}", in(reg) np4, options(nostack)); }
+                mem_manager.frame_allocator.mark_frame_allocated(np4);
+                // CRITICAL: Reconstruct page table manager to reference new PML4.
+                // The old OffsetPageTableManager holds a ref to the original PML4 in
+                // RECLAIMABLE. After CR3 switch, map_page() must target the new PML4.
+                mem_manager.page_table = unsafe {
+                    crate::memory::paging::OffsetPageTableManager::new(
+                        x86_64::VirtAddr::new(hhdm_reloc)
+                    )
+                };
+                crate::serial_println!(
+                    "[5a-RELOC] Done: 0x{:X} -> 0x{:X} ({} tables)", old_pml4_phys, np4, reloc_n
+                );
+            } else {
+                crate::serial_println!("[5a-RELOC] No frames for relocation!");
+            }
+        } else {
+            crate::serial_println!("[5a-RELOC] PML4 0x{:X} in USABLE (OK)", old_pml4_phys);
+        }
+    }
+
     // Step 5b: Heap
     crate::serial_write("[5b/12] Initializing kernel heap (64 MB)...\n");
     match mem_manager.init_heap() {
@@ -740,8 +889,8 @@ unsafe extern "C" fn kmain() -> ! {
     {
         // Initialize ELF frame pool: allocate a contiguous block of physical frames
         // for the ELF loader to use when creating per-process page tables.
-        // 32768 frames = 128 MiB -- BusyBox + musl need more for demand paging
-        let pool_frames = 32768usize; // 128 MiB
+        // 32768 frames = 128 MiB preload + overflow to kernel bitmap for larger models
+        let pool_frames = 32768usize; // 128 MiB preload + bitmap overflow
         if let Some(first_frame) = mem_manager.frame_allocator.alloc_frame_kernel() {
             let base_phys = first_frame.start_address().as_u64();
             // Pre-allocate all frames and push them to the pool freelist.
@@ -853,23 +1002,6 @@ unsafe extern "C" fn kmain() -> ! {
         drop(root);
     }
 
-    // Mount embedded GGUF model at /models/ for LLM inference test
-    {
-        let mut root = crate::fs::vfs::lock_root();
-        root.insert(
-            alloc::string::String::from("models"),
-            crate::fs::vfs::VfsNode::Directory(alloc::collections::BTreeMap::new()),
-        );
-        if let Some(crate::fs::vfs::VfsNode::Directory(ref mut models_dir)) = root.get_mut("models") {
-            models_dir.insert(
-                alloc::string::String::from("smollm2-135m-q4_0.gguf"),
-                crate::fs::vfs::VfsNode::StaticFile(MINI_MODEL_GGUF),
-            );
-            crate::serial_println!("       [OK] /models/smollm2-135m-q4_0.gguf ({} bytes, embedded)", MINI_MODEL_GGUF.len());
-        }
-        drop(root);
-    }
-
     // Step 9c: Network init
     crate::serial_write("[9c/12] Network init...\n");
     crate::net::init();
@@ -896,6 +1028,36 @@ unsafe extern "C" fn kmain() -> ! {
         }
     } else {
         crate::serial_write("       [INFO] No VirtIO-BLK device found\n");
+    }
+
+    // Mount GGUF model at /models/
+    // We only mount the embedded mini-model if the real one isn't on the Ext2 disk
+    {
+        let mut root = crate::fs::vfs::lock_root();
+        root.insert(
+            alloc::string::String::from("models"),
+            crate::fs::vfs::VfsNode::Directory(alloc::collections::BTreeMap::new()),
+        );
+        if let Some(crate::fs::vfs::VfsNode::Directory(ref mut models_dir)) = root.get_mut("models") {
+            let mut mount_mini = true;
+            
+            // Check if Ext2 is mounted and contains the real model
+            if crate::fs::ext2::is_mounted() {
+                if crate::fs::ext2::lookup_path("/models/smollm2-135m-q4_0.gguf").is_some() {
+                    crate::serial_println!("       [VFS] Real GGUF model found on Ext2 - skipping mini-model mapping.");
+                    mount_mini = false;
+                }
+            }
+
+            if mount_mini {
+                models_dir.insert(
+                    alloc::string::String::from("mini_model.gguf"),
+                    crate::fs::vfs::VfsNode::StaticFile(MINI_MODEL_GGUF),
+                );
+                crate::serial_println!("       [OK] /models/smollm2-135m-q4_0.gguf ({} bytes, embedded)", MINI_MODEL_GGUF.len());
+            }
+        }
+        drop(root);
     }
 
     // Step 10: Enable interrupts
@@ -1855,11 +2017,16 @@ fn run_kernel_llm_benchmark() {
                 continue;
             }
 
+            // PERF FIX: Resolve inode ONCE here. All subsequent reads use
+            // read_file_chunk_by_inode() to avoid re-traversing the directory
+            // tree for each of the 273 tensor reads.
+            let model_ino = stat.ino;
+
             // === Phase 1: Read metadata (4 MB) for GGUF parse ===
             let meta_read_size = (stat.size as usize).min(4 * 1024 * 1024);
             crate::serial_println!("[LLM] Phase 1: Reading {} bytes for GGUF metadata...", meta_read_size);
             let mut meta_buf = alloc::vec![0u8; meta_read_size];
-            let meta_bytes = crate::fs::ext2::read_file_chunk(mp, 0, &mut meta_buf);
+            let meta_bytes = crate::fs::ext2::read_file_chunk_by_inode(model_ino, 0, &mut meta_buf);
             crate::serial_println!("[LLM] Read {} bytes from ext2", meta_bytes);
 
             if meta_bytes < 24 {
@@ -1927,7 +2094,9 @@ fn run_kernel_llm_benchmark() {
                 crate::serial_println!("[LLM] Tokenize: \"{}\"", prompt);
 
                 let mut toks = alloc::vec::Vec::new();
-                toks.push(model.bos_token_id());
+                // Only prepend BOS if model defines one AND token is not all-zero reserved.
+                let bos = model.bos_token_id();
+                if bos >= 6 { toks.push(bos); }
                 let prompt_bytes = prompt.as_bytes();
                 let mut i = 0usize;
                 while i < prompt_bytes.len() {
@@ -1975,20 +2144,21 @@ fn run_kernel_llm_benchmark() {
             // Free metadata buffer before loading tensor data
             drop(meta_buf);
 
-            // === Phase 3: Load weights via chunked reads ===
-            // MEMORY BUDGET: 64 MB heap. Full file is 78 MB — can't read at once.
-            // Strategy: read each tensor separately using read_file_chunk(path, offset, buf).
-            // 1. Read token_embd raw Q4_0 data (~16 MB)
-            // 2. Read 2 layers' tensors one at a time, dequant to f32 (~28 MB total)
-            // 3. Read final_norm (2 KB)
-            // Peak: ~16 MB (embd) + 28 MB (layers) + temp dequant buf = ~46 MB < 64 MB
+            // === Phase 3: Load weights via chunked reads (ZERO-COPY Q8_0) ===
+            // MEMORY BUDGET: 256 MB heap.
+            // Strategy: store layer weights as raw Q8_0 bytes (no f32 dequant).
+            //   - token_embd: raw Q8_0/Q4_0 bytes (~30 MB)
+            //   - 30 layers: raw Q8_0 bytes (~111 MB) + norms as f32 (~138 KB)
+            //   - final_norm: f32 (2 KB)
+            //   - Total: ~142 MB << 256 MB heap
+            // matmul_q8_0() reads Q8_0 blocks directly during forward pass.
 
-            let n_layers_limit = 2;
+            let n_layers_to_load = 3; // TEMP: quick E2E test — will restore to cfg.n_layers after validation
             let mut run_cfg = cfg.clone();
-            run_cfg.n_layers = n_layers_limit;
             run_cfg.max_seq_len = 64;
+            run_cfg.n_layers = n_layers_to_load; // CRITICAL: sync config with actual loaded layers
 
-            crate::serial_println!("[LLM] Phase 3: Loading weights ({} layers, chunked reads)...", n_layers_limit);
+            crate::serial_println!("[LLM] Phase 3: Loading weights ({} layers, ZERO-COPY Q8_0)...", n_layers_to_load);
 
             // Helper: read a specific tensor's raw data from ext2
             let read_tensor_data = |name: &str| -> Option<alloc::vec::Vec<u8>> {
@@ -1997,7 +2167,7 @@ fn run_kernel_llm_benchmark() {
                 let size = info.data_size() as usize;
                 if size == 0 { return None; }
                 let mut buf = alloc::vec![0u8; size];
-                let read = crate::fs::ext2::read_file_chunk(mp, file_offset as u64, &mut buf);
+                let read = crate::fs::ext2::read_file_chunk_by_inode(model_ino, file_offset as u64, &mut buf);
                 if read < size {
                     crate::serial_println!("[LLM] WARN: {} read {}/{} bytes", name, read, size);
                 }
@@ -2005,198 +2175,288 @@ fn run_kernel_llm_benchmark() {
                 Some(buf)
             };
 
-            // Dequant helper matching from_gguf() logic
-            let dequant_data = |data: &[u8], dtype: crate::llm::gguf::GgmlType, n_elem: usize| -> alloc::vec::Vec<f32> {
-                match dtype {
+            // Helper: read a norm tensor (always small, always f32/F16/Q8_0 -> dequant to f32)
+            let read_norm_f32 = |name: &str, expected: usize| -> alloc::vec::Vec<f32> {
+                let info = match model.tensors.get(name) {
+                    Some(i) => i,
+                    None => return alloc::vec![1.0f32; expected],
+                };
+                let raw = match read_tensor_data(name) {
+                    Some(r) => r,
+                    None => return alloc::vec![1.0f32; expected],
+                };
+                let n_elem = info.n_elements() as usize;
+                let out = match info.dtype {
                     crate::llm::gguf::GgmlType::F32 => {
-                        let mut out = alloc::vec::Vec::with_capacity(n_elem);
+                        let mut v = alloc::vec::Vec::with_capacity(n_elem);
                         for i in 0..n_elem {
                             let off = i * 4;
-                            if off + 4 > data.len() { break; }
-                            out.push(f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]));
+                            if off + 4 > raw.len() { break; }
+                            let f = f32::from_le_bytes([raw[off], raw[off+1], raw[off+2], raw[off+3]]);
+                            v.push(if f.is_finite() { f } else { 0.0 });
                         }
-                        out
+                        v
                     },
                     crate::llm::gguf::GgmlType::F16 => {
-                        let mut out = alloc::vec::Vec::with_capacity(n_elem);
+                        let mut v = alloc::vec::Vec::with_capacity(n_elem);
                         for i in 0..n_elem {
                             let off = i * 2;
-                            if off + 2 > data.len() { break; }
-                            out.push(crate::llm::matmul::f16_to_f32(u16::from_le_bytes([data[off], data[off+1]])));
+                            if off + 2 > raw.len() { break; }
+                            v.push(crate::llm::matmul::f16_to_f32(u16::from_le_bytes([raw[off], raw[off+1]])));
                         }
-                        out
-                    },
-                    crate::llm::gguf::GgmlType::Q4_0 => {
-                        crate::llm::matmul::dequant_q4_0(data, n_elem)
+                        v
                     },
                     crate::llm::gguf::GgmlType::Q8_0 => {
-                        let block_size = 32usize;
-                        let bytes_per_block = 34usize;
-                        let n_blocks = n_elem / block_size;
-                        let mut out = alloc::vec![0.0f32; n_elem];
+                        let mut v = alloc::vec![0.0f32; n_elem];
+                        let n_blocks = n_elem / 32;
                         for b in 0..n_blocks {
-                            let off = b * bytes_per_block;
-                            if off + bytes_per_block > data.len() { break; }
-                            let scale = crate::llm::matmul::f16_to_f32(u16::from_le_bytes([data[off], data[off+1]]));
-                            for i in 0..32 {
-                                let val = data[off + 2 + i] as i8;
-                                let idx = b * block_size + i;
-                                if idx < n_elem { out[idx] = scale * val as f32; }
+                            let off = b * 34;
+                            if off + 34 > raw.len() { break; }
+                            let raw_s = crate::llm::matmul::f16_to_f32(u16::from_le_bytes([raw[off], raw[off+1]]));
+                            let scale = if raw_s.is_nan() || raw_s.is_infinite() || raw_s.abs() > 1.0 { 0.0 } else { raw_s };
+                            for j in 0..32 {
+                                let idx = b * 32 + j;
+                                if idx < n_elem { v[idx] = scale * (raw[off + 2 + j] as i8) as f32; }
                             }
                         }
-                        out
+                        v
                     },
-                    _ => alloc::vec![0.0f32; n_elem],
-                }
-            };
-
-            // Helper: read + dequant a tensor to f32
-            let read_dequant = |name: &str, expected: usize| -> Option<alloc::vec::Vec<f32>> {
-                let info = model.tensors.get(name)?;
-                let n_elem = info.n_elements() as usize;
-                let raw = read_tensor_data(name)?;
-                let out = dequant_data(&raw, info.dtype, n_elem);
-                drop(raw); // free raw data immediately
+                    _ => alloc::vec![1.0f32; n_elem],
+                };
+                drop(raw);
                 if out.len() < expected {
                     let mut padded = out;
-                    padded.resize(expected, 0.0);
-                    Some(padded)
+                    padded.resize(expected, 1.0);
+                    padded
                 } else {
-                    Some(out)
+                    out
                 }
             };
 
-            // Step 1: Load token_embd raw Q4_0 (~16 MB)
-            let token_embd_q4 = read_tensor_data("token_embd.weight").unwrap_or_default();
-            crate::serial_println!("[LLM] token_embd Q4_0: {} bytes", token_embd_q4.len());
+            // Step 1: Load token_embd raw quantized data (Q4_0 or Q8_0)
+            let token_embd_raw = read_tensor_data("token_embd.weight").unwrap_or_default();
+            let token_embd_is_q8 = model.tensors.get("token_embd.weight")
+                .map(|t| t.dtype == crate::llm::gguf::GgmlType::Q8_0)
+                .unwrap_or(false);
+            let dtype_str = if token_embd_is_q8 { "Q8_0" } else { "Q4_0" };
+            crate::serial_println!("[LLM] token_embd {}: {} bytes", dtype_str, token_embd_raw.len());
 
-            // Step 2: Load final_norm
-            let final_norm = read_dequant("output_norm.weight", cfg.dim)
-                .unwrap_or_else(|| alloc::vec![1.0f32; cfg.dim]);
+            // Step 2: Load final_norm (always dequant to f32, tiny)
+            let final_norm = read_norm_f32("output_norm.weight", cfg.dim);
 
-            // Step 3: Build layer weights (dequant each tensor, free raw data immediately)
+            // Step 3: Load layer weights as raw Q8_0 bytes (ZERO-COPY)
             let dim = cfg.dim;
             let hidden_dim = cfg.hidden_dim;
-            let kv_dim = dim / cfg.n_heads * cfg.n_kv_heads; // head_dim * n_kv_heads
-            let per_layer = dim + dim * dim + dim * kv_dim + dim * kv_dim + dim * dim
-                + dim + dim * hidden_dim + hidden_dim * dim + dim * hidden_dim;
-            let total_layer = per_layer * n_layers_limit;
-            crate::serial_println!("[LLM] Allocating layer weights: {} floats ({} MB)",
-                total_layer, total_layer * 4 / 1024 / 1024);
+            let kv_dim = dim / cfg.n_heads * cfg.n_kv_heads;
 
-            let mut layer_weights = alloc::vec![0.0f32; total_layer];
+            // Q8_0 bytes per layer: (n_elements / 32) * 34 for each weight tensor
+            // wq: dim*dim, wk: dim*kv_dim, wv: dim*kv_dim, wo: dim*dim
+            // w1: dim*hidden_dim, w2: hidden_dim*dim, w3: dim*hidden_dim
+            let q8_bytes = |n: usize| -> usize { (n / 32) * 34 };
+            let q8_per_layer = q8_bytes(dim * dim) + q8_bytes(dim * kv_dim) + q8_bytes(dim * kv_dim)
+                + q8_bytes(dim * dim) + q8_bytes(dim * hidden_dim) + q8_bytes(hidden_dim * dim)
+                + q8_bytes(dim * hidden_dim);
+            let total_q8_bytes = q8_per_layer * n_layers_to_load;
+            let total_norm_floats = 2 * dim * n_layers_to_load; // [attn_norm | ffn_norm] per layer
+            crate::serial_println!("[LLM] Allocating Q8_0 layer data: {} bytes ({} MB) + norms: {} floats ({} KB)",
+                total_q8_bytes, total_q8_bytes / 1024 / 1024,
+                total_norm_floats, total_norm_floats * 4 / 1024);
 
-            for l in 0..n_layers_limit {
-                let base = l * per_layer;
+            let mut layer_weights_q8 = alloc::vec![0u8; total_q8_bytes];
+            let mut layer_norms = alloc::vec![0.0f32; total_norm_floats];
 
-                // attn_norm
-                if let Some(w) = read_dequant(&alloc::format!("blk.{}.attn_norm.weight", l), dim) {
-                    let n = w.len().min(dim);
-                    layer_weights[base..base + n].copy_from_slice(&w[..n]);
+            for l in 0..n_layers_to_load {
+                // Load norms (small, dequant to f32)
+                let norm_base = l * 2 * dim;
+                let attn_norm = read_norm_f32(&alloc::format!("blk.{}.attn_norm.weight", l), dim);
+                layer_norms[norm_base..norm_base + dim].copy_from_slice(&attn_norm[..dim]);
+                drop(attn_norm);
+
+                let ffn_norm = read_norm_f32(&alloc::format!("blk.{}.ffn_norm.weight", l), dim);
+                layer_norms[norm_base + dim..norm_base + 2 * dim].copy_from_slice(&ffn_norm[..dim]);
+                drop(ffn_norm);
+
+                // Load weight tensors as raw Q8_0 bytes (NO dequant!)
+                let q8_base = l * q8_per_layer;
+                let mut q8_off = q8_base;
+
+                // wq (attn_q)
+                let wq_size = q8_bytes(dim * dim);
+                if let Some(raw) = read_tensor_data(&alloc::format!("blk.{}.attn_q.weight", l)) {
+                    let n = raw.len().min(wq_size);
+                    layer_weights_q8[q8_off..q8_off + n].copy_from_slice(&raw[..n]);
                 }
-                // wq
-                let wq_off = base + dim;
-                if let Some(w) = read_dequant(&alloc::format!("blk.{}.attn_q.weight", l), dim * dim) {
-                    let n = w.len().min(dim * dim);
-                    layer_weights[wq_off..wq_off + n].copy_from_slice(&w[..n]);
+                q8_off += wq_size;
+
+                // wk (attn_k)
+                let wk_size = q8_bytes(dim * kv_dim);
+                if let Some(raw) = read_tensor_data(&alloc::format!("blk.{}.attn_k.weight", l)) {
+                    let n = raw.len().min(wk_size);
+                    layer_weights_q8[q8_off..q8_off + n].copy_from_slice(&raw[..n]);
                 }
-                // wk
-                let wk_off = wq_off + dim * dim;
-                if let Some(w) = read_dequant(&alloc::format!("blk.{}.attn_k.weight", l), dim * kv_dim) {
-                    let n = w.len().min(dim * kv_dim);
-                    layer_weights[wk_off..wk_off + n].copy_from_slice(&w[..n]);
+                q8_off += wk_size;
+
+                // wv (attn_v)
+                let wv_size = q8_bytes(dim * kv_dim);
+                if let Some(raw) = read_tensor_data(&alloc::format!("blk.{}.attn_v.weight", l)) {
+                    let n = raw.len().min(wv_size);
+                    layer_weights_q8[q8_off..q8_off + n].copy_from_slice(&raw[..n]);
                 }
-                // wv
-                let wv_off = wk_off + dim * kv_dim;
-                if let Some(w) = read_dequant(&alloc::format!("blk.{}.attn_v.weight", l), dim * kv_dim) {
-                    let n = w.len().min(dim * kv_dim);
-                    layer_weights[wv_off..wv_off + n].copy_from_slice(&w[..n]);
+                q8_off += wv_size;
+
+                // wo (attn_output)
+                let wo_size = q8_bytes(dim * dim);
+                if let Some(raw) = read_tensor_data(&alloc::format!("blk.{}.attn_output.weight", l)) {
+                    let n = raw.len().min(wo_size);
+                    layer_weights_q8[q8_off..q8_off + n].copy_from_slice(&raw[..n]);
                 }
-                // wo
-                let wo_off = wv_off + dim * kv_dim;
-                if let Some(w) = read_dequant(&alloc::format!("blk.{}.attn_output.weight", l), dim * dim) {
-                    let n = w.len().min(dim * dim);
-                    layer_weights[wo_off..wo_off + n].copy_from_slice(&w[..n]);
+                q8_off += wo_size;
+
+                // w1 (ffn_gate)
+                let w1_size = q8_bytes(dim * hidden_dim);
+                if let Some(raw) = read_tensor_data(&alloc::format!("blk.{}.ffn_gate.weight", l)) {
+                    let n = raw.len().min(w1_size);
+                    layer_weights_q8[q8_off..q8_off + n].copy_from_slice(&raw[..n]);
                 }
-                // ffn_norm
-                let ffn_norm_off = wo_off + dim * dim;
-                if let Some(w) = read_dequant(&alloc::format!("blk.{}.ffn_norm.weight", l), dim) {
-                    let n = w.len().min(dim);
-                    layer_weights[ffn_norm_off..ffn_norm_off + n].copy_from_slice(&w[..n]);
+                q8_off += w1_size;
+
+                // w2 (ffn_down)
+                let w2_size = q8_bytes(hidden_dim * dim);
+                if let Some(raw) = read_tensor_data(&alloc::format!("blk.{}.ffn_down.weight", l)) {
+                    let n = raw.len().min(w2_size);
+                    layer_weights_q8[q8_off..q8_off + n].copy_from_slice(&raw[..n]);
                 }
-                // w1 (gate)
-                let w1_off = ffn_norm_off + dim;
-                if let Some(w) = read_dequant(&alloc::format!("blk.{}.ffn_gate.weight", l), dim * hidden_dim) {
-                    let n = w.len().min(dim * hidden_dim);
-                    layer_weights[w1_off..w1_off + n].copy_from_slice(&w[..n]);
-                }
-                // w2 (down)
-                let w2_off = w1_off + dim * hidden_dim;
-                if let Some(w) = read_dequant(&alloc::format!("blk.{}.ffn_down.weight", l), hidden_dim * dim) {
-                    let n = w.len().min(hidden_dim * dim);
-                    layer_weights[w2_off..w2_off + n].copy_from_slice(&w[..n]);
-                }
-                // w3 (up)
-                let w3_off = w2_off + hidden_dim * dim;
-                if let Some(w) = read_dequant(&alloc::format!("blk.{}.ffn_up.weight", l), dim * hidden_dim) {
-                    let n = w.len().min(dim * hidden_dim);
-                    layer_weights[w3_off..w3_off + n].copy_from_slice(&w[..n]);
+                q8_off += w2_size;
+
+                // w3 (ffn_up)
+                let w3_size = q8_bytes(dim * hidden_dim);
+                if let Some(raw) = read_tensor_data(&alloc::format!("blk.{}.ffn_up.weight", l)) {
+                    let n = raw.len().min(w3_size);
+                    layer_weights_q8[q8_off..q8_off + n].copy_from_slice(&raw[..n]);
                 }
 
-                crate::serial_println!("[LLM] Layer {} loaded", l);
+                if l % 5 == 0 || l == n_layers_to_load - 1 {
+                    crate::serial_println!("[LLM] Layer {}/{} loaded (Q8_0 raw)", l, n_layers_to_load);
+                }
             }
 
-            // Build TransformerWeights directly (bypass from_gguf which needs full file)
+            // Build TransformerWeights with zero-copy Q8_0 data
             let weights = crate::llm::inference::TransformerWeights {
-                token_embedding: alloc::vec::Vec::new(), // empty — using Q4_0
+                token_embedding: alloc::vec::Vec::new(), // empty: using quantized token_embd_raw
                 final_norm,
-                output_proj: alloc::vec::Vec::new(), // tied
-                layer_weights,
+                output_proj: alloc::vec::Vec::new(), // tied to token_embd
+                layer_weights: alloc::vec::Vec::new(), // empty: using Q8_0 mode
+                layer_weights_q8,
+                layer_norms,
                 dim,
                 hidden_dim,
                 kv_dim,
-                n_layers: n_layers_limit,
+                n_layers: n_layers_to_load,
                 tied_output: true,
-                token_embd_q4,
+                token_embd_raw,
+                token_embd_is_q8,
                 vocab_size: cfg.vocab_size,
             };
 
-            crate::serial_write("[LLM] Weights loaded, creating TransformerState...\n");
+            crate::serial_write("[LLM] Checking Q8_0 weights integrity...\n");
+            {
+                let q8_len = weights.layer_weights_q8.len();
+                let norms_len = weights.layer_norms.len();
+                let mut norms_bad = 0usize;
+                for &v in weights.layer_norms.iter() {
+                    if !v.is_finite() { norms_bad += 1; }
+                }
+                let mut fn_bad = 0usize;
+                for &v in weights.final_norm.iter() { if !v.is_finite() { fn_bad += 1; } }
+                crate::serial_println!("[W-Q8] layer_weights_q8: {} bytes ({} MB), is_q8_mode={}",
+                    q8_len, q8_len / 1024 / 1024, weights.is_q8_mode());
+                crate::serial_println!("[W-Q8] layer_norms: {} floats, {} non-finite", norms_len, norms_bad);
+                crate::serial_println!("[W-CHECK] final_norm: {} non-finite / {}", fn_bad, weights.final_norm.len());
+                // Sample first Q8_0 block from layer 0 wq
+                if q8_len >= 34 {
+                    let s = crate::llm::matmul::f16_to_f32(u16::from_le_bytes([
+                        weights.layer_weights_q8[0], weights.layer_weights_q8[1]]));
+                    // FIX: show scale*10000 (was `as i64` truncating 0.015 -> 0)
+                    crate::serial_println!("[W-SAMPLE] L0 wq block0: scale_x10k={}, bits=0x{:04X}, q[0..4]=[{},{},{},{}]",
+                        (s * 10000.0) as i64,
+                        u16::from_le_bytes([weights.layer_weights_q8[0], weights.layer_weights_q8[1]]),
+                        weights.layer_weights_q8[2] as i8,
+                        weights.layer_weights_q8[3] as i8,
+                        weights.layer_weights_q8[4] as i8,
+                        weights.layer_weights_q8[5] as i8);
+                    // Also sample block 1 for comparison
+                    if q8_len >= 68 {
+                        let s2 = crate::llm::matmul::f16_to_f32(u16::from_le_bytes([
+                            weights.layer_weights_q8[34], weights.layer_weights_q8[35]]));
+                        crate::serial_println!("[W-SAMPLE] L0 wq block1: scale_x10k={}, q[0..4]=[{},{},{},{}]",
+                            (s2 * 10000.0) as i64,
+                            weights.layer_weights_q8[36] as i8,
+                            weights.layer_weights_q8[37] as i8,
+                            weights.layer_weights_q8[38] as i8,
+                            weights.layer_weights_q8[39] as i8);
+                    }
+                }
+                // Sample norms — FIX: show as x10000 (was `as i64` truncating 0.99 -> 0)
+                if norms_len >= 4 {
+                    crate::serial_println!("[W-SAMPLE] L0 attn_norm[0..4] x10k: [{},{},{},{}]",
+                        (weights.layer_norms[0] * 10000.0) as i64,
+                        (weights.layer_norms[1] * 10000.0) as i64,
+                        (weights.layer_norms[2] * 10000.0) as i64,
+                        (weights.layer_norms[3] * 10000.0) as i64);
+                    crate::serial_println!("[W-SAMPLE] L0 ffn_norm[0..4] x10k: [{},{},{},{}]",
+                        (weights.layer_norms[dim] * 10000.0) as i64,
+                        (weights.layer_norms[dim + 1] * 10000.0) as i64,
+                        (weights.layer_norms[dim + 2] * 10000.0) as i64,
+                        (weights.layer_norms[dim + 3] * 10000.0) as i64);
+                }
+            }
 
-            // Create transformer state with reduced config
+            crate::serial_write("[LLM] Creating TransformerState...\n");
+
+            // Create transformer state with full config
             let mut state = crate::llm::inference::TransformerState::new(run_cfg.clone());
             crate::serial_println!("[LLM] State memory: {} bytes", state.memory_usage());
 
             // === Phase 4: Forward pass — process prompt tokens ===
-            crate::serial_write("[LLM] Running forward pass on prompt tokens...\n");
+            // Uses forward_greedy() for last prompt token: fused argmax
+            // bypasses softmax and 49152-entry logits array write.
+            crate::serial_write("[LLM] Running forward pass (GREEDY-FUSED)...\n");
             let prompt_len = tokens.len();
+            let mut first_gen_tok: u32 = 0;
             for (pos, &tok) in tokens.iter().enumerate() {
-                crate::llm::inference::forward(&mut state, tok, pos, &weights);
-                if pos == 0 || pos == prompt_len - 1 {
-                    // Log first and last logits for verification
-                    let max_logit = state.logits.iter().cloned().fold(f32::NEG_INFINITY, |a, b| if b > a { b } else { a });
-                    crate::serial_println!("[LLM] pos={} tok={} max_logit={}", pos, tok, max_logit as i64);
+                if pos + 1 < prompt_len {
+                    // Prefill: standard forward (builds KV cache)
+                    crate::llm::inference::forward(&mut state, tok, pos, &weights);
+                    if pos == 0 {
+                        let ml = state.logits.iter().cloned().fold(f32::NEG_INFINITY, |a, b| if b > a { b } else { a });
+                        crate::serial_println!("[LLM] pos=0 tok={} max_logit={}", tok, ml as i64);
+                    }
+                } else {
+                    // Last prompt token: fused argmax (no softmax needed)
+                    crate::serial_println!("[LLM] pos={} tok={} => forward_greedy", pos, tok);
+                    let (bt, bv) = crate::llm::inference::forward_greedy(&mut state, tok, pos, &weights);
+                    crate::serial_println!("[LLM] first_gen={} logit={}", bt, bv as i64);
+                    first_gen_tok = bt;
                 }
             }
-            crate::serial_println!("[LLM] Prompt processed ({} tokens through 2 layers)", prompt_len);
+            crate::serial_println!("[LLM] Prompt done ({} toks, {} layers, Q8={})", prompt_len, run_cfg.n_layers, weights.is_q8_mode());
 
-            // === Phase 5: Greedy generation — sample 3 new tokens ===
-            // 3 tokens is enough to prove the pipeline works; saves ~40% compute vs 5.
+            // === Phase 5: Greedy generation via fused argmax ===
+            // argmax(logits) = argmax(softmax(logits)) => no softmax needed
             let gen_count = 3;
-            crate::serial_write("[LLM] Generating tokens (greedy)...\n");
+            crate::serial_write("[LLM] Generating tokens (GREEDY-FUSED, no softmax)...\n");
             let mut generated_ids = alloc::vec::Vec::new();
+            generated_ids.push(first_gen_tok);
+            crate::serial_println!("[LLM] gen[0] = {}", first_gen_tok);
+            let mut next_tok = first_gen_tok;
             let mut pos = prompt_len;
-            // First generated token comes from logits after last prompt token
-            let mut next_tok = crate::llm::inference::sample_greedy(&state.logits);
-            generated_ids.push(next_tok);
-            crate::serial_println!("[LLM] gen[0] = {} (from prompt logits)", next_tok);
 
             for g in 1..gen_count {
-                crate::llm::inference::forward(&mut state, next_tok, pos, &weights);
-                next_tok = crate::llm::inference::sample_greedy(&state.logits);
-                generated_ids.push(next_tok);
+                let (tok, val) = crate::llm::inference::forward_greedy(&mut state, next_tok, pos, &weights);
+                generated_ids.push(tok);
                 pos += 1;
-                crate::serial_println!("[LLM] gen[{}] = {}", g, next_tok);
+                next_tok = tok;
+                crate::serial_println!("[LLM] gen[{}] = {} (logit={})", g, tok, val as i64);
             }
 
             // === Phase 6: Decode generated tokens to text ===
