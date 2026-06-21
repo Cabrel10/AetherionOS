@@ -2464,11 +2464,18 @@ fn run_kernel_llm_benchmark() {
             let mut pos = prompt_len;
 
             for g in 1..gen_count {
+                // Per-token TSC timing — proves the AVX2 + cached-RoPE speedup.
+                let t_before: u64;
+                unsafe { core::arch::asm!("rdtsc", "shl rdx, 32", "or rax, rdx", out("rax") t_before, out("rdx") _); }
                 let (tok, val) = crate::llm::inference::forward_greedy(&mut state, next_tok, pos, &weights);
+                let t_after: u64;
+                unsafe { core::arch::asm!("rdtsc", "shl rdx, 32", "or rax, rdx", out("rax") t_after, out("rdx") _); }
+                let mcyc = (t_after.wrapping_sub(t_before)) / 1_000_000;
                 generated_ids.push(tok);
                 pos += 1;
                 next_tok = tok;
-                crate::serial_println!("[LLM] gen[{}] = {} (logit={})", g, tok, val as i64);
+                crate::serial_println!("[LLM] gen[{}] = {} (logit={}) [{} Mcycles/token, AVX2={}]",
+                    g, tok, val as i64, mcyc, crate::compute::avx2::has_avx2_fma());
             }
 
             // === Phase 6: Decode generated tokens to text ===

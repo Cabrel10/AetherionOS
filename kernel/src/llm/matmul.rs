@@ -70,6 +70,11 @@ fn cos_f32(x: f32) -> f32 {
 /// Power function: base^exp using exp(exp * ln(base))
 /// For no_std, we use repeated squaring for integer exponents
 /// and logarithmic approximation for fractional
+/// Public wrapper for [`powf_f32`] — used to precompute RoPE frequency tables
+/// once at model-state construction (instead of per element per token).
+#[inline]
+pub fn powf_f32_pub(base: f32, exp: f32) -> f32 { powf_f32(base, exp) }
+
 #[inline]
 fn powf_f32(base: f32, exp: f32) -> f32 {
     if base <= 0.0 { return 0.0; }
@@ -229,6 +234,37 @@ pub fn apply_rope(q: &mut [f32], k: &mut [f32], pos: usize, head_dim: usize, the
         }
 
         // Apply to K if slice is large enough
+        if i + 1 < k.len() {
+            let (k0, k1) = (k[i], k[i + 1]);
+            k[i] = k0 * cv - k1 * sv;
+            k[i + 1] = k0 * sv + k1 * cv;
+        }
+    }
+}
+
+/// Apply RoPE using a PRECOMPUTED inverse-frequency table.
+///
+/// `inv_freq[j]` holds `theta^(-2j/head_dim)` for `j in 0..head_dim/2` and is
+/// built once per run (see `TransformerState::new`). This removes the expensive
+/// per-element `powf_f32`/`exp`/`ln` chain that the original [`apply_rope`] paid
+/// for every element, every head, every token — the single biggest scalar
+/// hotspot in the forward pass under QEMU-TCG.
+///
+/// Only `sin`/`cos` (cheap polynomial approximations) are evaluated here, and
+/// just `head_dim/2` of each per call. Either slice may be empty.
+pub fn apply_rope_cached(q: &mut [f32], k: &mut [f32], pos: usize, inv_freq: &[f32]) {
+    let pos_f = pos as f32;
+    for (j, &inv_f) in inv_freq.iter().enumerate() {
+        let i = 2 * j;
+        let angle = pos_f * inv_f;
+        let cv = cos_f32(angle);
+        let sv = sin_f32(angle);
+
+        if i + 1 < q.len() {
+            let (q0, q1) = (q[i], q[i + 1]);
+            q[i] = q0 * cv - q1 * sv;
+            q[i + 1] = q0 * sv + q1 * cv;
+        }
         if i + 1 < k.len() {
             let (k0, k1) = (k[i], k[i + 1]);
             k[i] = k0 * cv - k1 * sv;

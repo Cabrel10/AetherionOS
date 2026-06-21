@@ -84,6 +84,13 @@ impl KVCache {
 pub struct TransformerState {
     pub config: ModelConfig,
     pub kv_caches: Vec<KVCache>,
+    /// Precomputed RoPE inverse frequencies: `inv_freq[j] = theta^(-2j/head_dim)`
+    /// for `j in 0..head_dim/2`. RoPE frequencies are CONSTANT across tokens and
+    /// layers, so computing them once at construction removes thousands of
+    /// `powf`/`exp`/`ln` calls per generated token (the original `apply_rope`
+    /// recomputed `powf_f32` for every element of every head of every token —
+    /// a major hotspot under QEMU-TCG scalar emulation).
+    pub rope_inv_freq: Vec<f32>,
     // Working buffers
     pub x: Vec<f32>,      // [dim]
     pub xb: Vec<f32>,     // [dim] — pre-norm buffer
@@ -112,9 +119,23 @@ impl TransformerState {
             kv_caches.push(KVCache::new(max_seq, kv_dim));
         }
 
+        // Precompute RoPE inverse frequencies ONCE. head_dim = dim / n_heads.
+        // inv_freq[j] = 1 / theta^(2j/head_dim) for j in 0..head_dim/2.
+        let head_dim = config.head_dim();
+        let theta = config.rope_theta;
+        let half = head_dim / 2;
+        let mut rope_inv_freq = Vec::with_capacity(half);
+        for j in 0..half {
+            let exponent = (2 * j) as f32 / head_dim as f32;
+            // single powf per frequency slot, computed once for the whole run
+            let denom = super::matmul::powf_f32_pub(theta, exponent);
+            rope_inv_freq.push(if denom > 0.0 { 1.0 / denom } else { 0.0 });
+        }
+
         Self {
             config,
             kv_caches,
+            rope_inv_freq,
             x: vec![0.0; dim],
             xb: vec![0.0; dim],
             xb2: vec![0.0; dim],
@@ -447,6 +468,10 @@ pub fn forward(
     weights: &TransformerWeights,
 ) {
     let config = &state.config;
+    // Snapshot precomputed RoPE inverse-frequency table (tiny: head_dim/2 floats).
+    // Cloned once per forward so the per-head RoPE loop can mutably borrow state.q/state.k
+    // without conflicting with an immutable borrow of state.rope_inv_freq.
+    let rope_freq = state.rope_inv_freq.clone();
     let dim = config.dim;
     let kv_dim = config.kv_dim();
     let head_dim = config.head_dim();
@@ -522,13 +547,13 @@ pub fn forward(
             let k_start = kh * head_dim;
             // apply_rope: pass K slice as both q and k; or use empty for q
             let k_slice = &mut state.k[k_start..k_start + head_dim];
-            apply_rope(&mut [], k_slice, pos, head_dim, config.rope_theta);
+            super::matmul::apply_rope_cached(&mut [], k_slice, pos, &rope_freq);
         }
         // Then: apply RoPE to all Q heads
         for h in 0..n_heads {
             let q_start = h * head_dim;
             let q_slice = &mut state.q[q_start..q_start + head_dim];
-            apply_rope(q_slice, &mut [], pos, head_dim, config.rope_theta);
+            super::matmul::apply_rope_cached(q_slice, &mut [], pos, &rope_freq);
         }
 
         // 2d. KV cache store
@@ -711,6 +736,10 @@ pub fn forward_greedy(
     weights: &TransformerWeights,
 ) -> (u32, f32) {
     let config = &state.config;
+    // Snapshot precomputed RoPE inverse-frequency table (tiny: head_dim/2 floats).
+    // Cloned once per forward so the per-head RoPE loop can mutably borrow state.q/state.k
+    // without conflicting with an immutable borrow of state.rope_inv_freq.
+    let rope_freq = state.rope_inv_freq.clone();
     let dim = config.dim;
     let kv_dim = config.kv_dim();
     let head_dim = config.head_dim();
@@ -757,12 +786,12 @@ pub fn forward_greedy(
         for kh in 0..n_kv_heads {
             let k_start = kh * head_dim;
             let k_slice = &mut state.k[k_start..k_start + head_dim];
-            apply_rope(&mut [], k_slice, pos, head_dim, config.rope_theta);
+            super::matmul::apply_rope_cached(&mut [], k_slice, pos, &rope_freq);
         }
         for h in 0..n_heads {
             let q_start = h * head_dim;
             let q_slice = &mut state.q[q_start..q_start + head_dim];
-            apply_rope(q_slice, &mut [], pos, head_dim, config.rope_theta);
+            super::matmul::apply_rope_cached(q_slice, &mut [], pos, &rope_freq);
         }
 
         // KV cache
@@ -881,6 +910,10 @@ pub fn forward_prefill(
     weights: &TransformerWeights,
 ) {
     let config = &state.config;
+    // Snapshot precomputed RoPE inverse-frequency table (tiny: head_dim/2 floats).
+    // Cloned once per forward so the per-head RoPE loop can mutably borrow state.q/state.k
+    // without conflicting with an immutable borrow of state.rope_inv_freq.
+    let rope_freq = state.rope_inv_freq.clone();
     let dim = config.dim;
     let kv_dim = config.kv_dim();
     let head_dim = config.head_dim();
@@ -927,12 +960,12 @@ pub fn forward_prefill(
         for kh in 0..n_kv_heads {
             let k_start = kh * head_dim;
             let k_slice = &mut state.k[k_start..k_start + head_dim];
-            apply_rope(&mut [], k_slice, pos, head_dim, config.rope_theta);
+            super::matmul::apply_rope_cached(&mut [], k_slice, pos, &rope_freq);
         }
         for h in 0..n_heads {
             let q_start = h * head_dim;
             let q_slice = &mut state.q[q_start..q_start + head_dim];
-            apply_rope(q_slice, &mut [], pos, head_dim, config.rope_theta);
+            super::matmul::apply_rope_cached(q_slice, &mut [], pos, &rope_freq);
         }
 
         // KV cache store — THE point of prefill
@@ -1593,6 +1626,10 @@ pub fn forward_fast(
     weights: &TransformerWeights,
 ) {
     let config = &state.config;
+    // Snapshot precomputed RoPE inverse-frequency table (tiny: head_dim/2 floats).
+    // Cloned once per forward so the per-head RoPE loop can mutably borrow state.q/state.k
+    // without conflicting with an immutable borrow of state.rope_inv_freq.
+    let rope_freq = state.rope_inv_freq.clone();
     let dim = config.dim;
     let kv_dim = config.kv_dim();
     let head_dim = config.head_dim();
@@ -1632,13 +1669,13 @@ pub fn forward_fast(
         for kh in 0..n_kv_heads {
             let k_start = kh * head_dim;
             let k_slice = &mut state.k[k_start..k_start + head_dim];
-            apply_rope(&mut [], k_slice, pos, head_dim, config.rope_theta);
+            super::matmul::apply_rope_cached(&mut [], k_slice, pos, &rope_freq);
         }
         // RoPE on Q heads
         for h in 0..n_heads {
             let q_start = h * head_dim;
             let q_slice = &mut state.q[q_start..q_start + head_dim];
-            apply_rope(q_slice, &mut [], pos, head_dim, config.rope_theta);
+            super::matmul::apply_rope_cached(q_slice, &mut [], pos, &rope_freq);
         }
 
         state.kv_caches[layer].store(pos, &state.k, &state.v, kv_dim);
