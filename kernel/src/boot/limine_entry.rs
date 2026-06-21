@@ -404,6 +404,12 @@ unsafe extern "C" fn kmain() -> ! {
     let cpu_features = crate::arch::x86_64::context::detect_cpu_features();
     crate::arch::x86_64::context::log_cpu_features(&cpu_features);
 
+    // Step 1c: Compute backend selection (AVX2/FMA probe + cache).
+    // MUST run after enable_avx() so XCR0/OSXSAVE are configured before any
+    // AVX2 instruction executes on the matmul hot path.
+    crate::serial_write("[1c/12] Selecting compute backend...\n");
+    crate::compute::init_backend();
+
     // Step 2: IDT
     crate::serial_write("[2/12] Loading IDT...\n");
     crate::arch::x86_64::idt::init();
@@ -850,6 +856,12 @@ unsafe extern "C" fn kmain() -> ! {
         assert_eq!(v.len(), 6);
         crate::serial_write("       [OK] Box::new + Vec verified\n");
     }
+
+    // Step 5c: GPU detection (needs heap for scan_all's Vec).
+    // Reports vendor/device/BAR0 over serial — on i3 Gen11 bare metal this
+    // identifies the Intel iGPU so a targeted driver can be written.
+    crate::serial_write("[5c/12] Detecting GPU(s)...\n");
+    let _gpu_count = crate::gpu::detect::detect_and_report_gpu();
 
     // Step 6: Framebuffer (Limine GOP)
     if let Some(ref fb) = boot_info.framebuffer {
@@ -2425,11 +2437,11 @@ fn run_kernel_llm_benchmark() {
             let mut first_gen_tok: u32 = 0;
             for (pos, &tok) in tokens.iter().enumerate() {
                 if pos + 1 < prompt_len {
-                    // Prefill: standard forward (builds KV cache)
-                    crate::llm::inference::forward(&mut state, tok, pos, &weights);
+                    // Prefill: forward_prefill() builds the KV cache WITHOUT the
+                    // ~49k-wide vocab projection — large saving per prompt token.
+                    crate::llm::inference::forward_prefill(&mut state, tok, pos, &weights);
                     if pos == 0 {
-                        let ml = state.logits.iter().cloned().fold(f32::NEG_INFINITY, |a, b| if b > a { b } else { a });
-                        crate::serial_println!("[LLM] pos=0 tok={} max_logit={}", tok, ml as i64);
+                        crate::serial_println!("[LLM] pos=0 tok={} prefilled (KV cached, logits skipped)", tok);
                     }
                 } else {
                     // Last prompt token: fused argmax (no softmax needed)

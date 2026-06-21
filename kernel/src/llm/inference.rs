@@ -862,6 +862,154 @@ pub fn forward_greedy(
     (tok, val)
 }
 
+/// Prefill a single prompt token: run the full transformer stack to update the
+/// KV cache at `pos`, WITHOUT projecting to the vocabulary or sampling.
+///
+/// This is `forward_greedy()` minus the final RMSNorm + logits/argmax stage.
+/// During prompt ingestion we only care about populating the KV cache for every
+/// position except the last one (the last prompt token goes through
+/// `forward_greedy()` so we get the first generated token). Skipping the
+/// ~49k-wide vocab projection on each prefill position is a large saving — on
+/// the bare-metal i3 Gen11 (KVM + AVX2) an 8-token prefill drops from "hours of
+/// TCG" to a few seconds.
+///
+/// The updated state lives in `state.kv_caches[..]`; this function returns `()`.
+pub fn forward_prefill(
+    state: &mut TransformerState,
+    token: u32,
+    pos: usize,
+    weights: &TransformerWeights,
+) {
+    let config = &state.config;
+    let dim = config.dim;
+    let kv_dim = config.kv_dim();
+    let head_dim = config.head_dim();
+    let n_heads = config.n_heads;
+    let n_kv_heads = config.n_kv_heads;
+    let n_rep = config.n_rep();
+
+    // 1. Token embedding
+    let tok_idx = token as usize;
+    if tok_idx < config.vocab_size {
+        if !weights.token_embd_raw.is_empty() {
+            dequant_embedding_row(&weights.token_embd_raw, tok_idx, dim, &mut state.x, weights.token_embd_is_q8);
+        } else if !weights.token_embedding.is_empty() {
+            let emb_offset = tok_idx * dim;
+            if emb_offset + dim <= weights.token_embedding.len() {
+                state.x.copy_from_slice(&weights.token_embedding[emb_offset..emb_offset + dim]);
+            }
+        }
+    }
+
+    // 2. Transformer layers (identical to forward_greedy)
+    for layer in 0..config.n_layers {
+        // Pre-attention RMSNorm
+        state.xb.copy_from_slice(&state.x);
+        let norm_w = weights.get_attn_norm(layer, dim);
+        rmsnorm(&mut state.xb, norm_w, config.norm_eps);
+
+        // Q/K/V projections
+        if weights.is_q8_mode() {
+            use super::matmul::matmul_q8_0;
+            matmul_q8_0(&mut state.q, &state.xb, weights.get_wq_q8(layer), dim, dim);
+            matmul_q8_0(&mut state.k, &state.xb, weights.get_wk_q8(layer), dim, kv_dim);
+            matmul_q8_0(&mut state.v, &state.xb, weights.get_wv_q8(layer), dim, kv_dim);
+        } else {
+            let wq = weights.get_wq(layer, dim);
+            let wk = weights.get_wk(layer, dim, kv_dim);
+            let wv = weights.get_wv(layer, dim, kv_dim);
+            matmul_f32(&mut state.q, &state.xb, wq, dim, dim);
+            matmul_f32(&mut state.k, &state.xb, wk, dim, kv_dim);
+            matmul_f32(&mut state.v, &state.xb, wv, dim, kv_dim);
+        }
+
+        // RoPE on K heads then Q heads
+        for kh in 0..n_kv_heads {
+            let k_start = kh * head_dim;
+            let k_slice = &mut state.k[k_start..k_start + head_dim];
+            apply_rope(&mut [], k_slice, pos, head_dim, config.rope_theta);
+        }
+        for h in 0..n_heads {
+            let q_start = h * head_dim;
+            let q_slice = &mut state.q[q_start..q_start + head_dim];
+            apply_rope(q_slice, &mut [], pos, head_dim, config.rope_theta);
+        }
+
+        // KV cache store — THE point of prefill
+        state.kv_caches[layer].store(pos, &state.k, &state.v, kv_dim);
+
+        // GQA attention
+        let seq_len = pos + 1;
+        for h in 0..n_heads {
+            let kv_h = h / n_rep;
+            let q_start = h * head_dim;
+            let scale = 1.0 / sqrt_head_dim(head_dim);
+            let att_start = h * config.max_seq_len;
+            for t in 0..seq_len {
+                let k_offset = t * kv_dim + kv_h * head_dim;
+                let mut score = 0.0f32;
+                for d in 0..head_dim {
+                    score += state.q[q_start + d] * state.kv_caches[layer].key[k_offset + d];
+                }
+                state.att[att_start + t] = score * scale;
+            }
+            softmax(&mut state.att[att_start..att_start + seq_len]);
+            let xb_start = h * head_dim;
+            for d in 0..head_dim {
+                let mut val = 0.0f32;
+                for t in 0..seq_len {
+                    let v_offset = t * kv_dim + kv_h * head_dim;
+                    val += state.att[att_start + t] * state.kv_caches[layer].value[v_offset + d];
+                }
+                state.xb2[xb_start + d] = val;
+            }
+        }
+
+        // Output projection
+        state.xb.fill(0.0);
+        if weights.is_q8_mode() {
+            use super::matmul::matmul_q8_0;
+            matmul_q8_0(&mut state.xb, &state.xb2, weights.get_wo_q8(layer), dim, dim);
+        } else {
+            let wo = weights.get_wo(layer, dim);
+            matmul_f32(&mut state.xb, &state.xb2, wo, dim, dim);
+        }
+        for i in 0..dim { state.x[i] += state.xb[i]; }
+
+        // Pre-FFN RMSNorm + SwiGLU FFN
+        state.xb.copy_from_slice(&state.x);
+        let ffn_norm_w = weights.get_ffn_norm(layer, dim);
+        rmsnorm(&mut state.xb, ffn_norm_w, config.norm_eps);
+
+        if weights.is_q8_mode() {
+            use super::matmul::matmul_q8_0;
+            matmul_q8_0(&mut state.hb, &state.xb, weights.get_w1_q8(layer), dim, config.hidden_dim);
+            matmul_q8_0(&mut state.hb2, &state.xb, weights.get_w3_q8(layer), dim, config.hidden_dim);
+            for i in 0..config.hidden_dim {
+                state.hb[i] = silu(state.hb[i]) * state.hb2[i];
+            }
+            state.xb.fill(0.0);
+            matmul_q8_0(&mut state.xb, &state.hb, weights.get_w2_q8(layer), config.hidden_dim, dim);
+        } else {
+            let w1 = weights.get_w1(layer, dim, config.hidden_dim);
+            let w2 = weights.get_w2(layer, dim, config.hidden_dim);
+            let w3 = weights.get_w3(layer, dim, config.hidden_dim);
+            matmul_f32(&mut state.hb, &state.xb, w1, dim, config.hidden_dim);
+            matmul_f32(&mut state.hb2, &state.xb, w3, dim, config.hidden_dim);
+            for i in 0..config.hidden_dim {
+                state.hb[i] = silu(state.hb[i]) * state.hb2[i];
+            }
+            state.xb.fill(0.0);
+            matmul_f32(&mut state.xb, &state.hb, w2, config.hidden_dim, dim);
+        }
+        for i in 0..dim { state.x[i] += state.xb[i]; }
+    }
+
+    // NOTE: deliberately NO final RMSNorm and NO logits/argmax projection.
+    // The only product of prefill is the updated KV cache (state.kv_caches).
+    crate::serial_println!("[FWD-PREFILL] pos={} cached (KV updated, no logits)", pos);
+}
+
 /// Transformer weights container
 /// Supports two modes:
 /// 1. **f32 mode** (legacy/testing): layer_weights contains dequantized f32 data

@@ -325,7 +325,28 @@ pub fn matmul_f32_fast(out: &mut [f32], x: &[f32], w: &[f32], d_in: usize, d_out
 /// `d_out`: output dimension (number of rows)
 ///
 /// Q8_0 block format: 2 bytes (f16 scale) + 32 bytes (int8 values) = 34 bytes per block of 32
+///
+/// Dispatch: when AVX2+FMA is live (probed once at boot), the vectorised
+/// `compute::avx2::matmul_q8_0_avx2` path runs (≈4–8× faster); otherwise the
+/// scalar fallback below is used. Both produce identical results.
 pub fn matmul_q8_0(out: &mut [f32], x: &[f32], q8_data: &[u8], d_in: usize, d_out: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if crate::compute::avx2::has_avx2_fma() {
+            // SAFETY: has_avx2_fma() only returns true after the boot-time
+            // probe confirmed AVX2+FMA AND enable_avx() configured XCR0/OSXSAVE.
+            unsafe {
+                crate::compute::avx2::matmul_q8_0_avx2(out, x, q8_data, d_in, d_out);
+            }
+            return;
+        }
+    }
+    matmul_q8_0_scalar(out, x, q8_data, d_in, d_out);
+}
+
+/// Scalar reference implementation of [`matmul_q8_0`]. Always correct, used as
+/// the fallback when AVX2/FMA is unavailable (e.g. the CI runner CPU).
+pub fn matmul_q8_0_scalar(out: &mut [f32], x: &[f32], q8_data: &[u8], d_in: usize, d_out: usize) {
     let blocks_per_row = d_in / 32;
     let bytes_per_row = blocks_per_row * 34; // 34 bytes per Q8_0 block
 

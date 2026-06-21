@@ -4,6 +4,7 @@
 // reads BAR0, and initialises a VramAllocator.
 
 pub mod allocator;
+pub mod detect;
 
 use spin::Mutex;
 use lazy_static::lazy_static;
