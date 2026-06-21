@@ -1072,6 +1072,26 @@ unsafe extern "C" fn kmain() -> ! {
         drop(root);
     }
 
+    // ===================================================================
+    // Step 9f: ACPI + Local APIC + SMP (multi-core bring-up)
+    //
+    // RATIONALE: The SMP bring-up code in arch::x86_64::apic was only ever
+    // invoked from main.rs (the legacy bootloader_api path). The real boot
+    // path is THIS file (Limine), which never called it -> the kernel ran
+    // on the BSP only despite QEMU -smp N. We now wire it into the Limine
+    // path. ACPI MADT parsing must run before apic::init() (it discovers
+    // the AP APIC IDs), and APIC must be initialised before we enable
+    // interrupts below (the APIC timer supersedes the legacy PIC).
+    // ===================================================================
+    crate::serial_write("[9f/12] ACPI + Local APIC + SMP bring-up...\n");
+    crate::arch::x86_64::acpi::init(crate::elf::phys_offset());
+    crate::arch::x86_64::apic::init();
+    crate::arch::x86_64::apic::wake_application_processors();
+    let cpus_online = crate::arch::x86_64::apic::cpu_count();
+    crate::serial_println!("[SMP] CPUs online: {}", cpus_online);
+    crate::serial_println!("[SMP] ACPI reported: {} CPU(s)",
+        crate::arch::x86_64::acpi::cpu_count());
+
     // Step 10: Enable interrupts
     x86_64::instructions::interrupts::enable();
     crate::serial_write("[10/12] Interrupts: ENABLED (timer + keyboard)\n");
