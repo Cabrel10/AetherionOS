@@ -1086,6 +1086,112 @@ unsafe extern "C" fn kmain() -> ! {
     crate::serial_write("[9f/12] ACPI + Local APIC + SMP bring-up...\n");
     crate::arch::x86_64::acpi::init(crate::elf::phys_offset());
     crate::arch::x86_64::apic::init();
+
+    // ───────────────────────────────────────────────────────────────────
+    // SMP PREREQUISITE: identity-map the low 2 MiB of physical memory.
+    //
+    // WHY: The AP trampoline starts in 16-bit real mode at physical 0x8000
+    // (SIPI vector 0x08), switches to long mode, then loads the BSP's CR3
+    // (shared kernel page table). At that moment the AP is still executing
+    // from LOW PHYSICAL addresses (0x7000 temp stack, 0x8000 trampoline).
+    // Those addresses must remain valid AFTER the CR3 load, i.e. the kernel
+    // page table must IDENTITY-map low memory (PML4[0] -> ... -> 0x8000).
+    //
+    // The legacy bootloader_api path identity-mapped low memory, so
+    // apic::wake_application_processors() assumed PML4[0] was present.
+    // Limine does NOT: it provides a Higher-Half Direct Map at PML4[256]
+    // (0xFFFF800000000000) and leaves PML4[0] empty. Hence the guard in
+    // apic.rs ("PML4[0] not present!") aborted AP startup under Limine.
+    //
+    // FIX: replicate the existing manual page-walk pattern (kernel page
+    // verification block above) to identity-map virt 0x0..0x200000 =
+    // phys 0x0..0x200000 with Present|Writable (kernel pages, no User bit)
+    // in the CURRENT CR3 -- the very table the APs will load.
+    {
+        let hhdm = boot_info.hhdm_offset;
+        let cr3: u64;
+        unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)) };
+        let pml4_phys = cr3 & !0xFFF;
+        let pml4_virt = (pml4_phys + hhdm) as *mut u64;
+
+        let mut ok = true;
+        unsafe {
+            // PML4[0]
+            let mut pml4_e = core::ptr::read_volatile(pml4_virt.add(0));
+            if pml4_e & 1 == 0 {
+                match mem_manager.frame_allocator.alloc_frame_kernel() {
+                    Some(f) => {
+                        let p = f.start_address().as_u64();
+                        core::ptr::write_bytes((p + hhdm) as *mut u8, 0, 4096);
+                        core::ptr::write_volatile(pml4_virt.add(0), p | 0x03); // P|W
+                        pml4_e = p | 0x03;
+                    }
+                    None => ok = false,
+                }
+            }
+            if ok {
+                let pdpt_phys = pml4_e & 0x000F_FFFF_FFFF_F000;
+                let pdpt_virt = (pdpt_phys + hhdm) as *mut u64;
+                // PDPT[0]
+                let mut pdpt_e = core::ptr::read_volatile(pdpt_virt.add(0));
+                if pdpt_e & 1 == 0 {
+                    match mem_manager.frame_allocator.alloc_frame_kernel() {
+                        Some(f) => {
+                            let p = f.start_address().as_u64();
+                            core::ptr::write_bytes((p + hhdm) as *mut u8, 0, 4096);
+                            core::ptr::write_volatile(pdpt_virt.add(0), p | 0x03);
+                            pdpt_e = p | 0x03;
+                        }
+                        None => ok = false,
+                    }
+                }
+                // A 1 GiB huge PDPT entry would already cover low memory.
+                if ok && pdpt_e & 0x80 == 0 {
+                    let pd_phys = pdpt_e & 0x000F_FFFF_FFFF_F000;
+                    let pd_virt = (pd_phys + hhdm) as *mut u64;
+                    // PD[0]
+                    let mut pd_e = core::ptr::read_volatile(pd_virt.add(0));
+                    // If PD[0] is a 2 MiB huge page it already identity-maps
+                    // 0..2 MiB -- nothing to do. Otherwise ensure a PT exists.
+                    if pd_e & 0x80 == 0 {
+                        if pd_e & 1 == 0 {
+                            match mem_manager.frame_allocator.alloc_frame_kernel() {
+                                Some(f) => {
+                                    let p = f.start_address().as_u64();
+                                    core::ptr::write_bytes((p + hhdm) as *mut u8, 0, 4096);
+                                    core::ptr::write_volatile(pd_virt.add(0), p | 0x03);
+                                    pd_e = p | 0x03;
+                                }
+                                None => ok = false,
+                            }
+                        }
+                        if ok {
+                            // Fill all 512 PT entries: virt N*4K == phys N*4K.
+                            let pt_phys = pd_e & 0x000F_FFFF_FFFF_F000;
+                            let pt_virt = (pt_phys + hhdm) as *mut u64;
+                            for i in 0..512u64 {
+                                let cur = core::ptr::read_volatile(pt_virt.add(i as usize));
+                                if cur & 1 == 0 {
+                                    core::ptr::write_volatile(
+                                        pt_virt.add(i as usize),
+                                        (i * 4096) | 0x03, // identity, P|W
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Flush TLB so the new low mapping is live before SIPI.
+            core::arch::asm!("mov rax, cr3", "mov cr3, rax", out("rax") _, options(nostack));
+        }
+        if ok {
+            crate::serial_println!("[SMP] Low 2 MiB identity-mapped (PML4[0] populated for AP trampoline)");
+        } else {
+            crate::serial_println!("[SMP] WARN: low identity-map failed (frame alloc) -- APs may stay offline");
+        }
+    }
+
     crate::arch::x86_64::apic::wake_application_processors();
     let cpus_online = crate::arch::x86_64::apic::cpu_count();
     crate::serial_println!("[SMP] CPUs online: {}", cpus_online);
