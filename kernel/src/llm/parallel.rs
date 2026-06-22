@@ -86,7 +86,65 @@ fn unpack_partial(p: u64) -> (u32, f32) {
 /// Compute the argmax dot-product over the vocab range [row_start, row_end).
 /// This is the exact scalar kernel from inference::argmax_quant_logits, factored
 /// out so both the BSP and the APs run identical math (bit-for-bit reduction).
+///
+/// When the CPU exposes AVX2+FMA (probed once at boot), the Q8_0 inner product is
+/// computed 32 lanes at a time via the shared `compute::avx2` kernel — so each of
+/// the 4 cores runs the *vectorised* path, not the scalar one. ("4 cœurs AVX2/FMA"
+/// instead of "4 cœurs scalaires".) Falls back to scalar on CI/QEMU CPUs without AVX2.
 fn argmax_range(
+    x: &[f32], raw_data: &[u8], dim: usize,
+    row_start: usize, row_end: usize, is_q8: bool,
+) -> (u32, f32) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_q8 && crate::compute::avx2::has_avx2_fma() {
+            // SAFETY: has_avx2_fma() is only true after the boot probe confirmed
+            // AVX2+FMA and enable_avx() configured CR4.OSXSAVE / XCR0.
+            return unsafe { argmax_range_q8_avx2(x, raw_data, dim, row_start, row_end) };
+        }
+    }
+    argmax_range_scalar(x, raw_data, dim, row_start, row_end, is_q8)
+}
+
+/// AVX2/FMA argmax over a Q8_0 row range. Bit-compatible reduction with the scalar
+/// path (same scale sanitisation, same is_finite guard, same tie-break: first max wins).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn argmax_range_q8_avx2(
+    x: &[f32], raw_data: &[u8], dim: usize, row_start: usize, row_end: usize,
+) -> (u32, f32) {
+    use super::matmul::f16_to_f32;
+    let blocks_per_row = dim / 32;
+    let bytes_per_row = blocks_per_row * 34;
+
+    let mut best_tok: u32 = row_start as u32;
+    let mut best_val: f32 = f32::NEG_INFINITY;
+
+    for tok in row_start..row_end {
+        let row_off = tok * bytes_per_row;
+        if row_off + bytes_per_row > raw_data.len() {
+            continue;
+        }
+        let mut dot = 0.0f32;
+        for b in 0..blocks_per_row {
+            let off = row_off + b * 34;
+            let raw_scale = f16_to_f32(u16::from_le_bytes([raw_data[off], raw_data[off + 1]]));
+            let scale = if !raw_scale.is_finite() || raw_scale.abs() > 1000.0 { 0.0 } else { raw_scale };
+            if scale == 0.0 { continue; }
+            let w_ptr = raw_data.as_ptr().add(off + 2) as *const i8;
+            let x_ptr = x.as_ptr().add(b * 32);
+            dot += scale * crate::compute::avx2::dot_block32_i8_f32_pub(w_ptr, x_ptr);
+        }
+        if dot.is_finite() && dot > best_val {
+            best_val = dot;
+            best_tok = tok as u32;
+        }
+    }
+    (best_tok, best_val)
+}
+
+/// Scalar reference kernel — used on CPUs without AVX2 (CI runner / default QEMU).
+fn argmax_range_scalar(
     x: &[f32], raw_data: &[u8], dim: usize,
     row_start: usize, row_end: usize, is_q8: bool,
 ) -> (u32, f32) {

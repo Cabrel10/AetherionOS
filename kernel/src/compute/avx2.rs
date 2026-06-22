@@ -129,6 +129,18 @@ unsafe fn dot_block32_i8_f32(w: *const i8, x: *const f32) -> f32 {
     hsum256_ps(acc)
 }
 
+/// Public wrapper around the 32-wide Q8_0 block dot product, for callers that
+/// build their own row loop (e.g. the SMP parallel argmax in `llm::parallel`).
+///
+/// # Safety
+/// Caller must ensure AVX2+FMA are available (`has_avx2_fma()`), that `enable_avx()`
+/// ran at boot, and that `w` points to ≥32 i8 and `x` to ≥32 f32.
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+pub unsafe fn dot_block32_i8_f32_pub(w: *const i8, x: *const f32) -> f32 {
+    dot_block32_i8_f32(w, x)
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Full Q8_0 matrix–vector multiply (AVX2 path)
 // ───────────────────────────────────────────────────────────────────────────
