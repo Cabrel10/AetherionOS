@@ -94,3 +94,26 @@ Contraintes de sûreté :
   tête d'attention tant que les APs ne bootent pas proprement.** Ici, ils ne
   bootent pas encore → priorité = corriger le mapping bas, re-tester `-smp 4`,
   viser `[SMP] CPUs online: 4`.
+
+## 5. RÉSULTAT APRÈS CORRECTIF (2026-06-22) — RÉSOLU ✓
+
+Test `-smp 4` avec l'ISO release contenant le fix d'identity-map bas :
+
+```
+[SMP] Low 2 MiB identity-mapped (PML4[0] populated for AP trampoline)
+[SMP] PML4[0] = 0x0000000018156003 (identity mapping OK)
+[SMP] AP 1 (APIC ID 1) responded (sync=1, 0ms) — fully initialized ✓
+[SMP] AP 2 (APIC ID 2) responded (sync=1, 0ms) — fully initialized ✓
+[SMP] AP 3 (APIC ID 3) responded (sync=1, 0ms) — fully initialized ✓
+[SMP] Results: 3 APs awakened, 4 total CPUs
+[SMP] CPUs online: 4
+```
+
+- **4 CPUs en ligne** (BSP + 3 APs), tous répondent en 0 ms.
+- **Aucun panic / triple-fault** (grep panic = 0). Le boot continue jusqu'au
+  chargement LLM normalement.
+- L'objectif mono-core → multi-core est **atteint**.
+
+Prochaine étape (séparée) : vérifier que le multi-cœur **améliore réellement**
+l'inférence LLM (cache, registres, jeu d'instructions, bande passante RAM/cache,
+communication inter-cœurs, partage de tâches), pas juste "pour faire joujou".
