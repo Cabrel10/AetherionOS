@@ -2529,7 +2529,97 @@ fn sys_ioctl(fd: u32, cmd: u64, arg: u64) -> u64 {
                 ENOTTY
             }
         }
-        _ => {
+        // ── DRM / Direct Rendering Manager (Mesa LLVMpipe attach) ──────────
+        // DRM ioctls live in the 'd' (0x64) group. The two Mesa actually needs
+        // to bring up a software-render context are VERSION and GET_CAP.
+        //   DRM_IOCTL_VERSION     = 0xC0406400 (drm_version, in/out)
+        //   DRM_IOCTL_GET_CAP     = 0xC010640C (drm_get_cap, in/out)
+        //   DRM_IOCTL_SET_VERSION = 0xC0106407 (drm_set_version, in/out)
+        // We only service them for FDs opened on /dev/dri/*.
+        0xC0406400 | 0xC010640C | 0xC0106407 => {
+            let pid = crate::scheduler::current_pid();
+            let is_dri = crate::process::with_fd_table(pid, |fdt| {
+                fdt.get(fd as usize)
+                    .map(|e| e.path.starts_with("/dev/dri/"))
+                    .unwrap_or(false)
+            }).unwrap_or(false);
+            if !is_dri {
+                return ENOTTY;
+            }
+            match cmd {
+                // DRM_IOCTL_VERSION: report ourselves as the "aether_swrast"
+                // software-rendering driver so Mesa selects the swrast path.
+                0xC0406400 => {
+                    // struct drm_version (x86-64 layout):
+                    //   0  : i32 version_major
+                    //   4  : i32 version_minor
+                    //   8  : i32 version_patchlevel
+                    //   16 : usize name_len      24 : *char name
+                    //   32 : usize date_len      40 : *char date
+                    //   48 : usize desc_len      56 : *char desc
+                    if arg == 0 || !validate_user_ptr(arg, 64) {
+                        return EFAULT;
+                    }
+                    let mut hdr = [0u8; 64];
+                    unsafe { copy_from_user(&mut hdr, arg, 64); }
+
+                    let name: &[u8] = b"aether_swrast";
+                    let date: &[u8] = b"20260622";
+                    let desc: &[u8] = b"AetherionOS software renderer (LLVMpipe-compatible)";
+
+                    // Copy a DRM_IOCTL_VERSION string field into its user buffer.
+                    // The caller passes a buffer pointer (hdr[off_ptr]) and capacity
+                    // (hdr[off_len]); we fill it up to capacity and rewrite the length
+                    // field with the real string length, exactly like the real ioctl.
+                    // A free fn (not a closure) so it doesn't hold a long-lived &mut hdr.
+                    fn put_drm_str(hdr: &mut [u8; 64], off_len: usize, off_ptr: usize, s: &[u8]) {
+                        let cap = u64::from_le_bytes(hdr[off_len..off_len + 8].try_into().unwrap());
+                        let ptr = u64::from_le_bytes(hdr[off_ptr..off_ptr + 8].try_into().unwrap());
+                        if ptr != 0 && cap > 0 && validate_user_ptr(ptr, core::cmp::min(cap, s.len() as u64)) {
+                            let n = core::cmp::min(cap as usize, s.len());
+                            unsafe { copy_to_user(ptr, &s[..n]); }
+                        }
+                        // Always report the true length so the caller can size buffers.
+                        hdr[off_len..off_len + 8].copy_from_slice(&(s.len() as u64).to_le_bytes());
+                    }
+
+                    // version 1.0.0
+                    hdr[0..4].copy_from_slice(&1i32.to_le_bytes());
+                    hdr[4..8].copy_from_slice(&0i32.to_le_bytes());
+                    hdr[8..12].copy_from_slice(&0i32.to_le_bytes());
+                    put_drm_str(&mut hdr, 16, 24, name);
+                    put_drm_str(&mut hdr, 32, 40, date);
+                    put_drm_str(&mut hdr, 48, 56, desc);
+
+                    unsafe { copy_to_user(arg, &hdr); }
+                    crate::serial_println!("[DRM] VERSION -> aether_swrast 1.0.0 (fd={})", fd);
+                    0
+                }
+                // DRM_IOCTL_GET_CAP: struct drm_get_cap { u64 capability; u64 value; }
+                // We report value=0 for every capability (no hardware accel),
+                // which steers Mesa onto the pure software path.
+                0xC010640C => {
+                    if arg == 0 || !validate_user_ptr(arg, 16) {
+                        return EFAULT;
+                    }
+                    let mut buf = [0u8; 16];
+                    unsafe { copy_from_user(&mut buf, arg, 16); }
+                    let capability = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+                    buf[8..16].copy_from_slice(&0u64.to_le_bytes()); // value = 0
+                    unsafe { copy_to_user(arg, &buf); }
+                    crate::serial_println!("[DRM] GET_CAP cap=0x{:X} -> 0 (fd={})", capability, fd);
+                    0
+                }
+                // DRM_IOCTL_SET_VERSION: accept whatever interface version the
+                // client requests (we are version-agnostic for swrast).
+                0xC0106407 => {
+                    crate::serial_println!("[DRM] SET_VERSION accepted (fd={})", fd);
+                    0
+                }
+                _ => ENOTTY,
+            }
+        }
+                _ => {
             // Log unknown ioctls for debugging (first 50 only)
             static UNK_IOCTL_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
             let c = UNK_IOCTL_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);

@@ -925,6 +925,17 @@ pub fn init() -> Result<(), VfsError> {
         input_dir.insert(String::from("mice"),   VfsNode::File(Vec::new())); // legacy mouse
         dev_dir.insert(String::from("input"), VfsNode::Directory(input_dir));
 
+        // /dev/dri — Direct Rendering Manager nodes for Mesa.
+        // card0      = the primary KMS/DRM node (major 226, minor 0)
+        // renderD128 = the render-only node (major 226, minor 128)
+        // These respond to DRM_IOCTL_VERSION (in sys_ioctl) by identifying the
+        // driver as "aether_swrast", which is what Mesa's loader needs to bring
+        // up the software (LLVMpipe / swrast) rendering path on this machine.
+        let mut dri_dir = BTreeMap::new();
+        dri_dir.insert(String::from("card0"), VfsNode::File(Vec::new()));
+        dri_dir.insert(String::from("renderD128"), VfsNode::File(Vec::new()));
+        dev_dir.insert(String::from("dri"), VfsNode::Directory(dri_dir));
+
         root.insert(String::from("dev"), VfsNode::Directory(dev_dir));
 
         // Create /tmp directory
