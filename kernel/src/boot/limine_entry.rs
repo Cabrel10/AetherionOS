@@ -1327,7 +1327,9 @@ fn execute_shell_command(cmd: &str, boot_info: &LimineBootInfo) {
         return;
     }
 
-    // Parse "wget <url>" prefix (stub)
+    // "wget <url>" — real HTTP/HTTPS GET via the kernel network stack
+    // (DNS + TCP + TLS 1.3 + 301 redirects). Prints the response size and
+    // a short head of the body so it is observable in CI logs.
     if cmd.starts_with("wget ") {
         let url = cmd[5..].trim();
         crate::serial_println!("[WGET] URL: {}", url);
@@ -1335,7 +1337,53 @@ fn execute_shell_command(cmd: &str, boot_info: &LimineBootInfo) {
             crate::serial_write("[WGET] Network not available\n");
             return;
         }
-        crate::serial_write("[WGET] HTTP not yet implemented (TCP stack in progress)\n");
+        match crate::net::http::wget(url) {
+            Ok(body) => {
+                crate::serial_println!("[WGET] OK: {} bytes received", body.len());
+                let head = &body[..core::cmp::min(body.len(), 256)];
+                if let Ok(text) = core::str::from_utf8(head) {
+                    crate::serial_println!("[WGET] head: {}", text);
+                } else {
+                    crate::serial_println!("[WGET] head: <{} binary bytes>", head.len());
+                }
+            }
+            Err(e) => {
+                crate::serial_println!("[WGET] FAILED: error code {}", e);
+            }
+        }
+        return;
+    }
+
+    // "apk <subcommand>" — Alpine package manager front-end. Wires the shell
+    // to fs::apk so `apk update` HTTP-fetches + parses the real APKINDEX and
+    // `apk add <pkg>` installs from the repositories (e.g. mesa-dri-gallium).
+    if cmd == "apk" || cmd.starts_with("apk ") {
+        let rest = cmd[3..].trim();
+        let mut parts = rest.split_whitespace();
+        match parts.next() {
+            Some("update") => {
+                crate::serial_write("[APK] apk update\n");
+                let ok = crate::fs::apk::apk_update();
+                crate::serial_println!("[APK] update -> {}", if ok { "OK" } else { "no index" });
+            }
+            Some("add") => match parts.next() {
+                Some(pkg) => {
+                    crate::serial_println!("[APK] apk add {}", pkg);
+                    let ok = crate::fs::apk::apk_add(pkg);
+                    crate::serial_println!("[APK] add {} -> {}", pkg, if ok { "OK" } else { "FAIL" });
+                }
+                None => crate::serial_write("Usage: apk add <package>\n"),
+            },
+            Some("info") | None => {
+                crate::serial_println!("[APK] {} packages installed, {} available",
+                    crate::fs::apk::list_installed().len(),
+                    crate::fs::apk::package_count());
+            }
+            Some(other) => {
+                crate::serial_println!("[APK] unknown subcommand: {}", other);
+                crate::serial_write("Usage: apk update | apk add <pkg> | apk info\n");
+            }
+        }
         return;
     }
 
@@ -1352,7 +1400,8 @@ fn execute_shell_command(cmd: &str, boot_info: &LimineBootInfo) {
             crate::serial_write("  net           -- Network status\n");
             crate::serial_write("  exec <path>   -- Load and run ELF binary\n");
             crate::serial_write("  ping <ip>     -- Send ICMP echo request\n");
-            crate::serial_write("  wget <url>    -- HTTP GET (stub)\n");
+            crate::serial_write("  wget <url>    -- HTTP/HTTPS GET (real)\n");
+            crate::serial_write("  apk <cmd>     -- Package manager (update|add|info)\n");
             crate::serial_write("  clear         -- Clear screen\n");
             crate::serial_write("  halt          -- Halt the system\n");
         }
