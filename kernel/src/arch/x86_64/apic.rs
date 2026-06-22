@@ -681,6 +681,16 @@ pub extern "C" fn ap_main() -> ! {
         // transformer forward pass (attention-head / row-range splitting).
         check_parallel_work();
 
+        // REAL in-kernel logit-projection parallelism: this AP computes its
+        // assigned slice of the 49152-vocab argmax when the BSP publishes a job.
+        // (Replaces the userspace-stub work queue with actual computation, so
+        //  the 4 detected cores are 4 *used* cores during inference.)
+        if crate::llm::parallel::try_run_worker(core_id as usize) {
+            // Did real work this poll — reset back-off so we stay hot for the
+            // remaining slices of the same forward pass.
+            poll_count = 0;
+        }
+
         // yield_to_next() takes the CURRENT pid (0 = none); it derives this
         // core's affinity internally via apic::current_core(), so passing 0 is
         // correct for every AP — the scheduler routes work by core_id itself.

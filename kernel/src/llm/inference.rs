@@ -877,7 +877,10 @@ pub fn forward_greedy(
     //    we compute each dot product and track the running maximum inline.
     if weights.tied_output && !weights.token_embd_raw.is_empty() {
         crate::serial_println!("[FWD-GREEDY] Starting fused argmax over {} vocab (dim={})", config.vocab_size, dim);
-        let (tok, val) = argmax_quant_logits(&state.x, &weights.token_embd_raw, dim, config.vocab_size, weights.token_embd_is_q8);
+        // SMP: split the 49152-row logit projection across all online cores.
+        // Falls back to the single-core scalar kernel when only the BSP is up.
+        let (tok, val) = super::parallel::argmax_quant_logits_parallel(
+            &state.x, &weights.token_embd_raw, dim, config.vocab_size, weights.token_embd_is_q8);
         return (tok, val);
     } else if weights.tied_output && !weights.token_embedding.is_empty() {
         matmul_f32(&mut state.logits, &state.x, &weights.token_embedding, dim, config.vocab_size);
