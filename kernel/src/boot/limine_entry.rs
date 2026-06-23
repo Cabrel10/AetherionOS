@@ -1053,11 +1053,23 @@ unsafe extern "C" fn kmain() -> ! {
         if let Some(crate::fs::vfs::VfsNode::Directory(ref mut models_dir)) = root.get_mut("models") {
             let mut mount_mini = true;
             
-            // Check if Ext2 is mounted and contains the real model
+            // Check if Ext2 is mounted and contains the real model.
+            // The on-disk model can have several names depending on how disk.img
+            // was built (q4_0, plain "smollm2.gguf", or the Q4_K_S instruct build).
+            // Use the SAME candidate list as run_kernel_llm_benchmark() so the boot
+            // path and the inference path agree on what counts as "real model present".
             if crate::fs::ext2::is_mounted() {
-                if crate::fs::ext2::lookup_path("/models/smollm2-135m-q4_0.gguf").is_some() {
-                    crate::serial_println!("       [VFS] Real GGUF model found on Ext2 - skipping mini-model mapping.");
-                    mount_mini = false;
+                const REAL_MODEL_CANDIDATES: [&str; 3] = [
+                    "/models/smollm2-135m-q4_0.gguf",
+                    "/models/smollm2.gguf",
+                    "/models/SmolLM2-135M-Instruct-Q4_K_S.gguf",
+                ];
+                for cand in REAL_MODEL_CANDIDATES.iter() {
+                    if crate::fs::ext2::lookup_path(cand).is_some() {
+                        crate::serial_println!("       [VFS] Real GGUF model found on Ext2 ({}) - skipping mini-model mapping.", cand);
+                        mount_mini = false;
+                        break;
+                    }
                 }
             }
 
@@ -1066,7 +1078,11 @@ unsafe extern "C" fn kmain() -> ! {
                     alloc::string::String::from("mini_model.gguf"),
                     crate::fs::vfs::VfsNode::StaticFile(MINI_MODEL_GGUF),
                 );
-                crate::serial_println!("       [OK] /models/smollm2-135m-q4_0.gguf ({} bytes, embedded)", MINI_MODEL_GGUF.len());
+                // HONEST LOGGING: embedded *placeholder*, NOT the real 135M model.
+                // The real smollm2-135m-q4_0.gguf (~173 MB) lives on the Ext2 disk and is
+                // only available when VirtIO-BLK is attached. Seeing this line means the
+                // disk was NOT mounted and inference will use the tiny fallback only.
+                crate::serial_println!("       [WARN] /models/mini_model.gguf ({} bytes, embedded PLACEHOLDER) -- real smollm2-135m-q4_0.gguf NOT loaded (Ext2/VirtIO-BLK absent)", MINI_MODEL_GGUF.len());
             }
         }
         drop(root);
