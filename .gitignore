@@ -70,3 +70,7 @@ models/
 third_party/limine/
 target/
 AetherionOS/
+.aider*
+MORNINGSTAR/
+*.docx
+*.iso
