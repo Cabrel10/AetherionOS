@@ -282,28 +282,36 @@ pub fn ensure_experts_loaded(
 
     for &eidx in expert_indices {
         let key = (model_id, layer_idx, eidx);
-        if let Some(desc) = rt.experts.get_mut(&key) {
+        // Mutate the expert descriptor inside the borrow, defer rt counter
+        // updates until after the borrow ends (avoids E0499 double-mut-borrow).
+        let outcome: u8 = if let Some(desc) = rt.experts.get_mut(&key) {
             desc.last_access = crate::arch::x86_64::timer::read_tsc();
             desc.activation_count += 1;
 
             match desc.state {
-                ExpertState::Warm | ExpertState::Hot => {
-                    rt.cache_hits += 1;
-                }
-                ExpertState::Loading => {
-                    all_ready = false;
-                }
+                ExpertState::Warm | ExpertState::Hot => 0, // cache hit
+                ExpertState::Loading => 1,                 // still loading
                 ExpertState::Cold => {
-                    rt.cache_misses += 1;
                     // Trigger load from disk
                     desc.state = ExpertState::Loading;
                     // TODO: Issue async VirtIO-BLK read
                     // For now, simulate immediate load
                     desc.state = ExpertState::Warm;
-                    rt.loaded_count += 1;
-                    all_ready = true;
+                    2 // cache miss + loaded
                 }
             }
+        } else {
+            3 // expert not registered
+        };
+        match outcome {
+            0 => rt.cache_hits += 1,
+            1 => all_ready = false,
+            2 => {
+                rt.cache_misses += 1;
+                rt.loaded_count += 1;
+                all_ready = true;
+            }
+            _ => {}
         }
 
         // Update per-expert statistics

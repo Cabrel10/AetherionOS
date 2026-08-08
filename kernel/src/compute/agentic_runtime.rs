@@ -838,7 +838,7 @@ pub fn print_status() {
     for agent in registry.values() {
         if !agent.state.is_alive() { continue; }
         crate::serial_println!(
-            "  #{:<3} {:?:<12} {:?:<10} '{}' model={:?} tok={}+{} tools={} children={}",
+            "  #{:<3} {:12?} {:10?} '{}' model={:?} tok={}+{} tools={} children={}",
             agent.id, agent.class, agent.state, agent.name,
             agent.model_idx, agent.usage.tokens_prompted, agent.usage.tokens_generated,
             agent.usage.tool_calls_executed, agent.children.len(),

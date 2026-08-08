@@ -397,7 +397,17 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         norm_b += b[i] * b[i];
     }
 
-    let magnitude = (norm_a * norm_b).sqrt();
+    // no_std: f32::sqrt unavailable — Newton-Raphson sqrt approximation
+    let product = norm_a * norm_b;
+    let magnitude = if product > 0.0 {
+        let mut g = product; // initial guess
+        for _ in 0..8 {
+            g = 0.5 * (g + product / g);
+        }
+        g
+    } else {
+        0.0
+    };
     if magnitude < 1e-10 {
         0.0
     } else {

@@ -434,62 +434,6 @@ pub fn matmul_q8_0_scalar(out: &mut [f32], x: &[f32], q8_data: &[u8], d_in: usiz
 const Q8_0_BLOCK_SIZE: usize = 32;
 const Q8_0_BYTES_PER_BLOCK: usize = 34;
 
-/// Matrix-vector multiply directly from Q8_0 raw data.
-/// `raw_data` contains row-major weight matrix in Q8_0 format.
-/// Each row has `d_in` elements = `d_in/32` blocks of 34 bytes each.
-/// 4x loop unrolling + scale hoisting for performance.
-pub fn matmul_q8_0(out: &mut [f32], x: &[f32], raw_data: &[u8], d_in: usize, d_out: usize) {
-    let blocks_per_row = d_in / Q8_0_BLOCK_SIZE;
-    let row_bytes = blocks_per_row * Q8_0_BYTES_PER_BLOCK;
-
-    for row in 0..d_out {
-        let row_start = row * row_bytes;
-        let mut dot = 0.0f32;
-
-        for b in 0..blocks_per_row {
-            let block_offset = row_start + b * Q8_0_BYTES_PER_BLOCK;
-            // Read f16 scale
-            let scale_bits = u16::from_le_bytes([
-                raw_data[block_offset],
-                raw_data[block_offset + 1],
-            ]);
-            let scale = f16_to_f32(scale_bits);
-
-            if scale == 0.0 {
-                continue; // Skip zero-scale blocks (no contribution)
-            }
-
-            // Dot product with scale hoisting: accumulate block_acc, then multiply scale once
-            let data_start = block_offset + 2;
-            let elem_base = b * Q8_0_BLOCK_SIZE;
-            let mut block_acc = 0.0f32;
-
-            // 4x unrolled inner loop
-            let mut i = 0;
-            while i + 3 < Q8_0_BLOCK_SIZE {
-                let q0 = raw_data[data_start + i] as i8;
-                let q1 = raw_data[data_start + i + 1] as i8;
-                let q2 = raw_data[data_start + i + 2] as i8;
-                let q3 = raw_data[data_start + i + 3] as i8;
-                block_acc += x[elem_base + i]     * (q0 as f32);
-                block_acc += x[elem_base + i + 1] * (q1 as f32);
-                block_acc += x[elem_base + i + 2] * (q2 as f32);
-                block_acc += x[elem_base + i + 3] * (q3 as f32);
-                i += 4;
-            }
-            // Remainder (shouldn't happen for Q8_0 blocks of 32, but safe)
-            while i < Q8_0_BLOCK_SIZE {
-                let q = raw_data[data_start + i] as i8;
-                block_acc += x[elem_base + i] * (q as f32);
-                i += 1;
-            }
-
-            dot += scale * block_acc;
-        }
-
-        out[row] = dot;
-    }
-}
 
 /// Fused argmax over Q8_0 matrix rows: computes dot product per row
 /// and tracks running maximum inline. Returns (best_token_id, best_logit_value).

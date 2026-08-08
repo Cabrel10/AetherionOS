@@ -277,44 +277,50 @@ pub fn request_layer(model_id: u32, layer_idx: usize) -> StorageTier {
 pub fn promote_layer(model_id: u32, layer_idx: usize, target_tier: StorageTier) -> bool {
     let mut sched = LAYER_SCHEDULER.lock();
 
-    if let Some(desc) = sched.layers.get_mut(&(model_id, layer_idx)) {
-        if desc.tier as u8 >= target_tier as u8 {
-            return true; // Already at or above target tier
-        }
+    let key = (model_id, layer_idx);
+    // Read-only probe first; drop the borrow before mutating other state fields.
+    let (size_bytes, current_tier) = match sched.layers.get(&key) {
+        Some(desc) => (desc.size_bytes, desc.tier),
+        None => return false,
+    };
+    if current_tier as u8 >= target_tier as u8 {
+        return true; // Already at or above target tier
+    }
 
-        match target_tier {
-            StorageTier::Ram => {
-                let budget = sched.config.ram_budget;
-                let used = sched.ram_used;
-                if used + desc.size_bytes > budget {
-                    // Need to evict cold layers from RAM
-                    evict_ram_layers(&mut sched, desc.size_bytes);
-                }
-                if sched.ram_used + desc.size_bytes <= budget {
-                    // TODO: Actually read from disk via VirtIO-BLK
+    match target_tier {
+        StorageTier::Ram => {
+            let budget = sched.config.ram_budget;
+            if sched.ram_used + size_bytes > budget {
+                // Need to evict cold layers from RAM
+                evict_ram_layers(&mut sched, size_bytes);
+            }
+            if sched.ram_used + size_bytes <= budget {
+                // TODO: Actually read from disk via VirtIO-BLK
+                if let Some(desc) = sched.layers.get_mut(&key) {
                     desc.tier = StorageTier::Ram;
-                    sched.ram_used += desc.size_bytes;
-                    return true;
                 }
+                sched.ram_used += size_bytes;
+                return true;
             }
-            StorageTier::Vram => {
-                let budget = sched.config.vram_budget;
-                if budget == 0 {
-                    return false; // No GPU available
-                }
-                let used = sched.vram_used;
-                if used + desc.size_bytes > budget {
-                    evict_vram_layers(&mut sched, desc.size_bytes);
-                }
-                if sched.vram_used + desc.size_bytes <= budget {
-                    // TODO: DMA transfer from RAM to VRAM
-                    desc.tier = StorageTier::Vram;
-                    sched.vram_used += desc.size_bytes;
-                    return true;
-                }
-            }
-            _ => {}
         }
+        StorageTier::Vram => {
+            let budget = sched.config.vram_budget;
+            if budget == 0 {
+                return false; // No GPU available
+            }
+            if sched.vram_used + size_bytes > budget {
+                evict_vram_layers(&mut sched, size_bytes);
+            }
+            if sched.vram_used + size_bytes <= budget {
+                // TODO: DMA transfer from RAM to VRAM
+                if let Some(desc) = sched.layers.get_mut(&key) {
+                    desc.tier = StorageTier::Vram;
+                }
+                sched.vram_used += size_bytes;
+                return true;
+            }
+        }
+        _ => {}
     }
     false
 }
