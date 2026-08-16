@@ -39,15 +39,27 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-check-
 
-      - name: Cargo check (library)
-        run: cargo check --lib 2>&1 | tee check_output.txt
+      - name: Cargo check (library — no features)
+        run: cargo check --lib 2>&1 | tee check_output_base.txt
+
+      - name: Cargo check (library — with limine feature)
+        run: |
+          # CRITICAL: The boot module is gated by #[cfg(feature = "limine")].
+          # Without --features limine, cargo check SKIPS the entire boot module,
+          # hiding compilation errors (e.g., E0451 field visibility) that only
+          # surface during the QEMU build step 20 minutes later.
+          cargo check --lib --features limine 2>&1 | tee check_output.txt
 
       - name: Verify no errors
         run: |
-          if grep -q "^error" check_output.txt; then
-            echo "::error::Cargo check failed with errors"
-            exit 1
-          fi
+          FAIL=false
+          for f in check_output_base.txt check_output.txt; do
+            if grep -q "^error" "$f"; then
+              echo "::error::Cargo check failed with errors in $f"
+              FAIL=true
+            fi
+          done
+          if [ "$FAIL" = "true" ]; then exit 1; fi
           echo "Cargo check passed (warnings only)"
 
       - name: Count warnings
@@ -56,7 +68,7 @@ jobs:
           echo "Total warnings: $WARNINGS"
           echo "## Cargo Check Results" >> $GITHUB_STEP_SUMMARY
           echo "- **Status**: PASS" >> $GITHUB_STEP_SUMMARY
-          echo "- **Warnings**: $WARNINGS" >> $GITHUB_STEP_SUMMARY
+          echo "- **Warnings**: $WARNINGS (with --features limine)" >> $GITHUB_STEP_SUMMARY
 
   # ═══════════════════════════════════════════════════════════
   # Job 2: Build ISO + ext2 rootfs + QEMU Python3 integration test
@@ -266,8 +278,8 @@ jobs:
           done
           ls -lh /tmp/alpine-minirootfs.tar.gz
 
-          # Create ext2 image (256 MiB — room for Python3)
-          dd if=/dev/zero of=target/rootfs.ext2 bs=1M count=256
+          # Create ext2 image (512 MiB — room for Python3 + GGUF model)
+          dd if=/dev/zero of=target/rootfs.ext2 bs=1M count=512
           mkfs.ext2 -F target/rootfs.ext2
 
           # Mount and populate
@@ -309,6 +321,24 @@ jobs:
 
           # Test python3 actually works
           sudo chroot "$MNTDIR" /usr/bin/python3 -c "print(42*42)" 2>&1 || echo "  WARN: python3 chroot test failed"
+
+          # Download SmolLM2-135M GGUF model for bare-metal LLM inference test
+          echo "=== Downloading SmolLM2-135M GGUF model ==="
+          sudo mkdir -p "$MNTDIR/models"
+          GGUF_URL="https://huggingface.co/lmstudio-community/SmolLM2-135M-Instruct-GGUF/resolve/main/SmolLM2-135M-Instruct-Q4_0.gguf"
+          sudo wget -q --timeout=60 "$GGUF_URL" -O "$MNTDIR/models/smollm2-135m-q4_0.gguf" 2>&1 || {
+            echo "  WARN: Primary GGUF download failed, trying alternate URL"
+            GGUF_URL2="https://huggingface.co/TheBloke/SmolLM2-135M-GGUF/resolve/main/smollm2-135m.Q4_0.gguf"
+            sudo wget -q --timeout=60 "$GGUF_URL2" -O "$MNTDIR/models/smollm2-135m-q4_0.gguf" 2>&1 || echo "  WARN: GGUF download failed (non-fatal)"
+          }
+          if sudo test -f "$MNTDIR/models/smollm2-135m-q4_0.gguf"; then
+            GGUF_SIZE=$(sudo stat -c%s "$MNTDIR/models/smollm2-135m-q4_0.gguf")
+            echo "  [OK] GGUF model: $GGUF_SIZE bytes"
+            # Verify GGUF magic (first 4 bytes should be 0x47 0x47 0x55 0x46 = "GGUF")
+            sudo xxd -l 8 "$MNTDIR/models/smollm2-135m-q4_0.gguf" || true
+          else
+            echo "  [SKIP] GGUF model not downloaded (network issue, non-fatal)"
+          fi
 
           # Create essential directories
           sudo mkdir -p "$MNTDIR/dev" "$MNTDIR/proc" "$MNTDIR/sys" "$MNTDIR/tmp"
@@ -367,9 +397,13 @@ jobs:
           ls -lh /tmp/kernel-check.elf 2>/dev/null || true
 
           # Run QEMU with serial explicitly going to a file
-          timeout 60 qemu-system-x86_64 \
+          # VirtIO-Net with SLIRP user-mode networking for CI-TEST-5/6/8/9
+          # CPU: qemu64 + rdrand for hardware entropy (required by libssl/apk)
+          timeout 180 qemu-system-x86_64 \
             -cdrom target/aetherion-os.iso \
             -drive file=target/rootfs.ext2,format=raw,if=virtio \
+            -netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
+            -cpu qemu64,+rdrand,+rdseed \
             -m 512M -smp 1 -no-reboot \
             -display none \
             -chardev file,id=ser0,path=/tmp/qemu-serial.log \
@@ -395,11 +429,25 @@ jobs:
           grep -c "EXT2" /tmp/qemu-serial.log || echo "0 ext2 messages"
           grep -c "1764" /tmp/qemu-serial.log || echo "0 python3 (1764) messages"
           grep -c "CI-TEST" /tmp/qemu-serial.log || echo "0 CI-TEST messages"
+          grep -c "WGET-OK" /tmp/qemu-serial.log || echo "0 WGET-OK messages"
+          grep -c "DNS OK" /tmp/qemu-serial.log || echo "0 DNS messages"
+          grep -c "APKINDEX-OK" /tmp/qemu-serial.log || echo "0 APKINDEX messages"
+          grep -c "PING-OK" /tmp/qemu-serial.log || echo "0 PING-OK messages"
+          grep -c "WGET-WRITE-OK" /tmp/qemu-serial.log || echo "0 WGET-WRITE-OK (ext2 persistence)"
+          grep -c "APK-REPO-OK" /tmp/qemu-serial.log || echo "0 APK-REPO-OK messages"
+          grep -c "BUSYBOX-ELF-OK" /tmp/qemu-serial.log || echo "0 BUSYBOX-ELF-OK messages"
+          grep -c "ENTROPY-OK" /tmp/qemu-serial.log || echo "0 ENTROPY-OK messages"
+          grep -c "CI-TEST-16" /tmp/qemu-serial.log || echo "0 APK Ring3 messages"
+          grep -c "AVX2.*MatMul Speedup" /tmp/qemu-serial.log || echo "0 AVX2 benchmark messages"
+          grep -c "Scalar.*cycles.*GFLOPS" /tmp/qemu-serial.log || echo "0 scalar benchmark messages"
+          grep -c "RDRAND" /tmp/qemu-serial.log || echo "0 RDRAND messages"
+          grep -c "GGUF" /tmp/qemu-serial.log || echo "0 GGUF messages"
+          grep -c "LLM-LOAD-OK" /tmp/qemu-serial.log || echo "0 LLM-LOAD-OK messages"
 
-      - name: QEMU Python3 test (exec + ld-musl)
+      - name: QEMU full integration test (Python3 + network + ext2)
         run: |
-          echo "=== QEMU Python3 Test ==="
-          echo "Sending: python3 -c 'print(42*42)' via kernel shell"
+          echo "=== QEMU Full Integration Test ==="
+          echo "Tests: Python3 1764, wget, DNS, APK index, ext2 write, BusyBox, entropy"
 
           # Create a named pipe for serial I/O
           rm -f /tmp/qemu-input
@@ -408,9 +456,13 @@ jobs:
           # Start QEMU in background
           # -chardev pipe: allows bidirectional serial via named pipe
           # -display none: no VGA output
-          timeout 90 qemu-system-x86_64 \
+          # VirtIO-Net with SLIRP user-mode networking for wget/DNS/APK tests
+          # CPU: qemu64 + rdrand/rdseed for hardware entropy (libssl/apk)
+          timeout 240 qemu-system-x86_64 \
             -cdrom target/aetherion-os.iso \
             -drive file=target/rootfs.ext2,format=raw,if=virtio \
+            -netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
+            -cpu qemu64,+rdrand,+rdseed \
             -m 512M -smp 1 -no-reboot \
             -display none \
             -chardev file,id=ser0,path=/tmp/qemu-python3-serial.log \
@@ -434,41 +486,141 @@ jobs:
           grep -iE "1764|python|musl|ld-musl|DYNLINK|INTERP|mprotect|dlopen|Exception|GP|PF-|SIGSEGV|AETHERION_BOOT" /tmp/qemu-python3-serial.log || echo "(no markers found)"
 
           echo ""
-          echo "=== SUCCESS CHECK ==="
-          # Check both the python3 serial log AND the boot serial log
+          echo "=== Network / wget markers ==="
+          grep -iE "WGET-OK|DNS.OK|PING-OK|APKINDEX-OK|HTTPS|CI-TEST-[5-9]|WGET-WRITE-OK|APK-REPO-OK|BUSYBOX|ENTROPY-OK" /tmp/qemu-python3-serial.log || echo "(no markers found)"
+
+          echo ""
+          echo "=== COMPREHENSIVE SUCCESS CHECK ==="
+          PASS_COUNT=0
+          FAIL_COUNT=0
+          TOTAL_TESTS=9
+
+          # Helper function for checking markers
+          check_marker() {
+            local marker="$1"
+            local desc="$2"
+            local found=false
+            for LOG in /tmp/qemu-python3-serial.log /tmp/qemu-serial.log; do
+              if grep -qE "$marker" "$LOG" 2>/dev/null; then
+                found=true
+                break
+              fi
+            done
+            if [ "$found" = "true" ]; then
+              echo "  ✓ $desc"
+              PASS_COUNT=$((PASS_COUNT + 1))
+              return 0
+            else
+              echo "  ✗ $desc"
+              FAIL_COUNT=$((FAIL_COUNT + 1))
+              return 1
+            fi
+          }
+
+          # Test 1: Python3 dynamic linking
+          check_marker "1764" "Python3 print(42*42) = 1764 [ld-musl dynamic linking]" || true
+
+          # Test 2: ICMP networking
+          check_marker "PING-OK" "ICMP ping gateway 10.0.2.2 [VirtIO-Net + IP stack]" || true
+
+          # Test 3: DNS resolution
+          check_marker "DNS OK" "DNS resolution example.com [UDP + DNS protocol]" || true
+
+          # Test 4: HTTP wget
+          check_marker "WGET-OK" "HTTP wget example.com [TCP + HTTP/1.1]" || true
+
+          # Test 5: HTTPS/TLS
+          check_marker "HTTPS.*WGET-OK" "HTTPS wget example.com [TLS 1.3]" || true
+
+          # Test 6: APK index fetch
+          check_marker "APKINDEX-OK" "APK index fetch 339KB [Alpine pkg mgmt]" || true
+
+          # Test 7: wget + ext2 write persistence
+          check_marker "WGET-WRITE-OK" "wget → ext2 write → read-back verify [persistence]" || true
+
+          # Test 8: APK binary execution in Ring 3 (real userspace apk)
+          check_marker "apk-tools|APK-RING3-OK|CI-TEST-16.*loaded" "APK binary execution [Ring 3 ld-musl]" || true
+
+          # Test 9: SIMD matmul benchmark (AVX2 speedup on capable HW, scalar GFLOPS on CI)
+          # CI runners lack AVX2, so we accept the scalar-only GFLOPS marker too.
+          # On real AVX2 hardware: [AVX2] MatMul Speedup: X.X fois plus rapide
+          # On SSE-only CI runner: [LLM] Scalar: NNN cycles (X.XXX GFLOPS)
+          check_marker "AVX2.*MatMul Speedup|AVX2-BENCH-OK|Scalar.*cycles.*GFLOPS" "MatMul benchmark [XSAVE/FXSAVE context switch]" || true
+
+          echo ""
+          echo "=== RESULTS: $PASS_COUNT/$TOTAL_TESTS passed ==="
+
+          # Generate comprehensive summary
+          echo "## AetherionOS Integration Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Core Tests ($PASS_COUNT/$TOTAL_TESTS passed)" >> $GITHUB_STEP_SUMMARY
+
+          for LOG in /tmp/qemu-python3-serial.log /tmp/qemu-serial.log; do
+            if grep -q "1764" "$LOG" 2>/dev/null; then
+              echo "- [x] **Python3** \`print(42*42) = 1764\` — ld-musl dynamic linking" >> $GITHUB_STEP_SUMMARY; break
+            fi
+          done
+          for LOG in /tmp/qemu-python3-serial.log /tmp/qemu-serial.log; do
+            if grep -q "PING-OK" "$LOG" 2>/dev/null; then
+              echo "- [x] **ICMP Ping** gateway 10.0.2.2 — VirtIO-Net stack" >> $GITHUB_STEP_SUMMARY; break
+            fi
+          done
+          for LOG in /tmp/qemu-python3-serial.log /tmp/qemu-serial.log; do
+            if grep -q "DNS OK" "$LOG" 2>/dev/null; then
+              echo "- [x] **DNS** example.com → IP resolved" >> $GITHUB_STEP_SUMMARY; break
+            fi
+          done
+          for LOG in /tmp/qemu-python3-serial.log /tmp/qemu-serial.log; do
+            if grep -q "WGET-OK" "$LOG" 2>/dev/null; then
+              echo "- [x] **HTTP wget** example.com downloaded" >> $GITHUB_STEP_SUMMARY; break
+            fi
+          done
+          for LOG in /tmp/qemu-python3-serial.log /tmp/qemu-serial.log; do
+            if grep -q "\[HTTPS\] WGET-OK" "$LOG" 2>/dev/null; then
+              echo "- [x] **HTTPS/TLS 1.3** example.com \`<title>Example Domain</title>\`" >> $GITHUB_STEP_SUMMARY; break
+            fi
+          done
+          for LOG in /tmp/qemu-python3-serial.log /tmp/qemu-serial.log; do
+            if grep -q "APKINDEX-OK" "$LOG" 2>/dev/null; then
+              echo "- [x] **APK Index** 339KB gzip fetched from Alpine CDN" >> $GITHUB_STEP_SUMMARY; break
+            fi
+          done
+          for LOG in /tmp/qemu-python3-serial.log /tmp/qemu-serial.log; do
+            if grep -q "WGET-WRITE-OK" "$LOG" 2>/dev/null; then
+              echo "- [x] **Persistent Storage** wget → ext2 write → read-back verified" >> $GITHUB_STEP_SUMMARY; break
+            fi
+          done
+
+          # Additional markers (informational)
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Additional Checks" >> $GITHUB_STEP_SUMMARY
+          for LOG in /tmp/qemu-python3-serial.log /tmp/qemu-serial.log; do
+            if grep -q "ENTROPY-OK" "$LOG" 2>/dev/null; then
+              echo "- [x] **getrandom()** real entropy (Xorshift128+ TSC-seeded)" >> $GITHUB_STEP_SUMMARY; break
+            fi
+          done
+          for LOG in /tmp/qemu-python3-serial.log /tmp/qemu-serial.log; do
+            if grep -q "BUSYBOX-ELF-OK" "$LOG" 2>/dev/null; then
+              echo "- [x] **BusyBox** valid ELF on ext2" >> $GITHUB_STEP_SUMMARY; break
+            fi
+          done
+          for LOG in /tmp/qemu-python3-serial.log /tmp/qemu-serial.log; do
+            if grep -q "APK-REPO-OK" "$LOG" 2>/dev/null; then
+              echo "- [x] **APK HTTP Mirror** /etc/apk/repositories configured" >> $GITHUB_STEP_SUMMARY; break
+            fi
+          done
+
+          # HARD FAIL only if Python3 (1764) is missing — this is the baseline
           FOUND_1764=false
-          if grep -q "1764" /tmp/qemu-python3-serial.log 2>/dev/null; then
-            FOUND_1764=true
-            echo "Found 1764 in python3 serial log"
-          fi
-          if grep -q "1764" /tmp/qemu-serial.log 2>/dev/null; then
-            FOUND_1764=true
-            echo "Found 1764 in boot serial log"
-          fi
-
-          if [ "$FOUND_1764" = "true" ]; then
-            echo "SUCCESS: Python3 printed 1764 — dynamic linking works!"
-            echo "## QEMU Python3 Test: PASS" >> $GITHUB_STEP_SUMMARY
-            echo "- Python3 successfully computed \`42*42 = 1764\`" >> $GITHUB_STEP_SUMMARY
-            echo "- Dynamic linker (ld-musl) loaded and resolved symbols" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "FAIL: 1764 not found in any serial output"
-            echo "## QEMU Python3 Test: FAIL" >> $GITHUB_STEP_SUMMARY
-            echo "- Python3 did NOT produce output \`1764\`" >> $GITHUB_STEP_SUMMARY
-
+          for LOG in /tmp/qemu-python3-serial.log /tmp/qemu-serial.log; do
+            if grep -q "1764" "$LOG" 2>/dev/null; then FOUND_1764=true; break; fi
+          done
+          if [ "$FOUND_1764" != "true" ]; then
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### Python3 Serial log:" >> $GITHUB_STEP_SUMMARY
+            echo "### ❌ HARD FAIL: Python3 1764 not found" >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
-            cat /tmp/qemu-python3-serial.log >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo '(empty)' >> $GITHUB_STEP_SUMMARY
+            tail -100 /tmp/qemu-python3-serial.log >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo '(empty)' >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
-
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "### Boot Serial log:" >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-            cat /tmp/qemu-serial.log >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo '(empty)' >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
-
-            # HARD FAIL: 1764 must be in the output
             exit 1
           fi
 

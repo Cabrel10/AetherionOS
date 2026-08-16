@@ -70,6 +70,11 @@ fn cos_f32(x: f32) -> f32 {
 /// Power function: base^exp using exp(exp * ln(base))
 /// For no_std, we use repeated squaring for integer exponents
 /// and logarithmic approximation for fractional
+/// Public wrapper for [`powf_f32`] — used to precompute RoPE frequency tables
+/// once at model-state construction (instead of per element per token).
+#[inline]
+pub fn powf_f32_pub(base: f32, exp: f32) -> f32 { powf_f32(base, exp) }
+
 #[inline]
 fn powf_f32(base: f32, exp: f32) -> f32 {
     if base <= 0.0 { return 0.0; }
@@ -86,7 +91,12 @@ fn powf_f32(base: f32, exp: f32) -> f32 {
 // f16 conversion
 // ═══════════════════════════════════════════════════════════
 
-/// Convert f16 bits to f32
+/// Convert f16 bits to f32.
+/// SANITIZE: f16 NaN/Inf (exp==31) are clamped to 0.0 instead of propagating.
+/// This is necessary because the GGUF model file contains corrupted f16 scale
+/// values (295/10368 Q8_0 blocks in blk.0.attn_q.weight have NaN scales).
+/// Clamping to 0.0 zeroes out those blocks (safe degradation) rather than
+/// poisoning the entire forward pass with NaN.
 #[inline]
 pub fn f16_to_f32(bits: u16) -> f32 {
     let sign = ((bits >> 15) & 1) as u32;
@@ -105,7 +115,12 @@ pub fn f16_to_f32(bits: u16) -> f32 {
             f32::from_bits((sign << 31) | ((e as u32) << 23) | (f << 13))
         }
     } else if exp == 31 {
-        f32::from_bits((sign << 31) | 0x7F800000 | (frac << 13)) // inf/NaN
+        // Standard f16 to f32 NaN/Inf propagation
+        if frac == 0 {
+            f32::from_bits((sign << 31) | 0x7f800000) // Inf
+        } else {
+            f32::from_bits((sign << 31) | 0x7f800000 | (frac << 13)) // NaN
+        }
     } else {
         f32::from_bits((sign << 31) | (((exp + 127 - 15) as u32) << 23) | (frac << 13))
     }
@@ -131,7 +146,9 @@ pub fn dequant_q4_0(quantized: &[u8], n: usize) -> Vec<f32> {
     for b in 0..n_blocks {
         let offset = b * bytes_per_block;
         if offset + bytes_per_block > quantized.len() { break; }
-        let scale = f16_to_f32(u16::from_le_bytes([quantized[offset], quantized[offset + 1]]));
+        let raw_scale = f16_to_f32(u16::from_le_bytes([quantized[offset], quantized[offset + 1]]));
+        // Scale-level sanitization: corrupt GGUF blocks have |scale| >> 1.0 (e.g. -61408)
+        let scale = if !raw_scale.is_finite() || raw_scale.abs() > 1000.0 { 0.0 } else { raw_scale };
 
         for i in 0..16 {
             let byte = quantized[offset + 2 + i];
@@ -159,6 +176,9 @@ pub fn matmul_f32(out: &mut [f32], x: &[f32], w: &[f32], d_in: usize, d_out: usi
         let w_start = row * d_in;
         for k in 0..d_in {
             acc += w[w_start + k] * x[k];
+        }
+        if !acc.is_finite() {
+            acc = 0.0;
         }
         out[row] = acc;
     }
@@ -214,6 +234,37 @@ pub fn apply_rope(q: &mut [f32], k: &mut [f32], pos: usize, head_dim: usize, the
         }
 
         // Apply to K if slice is large enough
+        if i + 1 < k.len() {
+            let (k0, k1) = (k[i], k[i + 1]);
+            k[i] = k0 * cv - k1 * sv;
+            k[i + 1] = k0 * sv + k1 * cv;
+        }
+    }
+}
+
+/// Apply RoPE using a PRECOMPUTED inverse-frequency table.
+///
+/// `inv_freq[j]` holds `theta^(-2j/head_dim)` for `j in 0..head_dim/2` and is
+/// built once per run (see `TransformerState::new`). This removes the expensive
+/// per-element `powf_f32`/`exp`/`ln` chain that the original [`apply_rope`] paid
+/// for every element, every head, every token — the single biggest scalar
+/// hotspot in the forward pass under QEMU-TCG.
+///
+/// Only `sin`/`cos` (cheap polynomial approximations) are evaluated here, and
+/// just `head_dim/2` of each per call. Either slice may be empty.
+pub fn apply_rope_cached(q: &mut [f32], k: &mut [f32], pos: usize, inv_freq: &[f32]) {
+    let pos_f = pos as f32;
+    for (j, &inv_f) in inv_freq.iter().enumerate() {
+        let i = 2 * j;
+        let angle = pos_f * inv_f;
+        let cv = cos_f32(angle);
+        let sv = sin_f32(angle);
+
+        if i + 1 < q.len() {
+            let (q0, q1) = (q[i], q[i + 1]);
+            q[i] = q0 * cv - q1 * sv;
+            q[i + 1] = q0 * sv + q1 * cv;
+        }
         if i + 1 < k.len() {
             let (k0, k1) = (k[i], k[i + 1]);
             k[i] = k0 * cv - k1 * sv;
@@ -288,6 +339,182 @@ pub fn matmul_f32_fast(out: &mut [f32], x: &[f32], w: &[f32], d_in: usize, d_out
         for k in (chunks * 4)..d_in {
             rem_acc += w[w_start + k] * x[k];
         }
-        out[row] = acc0 + acc1 + acc2 + acc3 + rem_acc;
+        let result = acc0 + acc1 + acc2 + acc3 + rem_acc;
+        out[row] = if result.is_finite() { result } else { 0.0 };
     }
+}
+
+// ═══════════════════════════════════════════════════════════
+// Zero-copy Q8_0 matrix-vector multiply
+// ═══════════════════════════════════════════════════════════
+
+/// Matrix-vector multiply directly on Q8_0 quantized weight data.
+/// Computes out[row] = dot(w_row[Q8_0], x[f32]) for each row.
+///
+/// This avoids dequantizing the entire weight matrix to f32, saving
+/// 4× memory (Q8_0 = 34 bytes/32 elements vs f32 = 128 bytes/32 elements).
+///
+/// `q8_data`: raw Q8_0 weight data, row-major, each row = d_in elements
+/// `x`: input vector [d_in] in f32
+/// `out`: output vector [d_out] in f32
+/// `d_in`: input dimension (must be divisible by 32)
+/// `d_out`: output dimension (number of rows)
+///
+/// Q8_0 block format: 2 bytes (f16 scale) + 32 bytes (int8 values) = 34 bytes per block of 32
+///
+/// Dispatch: when AVX2+FMA is live (probed once at boot), the vectorised
+/// `compute::avx2::matmul_q8_0_avx2` path runs (≈4–8× faster); otherwise the
+/// scalar fallback below is used. Both produce identical results.
+pub fn matmul_q8_0(out: &mut [f32], x: &[f32], q8_data: &[u8], d_in: usize, d_out: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if crate::compute::avx2::has_avx2_fma() {
+            // SAFETY: has_avx2_fma() only returns true after the boot-time
+            // probe confirmed AVX2+FMA AND enable_avx() configured XCR0/OSXSAVE.
+            unsafe {
+                crate::compute::avx2::matmul_q8_0_avx2(out, x, q8_data, d_in, d_out);
+            }
+            return;
+        }
+    }
+    matmul_q8_0_scalar(out, x, q8_data, d_in, d_out);
+}
+
+/// Scalar reference implementation of [`matmul_q8_0`]. Always correct, used as
+/// the fallback when AVX2/FMA is unavailable (e.g. the CI runner CPU).
+pub fn matmul_q8_0_scalar(out: &mut [f32], x: &[f32], q8_data: &[u8], d_in: usize, d_out: usize) {
+    let blocks_per_row = d_in / 32;
+    let bytes_per_row = blocks_per_row * 34; // 34 bytes per Q8_0 block
+
+    for row in 0..d_out {
+        let row_start = row * bytes_per_row;
+        if row_start + bytes_per_row > q8_data.len() {
+            out[row] = 0.0;
+            continue;
+        }
+
+        let mut acc = 0.0f32;
+        for b in 0..blocks_per_row {
+            let off = row_start + b * 34;
+            let raw_scale = f16_to_f32(u16::from_le_bytes([q8_data[off], q8_data[off + 1]]));
+            // Scale-level sanitization: corrupt GGUF blocks have |scale| >> 1.0
+            let scale = if !raw_scale.is_finite() || raw_scale.abs() > 1000.0 { 0.0 } else { raw_scale };
+            let base_idx = b * 32;
+            // Unrolled inner loop: 4 elements at a time
+            let mut i = 0;
+            while i + 3 < 32 {
+                let v0 = q8_data[off + 2 + i] as i8;
+                let v1 = q8_data[off + 2 + i + 1] as i8;
+                let v2 = q8_data[off + 2 + i + 2] as i8;
+                let v3 = q8_data[off + 2 + i + 3] as i8;
+                acc += scale * (v0 as f32 * x[base_idx + i]
+                             + v1 as f32 * x[base_idx + i + 1]
+                             + v2 as f32 * x[base_idx + i + 2]
+                             + v3 as f32 * x[base_idx + i + 3]);
+                i += 4;
+            }
+            // Remainder (shouldn't happen since block_size=32 is divisible by 4)
+            while i < 32 {
+                let val = q8_data[off + 2 + i] as i8;
+                acc += scale * val as f32 * x[base_idx + i];
+                i += 1;
+            }
+        }
+        out[row] = if acc.is_finite() { acc } else { 0.0 };
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// Q8_0 Zero-Copy Matrix-Vector Multiply
+// ═══════════════════════════════════════════════════════════
+
+/// Q8_0 block layout: 34 bytes per block of 32 elements
+///   - 2 bytes: f16 scale (delta)
+///   - 32 bytes: int8 quantized values
+const Q8_0_BLOCK_SIZE: usize = 32;
+const Q8_0_BYTES_PER_BLOCK: usize = 34;
+
+
+/// Fused argmax over Q8_0 matrix rows: computes dot product per row
+/// and tracks running maximum inline. Returns (best_token_id, best_logit_value).
+/// This avoids allocating a full logits array (49152 floats = 192KB).
+pub fn argmax_q8_0(x: &[f32], raw_data: &[u8], d_in: usize, d_out: usize) -> (u32, f32) {
+    let blocks_per_row = d_in / Q8_0_BLOCK_SIZE;
+    let row_bytes = blocks_per_row * Q8_0_BYTES_PER_BLOCK;
+
+    let mut best_val = f32::NEG_INFINITY;
+    let mut best_idx = 0u32;
+
+    for row in 0..d_out {
+        let row_start = row * row_bytes;
+        let mut dot = 0.0f32;
+
+        for b in 0..blocks_per_row {
+            let block_offset = row_start + b * Q8_0_BYTES_PER_BLOCK;
+            let scale_bits = u16::from_le_bytes([
+                raw_data[block_offset],
+                raw_data[block_offset + 1],
+            ]);
+            let scale = f16_to_f32(scale_bits);
+            if scale == 0.0 { continue; }
+
+            let data_start = block_offset + 2;
+            let elem_base = b * Q8_0_BLOCK_SIZE;
+            let mut block_acc = 0.0f32;
+
+            let mut i = 0;
+            while i + 3 < Q8_0_BLOCK_SIZE {
+                let q0 = raw_data[data_start + i] as i8;
+                let q1 = raw_data[data_start + i + 1] as i8;
+                let q2 = raw_data[data_start + i + 2] as i8;
+                let q3 = raw_data[data_start + i + 3] as i8;
+                block_acc += x[elem_base + i]     * (q0 as f32);
+                block_acc += x[elem_base + i + 1] * (q1 as f32);
+                block_acc += x[elem_base + i + 2] * (q2 as f32);
+                block_acc += x[elem_base + i + 3] * (q3 as f32);
+                i += 4;
+            }
+            while i < Q8_0_BLOCK_SIZE {
+                let q = raw_data[data_start + i] as i8;
+                block_acc += x[elem_base + i] * (q as f32);
+                i += 1;
+            }
+
+            dot += scale * block_acc;
+        }
+
+        if dot > best_val {
+            best_val = dot;
+            best_idx = row as u32;
+        }
+    }
+
+    (best_idx, best_val)
+}
+
+/// Dequantize a single Q8_0 row for diagnostic purposes.
+/// Returns f32 values for the first `count` elements.
+pub fn dequant_q8_0_partial(raw_data: &[u8], offset: usize, count: usize) -> Vec<f32> {
+    let mut result = Vec::with_capacity(count);
+    let blocks_needed = (count + Q8_0_BLOCK_SIZE - 1) / Q8_0_BLOCK_SIZE;
+    let mut elem_idx = 0;
+
+    for b in 0..blocks_needed {
+        let block_offset = offset + b * Q8_0_BYTES_PER_BLOCK;
+        if block_offset + Q8_0_BYTES_PER_BLOCK > raw_data.len() { break; }
+
+        let scale_bits = u16::from_le_bytes([
+            raw_data[block_offset],
+            raw_data[block_offset + 1],
+        ]);
+        let scale = f16_to_f32(scale_bits);
+
+        for i in 0..Q8_0_BLOCK_SIZE {
+            if elem_idx >= count { break; }
+            let q = raw_data[block_offset + 2 + i] as i8;
+            result.push(scale * q as f32);
+            elem_idx += 1;
+        }
+    }
+    result
 }

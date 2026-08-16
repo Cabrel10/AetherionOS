@@ -73,8 +73,14 @@ impl core::fmt::Display for VfsError {
 /// A node in the virtual filesystem tree
 #[derive(Debug, Clone)]
 pub enum VfsNode {
-    /// A file with data content
+    /// A file with data content (heap-allocated)
     File(Vec<u8>),
+    /// A file backed by static data (zero-copy, no heap allocation).
+    /// Used for `include_bytes!` binaries embedded in the kernel image.
+    /// Eliminates 1.1 MB+ heap allocations during boot that caused triple faults
+    /// when the linked_list_allocator couldn't satisfy large contiguous requests
+    /// inside a VFS mutex lock.
+    StaticFile(&'static [u8]),
     /// A directory containing child nodes
     Directory(BTreeMap<String, VfsNode>),
     /// A mounted device with manifest
@@ -418,6 +424,11 @@ pub fn file_write(path: &str, data: &[u8]) -> Result<usize, VfsError> {
                 file_data.extend_from_slice(data);
                 bytes_written = data.len();
             }
+            VfsNode::StaticFile(_) => {
+                // Upgrade StaticFile to heap-allocated File on write
+                *node = VfsNode::File(Vec::from(data));
+                bytes_written = data.len();
+            }
             VfsNode::Directory(_) | VfsNode::Symlink(_) => {
                 VFS_METRICS.errors_count.fetch_add(1, Ordering::Relaxed);
                 return Err(VfsError::PermissionDenied);
@@ -478,6 +489,13 @@ pub fn file_read(path: &str) -> Result<Vec<u8>, VfsError> {
                         bus_publish_event(VFS_READ, data.len() as u64);
                         return Ok(data);
                     }
+                    VfsNode::StaticFile(static_data) => {
+                        let data = Vec::from(*static_data);
+                        VFS_METRICS.total_bytes_read
+                            .fetch_add(data.len() as u64, Ordering::Relaxed);
+                        bus_publish_event(VFS_READ, data.len() as u64);
+                        return Ok(data);
+                    }
                     VfsNode::Directory(_) => {
                         VFS_METRICS.errors_count.fetch_add(1, Ordering::Relaxed);
                         return Err(VfsError::PermissionDenied);
@@ -490,8 +508,10 @@ pub fn file_read(path: &str) -> Result<Vec<u8>, VfsError> {
                 }
             }
             None => {
-                // VFS miss — try ext2 filesystem as fallback
-                drop(root); // release VFS lock before ext2 I/O
+                // VFS miss — release lock before doing any I/O
+                drop(root);
+
+                // Fallback 1: try ext2 filesystem
                 if crate::fs::ext2::is_mounted() {
                     if let Some(ext2_data) = crate::fs::ext2::read_file_by_path(path) {
                         VFS_METRICS.total_bytes_read
@@ -500,22 +520,20 @@ pub fn file_read(path: &str) -> Result<Vec<u8>, VfsError> {
                         return Ok(ext2_data);
                     }
                 }
+
+                // Fallback 2: multi-backend VFS mount table (procfs, devfs, sysfs, etc.)
+                if let Ok(data) = crate::fs::vfs_backend::backend_read(path) {
+                    VFS_METRICS
+                        .total_bytes_read
+                        .fetch_add(data.len() as u64, Ordering::Relaxed);
+                    bus_publish_event(VFS_READ, data.len() as u64);
+                    return Ok(data);
+                }
+
                 VFS_METRICS.errors_count.fetch_add(1, Ordering::Relaxed);
                 return Err(VfsError::NotFound);
             }
         }
-    }
-
-    // Fall through to multi-backend VFS (ext2, procfs, devfs, sysfs)
-    match crate::fs::vfs_backend::backend_read(path) {
-        Ok(data) => {
-            VFS_METRICS
-                .total_bytes_read
-                .fetch_add(data.len() as u64, Ordering::Relaxed);
-            bus_publish_event(VFS_READ, data.len() as u64);
-            Ok(data)
-        }
-        Err(_) => Err(VfsError::NotFound),
     }
 }
 
@@ -534,9 +552,10 @@ pub fn file_read_at_offset(path: &str, offset: u64, buf: &mut [u8]) -> usize {
         let node = find_node(&root, &components);
 
         if let Some(n) = node {
-            let file_data = match n {
-                VfsNode::File(ref data) => data,
-                VfsNode::Device { data: ref device_data, .. } => device_data,
+            let file_data: &[u8] = match n {
+                VfsNode::File(ref data) => data.as_slice(),
+                VfsNode::StaticFile(data) => data,
+                VfsNode::Device { data: ref device_data, .. } => device_data.as_slice(),
                 _ => return 0,
             };
             let off = offset as usize;
@@ -555,6 +574,25 @@ pub fn file_read_at_offset(path: &str, offset: u64, buf: &mut [u8]) -> usize {
         return crate::fs::ext2::read_file_chunk(path, offset, buf);
     }
     0
+}
+
+/// Return (size, mode) for a VFS node at the given path.
+/// Uses the reliable `find_node` traversal.  Does NOT allocate
+/// or copy file data — only inspects the node variant.
+/// Returns None when the path does not exist in the in-memory VFS.
+pub fn file_stat(path: &str) -> Option<(u64, u32)> {
+    let components = path_components(path);
+    if components.is_empty() { return None; }
+
+    let root = VFS_ROOT.lock();
+    match find_node(&root, &components) {
+        Some(VfsNode::File(data))       => Some((data.len() as u64, 0o100755)),
+        Some(VfsNode::StaticFile(data)) => Some((data.len() as u64, 0o100755)),
+        Some(VfsNode::Device { data, .. }) => Some((data.len() as u64, 0o100644)),
+        Some(VfsNode::Directory(_))     => Some((0, 0o40755)),
+        Some(VfsNode::Symlink(_))       => Some((0, 0o120777)),
+        None                            => None,
+    }
 }
 
 /// List entries at a given path (directory listing)
@@ -674,7 +712,7 @@ pub fn unlink(path: &str) -> Result<(), VfsError> {
     };
 
     match parent.get(target_name[0]) {
-        Some(VfsNode::File(_)) => {
+        Some(VfsNode::File(_)) | Some(VfsNode::StaticFile(_)) => {
             parent.remove(target_name[0]);
             crate::serial_println!("[VFS] unlink: removed {}", path);
             Ok(())
@@ -886,6 +924,17 @@ pub fn init() -> Result<(), VfsError> {
         input_dir.insert(String::from("event1"), VfsNode::File(Vec::new())); // mouse
         input_dir.insert(String::from("mice"),   VfsNode::File(Vec::new())); // legacy mouse
         dev_dir.insert(String::from("input"), VfsNode::Directory(input_dir));
+
+        // /dev/dri — Direct Rendering Manager nodes for Mesa.
+        // card0      = the primary KMS/DRM node (major 226, minor 0)
+        // renderD128 = the render-only node (major 226, minor 128)
+        // These respond to DRM_IOCTL_VERSION (in sys_ioctl) by identifying the
+        // driver as "aether_swrast", which is what Mesa's loader needs to bring
+        // up the software (LLVMpipe / swrast) rendering path on this machine.
+        let mut dri_dir = BTreeMap::new();
+        dri_dir.insert(String::from("card0"), VfsNode::File(Vec::new()));
+        dri_dir.insert(String::from("renderD128"), VfsNode::File(Vec::new()));
+        dev_dir.insert(String::from("dri"), VfsNode::Directory(dri_dir));
 
         root.insert(String::from("dev"), VfsNode::Directory(dev_dir));
 

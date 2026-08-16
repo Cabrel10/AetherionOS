@@ -359,10 +359,16 @@ pub fn wake_application_processors() {
             continue;
         }
 
-        // Only wake up to Core 1 for now (single AP support)
-        // Additional cores are parked via CPUID check in ap_main
-        let core_idx = (woken + 1) as usize;
-        if core_idx >= MAX_CPUS { break; }
+        // The AP's per-core index MUST equal its APIC ID, because ap_main
+        // derives core_id from CPUID (its APIC ID) and indexes the per-core
+        // GDT/TSS/SYSCALL arrays with it. Using woken+1 here would mismatch
+        // when APIC IDs are non-contiguous, loading the wrong TSS/stack.
+        let core_idx = target_apic_id as usize;
+        if core_idx >= MAX_CPUS {
+            crate::serial_println!("[SMP] AP APIC ID {} exceeds MAX_CPUS={}, skipping",
+                target_apic_id, MAX_CPUS);
+            continue;
+        }
 
         crate::serial_println!("[SMP] Waking AP {} (APIC ID {}), core_idx={}...",
             cpu_idx, target_apic_id, core_idx);
@@ -415,7 +421,13 @@ pub fn wake_application_processors() {
             apic_write(APIC_ICR_LOW, ICR_STARTUP | startup_page);
         }
 
-        // 7f: Spinwait for sync_flag == 1 (AP acknowledges boot)
+        // 7f: Spinwait for sync_flag == 1 (this AP acknowledges boot).
+        //
+        // IMPORTANT: we must NOT short-circuit on the global AP_ALIVE flag.
+        // AP_ALIVE is sticky (set true by the FIRST AP and never cleared), so
+        // for the 2nd/3rd AP it would falsely read "alive" before that AP has
+        // actually booted. The per-AP sync_flag (cleared in step 7b) is the
+        // only reliable per-AP handshake.
         let mut ap_ok = false;
         for wait_iter in 0..100u32 {
             busy_wait_us(1_000); // 1ms per poll, 100ms timeout
@@ -425,12 +437,9 @@ pub fn wake_application_processors() {
                 core::ptr::read_unaligned(sync_ptr)
             };
 
-            // Also check AP_ALIVE for the Rust-side signal
-            let alive = AP_ALIVE.load(Ordering::SeqCst);
-
-            if sync == 1 || alive {
-                crate::serial_println!("[SMP] AP {} (APIC ID {}) responded (sync={}, alive={}, {}ms)",
-                    cpu_idx, target_apic_id, sync, alive, wait_iter);
+            if sync == 1 {
+                crate::serial_println!("[SMP] AP {} (APIC ID {}) responded (sync=1, {}ms)",
+                    cpu_idx, target_apic_id, wait_iter);
                 ap_ok = true;
                 break;
             }
@@ -445,8 +454,8 @@ pub fn wake_application_processors() {
             crate::serial_println!("[SMP] AP {} (APIC ID {}) TIMEOUT — skipping", cpu_idx, target_apic_id);
         }
 
-        // Only need Core 1 for now
-        if woken >= 1 { break; }
+        // Continue to the next AP — wake ALL discovered cores, not just one.
+        // (Previously stopped after the first AP, capping the OS at 2 cores.)
     }
 
     // Step 8: Update global state
@@ -458,8 +467,12 @@ pub fn wake_application_processors() {
     crate::serial_println!("[SMP]   BSP APIC ID: {}", bsp_id);
 
     if woken > 0 {
+        // LLM inference uses Core 1 as the primary worker; with >1 AP the
+        // attention-head split fans out across cores 1..=woken (see
+        // llm_worker_cores()). Core 0 (BSP) stays reserved for OS/UI.
         LLM_CORE_AFFINITY.store(1, Ordering::SeqCst);
-        crate::serial_println!("[SMP] LLM inference affinity: Core 1");
+        crate::serial_println!("[SMP] LLM inference: {} worker core(s) (cores 1..={})",
+            woken, woken);
     } else {
         // Fallback: ACPI detected cores but SIPI failed
         let acpi_n = crate::arch::x86_64::acpi::cpu_count();
@@ -501,8 +514,9 @@ pub extern "C" fn ap_main() -> ! {
     // CPUID leaf 1 returns the initial APIC ID in EBX[31:24].
     // This is safe on the temp stack (0x7000) because CPUID touches
     // no memory, needs no GDT/IDT, and works immediately in long mode.
-    // With -smp 4, APs have APIC IDs 1, 2, 3.
-    // Only Core 1 proceeds to full initialization; others park via HLT.
+    // With -smp 4, APs have APIC IDs 1, 2, 3 — ALL of them now do full
+    // initialisation (previously only Core 1 did; the others were parked
+    // in HLT, which is why the OS effectively used at most 2 cores).
     // ─────────────────────────────────────────────────────────────
     let apic_id: u8 = unsafe {
         let id: u32;
@@ -524,19 +538,19 @@ pub extern "C" fn ap_main() -> ! {
         id as u8
     };
 
-    // Only Core 1 (APIC ID 1) does full init. Others park safely via HLT.
-    if apic_id != 1 {
-        // Park: this AP enters an idle HLT loop forever.
-        // No GDT/TSS/SYSCALL/IDT needed — just stop executing.
+    // Park any AP whose APIC ID exceeds the per-core resource arrays
+    // (GDT/TSS/SYSCALL stacks are sized for MAX_CPUS). This is a safety
+    // bound, not the old "only core 1" restriction.
+    if (apic_id as usize) >= MAX_CPUS || apic_id == 0 {
         loop {
             unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
         }
     }
 
-    // After this point, we KNOW we're Core 1. Use a constant to avoid
-    // the local `apic_id` becoming invalid after the stack switch in Stage 2.
-    // (The compiler may spill `apic_id` to the old temp stack at 0x7000.)
-    let core_id: u8 = 1;
+    // The APIC ID IS this core's stable index. CPUID reads it from a
+    // register (no memory), so it survives the stack switch in Stage 2.
+    // We keep it in `core_id` and re-derive per-core resources from it.
+    let core_id: u8 = apic_id;
 
     // ─────────────────────────────────────────────────────────────
     // STAGE 1: Synchronize CPU state with BSP (still on temp stack 0x7000)
@@ -579,10 +593,10 @@ pub extern "C" fn ap_main() -> ! {
 
     // ─────────────────────────────────────────────────────────────
     // STAGE 3: Load per-core GDT + TSS (Jalon 102)
-    // This gives Core 1 its own TSS with its own RSP0 and IST stacks.
+    // This gives each AP its own TSS with its own RSP0 and IST stacks.
     // Without this, Ring3->Ring0 transitions corrupt Core 0's stack.
     // ─────────────────────────────────────────────────────────────
-    crate::arch::x86_64::gdt::create_and_load_per_core_gdt(1);
+    crate::arch::x86_64::gdt::create_and_load_per_core_gdt(core_id);
 
     // ─────────────────────────────────────────────────────────────
     // STAGE 4: Load the shared IDT
@@ -595,7 +609,7 @@ pub extern "C" fn ap_main() -> ! {
     // Programs EFER.SCE, STAR, LSTAR, FMASK, KERNEL_GS_BASE
     // pointing to this core's own PerCpuData + syscall stack.
     // ─────────────────────────────────────────────────────────────
-    crate::arch::x86_64::syscall::init_per_core_syscall(1);
+    crate::arch::x86_64::syscall::init_per_core_syscall(core_id);
 
     // ─────────────────────────────────────────────────────────────
     // STAGE 6: Enable FPU/SSE/AVX on this AP core
@@ -651,7 +665,10 @@ pub extern "C" fn ap_main() -> ! {
     // The loop uses direct IRETQ (not launch_next_userspace_process)
     // because yield_to_next already dequeued the PID from the scheduler.
     // ─────────────────────────────────────────────────────────────
-    crate::serial_println!("[SMP] Core 1: per-core GDT/TSS + SYSCALL ready, entering dispatch loop");
+    // NOTE: CPU_COUNT / AP_COUNT are updated authoritatively by the BSP in
+    // wake_application_processors() after the sequential sync_flag handshake.
+    // The AP must NOT increment them here (would double-count / race).
+    crate::serial_println!("[SMP] Core {}: per-core GDT/TSS + SYSCALL ready, entering dispatch loop", core_id);
 
     // Spin-wait dispatch loop: keep checking for work.
     // Use PAUSE for power efficiency. Once a process is found, IRETQ to Ring 3.
@@ -659,19 +676,37 @@ pub extern "C" fn ap_main() -> ! {
     // re-enter this loop.
     let mut poll_count: u64 = 0;
     loop {
+        // Before scheduling Ring-3 work, drain any pending parallel LLM
+        // matmul work dispatched by the BSP. This lets APs contribute to the
+        // transformer forward pass (attention-head / row-range splitting).
+        check_parallel_work();
+
+        // REAL in-kernel logit-projection parallelism: this AP computes its
+        // assigned slice of the 49152-vocab argmax when the BSP publishes a job.
+        // (Replaces the userspace-stub work queue with actual computation, so
+        //  the 4 detected cores are 4 *used* cores during inference.)
+        if crate::llm::parallel::try_run_worker(core_id as usize) {
+            // Did real work this poll — reset back-off so we stay hot for the
+            // remaining slices of the same forward pass.
+            poll_count = 0;
+        }
+
+        // yield_to_next() takes the CURRENT pid (0 = none); it derives this
+        // core's affinity internally via apic::current_core(), so passing 0 is
+        // correct for every AP — the scheduler routes work by core_id itself.
         let next_pid = crate::scheduler::yield_to_next(0);
         if next_pid != 0 {
             // Get the process's entry state (entry_point, stack_pointer, pml4_phys)
             if let Some((entry, stack, pml4)) = crate::process::get_entry_state(next_pid) {
                 if entry != 0 && pml4 != 0 {
-                    crate::serial_println!("[SMP] Core 1 dispatching PID {} to Ring 3 (entry=0x{:X})", next_pid, entry);
+                    crate::serial_println!("[SMP] Core {} dispatching PID {} to Ring 3 (entry=0x{:X})", core_id, next_pid, entry);
 
                     // Set scheduler state
                     crate::scheduler::set_current_pid(next_pid);
                     let _ = crate::process::set_state(next_pid, crate::process::ProcessState::Running);
 
                     // Reset GS bases for this core before IRETQ
-                    crate::arch::x86_64::syscall::reset_gs_bases_for_core(1);
+                    crate::arch::x86_64::syscall::reset_gs_bases_for_core(core_id);
 
                     // IRETQ to Ring 3: push SS, RSP, RFLAGS, CS, RIP
                     unsafe {
@@ -750,6 +785,14 @@ pub fn current_core() -> u32 {
 
 /// Check if SMP is available
 pub fn is_smp() -> bool { cpu_count() > 1 }
+
+/// Number of AP worker cores available for LLM forward-pass parallelization
+/// (i.e. cores 1..=N, excluding the BSP which is reserved for OS/UI).
+/// Returns 0 when running single-core, in which case the LLM runs entirely
+/// on the BSP. This is the value used to split attention heads across cores.
+pub fn llm_worker_cores() -> u32 {
+    AP_COUNT.load(Ordering::SeqCst)
+}
 
 /// Get LLM affinity core
 pub fn llm_affinity_core() -> u32 { LLM_CORE_AFFINITY.load(Ordering::SeqCst) }

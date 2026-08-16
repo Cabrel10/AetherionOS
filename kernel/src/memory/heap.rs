@@ -14,9 +14,10 @@ use linked_list_allocator::LockedHeap;
 /// Adresse de debut du heap
 pub const HEAP_START: usize = 0x_4444_4444_0000;
 
-/// Taille du heap: 64 MB (supports LLM weight loading, FAT32 cache, TCP/IP, agents)
-/// Increased from 8 MB to handle GGUF tensor data in kernel space
-pub const HEAP_SIZE: usize = 64 * 1024 * 1024;
+/// Taille du heap: 256 MB — needed for zero-copy Q8_0 LLM inference (30-layer SmolLM2 = ~142 MB).
+/// Mapping optimization: pages are mapped in batches with deferred TLB flush
+/// to avoid the slow per-page flush that previously took >3 min.
+pub const HEAP_SIZE: usize = 256 * 1024 * 1024;
 
 /// Nombre de pages necessaires pour le heap
 const HEAP_PAGES: usize = (HEAP_SIZE + 4095) / 4096;
@@ -40,22 +41,58 @@ pub fn init_heap(
     
     let heap_start = VirtAddr::new(HEAP_START as u64);
 
-    crate::serial_write("[HEAP] Mapping pages...\n");
+    {
+        use core::fmt::Write;
+        let mut s = arrayvec::ArrayString::<128>::new();
+        let _ = writeln!(s, "[HEAP] Mapping {} pages ({} MB)...", HEAP_PAGES, HEAP_SIZE / 1024 / 1024);
+        crate::serial_write(&s);
+    }
     
-    // Map each heap page
-    for i in 0..HEAP_PAGES {
-        let page = Page::containing_address(heap_start + (i * 4096) as u64);
+    // Map each heap page with DEFERRED TLB flush for speed.
+    // Instead of flushing TLB per-page (slow: 65536 invlpg instructions),
+    // we skip individual flushes and do one global TLB flush at the end.
+    {
+        use x86_64::structures::paging::mapper::Mapper;
+        for i in 0..HEAP_PAGES {
+            let page = Page::containing_address(heap_start + (i * 4096) as u64);
+            
+            let frame = frame_allocator
+                .alloc_frame_kernel()
+                .ok_or(MemoryError::OutOfMemory)?;
+            
+            // SAFETY: page and frame are valid, non-overlapping. We deliberately
+            // skip the per-page TLB flush (forget the flusher) and do a bulk flush below.
+            let result = unsafe {
+                page_table.mapper.map_to(page, frame, flags::KERNEL_DATA, frame_allocator)
+            };
+            match result {
+                Ok(flusher) => {
+                    // DELIBERATELY skip flusher.flush() — we'll do a bulk flush below
+                    flusher.ignore();
+                }
+                Err(_) => return Err(MemoryError::HeapInitFailed),
+            }
+            
+            // Progress report every 16384 pages (~64 MB)
+            if (i + 1) % 16384 == 0 {
+                use core::fmt::Write;
+                let mut s = arrayvec::ArrayString::<64>::new();
+                let _ = writeln!(s, "[HEAP] {}MB mapped...", (i + 1) * 4 / 1024);
+                crate::serial_write(&s);
+            }
+        }
         
-        let frame = frame_allocator
-            .alloc_frame_kernel()
-            .ok_or(MemoryError::OutOfMemory)?;
-        
-        // SAFETY: page and frame are valid, non-overlapping. The frame comes from
-        // bootloader's usable memory regions. flags::KERNEL_DATA = PRESENT | WRITABLE.
-        // frame_allocator provides frames for intermediate page tables (P3/P2/P1).
-        page_table
-            .map_page(page, frame, flags::KERNEL_DATA, frame_allocator)
-            .map_err(|_| MemoryError::HeapInitFailed)?;
+        // SAFETY: Global TLB flush — reload CR3 to flush all TLB entries.
+        // This is safe because all page table modifications are complete.
+        unsafe {
+            core::arch::asm!(
+                "mov rax, cr3",
+                "mov cr3, rax",
+                out("rax") _,
+                options(nostack, nomem)
+            );
+        }
+        crate::serial_write("[HEAP] TLB flushed (bulk)\n");
     }
     
     crate::serial_write("[HEAP] Pages mapped, initializing allocator...\n");

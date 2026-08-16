@@ -422,11 +422,26 @@ pub fn linux_brk(addr: u64) -> u64 {
     }
 }
 
-/// Linux getuid/geteuid/getgid/getegid — return sensible defaults
-pub fn linux_getuid() -> u64 { 0 }    // root for Kali compatibility
-pub fn linux_geteuid() -> u64 { 0 }   // root
-pub fn linux_getgid() -> u64 { 0 }    // root group
-pub fn linux_getegid() -> u64 { 0 }   // root group
+/// Current process UID, read from the real process table.
+/// Falls back to 0 (root) when the caller has no process entry (early kernel
+/// boot / pure-kernel contexts) — this preserves Kali/BusyBox compatibility
+/// for PID 1 and its direct children spawned as root.
+fn current_uid() -> u64 {
+    let pid = crate::scheduler::current_pid();
+    crate::process::with_process(pid, |p| p.uid).unwrap_or(0) as u64
+}
+/// Current process GID (same fallback policy as current_uid).
+fn current_gid() -> u64 {
+    let pid = crate::scheduler::current_pid();
+    crate::process::with_process(pid, |p| p.gid).unwrap_or(0) as u64
+}
+
+/// Linux getuid/geteuid/getgid/getegid — return the REAL process credentials
+/// (was hardcoded 0 for everyone, which defeated all privilege separation).
+pub fn linux_getuid() -> u64 { current_uid() }
+pub fn linux_geteuid() -> u64 { current_uid() }
+pub fn linux_getgid() -> u64 { current_gid() }
+pub fn linux_getegid() -> u64 { current_gid() }
 
 /// Linux getpid — return process ID
 pub fn linux_getpid() -> u64 {
@@ -468,60 +483,139 @@ pub fn linux_prlimit64(_pid: u64, _resource: u64, _new_rlim: u64, old_rlim: u64)
 // Additional Linux Syscalls for Busybox/sudo/bash (Jalon 94-95)
 // ═══════════════════════════════════════════════════════════
 
-/// Linux setuid(uid) — stub: accept silently (root)
-pub fn linux_setuid(_uid: u64) -> u64 { 0 }
-/// Linux setgid(gid) — stub: accept silently (root)
-pub fn linux_setgid(_gid: u64) -> u64 { 0 }
-/// Linux setreuid(ruid, euid) — stub: accept
-pub fn linux_setreuid(_ruid: u64, _euid: u64) -> u64 { 0 }
-/// Linux setregid(rgid, egid) — stub: accept
-pub fn linux_setregid(_rgid: u64, _egid: u64) -> u64 { 0 }
-/// Linux setresuid(ruid, euid, suid)
-pub fn linux_setresuid(_ruid: u64, _euid: u64, _suid: u64) -> u64 { 0 }
-/// Linux setresgid(rgid, egid, sgid)
-pub fn linux_setresgid(_rgid: u64, _egid: u64, _sgid: u64) -> u64 { 0 }
-/// Linux getresuid(ruid, euid, suid)
+/// Linux setuid(uid) — REAL semantics: only UID 0 may set an arbitrary UID;
+/// a non-root caller may only set its own UID (no-op). Updates the process
+/// table so subsequent getuid() reflects the change.
+pub fn linux_setuid(uid: u64) -> u64 {
+    let pid = crate::scheduler::current_pid();
+    let cur = current_uid();
+    if cur != 0 && uid != cur {
+        return (-1i64) as u64; // EPERM — unprivileged UID change refused
+    }
+    let _ = crate::process::with_process_mut(pid, |p| {
+        p.uid = uid as u32;
+        p.gid = uid as u32; // mirror: single-user model, gid follows uid
+    });
+    0
+}
+/// Linux setgid(gid) — REAL semantics: only root may set an arbitrary GID.
+pub fn linux_setgid(gid: u64) -> u64 {
+    let pid = crate::scheduler::current_pid();
+    let cur = current_uid();
+    if cur != 0 && gid != current_gid() {
+        return (-1i64) as u64; // EPERM
+    }
+    let _ = crate::process::with_process_mut(pid, |p| p.gid = gid as u32);
+    0
+}
+/// Linux setreuid(ruid, euid) — enforced: only root may change to another UID.
+/// -1 (0xFFFF_FFFF) means "leave unchanged" per POSIX.
+pub fn linux_setreuid(ruid: u64, euid: u64) -> u64 {
+    let cur = current_uid();
+    let want_r = if ruid == u64::from(u32::MAX) { cur } else { ruid };
+    let want_e = if euid == u64::from(u32::MAX) { cur } else { euid };
+    if cur != 0 && (want_r != cur || want_e != cur) {
+        return (-1i64) as u64; // EPERM
+    }
+    let pid = crate::scheduler::current_pid();
+    let _ = crate::process::with_process_mut(pid, |p| p.uid = want_e as u32);
+    0
+}
+/// Linux setregid(rgid, egid) — enforced: only root may change to another GID.
+pub fn linux_setregid(rgid: u64, egid: u64) -> u64 {
+    let cur = current_uid();
+    let cg = current_gid();
+    let want_r = if rgid == u64::from(u32::MAX) { cg } else { rgid };
+    let want_e = if egid == u64::from(u32::MAX) { cg } else { egid };
+    if cur != 0 && (want_r != cg || want_e != cg) {
+        return (-1i64) as u64; // EPERM
+    }
+    let pid = crate::scheduler::current_pid();
+    let _ = crate::process::with_process_mut(pid, |p| p.gid = want_e as u32);
+    0
+}
+/// Linux setresuid(ruid, euid, suid) — enforced for the effective UID.
+pub fn linux_setresuid(_ruid: u64, euid: u64, _suid: u64) -> u64 {
+    let cur = current_uid();
+    if cur != 0 && euid != u64::from(u32::MAX) && euid != cur {
+        return (-1i64) as u64; // EPERM
+    }
+    if euid != u64::from(u32::MAX) {
+        let pid = crate::scheduler::current_pid();
+        let _ = crate::process::with_process_mut(pid, |p| p.uid = euid as u32);
+    }
+    0
+}
+/// Linux setresgid(rgid, egid, sgid) — enforced for the effective GID.
+pub fn linux_setresgid(_rgid: u64, egid: u64, _sgid: u64) -> u64 {
+    let cur = current_uid();
+    let cg = current_gid();
+    if cur != 0 && egid != u64::from(u32::MAX) && egid != cg {
+        return (-1i64) as u64; // EPERM
+    }
+    if egid != u64::from(u32::MAX) {
+        let pid = crate::scheduler::current_pid();
+        let _ = crate::process::with_process_mut(pid, |p| p.gid = egid as u32);
+    }
+    0
+}
+/// Linux getresuid(ruid, euid, suid) — report the real process UID in all 3 slots
+/// (single-UID model: real == effective == saved).
 pub fn linux_getresuid(ruid: u64, euid: u64, suid: u64) -> u64 {
-    let zero_buf = 0u32.to_le_bytes();
+    let uid_buf = (current_uid() as u32).to_le_bytes();
     for addr in [ruid, euid, suid] {
         if addr != 0 && crate::arch::x86_64::syscall::validate_user_ptr_pub(addr, 4) {
-            unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(addr, &zero_buf); }
+            unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(addr, &uid_buf); }
         }
     }
     0
 }
-/// Linux getresgid(rgid, egid, sgid)
+/// Linux getresgid(rgid, egid, sgid) — report the real process GID.
 pub fn linux_getresgid(rgid: u64, egid: u64, sgid: u64) -> u64 {
-    let zero_buf = 0u32.to_le_bytes();
+    let gid_buf = (current_gid() as u32).to_le_bytes();
     for addr in [rgid, egid, sgid] {
         if addr != 0 && crate::arch::x86_64::syscall::validate_user_ptr_pub(addr, 4) {
-            unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(addr, &zero_buf); }
+            unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(addr, &gid_buf); }
         }
     }
     0
 }
 /// Linux setgroups(size, list) — stub
 pub fn linux_setgroups(_size: u64, _list: u64) -> u64 { 0 }
-/// Linux getgroups(size, list) — return 1 group (root=0)
+/// Linux getgroups(size, list) — return 1 group: the process's real GID.
 pub fn linux_getgroups(size: u64, list: u64) -> u64 {
     if size > 0 && list != 0 && crate::arch::x86_64::syscall::validate_user_ptr_pub(list, 4) {
-        let zero_buf = 0u32.to_le_bytes();
-        unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(list, &zero_buf); }
+        let gid_buf = (current_gid() as u32).to_le_bytes();
+        unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(list, &gid_buf); }
     }
     1 // one group
 }
-/// Linux capget/capset — stub (return all caps)
+/// Linux capget/capset — real credential-aware view: root sees the full set,
+/// non-root processes see an EMPTY capability set (was: everyone got all caps).
 pub fn linux_capget(_hdr: u64, data: u64) -> u64 {
     if data != 0 && crate::arch::x86_64::syscall::validate_user_ptr_pub(data, 24) {
+        let caps: u32 = if current_uid() == 0 { 0xFFFF_FFFF } else { 0 };
         let mut buf = [0u8; 12];
-        buf[0..4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // effective
-        buf[4..8].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // permitted
-        buf[8..12].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // inheritable
+        buf[0..4].copy_from_slice(&caps.to_le_bytes()); // effective
+        buf[4..8].copy_from_slice(&caps.to_le_bytes()); // permitted
+        buf[8..12].copy_from_slice(&0u32.to_le_bytes()); // inheritable: none
         unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(data, &buf); }
     }
     0
 }
-pub fn linux_capset(_hdr: u64, _data: u64) -> u64 { 0 }
+pub fn linux_capset(_hdr: u64, data: u64) -> u64 {
+    // SECURITY: only UID 0 may alter the capability set. Previously this was
+    // an unconditional success stub, letting ANY process grant itself all caps.
+    if current_uid() != 0 {
+        return (-1i64) as u64; // EPERM
+    }
+    // Root capset is accepted (we don't model a bounding set yet) but the
+    // request buffer must be a valid userspace pointer when non-null.
+    if data != 0 && !crate::arch::x86_64::syscall::validate_user_ptr_pub(data, 12) {
+        return (-14i64) as u64; // EFAULT
+    }
+    0
+}
 
 /// Linux prctl — process control
 pub fn linux_prctl(option: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 {
@@ -914,23 +1008,13 @@ pub fn linux_gettimeofday(tv: u64, _tz: u64) -> u64 {
 }
 
 /// Linux getrandom(buf, buflen, flags)
-pub fn linux_getrandom(buf: u64, buflen: u64, _flags: u64) -> u64 {
-    if !crate::arch::x86_64::syscall::validate_user_ptr_pub(buf, buflen) { return (-14i64) as u64; }
-    let tsc: u64 = unsafe {
-        let v: u64;
-        core::arch::asm!("rdtsc", "shl rdx, 32", "or rax, rdx",
-            out("rax") v, out("rdx") _, options(nomem, nostack));
-        v
-    };
-    let mut rng = tsc;
-    let total = buflen as usize;
-    let mut rand_buf = alloc::vec![0u8; total];
-    for i in 0..total {
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-        rand_buf[i] = (rng >> 33) as u8;
-    }
-    unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(buf, &rand_buf); }
-    buflen
+/// SECURITY FIX: the previous implementation used a weak LCG seeded only by the
+/// TSC (predictable, ~1-bit effective entropy per byte) — broken for TLS keys,
+/// musl arc4random, apk signature checks and Python hashseed.
+/// We now delegate to the hardened sys_getrandom (RDRAND hardware entropy with
+/// Xorshift128+ fallback seeded from TSC^PID^monotonic counter).
+pub fn linux_getrandom(buf: u64, buflen: u64, flags: u64) -> u64 {
+    crate::arch::x86_64::syscall::sys_getrandom_pub(buf, buflen, flags)
 }
 
 /// =========================================================================
@@ -4277,7 +4361,19 @@ pub fn linux_stat_vfs(path_addr: u64, buf: u64) -> u64 {
         return 0;
     }
 
-    // ═══ Check ext2 filesystem first (Alpine rootfs has most files) ═══
+    // ═══ Check VFS in-memory files first (StaticFile models, etc.) ═══
+    if let Some((vfs_size, vfs_mode)) = crate::fs::vfs::file_stat(path_str) {
+        let mut stat = LinuxStat::default();
+        stat.st_mode = vfs_mode;
+        stat.st_size = vfs_size as i64;
+        stat.st_blocks = (stat.st_size + 511) / 512;
+        stat.st_blksize = 4096;
+        let src_bytes = unsafe { core::slice::from_raw_parts(&stat as *const LinuxStat as *const u8, 144) };
+        unsafe { crate::arch::x86_64::syscall::copy_to_user_pub(buf, src_bytes); }
+        return 0;
+    }
+
+    // ═══ Check ext2 filesystem (Alpine rootfs has most files) ═══
     if crate::fs::ext2::is_mounted() {
         if let Some(ino) = crate::fs::ext2::lookup_path(path_str) {
             let mut stat = LinuxStat::default();
@@ -4376,31 +4472,52 @@ pub fn linux_fstat_vfs(fd: u64, buf: u64) -> u64 {
         if fd_type == Some(crate::process::FdType::Socket) {
             stat.st_mode = 0o140777; // S_IFSOCK | 0777
         } else {
-            // Try ext2 first for accurate file metadata
+            // Resolve the file path from the FD table
             let current_pid = crate::scheduler::current_pid();
             let file_path = crate::process::with_fd_table(current_pid, |fdt| {
                 fdt.get(fd as usize).map(|e| e.path.clone())
             }).flatten();
 
-            let mut found_ext2 = false;
+            let mut found = false;
+
+            // -- Priority 1: VFS in-memory files (StaticFile, File, Device) --
+            // This catches include_bytes! models at /models/smollm2-135m-q4_0.gguf
             if let Some(ref path) = file_path {
-                if crate::fs::ext2::is_mounted() {
-                    if let Some(ino) = crate::fs::ext2::lookup_path(path) {
-                        let fsize = crate::fs::ext2::file_size(path).unwrap_or(0);
-                        let is_dir = crate::fs::ext2::is_dir(path);
-                        stat.st_ino = ino as u64;
-                        stat.st_mode = if is_dir { 0o40755 } else { 0o100644 };
-                        stat.st_size = fsize as i64;
-                        stat.st_blocks = (fsize as i64 + 511) / 512;
-                        stat.st_blksize = 4096;
-                        stat.st_dev = 0x0801;
-                        found_ext2 = true;
+                if let Some((vfs_size, vfs_mode)) = crate::fs::vfs::file_stat(path) {
+                    stat.st_mode = vfs_mode;
+                    stat.st_size = vfs_size as i64;
+                    stat.st_blocks = (stat.st_size + 511) / 512;
+                    stat.st_blksize = 4096;
+                    found = true;
+                    // Debug: log fstat results for /models/ paths
+                    if path.contains("/models/") {
+                        crate::serial_println!("[LINUX-FSTAT] fd={} path='{}' VFS size={} mode=0o{:o}",
+                            fd, path, vfs_size, vfs_mode);
                     }
                 }
             }
 
-            if !found_ext2 {
-                // Fallback: get size via seek
+            // -- Priority 2: ext2 persistent filesystem --
+            if !found {
+                if let Some(ref path) = file_path {
+                    if crate::fs::ext2::is_mounted() {
+                        if let Some(ino) = crate::fs::ext2::lookup_path(path) {
+                            let fsize = crate::fs::ext2::file_size(path).unwrap_or(0);
+                            let is_dir = crate::fs::ext2::is_dir(path);
+                            stat.st_ino = ino as u64;
+                            stat.st_mode = if is_dir { 0o40755 } else { 0o100644 };
+                            stat.st_size = fsize as i64;
+                            stat.st_blocks = (fsize as i64 + 511) / 512;
+                            stat.st_blksize = 4096;
+                            stat.st_dev = 0x0801;
+                            found = true;
+                        }
+                    }
+                }
+            }
+
+            // -- Priority 3: lseek fallback --
+            if !found {
                 let current_pos = crate::arch::x86_64::syscall::sys_lseek_pub(fd as u32, 0, 1);
                 let size = crate::arch::x86_64::syscall::sys_lseek_pub(fd as u32, 0, 2);
                 if (current_pos as i64) >= 0 {

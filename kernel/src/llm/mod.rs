@@ -17,3 +17,4 @@
 pub mod gguf;
 pub mod matmul;
 pub mod inference;
+pub mod parallel;

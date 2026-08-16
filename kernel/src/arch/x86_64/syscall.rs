@@ -75,6 +75,7 @@ const EINTR:  u64 = (-4i64) as u64;
 const ENOTDIR: u64 = (-20i64) as u64;
 const EISDIR: u64 = (-21i64) as u64;
 const ERANGE: u64 = (-34i64) as u64;
+const ENODEV_IOCTL: u64 = (-19i64) as u64; // ENODEV for ioctl on non-existent device
 
 // POSIX open flags
 const O_RDONLY: u32 = 0;
@@ -638,7 +639,10 @@ extern "C" fn syscall_entry() {
         // Align RSP to 16 bytes (ABI requirement), use R15 as frame save
         "mov r15, rsp",
         "and rsp, -16",
+        "mov r10, gs:[56]",   // Load original user R9 (6th syscall arg)
+        "push r10",           // Push as 7th argument for System V ABI (on stack)
         "call {handler}",
+        "add rsp, 8",         // Clean up 7th argument from stack
         "mov rsp, r15",       // restore stack pointer to saved-regs frame
 
         // RAX = return value from Rust handler
@@ -731,8 +735,8 @@ fn print_hex_raw(val: u64) {
 /// touches XMM/YMM registers.  User FPU state therefore survives every
 /// syscall automatically — no fxsave/fxrstor needed in the fast path.
 #[no_mangle]
-extern "C" fn syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
-    syscall_dispatch(nr, a1, a2, a3, a4, a5)
+extern "C" fn syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> u64 {
+    syscall_dispatch(nr, a1, a2, a3, a4, a5, a6)
 }
 
 /// Internal syscall dispatch (separated for FPU save/restore wrapper).
@@ -743,7 +747,7 @@ extern "C" fn syscall_handler_rust(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, 
 /// Last syscall number (for GP fault diagnostics)
 pub static LAST_SYSCALL_NR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
+fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u64) -> u64 {
     LAST_SYSCALL_NR.store(nr, core::sync::atomic::Ordering::Relaxed);
     let current_pid = crate::scheduler::current_pid();
     // ══════════════════ Millimeter-level tracing ══════════════════
@@ -764,7 +768,7 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         // Log mmap calls with full detail
         if nr == 9 {
             crate::serial_println!("[MMAP] PID1 SC#{} mmap(addr=0x{:X}, len=0x{:X}, prot=0x{:X}, flags=0x{:X}, fd={}, off=0x{:X})",
-                c, a1, a2, a3, a4, a5 as i64, saved_user_r9());
+                c, a1, a2, a3, a4, a5 as i64, a6);
         }
         // Log mprotect
         if nr == 10 {
@@ -784,7 +788,7 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
     if current_pid == 2 {
         let c = TRACE_COUNT2.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         if c < 200 || is_critical_nr {
-            crate::serial_println!("[P2-SC#{}] nr={} a1=0x{:X} a2=0x{:X} a3=0x{:X} a4=0x{:X}", c, nr, a1, a2, a3, a4);
+            crate::serial_println!("[P2-SC#{}] nr={} a1=0x{:X} a2=0x{:X} a3=0x{:X} a4=0x{:X} a5=0x{:X} a6=0x{:X}", c, nr, a1, a2, a3, a4, a5, a6);
         }
     }
     // Jalon 105: Check if this process uses Linux ABI and route to Linux-specific handlers
@@ -794,7 +798,6 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64
         }).unwrap_or(false);
 
         if is_linux {
-            let a6 = saved_user_r9();  // 6th syscall arg (r9), e.g. mmap offset
             if let Some(result) = crate::compat::linux_abi::linux_syscall_override(nr, a1, a2, a3, a4, a5, a6) {
                 return result;
             }
@@ -918,6 +921,28 @@ fn sc_close(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_close(
 fn sc_stat(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_stat(a1, a2) }
 fn sc_fstat(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_fstat(a1 as u32, a2) }
 fn sc_poll(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_poll(a1, a2, a3) }
+/// ppoll(fds, nfds, tmo_p, sigmask, sigsetsize) → delegate to poll with ms-converted timeout
+fn sc_ppoll(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 {
+    // a3 = pointer to struct timespec {tv_sec: i64, tv_nsec: i64} or NULL
+    let timeout_ms = if a3 != 0 && validate_user_ptr(a3, 16) {
+        let mut ts_buf = [0u8; 16];
+        let copied = unsafe { copy_from_user(&mut ts_buf, a3, 16) };
+        if copied >= 16 {
+            let mut sec_buf = [0u8; 8];
+            let mut nsec_buf = [0u8; 8];
+            sec_buf.copy_from_slice(&ts_buf[0..8]);
+            nsec_buf.copy_from_slice(&ts_buf[8..16]);
+            let sec = i64::from_ne_bytes(sec_buf);
+            let nsec = i64::from_ne_bytes(nsec_buf);
+            (sec * 1000 + nsec / 1_000_000) as u64
+        } else { u64::MAX } // infinite timeout on parse failure
+    } else {
+        u64::MAX // NULL timeout = block indefinitely
+    };
+    // Cap at i32::MAX ms for poll compatibility
+    let timeout_capped = core::cmp::min(timeout_ms, i32::MAX as u64);
+    sys_poll(a1, a2, timeout_capped)
+}
 fn sc_seek(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_seek(a1 as u32, a2 as i64, a3 as u32) }
 fn sc_mmap(a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 { sys_mmap_full(a1, a2, a3, a4, a5) }
 fn sc_mprotect(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_mprotect(a1, a2, a3) }
@@ -944,11 +969,21 @@ fn sc_accept(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_ac
 fn sc_sendto(a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 { sys_sendto_linux(a1 as u32, a2, a3, a4, a5, saved_user_r9()) }
 fn sc_recvfrom(a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 { sys_recvfrom_linux(a1 as u32, a2, a3, a4, a5, saved_user_r9()) }
 fn sc_setsockopt(a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 { sys_setsockopt(a1 as u32, a2, a3, a4, a5) }
-fn sc_shutdown(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_tcp_shutdown_syscall(a1 as u32) }
-fn sc_bind(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_bind(a1 as u32, a2 as u16) }
+fn sc_shutdown(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_shutdown_linux(a1 as u32, a2 as i32) }
+fn sc_sendmsg(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_sendmsg_linux(a1 as u32, a2, a3 as u32) }
+fn sc_recvmsg(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_recvmsg_linux(a1 as u32, a2, a3 as u32) }
+fn sc_bind(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_bind_linux(a1 as u32, a2, a3) }
 fn sc_listen(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_listen(a1 as u32, a2) }
 fn sc_clone(a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 { sys_clone(a1, a2, a3, a4, a5) }
 fn sc_fork(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_fork() }
+fn sc_vfork(_a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 {
+    // vfork() semantics: in a real kernel, the parent suspends until child calls
+    // exec() or _exit(). In AetherionOS, our fork() already deep-copies the
+    // address space, so vfork can safely delegate to fork(). BusyBox sh and
+    // musl libc use vfork+execve as their primary subprocess launch mechanism.
+    crate::serial_println!("[SYSCALL] vfork() -> delegating to fork()");
+    sys_fork()
+}
 fn sc_execve(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_execve(a1, a2, a3) }
 fn sc_exit(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_exit(a1) }
 fn sc_wait(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_wait4(a1, a2, a3) }
@@ -995,7 +1030,10 @@ fn sc_pipe2(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_pipe2_r
 fn sc_prlimit64(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_prlimit64(a1, a2, a3) }
 fn sc_getrandom(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_getrandom(a1, a2, a3) }
 fn sc_mkdirat(_a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_mkdir(a2, a3) }
-fn sc_unlinkat(_a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_unlink(a2) }
+fn sc_unlinkat(_a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 {
+    // AT_REMOVEDIR = 0x200: if set, behave like rmdir instead of unlink
+    if a3 & 0x200 != 0 { sys_rmdir(a2) } else { sys_unlink(a2) }
+}
 fn sc_readlinkat(_a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> u64 { sys_readlink(a2, a3, a4) }
 fn sc_symlink(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_symlink(a1, a2) }
 fn sc_symlinkat(a1: u64, _a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_symlink(a1, a3) }
@@ -1019,7 +1057,7 @@ fn sc_fdatasync(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { 0 } //
 fn sc_truncate(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_truncate(a1, a2) }
 fn sc_ftruncate(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_ftruncate(a1 as u32, a2) }
 fn sc_utimensat(a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> u64 { sys_utimensat(a1, a2, a3, a4) }
-fn sc_sysinfo(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_sysinfo(a1) }
+fn sc_linux_sysinfo(a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_linux_sysinfo(a1) }
 fn sc_statfs(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_statfs(a1, a2) }
 fn sc_fstatfs(a1: u64, a2: u64, _a3: u64, _a4: u64, _a5: u64) -> u64 { sys_fstatfs(a1 as u32, a2) }
 fn sc_faccessat(_a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_stub_access(a2, a3) }
@@ -1115,9 +1153,9 @@ static SYSCALL_TABLE: [Option<SyscallFn>; SYSCALL_TABLE_LEN] = {
     t[43]  = Some(sc_accept);
     t[44]  = Some(sc_sendto);
     t[45]  = Some(sc_recvfrom);
-    t[46]  = Some(sc_zero);          // recvmsg
-    t[47]  = Some(sc_shutdown);
-    t[48]  = Some(sc_zero);          // shutdown stub
+    t[46]  = Some(sc_sendmsg);       // sendmsg(fd, msg, flags)
+    t[47]  = Some(sc_recvmsg);       // recvmsg(fd, msg, flags)
+    t[48]  = Some(sc_shutdown);       // shutdown(fd, how)
     t[49]  = Some(sc_bind);
     t[50]  = Some(sc_listen);
     t[51]  = Some(sc_getsockname);   // getsockname(fd, addr, addrlen)
@@ -1127,7 +1165,7 @@ static SYSCALL_TABLE: [Option<SyscallFn>; SYSCALL_TABLE_LEN] = {
     t[55]  = Some(sc_getsockopt);    // getsockopt(fd, level, name, val, len)
     t[56]  = Some(sc_clone);
     t[57]  = Some(sc_fork);
-    t[58]  = Some(sc_zero);          // vfork
+    t[58]  = Some(sc_vfork);          // vfork -> fork (same semantics for our kernel)
     t[59]  = Some(sc_execve);
     t[60]  = Some(sc_exit);
     t[61]  = Some(sc_wait);
@@ -1159,7 +1197,7 @@ static SYSCALL_TABLE: [Option<SyscallFn>; SYSCALL_TABLE_LEN] = {
     t[95]  = Some(sc_umask);          // umask
     t[96]  = Some(sc_gettimeofday);
     t[97]  = Some(sc_getrlimit);
-    t[99]  = Some(sc_sysinfo);        // sysinfo (real memory/uptime stats)
+    t[99]  = Some(sc_linux_sysinfo);   // sysinfo (real Linux struct sysinfo)
     t[100] = Some(sc_zero);          // times
     t[101] = Some(sc_zero);          // ptrace
     t[102] = Some(sc_getuid);
@@ -1246,8 +1284,8 @@ static SYSCALL_TABLE: [Option<SyscallFn>; SYSCALL_TABLE_LEN] = {
     t[267] = Some(sc_readlinkat);
     t[268] = Some(sc_fchmodat);       // fchmodat
     t[269] = Some(sc_faccessat);
-    t[270] = Some(sc_zero);          // pselect6
-    t[271] = Some(sc_zero);          // ppoll
+    t[270] = Some(sc_zero);          // pselect6 (TODO: implement for multi-socket wait)
+    t[271] = Some(sc_ppoll);         // ppoll -> poll (ignores sigmask/timespec precision)
     t[272] = Some(sc_zero);          // unshare
     t[273] = Some(sc_set_robust_list);
     t[274] = Some(sc_zero);          // get_robust_list
@@ -1412,17 +1450,24 @@ fn sys_stub_pwrite64(fd: u32, buf: u64, count: u64, offset: u64) -> u64 {
     let mut user_data = alloc::vec![0u8; count as usize];
     unsafe { copy_from_user(&mut user_data, buf, count as usize); }
 
-    // Write at offset: read-modify-write for ext2
-    if crate::fs::ext2::is_mounted() && crate::fs::ext2::file_exists(&path) {
-        if let Some(mut existing) = crate::fs::ext2::read_file_by_path(&path) {
-            let off = offset as usize;
-            if off > existing.len() { existing.resize(off, 0); }
-            if off + user_data.len() > existing.len() {
-                existing.resize(off + user_data.len(), 0);
-            }
-            existing[off..off + user_data.len()].copy_from_slice(&user_data);
-            if crate::fs::ext2::write_file_path(&path, &existing).is_some() {
-                return count;
+    // Session 15: Use write_file_chunk for efficient partial writes
+    if crate::fs::ext2::is_mounted() {
+        let wrote = crate::fs::ext2::write_file_chunk(&path, offset, &user_data);
+        if wrote > 0 {
+            return wrote as u64;
+        }
+        // Fallback: read-modify-write
+        if crate::fs::ext2::file_exists(&path) {
+            if let Some(mut existing) = crate::fs::ext2::read_file_by_path(&path) {
+                let off = offset as usize;
+                if off > existing.len() { existing.resize(off, 0); }
+                if off + user_data.len() > existing.len() {
+                    existing.resize(off + user_data.len(), 0);
+                }
+                existing[off..off + user_data.len()].copy_from_slice(&user_data);
+                if crate::fs::ext2::write_file_path(&path, &existing).is_some() {
+                    return count;
+                }
             }
         }
     }
@@ -1728,6 +1773,14 @@ fn sys_stub_stat(path_addr: u64, buf_addr: u64) -> u64 {
                             }
                             break;
                         }
+                        Some(crate::fs::vfs::VfsNode::StaticFile(data)) => {
+                            if i == components.len() - 1 {
+                                mode = 0o100755; // S_IFREG | 0755
+                                size = data.len() as u64;
+                                vfs_found = true;
+                            }
+                            break;
+                        }
                         Some(crate::fs::vfs::VfsNode::Symlink(_)) => {
                             if i == components.len() - 1 {
                                 mode = 0o120777; // S_IFLNK | 0777
@@ -1803,6 +1856,13 @@ fn sys_stub_fstat(fd: u32, buf_addr: u64) -> u64 {
                         else { current = children; }
                     }
                     Some(crate::fs::vfs::VfsNode::File(data)) => {
+                        if i == components.len() - 1 {
+                            mode = 0o100755;
+                            size = data.len() as u64;
+                        }
+                        break;
+                    }
+                    Some(crate::fs::vfs::VfsNode::StaticFile(data)) => {
                         if i == components.len() - 1 {
                             mode = 0o100755;
                             size = data.len() as u64;
@@ -2197,9 +2257,384 @@ fn sys_ioctl(fd: u32, cmd: u64, arg: u64) -> u64 {
         }
         FIONBIO => 0,  // Set/clear non-blocking - accept silently
         TCFLSH => 0,   // Flush buffers
-        _ => {
-            // Unknown ioctl - return 0 for stdio, ENOTTY for others
-            if fd <= 2 { 0 } else { ENOTTY }
+
+        // ===== Linux Framebuffer ioctls (for Xfbdev / TinyX) =====
+        // FBIOGET_VSCREENINFO = 0x4600 — Get variable screen info
+        0x4600 => {
+            // struct fb_var_screeninfo (160 bytes)
+            // Xfbdev uses this to discover resolution, bpp, pixel format
+            if arg == 0 || !validate_user_ptr(arg, 160) { return EINVAL; }
+            let fb_info = match crate::framebuffer::get_info() {
+                Some(i) => i,
+                None => return ENODEV_IOCTL,
+            };
+            let mut vsi = [0u8; 160];
+            // xres (offset 0, u32)
+            vsi[0..4].copy_from_slice(&fb_info.width.to_le_bytes());
+            // yres (offset 4, u32)
+            vsi[4..8].copy_from_slice(&fb_info.height.to_le_bytes());
+            // xres_virtual (offset 8, u32)
+            vsi[8..12].copy_from_slice(&fb_info.width.to_le_bytes());
+            // yres_virtual (offset 12, u32)
+            vsi[12..16].copy_from_slice(&fb_info.height.to_le_bytes());
+            // xoffset (offset 16) = 0
+            // yoffset (offset 20) = 0
+            // bits_per_pixel (offset 24, u32)
+            vsi[24..28].copy_from_slice(&fb_info.bpp.to_le_bytes());
+            // grayscale (offset 28) = 0
+            // red: offset=16, length=8, msb_right=0 (BGRA)
+            vsi[32..36].copy_from_slice(&16u32.to_le_bytes()); // red.offset
+            vsi[36..40].copy_from_slice(&8u32.to_le_bytes());  // red.length
+            // green: offset=8, length=8
+            vsi[44..48].copy_from_slice(&8u32.to_le_bytes());  // green.offset
+            vsi[48..52].copy_from_slice(&8u32.to_le_bytes());  // green.length
+            // blue: offset=0, length=8
+            vsi[56..60].copy_from_slice(&0u32.to_le_bytes());  // blue.offset
+            vsi[60..64].copy_from_slice(&8u32.to_le_bytes());  // blue.length
+            // transp: offset=24, length=8
+            vsi[68..72].copy_from_slice(&24u32.to_le_bytes()); // transp.offset
+            vsi[72..76].copy_from_slice(&8u32.to_le_bytes());  // transp.length
+            // nonstd = 0 (offset 80)
+            // activate = FB_ACTIVATE_NOW (0) (offset 84)
+            // height = -1 (offset 88)
+            vsi[88..92].copy_from_slice(&(-1i32 as u32).to_le_bytes());
+            // width = -1 (offset 92)
+            vsi[92..96].copy_from_slice(&(-1i32 as u32).to_le_bytes());
+            // pixclock, left_margin, etc. (offsets 96-144): leave zeroed
+            // vmode = FB_VMODE_NONINTERLACED (0) (offset 148)
+            unsafe { copy_to_user(arg, &vsi); }
+            crate::serial_println!("[IOCTL] FBIOGET_VSCREENINFO: {}x{}x{}", fb_info.width, fb_info.height, fb_info.bpp);
+            0
+        }
+
+        // FBIOPUT_VSCREENINFO = 0x4601 — Set variable screen info (accept silently)
+        0x4601 => {
+            // Xfbdev may try to change resolution — we accept but don't change
+            if arg != 0 && validate_user_ptr(arg, 160) {
+                let mut vsi = [0u8; 160];
+                unsafe { copy_from_user(&mut vsi, arg, 160); }
+                let req_w = u32::from_le_bytes([vsi[0], vsi[1], vsi[2], vsi[3]]);
+                let req_h = u32::from_le_bytes([vsi[4], vsi[5], vsi[6], vsi[7]]);
+                let req_bpp = u32::from_le_bytes([vsi[24], vsi[25], vsi[26], vsi[27]]);
+                crate::serial_println!("[IOCTL] FBIOPUT_VSCREENINFO: requested {}x{}x{}", req_w, req_h, req_bpp);
+                // Write back actual info (Xfbdev expects the ioctl to update the struct)
+                if let Some(fb_info) = crate::framebuffer::get_info() {
+                    vsi[0..4].copy_from_slice(&fb_info.width.to_le_bytes());
+                    vsi[4..8].copy_from_slice(&fb_info.height.to_le_bytes());
+                    vsi[8..12].copy_from_slice(&fb_info.width.to_le_bytes());
+                    vsi[12..16].copy_from_slice(&fb_info.height.to_le_bytes());
+                    vsi[24..28].copy_from_slice(&fb_info.bpp.to_le_bytes());
+                    unsafe { copy_to_user(arg, &vsi); }
+                }
+            }
+            0
+        }
+
+        // FBIOGET_FSCREENINFO = 0x4602 — Get fixed screen info
+        0x4602 => {
+            // struct fb_fix_screeninfo (68 bytes)
+            if arg == 0 || !validate_user_ptr(arg, 68) { return EINVAL; }
+            let fb_info = match crate::framebuffer::get_info() {
+                Some(i) => i,
+                None => return ENODEV_IOCTL,
+            };
+            let mut fsi = [0u8; 68];
+            // id[16] (offset 0): "AetherionFB\0"
+            let id = b"AetherionFB\0";
+            fsi[..id.len()].copy_from_slice(id);
+            // smem_start (offset 16, unsigned long = u64 on x86_64)
+            fsi[16..24].copy_from_slice(&fb_info.phys_addr.to_le_bytes());
+            // smem_len (offset 24, u32)
+            fsi[24..28].copy_from_slice(&(fb_info.size as u32).to_le_bytes());
+            // type = FB_TYPE_PACKED_PIXELS (0) (offset 28, u32)
+            fsi[28..32].copy_from_slice(&0u32.to_le_bytes());
+            // visual = FB_VISUAL_TRUECOLOR (2) (offset 36, u32)
+            fsi[36..40].copy_from_slice(&2u32.to_le_bytes());
+            // line_length (offset 48, u32)
+            fsi[48..52].copy_from_slice(&fb_info.stride.to_le_bytes());
+            // mmio_start (offset 56, unsigned long)
+            fsi[56..64].copy_from_slice(&fb_info.phys_addr.to_le_bytes());
+            // mmio_len (offset 64, u32)
+            fsi[64..68].copy_from_slice(&(fb_info.size as u32).to_le_bytes());
+            unsafe { copy_to_user(arg, &fsi); }
+            crate::serial_println!("[IOCTL] FBIOGET_FSCREENINFO: phys=0x{:X} size={} stride={}", fb_info.phys_addr, fb_info.size, fb_info.stride);
+            0
+        }
+
+        // FBIOPAN_DISPLAY = 0x4606 — Pan display (accept silently)
+        0x4606 => 0,
+
+        // FBIO_WAITFORVSYNC = 0x40044620 — Wait for vsync (return immediately)
+        0x40044620 => 0,
+
+        // FBIOGETCMAP / FBIOPUTCMAP = 0x4604 / 0x4605 — Colormap (no-op for truecolor)
+        0x4604 | 0x4605 => 0,
+
+        // ===== Console/VT ioctls (for X server KD/VT management) =====
+        // KDSETMODE = 0x4B3A — Set KD text/graphics mode
+        0x4B3A => {
+            // arg: KD_TEXT(0) or KD_GRAPHICS(1)
+            crate::serial_println!("[IOCTL] KDSETMODE: mode={}", arg);
+            0 // Accept silently
+        }
+        // KDGETMODE = 0x4B3B — Get KD mode
+        0x4B3B => {
+            if arg != 0 && validate_user_ptr(arg, 4) {
+                // Return KD_GRAPHICS (1)
+                unsafe { copy_to_user(arg, &1u32.to_le_bytes()); }
+            }
+            0
+        }
+        // VT_GETMODE = 0x5601
+        0x5601 => {
+            // struct vt_mode (12 bytes): mode=VT_AUTO(0), waitv=0, relsig=0, acqsig=0, frsig=0
+            if arg != 0 && validate_user_ptr(arg, 12) {
+                let vt_mode = [0u8; 12]; // VT_AUTO mode
+                unsafe { copy_to_user(arg, &vt_mode); }
+            }
+            0
+        }
+        // VT_SETMODE = 0x5602
+        0x5602 => 0, // Accept VT mode change silently
+        // VT_GETSTATE = 0x5603
+        0x5603 => {
+            // struct vt_stat: v_active=1, v_signal=0, v_state=0x2 (VT1 active)
+            if arg != 0 && validate_user_ptr(arg, 6) {
+                let mut vt_stat = [0u8; 6];
+                vt_stat[0..2].copy_from_slice(&1u16.to_le_bytes()); // v_active = 1
+                vt_stat[4..6].copy_from_slice(&0x02u16.to_le_bytes()); // v_state = bit 1 set
+                unsafe { copy_to_user(arg, &vt_stat); }
+            }
+            0
+        }
+        // VT_ACTIVATE = 0x5606 / VT_WAITACTIVE = 0x5607
+        0x5606 | 0x5607 => 0,
+        // VT_RELDISP = 0x5605 — Release display
+        0x5605 => 0,
+        // VT_OPENQRY = 0x5600 — Find next available VT
+        0x5600 => {
+            if arg != 0 && validate_user_ptr(arg, 4) {
+                // Return VT 7 (traditional X server VT)
+                unsafe { copy_to_user(arg, &7u32.to_le_bytes()); }
+            }
+            0
+        }
+
+        // ===== Input device ioctls (for evdev) =====
+        // EVIOCGVERSION = 0x80044501
+        0x80044501 => {
+            if arg != 0 && validate_user_ptr(arg, 4) {
+                // EV_VERSION = 0x010001 (1.0.1)
+                unsafe { copy_to_user(arg, &0x010001u32.to_le_bytes()); }
+            }
+            0
+        }
+        // EVIOCGID = 0x80084502 — Get device ID
+        0x80084502 => {
+            if arg != 0 && validate_user_ptr(arg, 8) {
+                let pid = crate::scheduler::current_pid();
+                let is_mouse = crate::process::with_fd_table(pid, |fdt| {
+                    fdt.get(fd as usize)
+                        .map(|e| e.path.contains("mice") || e.path.contains("mouse"))
+                        .unwrap_or(false)
+                }).unwrap_or(false);
+                let mut input_id = [0u8; 8];
+                // bustype (u16) = BUS_I8042 (0x11)
+                input_id[0..2].copy_from_slice(&0x11u16.to_le_bytes());
+                // vendor (u16) = 0x0001
+                input_id[2..4].copy_from_slice(&0x0001u16.to_le_bytes());
+                // product (u16) = 0x0001 (kbd) or 0x0002 (mouse)
+                let product: u16 = if is_mouse { 0x0002 } else { 0x0001 };
+                input_id[4..6].copy_from_slice(&product.to_le_bytes());
+                // version (u16) = 0x0001
+                input_id[6..8].copy_from_slice(&0x0001u16.to_le_bytes());
+                unsafe { copy_to_user(arg, &input_id); }
+            }
+            0
+        }
+        // EVIOCGBIT — specific commands BEFORE broad EVIOCGNAME range
+        // (specific values must precede the catch-all range 0x80004506..=0x80FF4506)
+        // 0x80204520 = EVIOCGBIT(0, 32) — supported event types
+        0x80204520 => {
+            if arg != 0 && validate_user_ptr(arg, 32) {
+                let pid = crate::scheduler::current_pid();
+                let is_mouse = crate::process::with_fd_table(pid, |fdt| {
+                    fdt.get(fd as usize)
+                        .map(|e| e.path.contains("mice") || e.path.contains("mouse"))
+                        .unwrap_or(false)
+                }).unwrap_or(false);
+                let mut bits = [0u8; 32];
+                if is_mouse {
+                    // EV_SYN(0) | EV_KEY(1) | EV_REL(2)
+                    bits[0] = 0x07;
+                } else {
+                    // EV_SYN(0) | EV_KEY(1) | EV_MSC(4)
+                    bits[0] = 0x13;
+                }
+                unsafe { copy_to_user(arg, &bits); }
+            }
+            0
+        }
+        // EVIOCGBIT for EV_KEY (0x80604521) — Key capability bits
+        0x80604521 => {
+            if arg != 0 && validate_user_ptr(arg, 96) {
+                let bits = [0xFFu8; 96]; // Report all keys supported
+                unsafe { copy_to_user(arg, &bits); }
+            }
+            0
+        }
+        // EVIOCGBIT for EV_REL (0x80044522) — Relative axis bits
+        0x80044522 => {
+            if arg != 0 && validate_user_ptr(arg, 4) {
+                // REL_X(0) | REL_Y(1) | REL_WHEEL(8)
+                let mut bits = [0u8; 4];
+                bits[0] = 0x03; // REL_X | REL_Y
+                bits[1] = 0x01; // REL_WHEEL (bit 8)
+                unsafe { copy_to_user(arg, &bits); }
+            }
+            0
+        }
+        // EVIOCGNAME = 0x80FF4506..0x80FF4506 — Get device name
+        // Actually encoded as _IOC(_IOC_READ, 'E', 0x06, len) — varies by length
+        // We match the common range
+        0x80004506..=0x80FF4506 => {
+            let pid = crate::scheduler::current_pid();
+            let is_mouse = crate::process::with_fd_table(pid, |fdt| {
+                fdt.get(fd as usize)
+                    .map(|e| e.path.contains("mice") || e.path.contains("mouse"))
+                    .unwrap_or(false)
+            }).unwrap_or(false);
+            let name: &[u8] = if is_mouse { b"AetherionOS PS/2 Mouse\0" } else { b"AetherionOS PS/2 Keyboard\0" };
+            if arg != 0 && validate_user_ptr(arg, name.len() as u64) {
+                unsafe { copy_to_user(arg, name); }
+            }
+            name.len() as u64
+        }
+        // EVIOCGRAB = 0x40044590 — Grab device (exclusive access)
+        0x40044590 => 0, // Accept silently
+
+        // /dev/vgpu ioctl commands (0xAE01-0xAE0F)
+        0xAE01..=0xAE0F => {
+            // Check if the FD is opened to /dev/vgpu
+            let pid = crate::scheduler::current_pid();
+            let is_vgpu = crate::process::with_fd_table(pid, |fdt| {
+                fdt.get(fd as usize)
+                    .map(|e| e.path.as_str() == "/dev/vgpu")
+                    .unwrap_or(false)
+            }).unwrap_or(false);
+            if is_vgpu {
+                let result = crate::drivers::virtio_gpu::vgpu_ioctl(cmd, arg);
+                if result < 0 { (-result) as u64 | 0xFFFF_FFFF_FFFF_0000 } else { result as u64 }
+            } else {
+                ENOTTY
+            }
+        }
+        // ── DRM / Direct Rendering Manager (Mesa LLVMpipe attach) ──────────
+        // DRM ioctls live in the 'd' (0x64) group. The two Mesa actually needs
+        // to bring up a software-render context are VERSION and GET_CAP.
+        //   DRM_IOCTL_VERSION     = 0xC0406400 (drm_version, in/out)
+        //   DRM_IOCTL_GET_CAP     = 0xC010640C (drm_get_cap, in/out)
+        //   DRM_IOCTL_SET_VERSION = 0xC0106407 (drm_set_version, in/out)
+        // We only service them for FDs opened on /dev/dri/*.
+        0xC0406400 | 0xC010640C | 0xC0106407 => {
+            let pid = crate::scheduler::current_pid();
+            let is_dri = crate::process::with_fd_table(pid, |fdt| {
+                fdt.get(fd as usize)
+                    .map(|e| e.path.starts_with("/dev/dri/"))
+                    .unwrap_or(false)
+            }).unwrap_or(false);
+            if !is_dri {
+                return ENOTTY;
+            }
+            match cmd {
+                // DRM_IOCTL_VERSION: report ourselves as the "aether_swrast"
+                // software-rendering driver so Mesa selects the swrast path.
+                0xC0406400 => {
+                    // struct drm_version (x86-64 layout):
+                    //   0  : i32 version_major
+                    //   4  : i32 version_minor
+                    //   8  : i32 version_patchlevel
+                    //   16 : usize name_len      24 : *char name
+                    //   32 : usize date_len      40 : *char date
+                    //   48 : usize desc_len      56 : *char desc
+                    if arg == 0 || !validate_user_ptr(arg, 64) {
+                        return EFAULT;
+                    }
+                    let mut hdr = [0u8; 64];
+                    unsafe { copy_from_user(&mut hdr, arg, 64); }
+
+                    let name: &[u8] = b"aether_swrast";
+                    let date: &[u8] = b"20260622";
+                    let desc: &[u8] = b"AetherionOS software renderer (LLVMpipe-compatible)";
+
+                    // Copy a DRM_IOCTL_VERSION string field into its user buffer.
+                    // The caller passes a buffer pointer (hdr[off_ptr]) and capacity
+                    // (hdr[off_len]); we fill it up to capacity and rewrite the length
+                    // field with the real string length, exactly like the real ioctl.
+                    // A free fn (not a closure) so it doesn't hold a long-lived &mut hdr.
+                    fn put_drm_str(hdr: &mut [u8; 64], off_len: usize, off_ptr: usize, s: &[u8]) {
+                        let cap = u64::from_le_bytes(hdr[off_len..off_len + 8].try_into().unwrap());
+                        let ptr = u64::from_le_bytes(hdr[off_ptr..off_ptr + 8].try_into().unwrap());
+                        if ptr != 0 && cap > 0 && validate_user_ptr(ptr, core::cmp::min(cap, s.len() as u64)) {
+                            let n = core::cmp::min(cap as usize, s.len());
+                            unsafe { copy_to_user(ptr, &s[..n]); }
+                        }
+                        // Always report the true length so the caller can size buffers.
+                        hdr[off_len..off_len + 8].copy_from_slice(&(s.len() as u64).to_le_bytes());
+                    }
+
+                    // version 1.0.0
+                    hdr[0..4].copy_from_slice(&1i32.to_le_bytes());
+                    hdr[4..8].copy_from_slice(&0i32.to_le_bytes());
+                    hdr[8..12].copy_from_slice(&0i32.to_le_bytes());
+                    put_drm_str(&mut hdr, 16, 24, name);
+                    put_drm_str(&mut hdr, 32, 40, date);
+                    put_drm_str(&mut hdr, 48, 56, desc);
+
+                    unsafe { copy_to_user(arg, &hdr); }
+                    crate::serial_println!("[DRM] VERSION -> aether_swrast 1.0.0 (fd={})", fd);
+                    0
+                }
+                // DRM_IOCTL_GET_CAP: struct drm_get_cap { u64 capability; u64 value; }
+                // We report value=0 for every capability (no hardware accel),
+                // which steers Mesa onto the pure software path.
+                0xC010640C => {
+                    if arg == 0 || !validate_user_ptr(arg, 16) {
+                        return EFAULT;
+                    }
+                    let mut buf = [0u8; 16];
+                    unsafe { copy_from_user(&mut buf, arg, 16); }
+                    let capability = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+                    buf[8..16].copy_from_slice(&0u64.to_le_bytes()); // value = 0
+                    unsafe { copy_to_user(arg, &buf); }
+                    crate::serial_println!("[DRM] GET_CAP cap=0x{:X} -> 0 (fd={})", capability, fd);
+                    0
+                }
+                // DRM_IOCTL_SET_VERSION: accept whatever interface version the
+                // client requests (we are version-agnostic for swrast).
+                0xC0106407 => {
+                    crate::serial_println!("[DRM] SET_VERSION accepted (fd={})", fd);
+                    0
+                }
+                _ => ENOTTY,
+            }
+        }
+                _ => {
+            // Log unknown ioctls for debugging (first 50 only)
+            static UNK_IOCTL_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            let c = UNK_IOCTL_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            if c < 50 {
+                crate::serial_println!("[IOCTL] UNKNOWN: fd={} cmd=0x{:X} arg=0x{:X}", fd, cmd, arg);
+            }
+            // Return 0 for stdio/tty, ENOTTY for others
+            // Also return 0 for framebuffer/input fds to avoid breaking X server
+            let pid = crate::scheduler::current_pid();
+            let is_device = crate::process::with_fd_table(pid, |fdt| {
+                fdt.get(fd as usize)
+                    .map(|e| e.path.starts_with("/dev/"))
+                    .unwrap_or(false)
+            }).unwrap_or(false);
+            if fd <= 2 || is_device { 0 } else { ENOTTY }
         }
     }
 }
@@ -2808,24 +3243,84 @@ fn sys_socketpair(_domain: u64, _type_: u64, _protocol: u64, sv_ptr: u64) -> u64
 fn sc_socketpair(a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> u64 { sys_socketpair(a1, a2, a3, a4) }
 
 /// getsockname(fd, addr, addrlen) -> 0 (stub: returns zeroed sockaddr)
-fn sys_getsockname(_fd: u64, addr: u64, addrlen: u64) -> u64 {
-    if addr != 0 && addrlen != 0 && validate_user_ptr(addrlen, 4) {
-        let mut len_buf = [0u8; 4];
-        unsafe { copy_from_user(&mut len_buf, addrlen, 4); }
-        let len = u32::from_le_bytes(len_buf);
-        if len > 0 && validate_user_ptr(addr, core::cmp::min(len as u64, 128)) {
-            let size = core::cmp::min(len as usize, 128);
-            let mut buf = [0u8; 128];
-            // AF_INET (2) as the first 2 bytes
-            buf[0..2].copy_from_slice(&2u16.to_le_bytes());
-            unsafe { copy_to_user(addr, &buf[..size]); }
+/// getsockname(fd, addr, addrlen) — returns local socket address.
+/// For connected TCP sockets, returns real local IP (10.0.2.15) and port.
+fn sys_getsockname(fd: u64, addr: u64, addrlen: u64) -> u64 {
+    if addr == 0 || addrlen == 0 || !validate_user_ptr(addrlen, 4) { return 0; }
+    let mut len_buf = [0u8; 4];
+    unsafe { copy_from_user(&mut len_buf, addrlen, 4); }
+    let len = u32::from_le_bytes(len_buf);
+    if len < 2 { return 0; }
+    let size = core::cmp::min(len as usize, 16);
+    if !validate_user_ptr(addr, size as u64) { return EFAULT; }
+
+    let mut sa = [0u8; 16];
+    // AF_INET = 2
+    sa[0..2].copy_from_slice(&2u16.to_ne_bytes());
+
+    // Try to get real local port/IP from socket table
+    let current_pid = crate::scheduler::current_pid();
+    let socket_id = crate::process::with_fd_table(current_pid, |fdt| {
+        fdt.get(fd as usize).and_then(|e| {
+            if e.fd_type == crate::process::FdType::Socket { Some(e.socket_id) } else { None }
+        })
+    }).flatten();
+    if let Some(sid) = socket_id {
+        let table = crate::net::socket::SOCKET_TABLE.lock();
+        if let Some(sock) = table.get(&sid) {
+            // sin_port (big-endian)
+            sa[2..4].copy_from_slice(&sock.tcp_local_port.to_be_bytes());
+            // sin_addr: our IP 10.0.2.15
+            sa[4] = 10; sa[5] = 0; sa[6] = 2; sa[7] = 15;
         }
     }
+    unsafe { copy_to_user(addr, &sa[..size]); }
+    // Write actual addrlen = 16
+    let actual_len = 16u32.to_le_bytes();
+    unsafe { copy_to_user(addrlen, &actual_len); }
+    0
+}
+
+/// getpeername(fd, addr, addrlen) — returns remote socket address.
+fn sys_getpeername(fd: u64, addr: u64, addrlen: u64) -> u64 {
+    if addr == 0 || addrlen == 0 || !validate_user_ptr(addrlen, 4) { return 0; }
+    let mut len_buf = [0u8; 4];
+    unsafe { copy_from_user(&mut len_buf, addrlen, 4); }
+    let len = u32::from_le_bytes(len_buf);
+    if len < 2 { return 0; }
+    let size = core::cmp::min(len as usize, 16);
+    if !validate_user_ptr(addr, size as u64) { return EFAULT; }
+
+    let mut sa = [0u8; 16];
+    sa[0..2].copy_from_slice(&2u16.to_ne_bytes()); // AF_INET = 2
+
+    let current_pid = crate::scheduler::current_pid();
+    let socket_id = crate::process::with_fd_table(current_pid, |fdt| {
+        fdt.get(fd as usize).and_then(|e| {
+            if e.fd_type == crate::process::FdType::Socket { Some(e.socket_id) } else { None }
+        })
+    }).flatten();
+    if let Some(sid) = socket_id {
+        let table = crate::net::socket::SOCKET_TABLE.lock();
+        if let Some(sock) = table.get(&sid) {
+            if sock.tcp_connected {
+                sa[2..4].copy_from_slice(&sock.tcp_remote_port.to_be_bytes());
+                let ip_octets = sock.tcp_remote_ip.0;
+                sa[4] = ip_octets[0]; sa[5] = ip_octets[1];
+                sa[6] = ip_octets[2]; sa[7] = ip_octets[3];
+            } else {
+                return (-107i64) as u64; // ENOTCONN
+            }
+        }
+    }
+    unsafe { copy_to_user(addr, &sa[..size]); }
+    let actual_len = 16u32.to_le_bytes();
+    unsafe { copy_to_user(addrlen, &actual_len); }
     0
 }
 
 fn sc_getsockname(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_getsockname(a1, a2, a3) }
-fn sc_getpeername(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_getsockname(a1, a2, a3) } // same impl
+fn sc_getpeername(a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> u64 { sys_getpeername(a1, a2, a3) }
 
 /// getsockopt(fd, level, optname, optval, optlen) -> 0 (stub)
 fn sys_getsockopt(_fd: u64, _level: u64, _optname: u64, optval: u64, optlen: u64) -> u64 {
@@ -3299,14 +3794,94 @@ fn sys_stub_newfstatat(_dirfd: u64, path_addr: u64, buf_addr: u64) -> u64 {
 /// prlimit64(pid, resource, new, old) -> 0 with generous limits
 fn sys_stub_prlimit64(_pid: u64, _resource: u64, _new_rlim: u64) -> u64 { 0 }
 
-/// Jalon 131: Real getrandom with Xorshift128+ PRNG, TSC-seeded.
+/// Jalon 131+: Real getrandom with hardware RDRAND (when available) + Xorshift128+ fallback.
 /// Supports GRND_RANDOM (0x2) and GRND_NONBLOCK (0x1) flags.
-/// Uses a per-call seed from TSC + PID + call counter for good entropy.
+///
+/// Entropy hierarchy (strongest to weakest):
+///   1. RDRAND (hardware DRNG, NIST SP 800-90A compliant) — used when CPUID.1:ECX.30 = 1
+///   2. Xorshift128+ seeded with TSC + PID + monotonic counter — deterministic fallback
+///
+/// This is NOT a stub — both paths produce real bytes. RDRAND failure (carry=0) falls
+/// through to the Xorshift path transparently, ensuring getrandom never returns -EAGAIN.
+///
+/// Critical consumers: musl libc (arc4random → getrandom), libssl (TLS keygen),
+/// apk-tools (signature verification), Python hashseed.
 fn sys_getrandom(buf_addr: u64, buflen: u64, _flags: u64) -> u64 {
     if buflen == 0 { return 0; }
     if !validate_user_ptr(buf_addr, buflen) { return EFAULT; }
 
-    // Seed with TSC + PID + monotonic counter for uniqueness
+    let total = buflen as usize;
+    let mut rand_buf = alloc::vec![0u8; total];
+
+    // Attempt 1: RDRAND hardware entropy (preferred)
+    // Check if RDRAND is available via the global feature flags
+    let has_rdrand = crate::arch::x86_64::context::cpu_has_rdrand();
+
+    if has_rdrand {
+        let mut i = 0usize;
+        let mut rdrand_failed = false;
+        while i < total {
+            let val: u64;
+            let success: u8;
+            unsafe {
+                asm!(
+                    "rdrand {val}",
+                    "setc {cf}",
+                    val = out(reg) val,
+                    cf = out(reg_byte) success,
+                    options(nomem, nostack),
+                );
+            }
+            if success != 0 {
+                // RDRAND succeeded — write 8 bytes (or remaining)
+                let bytes = val.to_le_bytes();
+                let to_write = core::cmp::min(total - i, 8);
+                rand_buf[i..i + to_write].copy_from_slice(&bytes[..to_write]);
+                i += to_write;
+            } else {
+                // RDRAND returned carry=0 (entropy depleted temporarily)
+                // Retry up to 10 times before falling back
+                let mut retries = 0u32;
+                let mut got_it = false;
+                while retries < 10 {
+                    let v2: u64;
+                    let s2: u8;
+                    unsafe {
+                        asm!(
+                            "rdrand {val}",
+                            "setc {cf}",
+                            val = out(reg) v2,
+                            cf = out(reg_byte) s2,
+                            options(nomem, nostack),
+                        );
+                    }
+                    if s2 != 0 {
+                        let bytes = v2.to_le_bytes();
+                        let to_write = core::cmp::min(total - i, 8);
+                        rand_buf[i..i + to_write].copy_from_slice(&bytes[..to_write]);
+                        i += to_write;
+                        got_it = true;
+                        break;
+                    }
+                    retries += 1;
+                }
+                if !got_it {
+                    rdrand_failed = true;
+                    break;
+                }
+            }
+        }
+        if !rdrand_failed {
+            // All bytes generated via RDRAND — hardware-quality entropy
+            unsafe { copy_to_user(buf_addr, &rand_buf); }
+            return buflen;
+        }
+        // RDRAND failed after retries — fall through to Xorshift for remaining bytes
+    }
+
+    // Fallback: Xorshift128+ seeded with TSC + PID + monotonic counter
+    // This provides good statistical quality (passes SmallCrush/BigCrush)
+    // though it's not cryptographically secure without hardware seeding.
     let tsc: u64;
     unsafe { asm!("rdtsc", "shl rdx, 32", "or rax, rdx", out("rax") tsc, out("rdx") _); }
     let pid = crate::scheduler::current_pid();
@@ -3316,15 +3891,13 @@ fn sys_getrandom(buf_addr: u64, buflen: u64, _flags: u64) -> u64 {
         GETRANDOM_CTR
     };
 
-    // Xorshift128+ state
+    // Xorshift128+ state — seeded from TSC (high-resolution, unpredictable jitter)
     let mut s0 = tsc ^ (pid.wrapping_mul(0x9E3779B97F4A7C15));
     let mut s1 = counter.wrapping_mul(0x6C62272E07BB0142) ^ tsc.rotate_left(17);
     if s0 == 0 { s0 = 0xDEAD_BEEF_CAFE_BABE; }
     if s1 == 0 { s1 = 0x0123_4567_89AB_CDEF; }
 
-    // Generate random bytes into a kernel buffer, then copy to user
-    let total = buflen as usize;
-    let mut rand_buf = alloc::vec![0u8; total];
+    // Generate random bytes
     let mut i = 0usize;
     while i < total {
         let mut t = s0;
@@ -3514,6 +4087,29 @@ fn sys_write(fd: u64, buf_addr: u64, len: u64) -> u64 {
                 return len; // /dev/null: accept all writes, return requested len
             }
 
+            // ═══ MANDAT 2: /dev/fb0 — Framebuffer write (raw pixel data) ═══
+            if path == "/dev/fb0" {
+                if let Some(fb_info) = crate::framebuffer::get_info() {
+                    let fb_size = fb_info.size as usize;
+                    let start = offset as usize;
+                    if start >= fb_size { return 0; }
+                    let avail = fb_size - start;
+                    let to_copy = core::cmp::min(avail, len as usize);
+                    // Write directly to physical framebuffer via HHDM
+                    let hhdm_base: u64 = 0xFFFF_8000_0000_0000;
+                    let fb_virt = hhdm_base + fb_info.phys_addr;
+                    let dst = unsafe { core::slice::from_raw_parts_mut((fb_virt + start as u64) as *mut u8, to_copy) };
+                    unsafe { copy_from_user(dst, buf_addr, to_copy); }
+                    crate::process::with_fd_table_mut(current_pid, |fd_table| {
+                        if let Some(entry) = fd_table.get_mut(fd as usize) {
+                            entry.offset += to_copy as u64;
+                        }
+                    });
+                    return to_copy as u64;
+                }
+                return 0;
+            }
+
             // Copy user data to kernel buffer (KPTI-safe)
             let user_data = unsafe {
                 let mut data = alloc::vec![0u8; len as usize];
@@ -3555,8 +4151,12 @@ fn sys_write(fd: u64, buf_addr: u64, len: u64) -> u64 {
                     (crate::fs::ext2::file_exists(&path) || !path.starts_with("/proc")) {
                     // Attempt ext2 write for persistent storage
                     if offset > 0 {
-                        // Append at offset: read existing, overlay, write back
-                        if let Some(existing) = crate::fs::ext2::read_file_by_path(&path) {
+                        // Session 15: Use write_file_chunk for efficient partial writes
+                        let wrote = crate::fs::ext2::write_file_chunk(&path, offset, &user_data);
+                        if wrote > 0 {
+                            true
+                        } else if let Some(existing) = crate::fs::ext2::read_file_by_path(&path) {
+                            // Fallback: read-modify-write for edge cases
                             let mut full = existing;
                             let off = offset as usize;
                             if off > full.len() { full.resize(off, 0); }
@@ -3986,6 +4586,118 @@ fn sys_read(fd: u32, buf_addr: u64, len: u64) -> u64 {
                 return to_fill as u64;
             }
 
+            // ═══ MANDAT 2: /dev/input/event* — Linux evdev input device reads ═══
+            // Returns struct input_event { tv_sec: u64, tv_usec: u64, type: u16, code: u16, value: i32 } = 24 bytes
+            if path.starts_with("/dev/input/event") || path == "/dev/input/mice" {
+                // Poll HID event from kernel ring buffer
+                let evt_u64 = crate::drivers::mouse::poll_event();
+                if evt_u64 == 0 {
+                    // No event available — return EAGAIN for non-blocking, or block briefly
+                    // X server typically opens input in non-blocking mode
+                    return EAGAIN;
+                }
+                // Decode HidEvent from u64
+                let evt_bytes = evt_u64.to_le_bytes();
+                let evt_type = evt_bytes[0]; // HidEventType
+                let buttons = evt_bytes[1];
+                let dx = i16::from_le_bytes([evt_bytes[2], evt_bytes[3]]);
+                let dy = i16::from_le_bytes([evt_bytes[4], evt_bytes[5]]);
+                let scancode = evt_bytes[6];
+
+                if path == "/dev/input/mice" {
+                    // PS/2 mouse protocol: 3-byte packets [flags, dx, dy]
+                    // Used by Xfbdev -mouse /dev/input/mice
+                    if len < 3 { return EINVAL; }
+                    let mut mouse_pkt = [0u8; 3];
+                    // Flags: bit3=1(always), bit0=left, bit1=right, bit2=middle
+                    mouse_pkt[0] = 0x08 | (buttons & 0x07);
+                    // Sign bits in flags
+                    if dx < 0 { mouse_pkt[0] |= 0x10; }
+                    if dy < 0 { mouse_pkt[0] |= 0x20; }
+                    mouse_pkt[1] = (dx & 0xFF) as u8;
+                    mouse_pkt[2] = ((-dy) & 0xFF) as u8; // PS/2: Y inverted
+                    unsafe { copy_to_user(buf_addr, &mouse_pkt); }
+                    return 3;
+                }
+
+                // evdev format: struct input_event (24 bytes on x86_64)
+                if len < 24 { return EINVAL; }
+                let mut ie = [0u8; 24];
+                // tv_sec (offset 0, u64) — use TSC-derived timestamp
+                let tsc: u64;
+                unsafe { core::arch::asm!("rdtsc", "shl rdx, 32", "or rax, rdx", out("rax") tsc, out("rdx") _, options(nomem, nostack)); }
+                let sec = tsc / 2_000_000_000; // Approximate: assume 2 GHz
+                let usec = (tsc % 2_000_000_000) / 2000;
+                ie[0..8].copy_from_slice(&sec.to_le_bytes());
+                ie[8..16].copy_from_slice(&usec.to_le_bytes());
+
+                // Convert HidEvent to Linux input_event
+                match evt_type {
+                    1 | 2 => {
+                        // MouseMove or MouseButton
+                        if evt_type == 1 {
+                            // EV_REL (type=2), REL_X (code=0)
+                            ie[16..18].copy_from_slice(&2u16.to_le_bytes()); // EV_REL
+                            ie[18..20].copy_from_slice(&0u16.to_le_bytes()); // REL_X
+                            ie[20..24].copy_from_slice(&(dx as i32).to_le_bytes());
+                        } else {
+                            // EV_KEY (type=1), BTN_LEFT=0x110
+                            ie[16..18].copy_from_slice(&1u16.to_le_bytes()); // EV_KEY
+                            ie[18..20].copy_from_slice(&0x110u16.to_le_bytes()); // BTN_LEFT
+                            ie[20..24].copy_from_slice(&((buttons & 1) as i32).to_le_bytes());
+                        }
+                    }
+                    3 => {
+                        // KeyPress: EV_KEY (type=1) + keycode
+                        ie[16..18].copy_from_slice(&1u16.to_le_bytes()); // EV_KEY
+                        ie[18..20].copy_from_slice(&(scancode as u16).to_le_bytes());
+                        ie[20..24].copy_from_slice(&1i32.to_le_bytes()); // value=1 (press)
+                    }
+                    4 => {
+                        // KeyRelease: EV_KEY (type=1) + keycode
+                        ie[16..18].copy_from_slice(&1u16.to_le_bytes()); // EV_KEY
+                        ie[18..20].copy_from_slice(&(scancode as u16).to_le_bytes());
+                        ie[20..24].copy_from_slice(&0i32.to_le_bytes()); // value=0 (release)
+                    }
+                    5 => {
+                        // MouseScroll: EV_REL (type=2), REL_WHEEL (code=8)
+                        ie[16..18].copy_from_slice(&2u16.to_le_bytes()); // EV_REL
+                        ie[18..20].copy_from_slice(&8u16.to_le_bytes()); // REL_WHEEL
+                        ie[20..24].copy_from_slice(&(dy as i32).to_le_bytes());
+                    }
+                    _ => {
+                        // EV_SYN (type=0, code=0, value=0)
+                        // ie is already zeroed
+                    }
+                }
+                unsafe { copy_to_user(buf_addr, &ie); }
+                return 24;
+            }
+
+            // ═══ MANDAT 2: /dev/fb0 — Framebuffer read (raw pixel data) ═══
+            if path == "/dev/fb0" {
+                // Reading /dev/fb0 returns raw framebuffer pixel data
+                if let Some(fb_info) = crate::framebuffer::get_info() {
+                    let fb_size = fb_info.size as usize;
+                    let start = offset as usize;
+                    if start >= fb_size { return 0; } // EOF
+                    let avail = fb_size - start;
+                    let to_copy = core::cmp::min(avail, len as usize);
+                    // Read from physical framebuffer via HHDM
+                    let hhdm_base: u64 = 0xFFFF_8000_0000_0000;
+                    let fb_virt = hhdm_base + fb_info.phys_addr;
+                    let src = unsafe { core::slice::from_raw_parts((fb_virt + start as u64) as *const u8, to_copy) };
+                    unsafe { copy_to_user(buf_addr, src); }
+                    crate::process::with_fd_table_mut(current_pid, |fd_table| {
+                        if let Some(entry) = fd_table.get_mut(fd as usize) {
+                            entry.offset += to_copy as u64;
+                        }
+                    });
+                    return to_copy as u64;
+                }
+                return 0;
+            }
+
             // Route /disk/ paths directly to FAT32 for fresh reads
             let is_disk = path.starts_with("/disk/");
             if is_disk {
@@ -4196,6 +4908,23 @@ fn sys_open(path_addr: u64, flags: u32) -> u64 {
         }
     }
 
+    // /dev/vgpu — VirtIO GPU compute device
+    if path == "/dev/vgpu" {
+        if crate::drivers::virtio_gpu::is_available() {
+            match crate::process::with_fd_table_mut(current_pid, |fd_table| {
+                fd_table.alloc_fd(&path, flags)
+            }) {
+                Some(Some(fd)) => {
+                    crate::serial_println!("[SYSCALL] sys_open('/dev/vgpu') = FD {} (VGPU device)", fd);
+                    return fd as u64;
+                }
+                _ => return EMFILE,
+            }
+        } else {
+            return ENOENT; // No GPU available
+        }
+    }
+
     // Standard open: check the file/directory exists in VFS
     // Allow opening directories for getdents (ls)
     let node_found = {
@@ -4216,6 +4945,7 @@ fn sys_open(path_addr: u64, flags: u32) -> u64 {
                         }
                     }
                     Some(crate::fs::vfs::VfsNode::File(_))
+                    | Some(crate::fs::vfs::VfsNode::StaticFile(_))
                     | Some(crate::fs::vfs::VfsNode::Device { .. })
                     | Some(crate::fs::vfs::VfsNode::Symlink(_)) => {
                         if i == components.len() - 1 {
@@ -4237,6 +4967,11 @@ fn sys_open(path_addr: u64, flags: u32) -> u64 {
             if let Some(info) = crate::fs::ext2::stat_path(&path) {
                 ext2_found = true;
                 let _ = info; // We don't need the info, just confirm existence
+                // O_TRUNC: truncate the file if it already exists
+                if (flags & O_TRUNC) != 0 {
+                    crate::fs::ext2::truncate_file(&path);
+                    crate::serial_println!("[SYSCALL] sys_open: O_TRUNC on ext2 '{}'", path);
+                }
             }
         }
         if !ext2_found {
@@ -5263,54 +5998,31 @@ fn sys_execve(path_addr: u64, argv_addr: u64, envp_addr: u64) -> u64 {
                 // can switch back to user page tables on sysretq.
                 PER_CPU.user_cr3 = f_pml4;
 
-                // CRITICAL: CR3 switch + Ring 3 transition via heap-allocated trampoline.
-                //
-                // Problem: BusyBox at 0x400000 overlaps kernel .text in PML4[0].
-                // After mov cr3, instructions at the current RIP become BusyBox code.
-                //
-                // Solution: Allocate a trampoline on the KERNEL HEAP (virtual address
-                // 0x444444440000+, PML4[136]). This region is NOT overlapped by any
-                // user ELF, so it survives the CR3 switch. We copy machine code bytes
-                // (mov cr3 + swapgs + iretq) there, build the IRETQ frame on the
-                // current stack, then jump to the heap trampoline with interrupts off.
-                
-                // Allocate a small buffer on the kernel heap
-                let trampoline_buf = alloc::vec![0u8; 64];
-                let trampoline_ptr = trampoline_buf.as_ptr() as *mut u8;
-                let trampoline_addr = trampoline_ptr as u64;
-                
-                // Write trampoline machine code:
-                // mov cr3, r8   (41 0F 22 D8)
-                // swapgs         (0F 01 F8)
-                // iretq           (48 CF)
-                *trampoline_ptr.add(0) = 0x41;   // REX.B
-                *trampoline_ptr.add(1) = 0x0F;   // 2-byte opcode prefix
-                *trampoline_ptr.add(2) = 0x22;   // mov cr, reg
-                *trampoline_ptr.add(3) = 0xD8;   // cr3, r8
-                *trampoline_ptr.add(4) = 0x0F;   // 2-byte opcode prefix
-                *trampoline_ptr.add(5) = 0x01;   // swapgs prefix
-                *trampoline_ptr.add(6) = 0xF8;   // swapgs
-                *trampoline_ptr.add(7) = 0x48;   // REX.W
-                *trampoline_ptr.add(8) = 0xCF;   // iretq
+                // Session 8 FIX: Use global IRETQ trampoline (HHDM/PML4[256])
+                // and build IRETQ frame on HHDM mini-stack (phys_off + 0x7000).
+                // The kernel SYSCALL_STACK becomes inaccessible after CR3 switch
+                // because it lives in PML4[511] which may not have identical
+                // page-table pointers in the user PML4. The HHDM mini-stack
+                // at phys_off + 0x7000 (PML4[256]) survives CR3 switch.
+                let trampoline_addr = crate::elf::iretq_trampoline_addr();
+                let phys_off = crate::elf::phys_offset();
                 
                 crate::serial_println!(
-                    "[EXEC] Heap trampoline at 0x{:X} (PML4[{}]), cr3=0x{:X}, rip=0x{:X}, rsp=0x{:X}",
-                    trampoline_addr, trampoline_addr >> 39, f_pml4, f_rip, f_rsp
+                    "[EXEC] HHDM trampoline at 0x{:X}, cr3=0x{:X}, rip=0x{:X}, rsp=0x{:X}",
+                    trampoline_addr, f_pml4, f_rip, f_rsp
                 );
                 
-                // Use rcx for trampoline address (not clobbered by any xor below)
-                let trampoline_reg = trampoline_addr;
                 core::arch::asm!(
-                    // Disable interrupts
                     "cli",
-                    // Build IRETQ frame on the current (still valid) kernel stack
+                    // Step 1: Switch RSP to HHDM mini-stack (survives CR3 switch)
+                    "lea rsp, [{phys_off} + 0x7000]",
+                    // Step 2: Build IRETQ frame on HHDM mini-stack
                     "push 0x1B",      // SS (Ring 3 data)
                     "push r9",        // RSP (user stack)
                     "push 0x202",     // RFLAGS (IF=1)
                     "push 0x23",      // CS (Ring 3 code)
                     "push r10",       // RIP (user entry)
-                    // Zero all registers except r8 (CR3) and rcx (trampoline addr)
-                    // r9, r10 are consumed by the pushes above
+                    // Zero GPRs (security: don't leak kernel data)
                     "xor rax, rax",
                     "xor rbx, rbx",
                     "xor rdx, rdx",
@@ -5324,17 +6036,16 @@ fn sys_execve(path_addr: u64, argv_addr: u64, envp_addr: u64) -> u64 {
                     "xor r13, r13",
                     "xor r14, r14",
                     "xor r15, r15",
-                    // Jump to heap trampoline (PML4[136], safe across CR3 switch)
-                    // Trampoline does: mov cr3, r8 → swapgs → iretq
-                    // After iretq, rcx and r8 are overwritten by the CPU (CS:RIP)
+                    // Step 3: Jump to global HHDM trampoline (PML4[256])
+                    // Trampoline: mov cr3, r8 → swapgs → iretq
                     "jmp rcx",
-                    in("rcx") trampoline_reg,
+                    phys_off = in(reg) phys_off,
+                    in("rcx") trampoline_addr,
                     in("r8") f_pml4,
                     in("r9") f_rsp,
                     in("r10") f_rip,
                     options(noreturn),
                 );
-                // trampoline_buf is leaked intentionally (process is transitioning)
             }
         }
         Err(e) => {
@@ -5425,27 +6136,25 @@ fn sys_exit(code: u64) -> u64 {
                 );
                 let _ = crate::process::set_state(next_child, crate::process::ProcessState::Running);
                 crate::scheduler::set_current_pid(next_child);
-                // KPTI: Use heap trampoline for child launch
+                // KPTI: Use global HHDM trampoline + HHDM mini-stack (Session 8 fix)
                 unsafe { PER_CPU.user_cr3 = child_pml4; }
                 let f_pml4_c = unsafe { core::ptr::read_unaligned(&child_pml4) };
                 let f_stack_c = unsafe { core::ptr::read_unaligned(&child_stack) };
                 let f_entry_c = unsafe { core::ptr::read_unaligned(&child_entry) };
                 unsafe {
-                    let tb = alloc::vec![0u8; 64];
-                    let tp = tb.as_ptr() as *mut u8;
-                    let ta = tp as u64;
-                    *tp.add(0) = 0x41; *tp.add(1) = 0x0F; *tp.add(2) = 0x22; *tp.add(3) = 0xD8;
-                    *tp.add(4) = 0x0F; *tp.add(5) = 0x01; *tp.add(6) = 0xF8;
-                    *tp.add(7) = 0x48; *tp.add(8) = 0xCF;
+                    let trampoline_addr = crate::elf::iretq_trampoline_addr();
+                    let phys_off = crate::elf::phys_offset();
                     core::arch::asm!(
                         "cli",
+                        "lea rsp, [{phys_off} + 0x7000]",
                         "push 0x1B", "push r9", "push 0x202", "push 0x23", "push r10",
                         "xor rax, rax", "xor rbx, rbx", "xor rdx, rdx",
                         "xor rsi, rsi", "xor rdi, rdi", "xor rbp, rbp",
                         "xor r9, r9", "xor r10, r10", "xor r11, r11",
                         "xor r12, r12", "xor r13, r13", "xor r14, r14", "xor r15, r15",
                         "jmp rcx",
-                        in("rcx") ta,
+                        phys_off = in(reg) phys_off,
+                        in("rcx") trampoline_addr,
                         in("r8") f_pml4_c,
                         in("r9") f_stack_c,
                         in("r10") f_entry_c,
@@ -5487,36 +6196,35 @@ fn sys_exit(code: u64) -> u64 {
                         "[SYSCALL] Fallback IRETQ to parent: RIP=0x{:X}, RSP=0x{:X}",
                         saved_rip, saved_rsp
                     );
+                    // Session 8 FIX: Use global HHDM trampoline + HHDM mini-stack
                     let f_result = unsafe { core::ptr::read_unaligned(&wait_result) };
                     let f_rsp_p = unsafe { core::ptr::read_unaligned(&saved_rsp) };
                     let f_rip_p = unsafe { core::ptr::read_unaligned(&saved_rip) };
                     unsafe {
-                        let tb = alloc::vec![0u8; 64];
-                        let tp = tb.as_ptr() as *mut u8;
-                        let ta = tp as u64;
-                        // nop (no CR3 switch needed — already on parent PML4 via kernel)
-                        // swapgs (0F 01 F8)
-                        *tp.add(0) = 0x0F; *tp.add(1) = 0x01; *tp.add(2) = 0xF8;
-                        // iretq (48 CF)
-                        *tp.add(3) = 0x48; *tp.add(4) = 0xCF;
+                        let trampoline_addr = crate::elf::iretq_trampoline_addr();
+                        let phys_off = crate::elf::phys_offset();
 
                         core::arch::asm!(
                             "cli",
-                            // Switch to parent PML4 first (we're on kernel PML4)
-                            "mov cr3, {pml4}",
-                            "mov rax, r8",      // r8 = wait result
+                            // Switch RSP to HHDM mini-stack (survives CR3 switch)
+                            "lea rsp, [{phys_off} + 0x7000]",
+                            // Set RAX = wait result for parent
+                            "mov rax, r11",
+                            // Build IRETQ frame on HHDM mini-stack
                             "push 0x1B",
                             "push r9",          // r9 = parent RSP
                             "push 0x202",
                             "push 0x23",
                             "push r10",         // r10 = parent RIP
-                            // Jump to trampoline for swapgs + iretq
+                            // r8 = parent PML4 for trampoline's mov cr3, r8
+                            // Jump to global trampoline: mov cr3 → swapgs → iretq
                             "jmp rcx",
-                            pml4 = in(reg) pml4,
-                            in("rcx") ta,
-                            in("r8") f_result,
+                            phys_off = in(reg) phys_off,
+                            in("rcx") trampoline_addr,
+                            in("r8") pml4,
                             in("r9") f_rsp_p,
                             in("r10") f_rip_p,
+                            in("r11") f_result,
                             options(noreturn),
                         );
                     }
@@ -5528,18 +6236,24 @@ fn sys_exit(code: u64) -> u64 {
                         "[SYSCALL] Fallback: restarting parent at entry=0x{:X}",
                         entry
                     );
-                    // Jalon 109c: hardcoded GPR allocation
+                    // Jalon 109c / Session 8 FIX: Use HHDM mini-stack for safety
                     let f_stack_fb = unsafe { core::ptr::read_unaligned(&stack) };
                     let f_entry_fb = unsafe { core::ptr::read_unaligned(&entry) };
                     unsafe {
+                        // No CR3 switch needed (already on correct PML4),
+                        // but still use HHDM mini-stack for robustness.
+                        let phys_off = crate::elf::phys_offset();
                         core::arch::asm!(
-                            "swapgs",           // Restore user GS before Ring 3
+                            "cli",
+                            "lea rsp, [{phys_off} + 0x7000]",
+                            "swapgs",
                             "push 0x1B",
                             "push r9",          // r9 = parent stack
                             "push 0x202",
                             "push 0x23",
                             "push r10",         // r10 = parent entry
                             "iretq",
+                            phys_off = in(reg) phys_off,
                             in("r9") f_stack_fb,
                             in("r10") f_entry_fb,
                             options(noreturn),
@@ -5617,30 +6331,29 @@ fn sys_exit(code: u64) -> u64 {
                             parent_pid, saved_rip
                         );
 
-                        // KPTI: heap trampoline for fallback IRETQ
+                        // Session 8 FIX: Use global HHDM trampoline + HHDM mini-stack
                         unsafe { PER_CPU.user_cr3 = pml4; }
                         let f_pml4_fc = unsafe { core::ptr::read_unaligned(&pml4) };
                         let f_result_fc = unsafe { core::ptr::read_unaligned(&wait_result) };
                         let f_rsp_fc = unsafe { core::ptr::read_unaligned(&saved_rsp) };
                         let f_rip_fc = unsafe { core::ptr::read_unaligned(&saved_rip) };
                         unsafe {
-                            let tb = alloc::vec![0u8; 64];
-                            let tp = tb.as_ptr() as *mut u8;
-                            let ta = tp as u64;
-                            *tp.add(0) = 0x41; *tp.add(1) = 0x0F; *tp.add(2) = 0x22; *tp.add(3) = 0xD8; // mov cr3,r8
-                            *tp.add(4) = 0x0F; *tp.add(5) = 0x01; *tp.add(6) = 0xF8; // swapgs
-                            *tp.add(7) = 0x48; *tp.add(8) = 0xCF; // iretq
+                            let trampoline_addr = crate::elf::iretq_trampoline_addr();
+                            let phys_off = crate::elf::phys_offset();
                             core::arch::asm!(
                                 "cli",
+                                // Switch RSP to HHDM mini-stack
+                                "lea rsp, [{phys_off} + 0x7000]",
                                 "mov rax, r9",       // r9 = wait result
                                 "push 0x1B",
                                 "push r10",          // r10 = parent RSP
                                 "push 0x202",
                                 "push 0x23",
                                 "push r11",          // r11 = parent RIP
-                                // Jump to heap trampoline: mov cr3 → swapgs → iretq
+                                // r8 = parent PML4 for trampoline's mov cr3, r8
                                 "jmp rcx",
-                                in("rcx") ta,
+                                phys_off = in(reg) phys_off,
+                                in("rcx") trampoline_addr,
                                 in("r8") f_pml4_fc,
                                 in("r9") f_result_fc,
                                 in("r10") f_rsp_fc,
@@ -5736,32 +6449,29 @@ pub fn launch_next_userspace_process(exclude_pid: u64) {
         crate::scheduler::set_current_pid(next_pid);
         let _ = crate::process::set_state(next_pid, crate::process::ProcessState::Running);
 
-        // KPTI: Set user_cr3 + use heap trampoline for safe CR3 switch
+        // XRSTOR: Restore FPU/SSE/AVX state before entering the new process
+        crate::process::restore_fpu_state(next_pid);
+
+        // Session 8 FIX: Use global HHDM trampoline + HHDM mini-stack
         unsafe { PER_CPU.user_cr3 = pml4; }
         let f_pml4 = unsafe { core::ptr::read_unaligned(&pml4) };
         let f_stack = unsafe { core::ptr::read_unaligned(&stack) };
         let f_entry = unsafe { core::ptr::read_unaligned(&entry) };
         unsafe {
-            // Allocate iretq trampoline on kernel heap
-            let tb = alloc::vec![0u8; 64];
-            let tp = tb.as_ptr() as *mut u8;
-            let ta = tp as u64;
-            // mov cr3, r8   (41 0F 22 D8)
-            *tp.add(0) = 0x41; *tp.add(1) = 0x0F; *tp.add(2) = 0x22; *tp.add(3) = 0xD8;
-            // swapgs           (0F 01 F8)
-            *tp.add(4) = 0x0F; *tp.add(5) = 0x01; *tp.add(6) = 0xF8;
-            // iretq             (48 CF)
-            *tp.add(7) = 0x48; *tp.add(8) = 0xCF;
+            let trampoline_addr = crate::elf::iretq_trampoline_addr();
+            let phys_off = crate::elf::phys_offset();
 
             core::arch::asm!(
                 "cli",
-                // Build IRETQ frame on current kernel stack
+                // Switch RSP to HHDM mini-stack (survives CR3 switch)
+                "lea rsp, [{phys_off} + 0x7000]",
+                // Build IRETQ frame on HHDM mini-stack
                 "push 0x1B",        // SS
                 "push r9",          // RSP (user stack)
                 "push 0x202",       // RFLAGS
                 "push 0x23",        // CS
                 "push r10",         // RIP (entry point)
-                // Zero GPRs
+                // Zero GPRs (security)
                 "xor rax, rax",
                 "xor rbx, rbx",
                 "xor rdx, rdx",
@@ -5775,15 +6485,15 @@ pub fn launch_next_userspace_process(exclude_pid: u64) {
                 "xor r13, r13",
                 "xor r14, r14",
                 "xor r15, r15",
-                // Jump to heap trampoline: mov cr3 → swapgs → iretq
+                // Jump to global HHDM trampoline: mov cr3 → swapgs → iretq
                 "jmp rcx",
-                in("rcx") ta,
+                phys_off = in(reg) phys_off,
+                in("rcx") trampoline_addr,
                 in("r8") f_pml4,
                 in("r9") f_stack,
                 in("r10") f_entry,
                 options(noreturn),
             );
-            // tb leaked intentionally
         }
     }
 }
@@ -5847,23 +6557,28 @@ fn sys_wait(pid: u64) -> u64 {
         // Set scheduler's current PID to child
         crate::scheduler::set_current_pid(child_pid);
 
-        // Switch CR3 to child's PML4 (same as parent for threads)
+        // Session 8 FIX: Use global HHDM trampoline + HHDM mini-stack
+        // Even for threads (same PML4), use the safe pattern for consistency
         unsafe {
-            core::arch::asm!("mov cr3, {}", in(reg) child_pml4, options(nostack));
-        }
-
-        // IRETQ to the child thread!
-        unsafe {
+            PER_CPU.user_cr3 = child_pml4;
+            let trampoline_addr = crate::elf::iretq_trampoline_addr();
+            let phys_off = crate::elf::phys_offset();
             core::arch::asm!(
-                "swapgs",           // Restore user GS before Ring 3
+                "cli",
+                "lea rsp, [{phys_off} + 0x7000]",
                 "push 0x1B",        // SS
                 "push {stack}",     // RSP
                 "push 0x202",       // RFLAGS (IF=1)
                 "push 0x23",        // CS
                 "push {entry}",     // RIP
-                "iretq",
+                // r8 = child PML4 for trampoline's mov cr3, r8
+                "mov r8, {pml4}",
+                "jmp {trampoline}",
+                phys_off = in(reg) phys_off,
                 stack = in(reg) child_stack,
                 entry = in(reg) child_entry,
+                pml4 = in(reg) child_pml4,
+                trampoline = in(reg) trampoline_addr,
                 options(noreturn),
             );
         }
@@ -6356,6 +7071,7 @@ fn sys_getdents(fd: u32, buf_ptr: u64, buf_size: u64) -> u64 {
                 let dtype = match node {
                     crate::fs::vfs::VfsNode::Directory(_) => DT_DIR,
                     crate::fs::vfs::VfsNode::File(_) => DT_REG,
+                    crate::fs::vfs::VfsNode::StaticFile(_) => DT_REG,
                     crate::fs::vfs::VfsNode::Symlink(_) => DT_LNK,
                     crate::fs::vfs::VfsNode::Device { .. } => DT_REG,
                 };
@@ -6375,6 +7091,7 @@ fn sys_getdents(fd: u32, buf_ptr: u64, buf_size: u64) -> u64 {
                     let dtype = match node {
                         crate::fs::vfs::VfsNode::Directory(_) => DT_DIR,
                         crate::fs::vfs::VfsNode::File(_) => DT_REG,
+                        crate::fs::vfs::VfsNode::StaticFile(_) => DT_REG,
                         crate::fs::vfs::VfsNode::Symlink(_) => DT_LNK,
                         crate::fs::vfs::VfsNode::Device { .. } => DT_REG,
                     };
@@ -6970,6 +7687,28 @@ fn sys_mmap_full(addr_hint: u64, len: u64, prot: u64, flags: u64, fd: u64) -> u6
     } else {
         None
     };
+
+    // ═══ MANDAT 2: Special handling for mmap(/dev/fb0) — map physical framebuffer ═══
+    if !is_anonymous {
+        if let Some(ref path) = file_path {
+            if path == "/dev/fb0" {
+                if let Some(fb_info) = crate::framebuffer::get_info() {
+                    let fb_vaddr = crate::framebuffer::map_fb_for_user(pml4_phys);
+                    match fb_vaddr {
+                        Some(addr) => {
+                            crate::serial_println!("[MMAP] /dev/fb0 mapped at 0x{:X} ({} pages)", addr, num_pages);
+                            return addr;
+                        }
+                        None => {
+                            crate::serial_println!("[MMAP] /dev/fb0 map_fb_for_user failed");
+                            return ENOMEM;
+                        }
+                    }
+                }
+                return ENODEV_IOCTL;
+            }
+        }
+    }
 
     // Map pages
     for i in 0..num_pages {
@@ -7581,12 +8320,28 @@ fn sys_socket(domain: u32, sock_type: u32, protocol: u32) -> u64 {
 /// For TCP: encoded_dest == 0, uses connected remote; length in first 8 bytes of buf
 /// Linux ABI sendto(fd, buf, len, flags, dest_addr, addrlen)
 /// Parses sockaddr_in from user pointer when dest_addr is non-null.
-/// Falls back to connected-socket send (TCP) when dest_addr is null.
+/// Falls back to connected-socket send when dest_addr is null.
 fn sys_sendto_linux(fd: u32, buf_addr: u64, len: u64, _flags: u64, dest_addr: u64, addrlen: u64) -> u64 {
     // If dest_addr is 0 or addrlen < 8, treat as send() on a connected socket
     if dest_addr == 0 || addrlen < 8 {
-        // Connected-mode send (TCP)
-        return crate::net::socket::sys_tcp_send(fd, buf_addr, len);
+        // Check socket type to dispatch correctly — UDP uses sendto with stored peer
+        let socket_id = crate::net::socket::resolve_socket_id(fd).unwrap_or(fd);
+        let sock_info = {
+            let table = crate::net::socket::SOCKET_TABLE.lock();
+            table.get(&socket_id).map(|s| (s.sock_type & 0xF, s.tcp_remote_ip, s.tcp_remote_port, s.tcp_connected))
+        };
+        match sock_info {
+            Some((2, remote_ip, remote_port, true)) => {
+                // SOCK_DGRAM with connect() called — use stored peer address
+                if !validate_user_ptr(buf_addr, len) { return EFAULT; }
+                crate::serial_println!("[SENDTO] fd={} UDP connected-mode -> {}:{}", fd, remote_ip, remote_port);
+                return crate::net::socket::sys_sendto(fd, buf_addr, len, 0, remote_ip, remote_port);
+            }
+            _ => {
+                // TCP or other — use tcp_send
+                return crate::net::socket::sys_tcp_send(fd, buf_addr, len);
+            }
+        }
     }
 
     // Parse sockaddr_in from user space
@@ -7615,6 +8370,137 @@ fn sys_sendto_linux(fd: u32, buf_addr: u64, len: u64, _flags: u64, dest_addr: u6
 fn sys_recvfrom_linux(fd: u32, buf_addr: u64, len: u64, _flags: u64, _src_addr: u64, _addrlen_ptr: u64) -> u64 {
     if !validate_user_ptr(buf_addr, len) { return EFAULT; }
     crate::net::socket::sys_recvfrom(fd, buf_addr, len)
+}
+
+/// Linux ABI sendmsg(fd, *msghdr, flags) -> bytes sent or negative error
+/// struct msghdr {
+///   msg_name: *void (sockaddr),  msg_namelen: socklen_t,
+///   msg_iov: *iovec,            msg_iovlen: size_t,
+///   msg_control: *void,         msg_controllen: size_t,
+///   msg_flags: int
+/// }
+/// Layout on x86_64: [name:8][namelen:4][pad:4][iov:8][iovlen:8][ctrl:8][ctrllen:8][flags:4]
+/// Total: 56 bytes
+fn sys_sendmsg_linux(fd: u32, msg_addr: u64, _flags: u32) -> u64 {
+    if !validate_user_ptr(msg_addr, 56) { return EFAULT; }
+    let mut hdr = [0u8; 56];
+    let copied = unsafe { copy_from_user(&mut hdr, msg_addr, 56) };
+    if copied < 56 {
+        crate::serial_println!("[SENDMSG] copy_from_user failed (copied={}/56)", copied);
+        return EFAULT;
+    }
+
+    // Parse msghdr fields
+    let msg_name = u64::from_le_bytes([hdr[0],hdr[1],hdr[2],hdr[3],hdr[4],hdr[5],hdr[6],hdr[7]]);
+    let msg_namelen = u32::from_le_bytes([hdr[8],hdr[9],hdr[10],hdr[11]]);
+    let msg_iov = u64::from_le_bytes([hdr[16],hdr[17],hdr[18],hdr[19],hdr[20],hdr[21],hdr[22],hdr[23]]);
+    let msg_iovlen = u64::from_le_bytes([hdr[24],hdr[25],hdr[26],hdr[27],hdr[28],hdr[29],hdr[30],hdr[31]]);
+
+    crate::serial_println!("[SENDMSG] fd={} name=0x{:X} namelen={} iov=0x{:X} iovlen={}",
+        fd, msg_name, msg_namelen, msg_iov, msg_iovlen);
+
+    // Parse destination address if present (for UDP sendmsg)
+    let mut dest_ip = crate::net::ipv4::Ipv4Addr::new(0,0,0,0);
+    let mut dest_port: u16 = 0;
+    let has_dest = msg_name != 0 && msg_namelen >= 8;
+    if has_dest && validate_user_ptr(msg_name, 8) {
+        let mut sa_buf = [0u8; 16];
+        let sa_copied = unsafe { copy_from_user(&mut sa_buf, msg_name, core::cmp::min(msg_namelen as usize, 16)) };
+        if sa_copied >= 8 {
+            let family = u16::from_ne_bytes([sa_buf[0], sa_buf[1]]);
+            if family == 2 { // AF_INET
+                dest_port = u16::from_be(u16::from_ne_bytes([sa_buf[2], sa_buf[3]]));
+                dest_ip = crate::net::ipv4::Ipv4Addr([sa_buf[4], sa_buf[5], sa_buf[6], sa_buf[7]]);
+            }
+        }
+    }
+
+    // Gather data from iovecs
+    if msg_iovlen == 0 || msg_iovlen > 64 { return 0; }
+    if !validate_user_ptr(msg_iov, msg_iovlen * 16) { return EFAULT; }
+
+    let mut total_sent: u64 = 0;
+    for i in 0..msg_iovlen {
+        let iov_off = msg_iov + i * 16;
+        let mut iov_buf = [0u8; 16];
+        let ic = unsafe { copy_from_user(&mut iov_buf, iov_off, 16) };
+        if ic < 16 { break; }
+        let base = u64::from_le_bytes([iov_buf[0],iov_buf[1],iov_buf[2],iov_buf[3],
+                                        iov_buf[4],iov_buf[5],iov_buf[6],iov_buf[7]]);
+        let len = u64::from_le_bytes([iov_buf[8],iov_buf[9],iov_buf[10],iov_buf[11],
+                                       iov_buf[12],iov_buf[13],iov_buf[14],iov_buf[15]]);
+        if len == 0 { continue; }
+        if !validate_user_ptr(base, len) { return EFAULT; }
+
+        let n = if has_dest {
+            // UDP sendmsg with destination
+            crate::net::socket::sys_sendto(fd, base, len, 0, dest_ip, dest_port)
+        } else {
+            // Connected-mode send (TCP)
+            crate::net::socket::sys_tcp_send(fd, base, len)
+        };
+        if (n as i64) < 0 { return n; }
+        total_sent += n;
+    }
+    total_sent
+}
+
+/// Linux ABI recvmsg(fd, *msghdr, flags) -> bytes received or negative error
+fn sys_recvmsg_linux(fd: u32, msg_addr: u64, _flags: u32) -> u64 {
+    if !validate_user_ptr(msg_addr, 56) { return EFAULT; }
+    let mut hdr = [0u8; 56];
+    let copied = unsafe { copy_from_user(&mut hdr, msg_addr, 56) };
+    if copied < 56 {
+        crate::serial_println!("[RECVMSG] copy_from_user failed (copied={}/56)", copied);
+        return EFAULT;
+    }
+
+    let msg_iov = u64::from_le_bytes([hdr[16],hdr[17],hdr[18],hdr[19],hdr[20],hdr[21],hdr[22],hdr[23]]);
+    let msg_iovlen = u64::from_le_bytes([hdr[24],hdr[25],hdr[26],hdr[27],hdr[28],hdr[29],hdr[30],hdr[31]]);
+
+    crate::serial_println!("[RECVMSG] fd={} iov=0x{:X} iovlen={}", fd, msg_iov, msg_iovlen);
+
+    if msg_iovlen == 0 || msg_iovlen > 64 { return 0; }
+    if !validate_user_ptr(msg_iov, msg_iovlen * 16) { return EFAULT; }
+
+    // Receive data into the FIRST iovec (most common case for DNS/musl)
+    // For multi-iovec, we fill each one sequentially.
+    let mut total_recv: u64 = 0;
+    for i in 0..msg_iovlen {
+        let iov_off = msg_iov + i * 16;
+        let mut iov_buf = [0u8; 16];
+        let ic = unsafe { copy_from_user(&mut iov_buf, iov_off, 16) };
+        if ic < 16 { break; }
+        let base = u64::from_le_bytes([iov_buf[0],iov_buf[1],iov_buf[2],iov_buf[3],
+                                        iov_buf[4],iov_buf[5],iov_buf[6],iov_buf[7]]);
+        let len = u64::from_le_bytes([iov_buf[8],iov_buf[9],iov_buf[10],iov_buf[11],
+                                       iov_buf[12],iov_buf[13],iov_buf[14],iov_buf[15]]);
+        if len == 0 { continue; }
+        if !validate_user_ptr(base, len) { return EFAULT; }
+
+        let n = crate::net::socket::sys_recvfrom(fd, base, len);
+        if (n as i64) < 0 { return n; }
+        total_recv += n;
+        // If we received less than requested, don't fill remaining iovecs
+        if n < len { break; }
+    }
+
+    // Clear msg_flags in the msghdr (offset 48, 4 bytes)
+    let zero_flags: [u8; 4] = [0, 0, 0, 0];
+    unsafe { copy_to_user(msg_addr + 48, &zero_flags); }
+
+    // Set msg_controllen to 0 (offset 40, 8 bytes) — no ancillary data
+    let zero_ctrl: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0];
+    unsafe { copy_to_user(msg_addr + 40, &zero_ctrl); }
+
+    total_recv
+}
+
+/// Linux ABI shutdown(fd, how) -> 0 or negative error
+/// how: 0=SHUT_RD, 1=SHUT_WR, 2=SHUT_RDWR
+fn sys_shutdown_linux(fd: u32, _how: i32) -> u64 {
+    crate::serial_println!("[SYSCALL] shutdown(fd={}, how={})", fd, _how);
+    crate::net::socket::sys_tcp_shutdown(fd)
 }
 
 fn sys_sendto(fd: u32, buf_addr: u64, encoded: u64) -> u64 {
@@ -7670,6 +8556,25 @@ fn sys_recvfrom(fd: u32, buf_addr: u64, len: u64) -> u64 {
 fn sys_bind(fd: u32, port: u16) -> u64 {
     crate::serial_println!("[SYSCALL] sys_bind(fd={}, port={})", fd, port);
     crate::net::socket::sys_bind(fd, port)
+}
+
+/// Linux ABI bind(fd, sockaddr_ptr, addrlen) — parses sockaddr_in to extract port.
+/// Falls back to legacy call if addrlen is too small (legacy: port in a2 directly).
+fn sys_bind_linux(fd: u32, addr: u64, addrlen: u64) -> u64 {
+    if addrlen >= 8 && addr >= 0x10000 && validate_user_ptr(addr, 8) {
+        let mut sa_buf = [0u8; 16];
+        let copied = unsafe { copy_from_user(&mut sa_buf, addr, core::cmp::min(addrlen as usize, 16)) };
+        if copied >= 8 {
+            let family = u16::from_ne_bytes([sa_buf[0], sa_buf[1]]);
+            if family == 2 { // AF_INET
+                let port = u16::from_be(u16::from_ne_bytes([sa_buf[2], sa_buf[3]]));
+                crate::serial_println!("[SYSCALL] sys_bind/LinuxABI(fd={}, port={}, family=AF_INET)", fd, port);
+                return crate::net::socket::sys_bind(fd, port);
+            }
+        }
+    }
+    // Legacy fallback: addr is the port number directly
+    sys_bind(fd, addr as u16)
 }
 
 /// sys_net_ping(ip_packed, sequence) -> 0 or error
@@ -8020,6 +8925,13 @@ fn sys_rmdir(path_addr: u64) -> u64 {
 
     crate::serial_println!("[SYSCALL] rmdir: '{}'", path_str);
 
+    // Session 15: Try ext2 first for persistent directories
+    if crate::fs::ext2::is_mounted() && crate::fs::ext2::is_dir(&path_str) {
+        if crate::fs::ext2::rmdir(&path_str) {
+            return 0;
+        }
+    }
+
     match crate::fs::vfs::unlink(&path_str) {
         Ok(()) => 0,
         Err(_) => ENOENT,
@@ -8090,9 +9002,9 @@ fn sys_unlink(path_addr: u64) -> u64 {
 
 // ===== Real statfs/sysinfo Syscalls =====
 
-/// sysinfo(info) — Returns real system information.
+/// sysinfo(info) — Returns real system information (Linux struct sysinfo).
 /// struct sysinfo is 112 bytes on x86_64.
-fn sys_sysinfo(buf_addr: u64) -> u64 {
+fn sys_linux_sysinfo(buf_addr: u64) -> u64 {
     if !validate_user_ptr(buf_addr, 112) { return EFAULT; }
 
     let mut buf = [0u8; 112];
@@ -8421,11 +9333,9 @@ fn sys_ftruncate(fd: u32, length: u64) -> u64 {
                 return 0;
             }
         } else {
-            if let Some(mut data) = crate::fs::ext2::read_file_by_path(&path) {
-                data.resize(length as usize, 0);
-                if crate::fs::ext2::write_file_path(&path, &data).is_some() {
-                    return 0;
-                }
+            // Session 15: Use set_file_size for efficient truncation
+            if crate::fs::ext2::set_file_size(&path, length) {
+                return 0;
             }
         }
     }
@@ -9655,6 +10565,13 @@ pub fn validate_user_ptr_pub(addr: u64, len: u64) -> bool {
 /// Public wrapper for sys_brk, used by compat::linux_abi
 pub fn sys_brk_pub(new_break: u64) -> u64 {
     sys_brk(new_break)
+}
+
+/// Public wrapper for sys_getrandom, used by compat::linux_abi.
+/// SECURITY: routes through the hardened RDRAND/Xorshift128+ implementation
+/// (Jalon 131+) instead of the weak LCG/TSC PRNG that linux_abi.rs used to have.
+pub fn sys_getrandom_pub(buf: u64, buflen: u64, flags: u64) -> u64 {
+    sys_getrandom(buf, buflen, flags)
 }
 
 /// Public wrapper for sys_write, used by compat::linux_abi

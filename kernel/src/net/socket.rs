@@ -356,13 +356,30 @@ pub fn sys_connect(fd: u32, ip_a: u8, ip_b: u8, ip_c: u8, ip_d: u8, port: u16) -
     let remote_ip = super::ipv4::Ipv4Addr::new(ip_a, ip_b, ip_c, ip_d);
     let socket_id = resolve_socket_id(fd).unwrap_or(fd);
 
-    // Verify socket exists and is a TCP socket
+    // Verify socket exists and determine type
     {
         let table = SOCKET_TABLE.lock();
         match table.get(&socket_id) {
-            Some(s) if s.sock_type == SOCK_STREAM || s.sock_type == (SOCK_STREAM | 0x800) => {},
+            Some(s) if (s.sock_type & 0xF) == SOCK_STREAM => {
+                // TCP: fall through to TCP connect below
+            },
+            Some(s) if (s.sock_type & 0xF) == SOCK_DGRAM => {
+                // UDP connect: just store remote address for default destination
+                // This is valid POSIX — connect() on UDP sets default peer address
+                crate::serial_println!("[SOCKET] connect/UDP fd={} sid={} -> {}:{}", fd, socket_id, remote_ip, port);
+                drop(table);
+                {
+                    let mut t = SOCKET_TABLE.lock();
+                    if let Some(socket) = t.get_mut(&socket_id) {
+                        socket.tcp_remote_ip = remote_ip;
+                        socket.tcp_remote_port = port;
+                        socket.tcp_connected = true; // marks default peer set
+                    }
+                }
+                return 0;
+            },
             Some(s) => {
-                crate::serial_println!("[SOCKET] connect: fd={} sid={} not TCP (type={})", fd, socket_id, s.sock_type);
+                crate::serial_println!("[SOCKET] connect: fd={} sid={} unsupported type={}", fd, socket_id, s.sock_type);
                 return (-22i64) as u64; // EINVAL
             }
             None => {
@@ -723,7 +740,7 @@ pub fn deliver_udp(src_ip: Ipv4Addr, src_port: u16, dst_port: u16, data: &[u8]) 
 }
 
 /// Resolve a process fd to a socket_id by looking up the FD table
-fn resolve_socket_id(fd: u32) -> Option<u32> {
+pub fn resolve_socket_id(fd: u32) -> Option<u32> {
     let current_pid = crate::scheduler::current_pid();
     crate::process::with_fd_table(current_pid, |fdt| {
         if let Some(entry) = fdt.get(fd as usize) {

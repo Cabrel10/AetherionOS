@@ -145,6 +145,7 @@ for agent in $AGENTS; do
        cargo build --release \
            --manifest-path "$CARGO_TOML" \
            --target x86_64-aetherion-user.json \
+           -Zjson-target-spec \
            $BUILD_STD_FLAGS \
        > "$BUILD_LOG" 2>&1; then
 

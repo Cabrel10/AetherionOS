@@ -173,10 +173,55 @@ pub fn parse_apkindex(text: &str) -> Vec<ApkPackage> {
     packages
 }
 
-/// Simulate `apk update`: download APKINDEX.tar.gz from each repository
-/// In the real implementation, this would HTTP-fetch each APKINDEX.tar.gz,
-/// gunzip + untar it, and parse the APKINDEX text.
-/// For now, we check if APKINDEX is already on the ext2 disk.
+/// Decompress an APKINDEX.tar.gz blob (as served by Alpine repositories) and
+/// return the UTF-8 text of its `APKINDEX` member.
+///
+/// Pipeline: gunzip (RFC 1952 / DEFLATE, `fs::tar::gunzip`) → untar
+/// (`fs::tar::parse_tar`) → locate the `APKINDEX` entry → decode as UTF-8.
+/// Returns `None` if any stage fails (bad gzip, missing member, non-UTF-8).
+fn extract_apkindex_text(gz_data: &[u8]) -> Option<String> {
+    // 1. DEFLATE decompression via the in-kernel gunzip implementation.
+    let tar_bytes = match crate::fs::tar::gunzip(gz_data) {
+        Some(d) => d,
+        None => {
+            crate::serial_println!("[APK]   gunzip failed on APKINDEX.tar.gz ({} bytes)", gz_data.len());
+            return None;
+        }
+    };
+
+    // 2. Parse the tar archive into named entries.
+    let entries = crate::fs::tar::parse_tar(&tar_bytes);
+
+    // 3. Find the APKINDEX member. Alpine archives store it at the top level,
+    //    but tolerate a leading "./" or a sub-path just in case.
+    for entry in &entries {
+        let name = entry.name.trim_start_matches("./");
+        if name == "APKINDEX" || name.ends_with("/APKINDEX") {
+            return match core::str::from_utf8(&entry.data) {
+                Ok(text) => Some(String::from(text)),
+                Err(_) => {
+                    crate::serial_println!("[APK]   APKINDEX member is not valid UTF-8");
+                    None
+                }
+            };
+        }
+    }
+
+    crate::serial_println!(
+        "[APK]   APKINDEX member not found in tar archive ({} entries)",
+        entries.len()
+    );
+    None
+}
+
+/// `apk update`: refresh the package index for every configured repository.
+///
+/// For each repo we first try the ext2 cache (`/var/lib/apk/APKINDEX-*.txt`);
+/// on a miss we HTTP/HTTPS-fetch `<repo>/x86_64/APKINDEX.tar.gz` via the kernel
+/// network stack (DNS + TCP + TLS 1.3 + 301 redirects), gunzip + untar it,
+/// parse the APKINDEX text, and persist the decoded text back to ext2 so
+/// subsequent boots are offline-capable. A bundled on-disk index is used as a
+/// last-resort fallback when the network is unreachable.
 pub fn apk_update() -> bool {
     let db = match unsafe { APK_DB.as_mut() } {
         Some(db) => db,
@@ -205,20 +250,46 @@ pub fn apk_update() -> bool {
                 db.available.extend(pkgs);
             }
         } else {
-            // Try to fetch via HTTP
-            // For QEMU SLIRP, we can't reach the real internet easily
-            // Check for a bundled APKINDEX on disk
-            let alt_path = "/var/lib/apk/APKINDEX.txt";
-            if let Some(data) = crate::fs::ext2::read_file_path(alt_path) {
-                if let Ok(text) = core::str::from_utf8(&data) {
-                    let pkgs = parse_apkindex(text);
-                    crate::serial_println!("[APK]   Loaded {} packages from {}", pkgs.len(), alt_path);
-                    total_packages += pkgs.len();
-                    db.available.extend(pkgs);
-                }
+            // Not cached on ext2 → fetch the real APKINDEX over the network using
+            // the kernel HTTP/HTTPS client (DNS + TCP + TLS 1.3 + 301 redirects).
+            // Alpine layout: <repo>/x86_64/APKINDEX.tar.gz
+            let index_url = if repo.url.ends_with('/') {
+                format!("{}x86_64/APKINDEX.tar.gz", repo.url)
             } else {
-                crate::serial_println!("[APK]   WARNING: Cannot fetch {} (no HTTP yet)", repo.url);
-                crate::serial_println!("[APK]   Place APKINDEX.txt at {}", index_path);
+                format!("{}/x86_64/APKINDEX.tar.gz", repo.url)
+            };
+            crate::serial_println!("[APK]   HTTP fetch: {}", index_url);
+            match crate::net::http::wget(&index_url) {
+                Ok(body) => {
+                    crate::serial_println!("[APK]   Downloaded {} bytes from {}", body.len(), index_url);
+                    // APKINDEX.tar.gz: gunzip + untar, then parse the APKINDEX text member.
+                    if let Some(text) = extract_apkindex_text(&body) {
+                        let pkgs = parse_apkindex(&text);
+                        crate::serial_println!("[APK]   Parsed {} packages from network index", pkgs.len());
+                        total_packages += pkgs.len();
+                        db.available.extend(pkgs);
+                        // Persist to ext2 cache so subsequent boots are offline-capable.
+                        let _ = crate::fs::ext2::write_file_path(&index_path, text.as_bytes());
+                    } else {
+                        crate::serial_println!("[APK]   WARNING: could not decode APKINDEX.tar.gz");
+                    }
+                }
+                Err(e) => {
+                    // Network unreachable (e.g. QEMU without -netdev) → fall back to a
+                    // bundled APKINDEX on disk so apk add still works offline.
+                    crate::serial_println!("[APK]   HTTP fetch failed ({}) — trying disk fallback", e);
+                    let alt_path = "/var/lib/apk/APKINDEX.txt";
+                    if let Some(data) = crate::fs::ext2::read_file_path(alt_path) {
+                        if let Ok(text) = core::str::from_utf8(&data) {
+                            let pkgs = parse_apkindex(text);
+                            crate::serial_println!("[APK]   Loaded {} packages from {}", pkgs.len(), alt_path);
+                            total_packages += pkgs.len();
+                            db.available.extend(pkgs);
+                        }
+                    } else {
+                        crate::serial_println!("[APK]   No network and no cached index at {}", index_path);
+                    }
+                }
             }
         }
     }
