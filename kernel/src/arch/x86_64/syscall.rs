@@ -10567,6 +10567,13 @@ pub fn sys_brk_pub(new_break: u64) -> u64 {
     sys_brk(new_break)
 }
 
+/// Public wrapper for sys_getrandom, used by compat::linux_abi.
+/// SECURITY: routes through the hardened RDRAND/Xorshift128+ implementation
+/// (Jalon 131+) instead of the weak LCG/TSC PRNG that linux_abi.rs used to have.
+pub fn sys_getrandom_pub(buf: u64, buflen: u64, flags: u64) -> u64 {
+    sys_getrandom(buf, buflen, flags)
+}
+
 /// Public wrapper for sys_write, used by compat::linux_abi
 pub fn sys_write_pub(fd: u64, buf: u64, len: u64) -> u64 {
     sys_write(fd, buf, len)
